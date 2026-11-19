@@ -3,6 +3,7 @@ import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileS
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3-multiple-ciphers';
 
 const MARKER = 'FOUNDRY_V0_PLANTED_PLAINTEXT_MARKER_9F8E7D6C5B4A';
@@ -12,6 +13,21 @@ const wrongKeyHex = randomBytes(32).toString('hex');
 const tempDir = mkdtempSync(join(tmpdir(), 'foundry-v0-sqlcipher-'));
 const dbPath = join(tempDir, 'index.db');
 const tamperedPath = join(tempDir, 'tampered.db');
+
+const builtAddonPath = fileURLToPath(
+  new URL('./node_modules/better-sqlite3-multiple-ciphers/build/Release/better_sqlite3.node', import.meta.url),
+);
+const builtBinaryExists = existsSync(builtAddonPath);
+const prebuildBinaryExists = existsSync(
+  new URL(`./node_modules/better-sqlite3-multiple-ciphers/prebuilds/${process.platform}-${process.arch}.node`, import.meta.url),
+);
+const requireBuilt = process.env.FOUNDRY_V0_REQUIRE_BUILT === '1';
+
+if (requireBuilt && !builtBinaryExists) {
+  throw new Error('FOUNDRY_V0_REQUIRE_BUILT=1 set, but build/Release/better_sqlite3.node does not exist.');
+}
+
+const dbOptions = requireBuilt ? { nativeBinding: builtAddonPath } : {};
 
 function configureCipher(db, hexKey) {
   db.pragma("cipher = 'sqlcipher'");
@@ -23,11 +39,15 @@ function configureCipher(db, hexKey) {
   db.pragma('secure_delete = ON');
 }
 
+function isExpectedAuthOrCorruptError(err) {
+  return err?.code === 'SQLITE_NOTADB' || err?.code === 'SQLITE_CORRUPT';
+}
+
 let openDb = null;
 
 try {
   const t0 = performance.now();
-  const db = new Database(dbPath);
+  const db = new Database(dbPath, dbOptions);
   openDb = db;
   configureCipher(db, keyHex);
 
@@ -40,8 +60,17 @@ try {
   const tempStore = Number(db.pragma('temp_store', { simple: true }));
   const secureDelete = Number(db.pragma('secure_delete', { simple: true }));
 
-  if (pinnedCipher !== 'sqlcipher' || pinnedLegacy !== 4 || pinnedHmacCheck !== 1 || pinnedPageSize !== 4096) {
-    throw new Error(`Unexpected cipher config: cipher=${pinnedCipher} legacy=${pinnedLegacy} hmac=${pinnedHmacCheck} page=${pinnedPageSize}`);
+  if (
+    pinnedCipher !== 'sqlcipher' ||
+    pinnedLegacy !== 4 ||
+    pinnedHmacCheck !== 1 ||
+    pinnedPageSize !== 4096 ||
+    tempStore !== 2 ||
+    secureDelete !== 1
+  ) {
+    throw new Error(
+      `Unexpected cipher config: cipher=${pinnedCipher} legacy=${pinnedLegacy} hmac=${pinnedHmacCheck} page=${pinnedPageSize} temp_store=${tempStore} secure_delete=${secureDelete}`,
+    );
   }
 
   // Verify FTS5 and R-tree (rtree_i32) are compiled in and usable under SQLCipher.
@@ -79,19 +108,38 @@ try {
     throw new Error(`R-tree check failed: ${JSON.stringify(rtreeHits)}`);
   }
 
+  // Scan the live WAL file BEFORE checkpointing to confirm the planted marker is encrypted in WAL too.
+  const markerBytes = Buffer.from(MARKER, 'utf8');
+  const liveWalPath = `${dbPath}-wal`;
+  if (!existsSync(liveWalPath)) {
+    throw new Error('Expected active -wal file before checkpoint.');
+  }
+  const liveWalBytes = readFileSync(liveWalPath);
+  if (liveWalBytes.length === 0) {
+    throw new Error('Expected non-empty -wal file before checkpoint.');
+  }
+  const liveWalMarkerLeakFound = liveWalBytes.includes(markerBytes);
+  if (liveWalMarkerLeakFound) {
+    throw new Error('Planted plaintext marker found in active -wal file.');
+  }
+  const liveWalScan = {
+    exists: true,
+    bytes: liveWalBytes.length,
+    markerLeakFound: liveWalMarkerLeakFound,
+  };
+
   db.pragma('wal_checkpoint(TRUNCATE)');
   db.close();
   openDb = null;
 
-  // Verify planted marker string does not appear in any on-disk file bytes.
-  const markerBytes = Buffer.from(MARKER, 'utf8');
+  // Verify planted marker string does not appear in any post-close on-disk file bytes.
   let markerLeakFound = false;
-  const scannedFiles = [];
+  const postCloseScannedFiles = [];
   for (const suffix of ['', '-wal', '-shm', '-journal']) {
     const candidate = `${dbPath}${suffix}`;
     if (existsSync(candidate)) {
       const data = readFileSync(candidate);
-      scannedFiles.push({ suffix: suffix || '.db', bytes: data.length });
+      postCloseScannedFiles.push({ suffix: suffix || '.db', bytes: data.length });
       if (data.includes(markerBytes)) {
         markerLeakFound = true;
       }
@@ -101,15 +149,22 @@ try {
     throw new Error('Planted plaintext marker found on disk in encrypted database files.');
   }
 
-  // Verify fail-closed wrong-key rejection.
+  // Verify fail-closed wrong-key rejection (configuration stays outside the failure catch).
   let wrongKeyRejected = false;
-  const wrongDb = new Database(dbPath);
+  let wrongKeyErrorCode = null;
+  const wrongDb = new Database(dbPath, dbOptions);
   openDb = wrongDb;
   try {
     configureCipher(wrongDb, wrongKeyHex);
-    wrongDb.prepare('SELECT count(*) AS n FROM sqlite_master').get();
-  } catch {
-    wrongKeyRejected = true;
+    try {
+      wrongDb.prepare('SELECT count(*) AS n FROM sqlite_master').get();
+    } catch (err) {
+      if (!isExpectedAuthOrCorruptError(err)) {
+        throw err;
+      }
+      wrongKeyRejected = true;
+      wrongKeyErrorCode = err.code;
+    }
   } finally {
     wrongDb.close();
     openDb = null;
@@ -128,13 +183,20 @@ try {
   writeFileSync(tamperedPath, rawDb);
 
   let modifiedPageRejected = false;
-  const tamperedDb = new Database(tamperedPath);
+  let modifiedPageErrorCode = null;
+  const tamperedDb = new Database(tamperedPath, dbOptions);
   openDb = tamperedDb;
   try {
     configureCipher(tamperedDb, keyHex);
-    tamperedDb.prepare('SELECT count(*) AS n FROM items').get();
-  } catch {
-    modifiedPageRejected = true;
+    try {
+      tamperedDb.prepare('SELECT sum(length(body)) AS total FROM items').get();
+    } catch (err) {
+      if (!isExpectedAuthOrCorruptError(err)) {
+        throw err;
+      }
+      modifiedPageRejected = true;
+      modifiedPageErrorCode = err.code;
+    }
   } finally {
     tamperedDb.close();
     openDb = null;
@@ -144,7 +206,7 @@ try {
   }
 
   // Re-open original with the correct key and confirm FTS5 + R-tree still query cleanly.
-  const verifyDb = new Database(dbPath);
+  const verifyDb = new Database(dbPath, dbOptions);
   openDb = verifyDb;
   configureCipher(verifyDb, keyHex);
   const reopenFts = verifyDb.prepare("SELECT count(*) AS n FROM items_fts WHERE items_fts MATCH 'synthetic'").get().n;
@@ -156,25 +218,14 @@ try {
     throw new Error(`Reopen check failed: fts=${reopenFts}, rtree=${reopenRtree}`);
   }
 
-  const builtBinaryExists = existsSync(
-    new URL('./node_modules/better-sqlite3-multiple-ciphers/build/Release/better_sqlite3.node', import.meta.url),
-  );
-  const prebuildName = `${process.platform}-${process.arch}.node`;
-  const prebuildBinaryExists = existsSync(
-    new URL(`./node_modules/better-sqlite3-multiple-ciphers/prebuilds/${prebuildName}`, import.meta.url),
-  );
-
-  if (process.env.FOUNDRY_V0_REQUIRE_BUILT === '1' && !builtBinaryExists) {
-    throw new Error('FOUNDRY_V0_REQUIRE_BUILT=1 set, but build/Release/better_sqlite3.node does not exist.');
-  }
-
   const elapsedMs = performance.now() - t0;
   const ru = process.resourceUsage();
 
   console.log(JSON.stringify({
     benchmark: 'sqlcipher-addon',
     addonLoaded: true,
-    loadedAddonVariant: builtBinaryExists ? 'built-from-source' : 'prebuild',
+    loadedAddonVariant: requireBuilt || builtBinaryExists ? 'built-from-source' : 'prebuild',
+    explicitNativeBindingUsed: requireBuilt,
     builtBinaryExists,
     prebuildBinaryExists,
     sqliteVersion,
@@ -190,9 +241,12 @@ try {
     fts5Available: true,
     rtreeAvailable: true,
     wrongKeyRejected,
+    wrongKeyErrorCode,
     modifiedPageRejected,
+    modifiedPageErrorCode,
+    liveWalScan,
     markerLeakFound,
-    scannedFiles,
+    postCloseScannedFiles,
     elapsedMs: Number(elapsedMs.toFixed(2)),
     internalMaxRssKiB: ru.maxRSS,
     internalMaxRssMiB: Number((ru.maxRSS / 1024).toFixed(2)),

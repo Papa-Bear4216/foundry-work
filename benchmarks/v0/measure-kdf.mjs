@@ -10,7 +10,6 @@ const iterations = 3;
 
 const passphrase = Buffer.from('foundry-v0-synthetic-passphrase-for-measurement', 'utf8');
 const timingsMs = [];
-let digestHex = '';
 
 for (let i = 0; i < iterations; i++) {
   const salt = randomBytes(32);
@@ -21,7 +20,6 @@ for (let i = 0; i < iterations; i++) {
   if (key.length !== keylen) {
     throw new Error(`Unexpected derived key length: ${key.length}`);
   }
-  digestHex = key.subarray(0, 4).toString('hex');
 }
 
 const sorted = [...timingsMs].sort((a, b) => a - b);
@@ -37,5 +35,4 @@ console.log(JSON.stringify({
   maxMs: sorted[sorted.length - 1],
   internalMaxRssKiB: ru.maxRSS,
   internalMaxRssMiB: Number((ru.maxRSS / 1024).toFixed(2)),
-  samplePrefix: digestHex,
 }));

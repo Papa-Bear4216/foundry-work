@@ -5,10 +5,6 @@ on: [push]
 permissions:
   contents: read
 
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   check:
     strategy:
@@ -69,6 +65,9 @@ jobs:
         run: node --input-type=module -e "await import('facts-ledger')"
 
   v0-measure:
+    concurrency:
+      group: v0-measure-${{ github.ref }}
+      cancel-in-progress: true
     strategy:
       fail-fast: false
       matrix:
@@ -89,7 +88,7 @@ jobs:
 
       - name: Build SQLCipher native addon from source
         working-directory: benchmarks/v0/node_modules/better-sqlite3-multiple-ciphers
-        run: npx --yes node-gyp rebuild --release --force_build=1
+        run: npx --yes node-gyp@13.1.0 rebuild --release --force_build=1
 
       - name: Run V-0 measurements
         env:

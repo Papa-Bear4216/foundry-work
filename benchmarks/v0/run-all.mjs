@@ -1,11 +1,11 @@
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
 import { cpus, totalmem } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const dir = dirname(fileURLToPath(import.meta.url));
 const nodeBin = process.execPath;
+const MIB = 1024 * 1024;
 
 function getGlibcVersion() {
   if (process.platform !== 'linux') return null;
@@ -62,9 +62,12 @@ $sw.Stop()
 $pmc = New-Object WinMem+PROCESS_MEMORY_COUNTERS
 $pmc.cb = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf($pmc)
 $ok = [WinMem]::GetProcessMemoryInfo($proc.Handle, [ref]$pmc, $pmc.cb)
-$peakBytes = if ($ok) { [uint64]$pmc.PeakWorkingSetSize } else { 0 }
+$peakBytes = [uint64]$pmc.PeakWorkingSetSize
 $exitCode = $proc.ExitCode
 $proc.Dispose()
+if (-not $ok -or $peakBytes -eq 0) {
+  throw "GetProcessMemoryInfo failed or returned zero PeakWorkingSetSize."
+}
 
 [PSCustomObject]@{
   exitCode = $exitCode
@@ -111,6 +114,8 @@ if os.WIFEXITED(status):
     code = os.WEXITSTATUS(status)
 else:
     code = -os.WTERMSIG(status)
+if rusage.ru_maxrss <= 0:
+    raise RuntimeError(f"os.wait4 returned non-positive ru_maxrss: {rusage.ru_maxrss}")
 print(json.dumps({
     "exitCode": code,
     "wallMs": wall_ms,
@@ -138,8 +143,14 @@ function runMeasured(scriptName) {
   if (raw.exitCode !== 0) {
     throw new Error(`${scriptName} failed (exit ${raw.exitCode}): ${raw.stderr || raw.stdout}`);
   }
+  if (typeof raw.externalPeakBytes !== 'number' || !Number.isFinite(raw.externalPeakBytes) || raw.externalPeakBytes <= 0) {
+    throw new Error(`${scriptName} produced invalid externalPeakBytes: ${raw.externalPeakBytes}`);
+  }
   const payload = JSON.parse(raw.stdout.trim());
-  const externalPeakMiB = Number((raw.externalPeakBytes / (1024 * 1024)).toFixed(2));
+  if (typeof payload.internalMaxRssKiB !== 'number' || !Number.isFinite(payload.internalMaxRssKiB) || payload.internalMaxRssKiB <= 0) {
+    throw new Error(`${scriptName} produced invalid internalMaxRssKiB: ${payload.internalMaxRssKiB}`);
+  }
+  const externalPeakMiB = Number((raw.externalPeakBytes / MIB).toFixed(2));
   return {
     ...payload,
     externalWallMs: raw.wallMs,
@@ -151,6 +162,9 @@ function runMeasured(scriptName) {
 const kdf = runMeasured('measure-kdf.mjs');
 const encrypt = runMeasured('measure-encrypt.mjs');
 const sqlcipher = runMeasured('measure-sqlcipher.mjs');
+
+const kdfMaxBytes = Math.max(kdf.internalMaxRssKiB * 1024, kdf.externalPeakBytes);
+const encryptMaxBytes = Math.max(encrypt.internalMaxRssKiB * 1024, encrypt.externalPeakBytes);
 
 const report = {
   environment: {
@@ -168,18 +182,21 @@ const report = {
   },
   ceilings: {
     kdfCeilingMiB: 256,
-    kdfWithinCeiling: Math.max(kdf.internalMaxRssMiB, kdf.externalPeakMiB) <= 256,
+    kdfWithinCeiling: kdfMaxBytes <= 256 * MIB,
     streamEncryptVerifyCeilingMiB: 128,
     streamEncryptImportCeilingMiB: 256,
-    streamWithinVerifyCeiling: Math.max(encrypt.internalMaxRssMiB, encrypt.externalPeakMiB) <= 128,
-    streamWithinImportCeiling: Math.max(encrypt.internalMaxRssMiB, encrypt.externalPeakMiB) <= 256,
+    streamWithinVerifyCeiling: encryptMaxBytes <= 128 * MIB,
+    streamWithinImportCeiling: encryptMaxBytes <= 256 * MIB,
     sqlcipherLoadedWithFts5AndRtree:
       sqlcipher.addonLoaded &&
       sqlcipher.fts5Available &&
       sqlcipher.rtreeAvailable &&
       sqlcipher.wrongKeyRejected &&
       sqlcipher.modifiedPageRejected &&
+      !sqlcipher.liveWalScan?.markerLeakFound &&
       !sqlcipher.markerLeakFound,
+    encryptRoundtripAndTamperVerified:
+      encrypt.roundtripVerified && encrypt.tamperRejected,
   },
 };
 
@@ -188,7 +205,8 @@ console.log(JSON.stringify(report, null, 2));
 if (
   !report.ceilings.kdfWithinCeiling ||
   !report.ceilings.streamWithinImportCeiling ||
-  !report.ceilings.sqlcipherLoadedWithFts5AndRtree
+  !report.ceilings.sqlcipherLoadedWithFts5AndRtree ||
+  !report.ceilings.encryptRoundtripAndTamperVerified
 ) {
   process.exitCode = 1;
 }
