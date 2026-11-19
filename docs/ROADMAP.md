@@ -25,9 +25,11 @@ Items marked **Owner** need the project owner and cannot be completed by a build
 |---|---|---|---|
 | 0. Step Zero | A facts ledger agents use to cite or abstain, with both proof deliverables green | Z-0 to Z-8 | 2 to 3 weeks |
 | 1. Thin slice | Synthetic Takeout archive in, encrypted vault, search out, from the command line | V-0 to V-8 | 4 to 6 weeks |
-| 2. Product v1 | Wizard, profiles and erasure, offline second copy, restore drill, installers, first public release | P-1 to P-8 | 6 to 8 weeks |
-| 3. Growth | More sources, places, semantic search, cited answers, relationship map, always-on second device | X-1 to X-7 | Open-ended |
-| 4. Adoption | The private predecessor consumes Foundry as a package | Planned separately | Not public |
+| 2. Product v1 (Tier 0) | Wizard, profiles and erasure, offline second copy, restore drill, installers, first public release | P-1 to P-8 | 6 to 8 weeks |
+| 3. Growth (Data & Ask) | More sources, places, semantic search, cited answers, relationship map, always-on second device | X-1 to X-7 | Open-ended |
+| 4. Remember Live Stack (Opt-in Tier 1+) | Opt-in `exocortexd`, event bus, local memory, write-time recap cards, encrypted channel vaults, `llama.cpp` role runner, Tauri desktop shell, Android companion | E-1 to E-6 | 6 to 8 weeks |
+| 5. Act — World Model & Earned Autonomy (Opt-in Tier 1–2) | Living Life Graph (`GraphStore`), Cognitive Mode Gate, Pre-Cognitive Wake, Active Inference, 14-day shadow calibration (`SHADOW=1` default), WYSIWYS biometric approvals, Agent Mesh & Advisory Triad, Morphogenetic self-healing ladder | W-1 to W-5 | 6 to 8 weeks |
+| 6. Adoption | The private predecessor consumes Foundry as a package | Planned separately | Not public |
 
 Phases 0 and 1 may overlap once Z-2 is merged: V-0 and V-1 do not depend on the ledger.
 
@@ -101,7 +103,32 @@ fixtures and its own measured memory ceiling.
 | X-6 | Always-on second device: home network first, then private overlay network | Architecture 8.4; Product 8 | Phase 2 |
 | X-7 | Reach: `.deb`, macOS, Linux arm64, a compact command that starts a new chain epoch | Architecture 4.5, 13 | Phase 2 |
 
-## Phase 4: adoption by the predecessor
+## Phase 4: Remember Live Stack (Opt-in Tier 1+, D-20, D-21)
+
+| Id | Package | Spec | Needs | Done when | Size |
+|---|---|---|---|---|---|
+| E-1 | Core event bus & local memory | Decisions D-20, D-21; Extraction plan | V-7 | `packages/core` and `packages/memory` pass the scrub gate, store events cleanly without personal identifiers, and pass all unit tests under CI. | M |
+| E-2 | `exocortexd` gateway, enrollment & attestation | Decisions D-20, D-21; Architecture 5, 8.4 | V-7, E-1 | `apps/daemon` starts without mandatory external home-proxy lock-in, enforces JWT device enrollment and attestation checks, appends hash-chained events, and stops cleanly when disabled. | L |
+| E-3 | Recap cards, encrypted channels & autonomic archival | Decisions D-20, D-21 | V-4, E-1, E-2 | Write-time session recap cards pass anti-empty-card, anti-junk-tag, and anti-hallucinated-next-step tests; Obsidian/Notion/Gmail `ChannelVault` adapters encrypt content via `FVR1`/SQLCipher and shred keys cleanly on disconnect. | L |
+| E-4 | Local `llama.cpp` role runner | Decisions D-2, D-6, D-21 | E-2 | Triage, embedding, and vision local role servers launch only on opt-in, enforce explicit memory/concurrency bounds, log calls to `model_calls`, and tear down cleanly on exit. | M |
+| E-5 | Tauri desktop shell | Decisions D-20, D-21 | E-2, E-3 | `apps/desktop` builds with generic branding, discovers local `exocortexd` on opt-in, and renders the local dashboard without leaving Tier 0 users needing desktop runtime dependencies. | M |
+| E-6 | Android companion (`apps/mobile`) | Decisions D-20, D-21 | E-2 | Capacitor Android companion builds with generic IDs/strings, completes QR pairing, verifies Android Keystore `BiometricPrompt` WYSIWYS signatures, and passes the mobile test suite with zero hardcoded URLs or real device IDs. | L |
+
+Phase exit: opt-in Remember live stack builds cleanly, runs synthetic end-to-end capture -> recap -> channel vault -> desktop/mobile companion tests, and keeps Tier 0 zero-daemon when disabled.
+
+## Phase 5: Act — World Model, Shadow Calibration & Earned Autonomy (Opt-in Tier 1–2, D-20, D-21)
+
+| Id | Package | Spec | Needs | Done when | Size |
+|---|---|---|---|---|---|
+| W-1 | Living Life Graph (`GraphStore`) | Decisions D-20, A-11; Extraction plan | E-2, E-3 | `packages/world-model` rebuilds deterministic generic entity/edge graphs with spreading/decaying activation from the event log in SQLite/in-process store (no Neo4j). | M |
+| W-2 | Cognitive Mode Gate, Dynamic Wake & Active Inference | Decisions D-20, D-21 | W-1 | Five-state Cognitive Mode Gate, `p20` Pre-Cognitive Wake calibration, discrete A/B/C/D Active Inference scoring, and next-action prediction logging pass deterministic synthetic evaluation against a frequency baseline. | L |
+| W-3 | Shadow calibration (`SHADOW=1`) & attested actuation | Decisions D-20, D-21 | E-6, W-2 | `SHADOW=1` blocks live execution by default, `wanted`/`not_wanted` tap labels and `InferredOutcomeScheduler` measure `Precision@surface >= 0.90` over 14 days / 50+ labels before any tier gate opens, and single-use biometric WYSIWYS tickets fail closed on replay/mismatch. | L |
+| W-4 | Agent Mesh & Advisory Triad | Decisions D-20, D-21 | W-3 | `packages/mesh` and `packages/triad` enforce per-action default-deny capability allowlists on `/network/delegate`, strip secrets/MCP bloat on $0 subscription CLI bridges, and contain zero personal config paths. | L |
+| W-5 | Morphogenetic self-healing patch ladder | Decisions D-20, D-21 | W-4 | Disabled by default (`TRIAD_MORPHOGENETIC=0`), runs repairs only inside no-network sandboxed worktrees within strict line/file caps, excludes safety/tests/CI/engine code permanently, and requires biometric patch approval before any earned auto-merge progression. | M |
+
+Phase exit: opt-in Act stack stays fail-closed under `SHADOW=1` by default, passes biometric WYSIWYS replay/deny gates, passes identifier/license scans across all new workspaces, and verifies Morphogenetic exclusions.
+
+## Phase 6: Adoption by the predecessor
 
 The private project that Foundry was extracted from replaces its own storage code with
 Foundry packages. That migration is planned outside this repository. The only requirement

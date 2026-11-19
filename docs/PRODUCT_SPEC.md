@@ -5,12 +5,10 @@ dates in [DECISIONS.md](DECISIONS.md). Everything else is the planner's proposal
 
 ## 1. Goal
 
-A person with one ordinary computer installs Foundry, answers a short wizard, and ends up
-with an encrypted, searchable copy of their own digital history plus a second copy on a
-drive they control. Incremental cost is $0: no subscription, no cloud account, no paid API.
+Foundry is the public, MIT-licensed, zero-personal-info distribution of the Sovereign Exocortex. A person with one ordinary computer installs Foundry, answers a short wizard, and starts with a portable, encrypted, searchable databank of their digital history plus a second offline copy on hardware they control (Tier 0, zero resident daemons). Users on capable hardware (Tier 1–2) can optionally enable the live **Remember** and **Act** layers — local capture, write-time recap synthesis, local `llama.cpp` inference, desktop tray shell, Android companion with biometric WYSIWYS approval, Living World Model, and shadow-calibrated automation. Incremental cost is $0: no required subscription, no cloud account, no paid API.
 
 The product helps people by helping them use what they already have: data they are
-entitled to export, hardware they already own.
+entitled to export or capture locally, and hardware they already own.
 
 ## 2. Who it is for
 
@@ -33,21 +31,19 @@ Not a target in v1: teams, businesses, multi-user servers, phones as the main de
    summaries are derived and can be rebuilt. Corrections are new records, not edits.
 4. **Cite or abstain.** Any generated answer points at stored records or says it found nothing.
 5. **Honest limits.** The docs and the wizard say what the product cannot guarantee.
-6. **Runs lean.** No always-running helper processes. Work happens in short-lived commands
-   and scheduled tasks. Memory use is measured in CI, with fixed ceilings.
+6. **Runs lean.** Tier 0 runs zero always-on helper processes: work happens in short-lived commands and scheduled tasks, and memory use is measured in CI with fixed ceilings. Tier 1–2 users who explicitly opt into Phase 4–5 live capabilities may enable `exocortexd` and local `llama.cpp` role servers on demand, still bounded and measurable, and disabled cleanly when turned off.
 7. **No real-life sample data.** Every fixture in the repository is synthetic.
 
-## 4. Platforms and hardware (Decided)
+## 4. Platforms and hardware (Decided, updated by D-21)
 
-- Windows 10/11 x64 and Linux x64 in v1. macOS deferred. Linux arm64 is a stretch target
-  for the always-on second device.
+- Windows 10/11 x64 and Linux x64 in v1, plus opt-in Android companion client in Phase 4 (`E-6`). macOS deferred. Linux arm64 is a stretch target for the always-on second device.
 - Hardware tiers, chosen by the wizard from measured RAM, cores and GPU:
 
 | Tier | Minimum | Enabled |
 |---|---|---|
-| 0 | 4 GiB RAM | Vault, import, full-text search, second copy, restore drill |
-| 1 | 8 GiB RAM, 4 CPU cores | Tier 0 + on-demand embeddings + small local model (2–4 B parameters, 4-bit) |
-| 2 | 16 GiB RAM or a discrete GPU | Tier 1 + larger model + answer verifier |
+| 0 | 4 GiB RAM | Vault, import, full-text search, second copy, restore drill, loopback wizard (zero resident daemons) |
+| 1 | 8 GiB RAM, 4 CPU cores | Tier 0 + on-demand embeddings, small local model (2–4 B parameters, 4-bit), and optional opt-in Phase 4 (`exocortexd`, write-time recap cards, channel vaults, Tauri desktop shell, Android companion) |
+| 2 | 16 GiB RAM or a discrete GPU | Tier 1 + larger local `llama.cpp` role servers, answer verifier, and optional opt-in Phase 5 (Living World Model, Cognitive Mode Gate, Active Inference, Shadow-calibrated WYSIWYS biometric actuation, Agent Mesh/Triad, Morphogenetic self-healing ladder) |
 
 The wizard never enables a feature whose measured peak memory exceeds half of the
 machine's free RAM at check time. A user can lower a tier; raising one requires re-running the check.
@@ -215,7 +211,8 @@ length of a transfer.
 | Peak memory per command | Within the ceilings in [ARCHITECTURE.md](ARCHITECTURE.md#9-resource-budgets), measured in CI |
 | Personal identifiers in the repository | Zero (scanned on every push) |
 
-## 12. Out of scope for v1
+## 12. Scope boundaries and progressive tiers (D-20, D-21)
 
-Mobile apps, live capture from phones, automations that act on the user's behalf, sharing
-between households, macOS, a hosted demo, and any feature that needs a paid service.
+- **Tier 0 (core v1 foundation):** offline vault, archived imports, full-text search, Mode B offline second copy, restore drill, and loopback setup wizard with zero resident daemons.
+- **Opt-in Phases 4–5 (Tier 1–2):** `exocortexd`, local capture, write-time recap cards, encrypted channels (`ChannelVault`), local `llama.cpp` role runner, Tauri desktop shell, Android companion with Keystore/BiometricPrompt WYSIWYS approvals, Living World Model, Shadow-calibrated actuation (`SHADOW=1` default), Agent Mesh, Advisory Triad, and Morphogenetic self-healing ladder (disabled by default).
+- **Permanently excluded:** cloud-hosted core state, sharing between households, macOS in initial releases (deferred), hosted demos, any feature requiring a paid subscription/API, personal identifiers/real fixtures, and unrelated external consumer apps.
