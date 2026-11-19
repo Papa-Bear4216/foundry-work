@@ -33,6 +33,8 @@ function configureCipher(db, hexKey, { hmacCheck = 1 } = {}) {
   db.pragma("cipher = 'sqlcipher'");
   db.pragma('legacy = 4');
   db.pragma('legacy_page_size = 4096');
+  db.pragma('kdf_iter = 256000');
+  db.pragma('fast_kdf_iter = 2');
   db.pragma('hmac_use = 1');
   db.pragma(`hmac_check = ${hmacCheck}`);
   db.pragma('hmac_pgno = 1');
@@ -50,6 +52,8 @@ function readPinnedConfig(db) {
     cipher: String(db.pragma('cipher', { simple: true })),
     legacy: Number(db.pragma('legacy', { simple: true })),
     pageSize: Number(db.pragma('legacy_page_size', { simple: true })),
+    kdfIter: Number(db.pragma('kdf_iter', { simple: true })),
+    fastKdfIter: Number(db.pragma('fast_kdf_iter', { simple: true })),
     hmacUse: Number(db.pragma('hmac_use', { simple: true })),
     hmacCheck: Number(db.pragma('hmac_check', { simple: true })),
     hmacPgno: Number(db.pragma('hmac_pgno', { simple: true })),
@@ -82,6 +86,8 @@ try {
     pinnedConfig.cipher !== 'sqlcipher' ||
     pinnedConfig.legacy !== 4 ||
     pinnedConfig.pageSize !== 4096 ||
+    pinnedConfig.kdfIter !== 256000 ||
+    pinnedConfig.fastKdfIter !== 2 ||
     pinnedConfig.hmacUse !== 1 ||
     pinnedConfig.hmacCheck !== 1 ||
     pinnedConfig.hmacPgno !== 1 ||

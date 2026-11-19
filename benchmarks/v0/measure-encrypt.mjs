@@ -28,6 +28,7 @@ header.writeBigUInt64BE(EXPECTED_TOTAL_LEN, 61);
 
 const plainFrame = Buffer.alloc(FRAME_SIZE, 0x5a);
 const encodedFrame = Buffer.allocUnsafe(FRAME_SIZE + FRAME_OVERHEAD);
+const decryptedFrame = Buffer.allocUnsafe(FRAME_SIZE);
 const nonce = Buffer.alloc(12, 0);
 const aad = Buffer.alloc(69 + 16 + 8 + 1);
 header.copy(aad, 0);
@@ -78,13 +79,21 @@ for (let i = 0; i < FRAME_COUNT; i++) {
   const decipher = createDecipheriv('aes-256-gcm', recordKey, nonce);
   decipher.setAAD(aad);
   decipher.setAuthTag(parsedTag);
+  let decPos = 0;
   for (let off = 0; off < parsedCtLen; off += CHUNK_SIZE) {
     const pt = decipher.update(encodedFrame.subarray(4 + off, 4 + Math.min(off + CHUNK_SIZE, parsedCtLen)));
-    if (pt.length > 0) roundtripHash.update(pt);
+    if (pt.length > 0) {
+      pt.copy(decryptedFrame, decPos);
+      decPos += pt.length;
+    }
   }
   const ptFinal = decipher.final();
-  if (ptFinal.length > 0) roundtripHash.update(ptFinal);
+  if (ptFinal.length > 0) {
+    ptFinal.copy(decryptedFrame, decPos);
+    decPos += ptFinal.length;
+  }
   decryptNs += process.hrtime.bigint() - decStart;
+  roundtripHash.update(decryptedFrame.subarray(0, decPos));
 }
 
 // Verify 1-bit tamper on the serialized frame fails authentication.
@@ -124,6 +133,7 @@ const ru = process.resourceUsage();
 
 console.log(JSON.stringify({
   benchmark: 'stream-encrypt-aes-256-gcm',
+  scopeNote: 'encryptMs and decryptMs exclude SHA-256 verification; totalWallMs and process peak RSS cover the 128 MiB payload loop plus a 1-frame tamper check.',
   payloadMiB: totalMiB,
   encodedRecordBodyBytes: totalEncodedBytes,
   headerTotalLen: Number(headerTotalLen),

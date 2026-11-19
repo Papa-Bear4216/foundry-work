@@ -209,6 +209,7 @@ const sqlcipher = runMeasured('measure-sqlcipher.mjs');
 
 const kdfMaxBytes = Math.max(kdf.internalMaxRssKiB * 1024, kdf.externalPeakBytes);
 const encryptMaxBytes = Math.max(encrypt.internalMaxRssKiB * 1024, encrypt.externalPeakBytes);
+const sqlcipherMaxBytes = Math.max(sqlcipher.internalMaxRssKiB * 1024, sqlcipher.externalPeakBytes);
 
 const report = {
   environment: {
@@ -224,14 +225,18 @@ const report = {
     encrypt,
     sqlcipher,
   },
-  ceilings: {
-    kdfCeilingMiB: 256,
-    kdfWithinCeiling: kdfMaxBytes <= 256 * MIB,
-    streamEncryptVerifyCeilingMiB: 128,
-    streamEncryptImportCeilingMiB: 256,
-    streamWithinVerifyCeiling: encryptMaxBytes <= 128 * MIB,
-    streamWithinImportCeiling: encryptMaxBytes <= 256 * MIB,
-    sqlcipherLoadedWithFts5AndRtree:
+  budgets: {
+    scopeNote:
+      'V-0 measures isolated primitives (each benchmark child process individually, not full end-to-end commands or launcher+helper trees).',
+    kdfBudgetMiB: 256,
+    kdfWithinBudget: kdfMaxBytes <= 256 * MIB,
+    streamProbeBudgetMiB: 128,
+    streamProbeWithinBudget: encryptMaxBytes <= 128 * MIB,
+    sqlcipherProbeBudgetMiB: 192,
+    sqlcipherProbeWithinBudget: sqlcipherMaxBytes <= 192 * MIB,
+  },
+  checks: {
+    sqlcipherChecksPassed:
       sqlcipher.addonLoaded &&
       sqlcipher.fts5Available &&
       sqlcipher.rtreeAvailable &&
@@ -240,7 +245,7 @@ const report = {
       sqlcipher.hmacControlBypassSucceeded &&
       !sqlcipher.liveWalScan?.markerLeakFound &&
       !sqlcipher.markerLeakFound,
-    encryptRoundtripAndTamperVerified:
+    encryptChecksPassed:
       encrypt.roundtripVerified && encrypt.tamperRejected,
   },
 };
@@ -248,11 +253,11 @@ const report = {
 console.log(JSON.stringify(report, null, 2));
 
 if (
-  !report.ceilings.kdfWithinCeiling ||
-  !report.ceilings.streamWithinVerifyCeiling ||
-  !report.ceilings.streamWithinImportCeiling ||
-  !report.ceilings.sqlcipherLoadedWithFts5AndRtree ||
-  !report.ceilings.encryptRoundtripAndTamperVerified
+  !report.budgets.kdfWithinBudget ||
+  !report.budgets.streamProbeWithinBudget ||
+  !report.budgets.sqlcipherProbeWithinBudget ||
+  !report.checks.sqlcipherChecksPassed ||
+  !report.checks.encryptChecksPassed
 ) {
   process.exitCode = 1;
 }
