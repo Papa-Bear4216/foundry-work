@@ -133,7 +133,7 @@ const ru = process.resourceUsage();
 
 console.log(JSON.stringify({
   benchmark: 'stream-encrypt-aes-256-gcm',
-  scopeNote: 'encryptMs and decryptMs exclude SHA-256 verification; totalWallMs and process peak RSS cover the 128 MiB payload loop plus a 1-frame tamper check.',
+  scopeNote: 'encryptMs and decryptMs exclude SHA-256 verification; totalWallMs covers the 128 MiB payload loop plus a 1-frame tamper check; internalMaxRssKiB reflects child-process peak RSS from startup through measurement.',
   payloadMiB: totalMiB,
   encodedRecordBodyBytes: totalEncodedBytes,
   headerTotalLen: Number(headerTotalLen),

@@ -210,6 +210,7 @@ const sqlcipher = runMeasured('measure-sqlcipher.mjs');
 const kdfMaxBytes = Math.max(kdf.internalMaxRssKiB * 1024, kdf.externalPeakBytes);
 const encryptMaxBytes = Math.max(encrypt.internalMaxRssKiB * 1024, encrypt.externalPeakBytes);
 const sqlcipherMaxBytes = Math.max(sqlcipher.internalMaxRssKiB * 1024, sqlcipher.externalPeakBytes);
+const PROBE_SANITY_GUARD_MIB = 256;
 
 const report = {
   environment: {
@@ -227,13 +228,19 @@ const report = {
   },
   budgets: {
     scopeNote:
-      'V-0 measures isolated primitives (each benchmark child process individually, not full end-to-end commands or launcher+helper trees).',
+      'V-0 measures isolated primitives in individual benchmark child processes (startup through measurement/exit), not full end-to-end commands or launcher+helper trees.',
+    policyNote:
+      'CI fails if KDF exceeds its 256 MiB allowance, if any isolated probe exceeds the 256 MiB runaway-memory sanity guard, or if any functional/security check fails. Provisional Architecture section 9 full-command ceilings (vault verify 128 MiB, search 192 MiB) are reported for reference only and deferred to implementing packages per A-24.',
     kdfBudgetMiB: 256,
+    kdfMaxMiB: Number((kdfMaxBytes / MIB).toFixed(2)),
     kdfWithinBudget: kdfMaxBytes <= 256 * MIB,
-    streamProbeBudgetMiB: 128,
-    streamProbeWithinBudget: encryptMaxBytes <= 128 * MIB,
-    sqlcipherProbeBudgetMiB: 192,
-    sqlcipherProbeWithinBudget: sqlcipherMaxBytes <= 192 * MIB,
+    probeSanityGuardMiB: PROBE_SANITY_GUARD_MIB,
+    streamProbeMaxMiB: Number((encryptMaxBytes / MIB).toFixed(2)),
+    streamProbeWithinSanityGuard: encryptMaxBytes <= PROBE_SANITY_GUARD_MIB * MIB,
+    referenceVaultVerifyCeilingMiB: 128,
+    sqlcipherProbeMaxMiB: Number((sqlcipherMaxBytes / MIB).toFixed(2)),
+    sqlcipherProbeWithinSanityGuard: sqlcipherMaxBytes <= PROBE_SANITY_GUARD_MIB * MIB,
+    referenceSearchCeilingMiB: 192,
   },
   checks: {
     sqlcipherChecksPassed:
@@ -254,8 +261,8 @@ console.log(JSON.stringify(report, null, 2));
 
 if (
   !report.budgets.kdfWithinBudget ||
-  !report.budgets.streamProbeWithinBudget ||
-  !report.budgets.sqlcipherProbeWithinBudget ||
+  !report.budgets.streamProbeWithinSanityGuard ||
+  !report.budgets.sqlcipherProbeWithinSanityGuard ||
   !report.checks.sqlcipherChecksPassed ||
   !report.checks.encryptChecksPassed
 ) {

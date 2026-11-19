@@ -17,6 +17,10 @@ const tamperedPath = join(tempDir, 'tampered.db');
 const builtAddonPath = fileURLToPath(
   new URL('./node_modules/better-sqlite3-multiple-ciphers/build/Release/better_sqlite3.node', import.meta.url),
 );
+const addonPkgJson = JSON.parse(
+  readFileSync(new URL('./node_modules/better-sqlite3-multiple-ciphers/package.json', import.meta.url), 'utf8'),
+);
+const addonPackageVersion = String(addonPkgJson.version);
 const builtBinaryExists = existsSync(builtAddonPath);
 const prebuildBinaryExists = existsSync(
   new URL(`./node_modules/better-sqlite3-multiple-ciphers/prebuilds/${process.platform}-${process.arch}.node`, import.meta.url),
@@ -139,7 +143,9 @@ try {
   }
 
   // Scan the live WAL file BEFORE checkpointing to confirm the planted marker is encrypted in WAL too.
-  const markerBytes = Buffer.from(MARKER, 'utf8');
+  const markerUtf8Bytes = Buffer.from(MARKER, 'utf8');
+  const markerUtf16LeBytes = Buffer.from(MARKER, 'utf16le');
+  const containsMarker = (buf) => buf.includes(markerUtf8Bytes) || buf.includes(markerUtf16LeBytes);
   const liveWalPath = `${dbPath}-wal`;
   if (!existsSync(liveWalPath)) {
     throw new Error('Expected active -wal file before checkpoint.');
@@ -148,7 +154,7 @@ try {
   if (liveWalBytes.length === 0) {
     throw new Error('Expected non-empty -wal file before checkpoint.');
   }
-  const liveWalMarkerLeakFound = liveWalBytes.includes(markerBytes);
+  const liveWalMarkerLeakFound = containsMarker(liveWalBytes);
   if (liveWalMarkerLeakFound) {
     throw new Error('Planted plaintext marker found in active -wal file.');
   }
@@ -170,7 +176,7 @@ try {
     if (existsSync(candidate)) {
       const data = readFileSync(candidate);
       postCloseScannedFiles.push({ suffix: suffix || '.db', bytes: data.length });
-      if (data.includes(markerBytes)) {
+      if (containsMarker(data)) {
         markerLeakFound = true;
       }
     }
@@ -271,6 +277,8 @@ try {
   console.log(JSON.stringify({
     benchmark: 'sqlcipher-addon',
     addonLoaded: true,
+    addonPackageName: 'better-sqlite3-multiple-ciphers',
+    addonPackageVersion,
     loadedAddonVariant: requireBuilt ? 'built-from-source' : 'default-resolution',
     explicitNativeBindingUsed: requireBuilt,
     builtBinaryExists,
@@ -285,6 +293,7 @@ try {
     modifiedPageRejected,
     modifiedPageErrorCode,
     hmacControlBypassSucceeded,
+    markerEncodingsScanned: ['utf8', 'utf16le'],
     liveWalScan,
     markerLeakFound,
     postCloseScannedFiles,
