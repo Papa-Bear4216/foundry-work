@@ -5,6 +5,10 @@ on: [push]
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     strategy:
@@ -63,3 +67,31 @@ jobs:
       - run: npm run build
       - name: Load the built JavaScript
         run: node --input-type=module -e "await import('facts-ledger')"
+
+  v0-measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          package-manager-cache: false
+
+      - name: Install V-0 measurement dependencies
+        run: npm ci --prefix benchmarks/v0 --ignore-scripts --no-audit --no-fund
+
+      - name: Build SQLCipher native addon from source
+        working-directory: benchmarks/v0/node_modules/better-sqlite3-multiple-ciphers
+        run: npx --yes node-gyp rebuild --release --force_build=1
+
+      - name: Run V-0 measurements
+        env:
+          FOUNDRY_V0_REQUIRE_BUILT: "1"
+        run: node benchmarks/v0/run-all.mjs

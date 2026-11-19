@@ -1,0 +1,17 @@
+{
+  "name": "foundry-v0-benchmarks",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.22.3"
+  },
+  "scripts": {
+    "measure:kdf": "node measure-kdf.mjs",
+    "measure:encrypt": "node measure-encrypt.mjs",
+    "measure:sqlcipher": "node measure-sqlcipher.mjs",
+    "measure:all": "node run-all.mjs"
+  },
+  "dependencies": {
+    "better-sqlite3-multiple-ciphers": "13.2.0"
+  }
+}
