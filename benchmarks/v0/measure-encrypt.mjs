@@ -2,6 +2,7 @@ import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes } f
 import { performance } from 'node:perf_hooks';
 
 const FRAME_SIZE = 1024 * 1024; // 1 MiB frames per Architecture 4.2
+const CHUNK_SIZE = 64 * 1024; // 64 KiB streaming slices keep V8 external buffer churn flat
 const FRAME_COUNT = 128; // 128 MiB total synthetic payload
 const TOTAL_PLAINTEXT_BYTES = FRAME_SIZE * FRAME_COUNT;
 const FRAME_OVERHEAD = 4 + 16; // u32 BE ciphertext_len + 16-byte GCM tag
@@ -52,31 +53,38 @@ for (let i = 0; i < FRAME_COUNT; i++) {
   const encStart = process.hrtime.bigint();
   const cipher = createCipheriv('aes-256-gcm', recordKey, nonce);
   cipher.setAAD(aad);
-  const ct1 = cipher.update(plainFrame);
-  const ct2 = cipher.final();
-  const tag = cipher.getAuthTag();
-  const ctLen = ct1.length + ct2.length;
+  let encPos = 4;
+  for (let off = 0; off < FRAME_SIZE; off += CHUNK_SIZE) {
+    const out = cipher.update(plainFrame.subarray(off, off + CHUNK_SIZE));
+    out.copy(encodedFrame, encPos);
+    encPos += out.length;
+  }
+  const ctFinal = cipher.final();
+  if (ctFinal.length > 0) {
+    ctFinal.copy(encodedFrame, encPos);
+    encPos += ctFinal.length;
+  }
+  const ctLen = encPos - 4;
   encodedFrame.writeUInt32BE(ctLen, 0);
-  ct1.copy(encodedFrame, 4);
-  if (ct2.length > 0) ct2.copy(encodedFrame, 4 + ct1.length);
-  tag.copy(encodedFrame, 4 + ctLen);
+  const tag = cipher.getAuthTag();
+  tag.copy(encodedFrame, encPos);
   encryptNs += process.hrtime.bigint() - encStart;
 
   totalEncodedBytes += 4 + ctLen + tag.length;
 
   const decStart = process.hrtime.bigint();
   const parsedCtLen = encodedFrame.readUInt32BE(0);
-  const parsedCt = encodedFrame.subarray(4, 4 + parsedCtLen);
   const parsedTag = encodedFrame.subarray(4 + parsedCtLen, 4 + parsedCtLen + 16);
   const decipher = createDecipheriv('aes-256-gcm', recordKey, nonce);
   decipher.setAAD(aad);
   decipher.setAuthTag(parsedTag);
-  const pt1 = decipher.update(parsedCt);
-  const pt2 = decipher.final();
+  for (let off = 0; off < parsedCtLen; off += CHUNK_SIZE) {
+    const pt = decipher.update(encodedFrame.subarray(4 + off, 4 + Math.min(off + CHUNK_SIZE, parsedCtLen)));
+    if (pt.length > 0) roundtripHash.update(pt);
+  }
+  const ptFinal = decipher.final();
+  if (ptFinal.length > 0) roundtripHash.update(ptFinal);
   decryptNs += process.hrtime.bigint() - decStart;
-
-  roundtripHash.update(pt1);
-  if (pt2.length > 0) roundtripHash.update(pt2);
 }
 
 // Verify 1-bit tamper on the serialized frame fails authentication.
@@ -120,6 +128,7 @@ console.log(JSON.stringify({
   encodedRecordBodyBytes: totalEncodedBytes,
   headerTotalLen: Number(headerTotalLen),
   frameSizeKiB: FRAME_SIZE / 1024,
+  chunkSizeKiB: CHUNK_SIZE / 1024,
   frameCount: FRAME_COUNT,
   roundtripVerified: true,
   tamperRejected,
