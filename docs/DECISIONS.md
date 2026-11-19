@@ -69,6 +69,7 @@ interface other packages build on; **high** = needs a migration of users' vaults
 | A-21 | Foundry is a new repository under the MIT licence, extracted from a private project and not a fork of it. Public history starts with a single commit. Profiles are generic (`me`, `partner`, `child`, `other`). | Proposed on 2026-11-18 and carried by every later instruction, but never ratified in so many words. A fork would carry private history. | High once published |
 | A-22 | Build order after Step Zero: thin slice (Takeout archive in, encrypted databank, search out), then wizard and second copy, then more sources. | Proves the hardest path first, at real size. | Low |
 | A-23 | Documentation says "tamper-evident". It never says "tamper-proof", "undeniable" or "zero hallucination". | Each of those claims is false for some attacker or some model. | Low |
+| A-24 | Updates A-17 after V-0 measurements. Confirms the 256 MiB ceiling for passphrase KDF commands. Retains the remaining Architecture section 9 ceilings (`vault verify` 128 MiB, `import` 256 MiB, `search` 192 MiB, wizard 192 MiB, Mode A receiver 96 MiB) unchanged as provisional targets, explicitly deferring full-command confirmation to the packages that implement those workloads (V-3, V-4, V-5, V-7, P-5, X-6). | V-0 isolated probes establish feasibility under the ceilings on Windows and Linux with pinned Node 24.22.3, while full keyless hash verification, 1 GiB archive import, and full index search workloads do not exist yet in V-0. | Low |
 
 ## 3. Open questions for the owner
 
@@ -194,3 +195,4 @@ reviewer could read the predecessor's code (R-10).
 | 2026-11-19 | D-5 to D-11 ratified by the owner. A-1 to A-23, Q-0 to Q-6, R-1 to R-10 written by the planner. Review record added. |
 | 2026-11-19 | D-12 to D-18 added: the owner accepted every recommendation for Q-0 to Q-6. A-1, A-9 and A-21 are now confirmed by D-13, D-18 and D-12. The final name (Q-2) stays open until P-8. |
 | 2026-11-19 | D-19 added: O-3 code-signing programme terms checked; SignPath Foundation requires a public repository and releases, so the application waits for P-8. |
+| 2026-11-19 | A-24 added during V-0: confirms the 256 MiB KDF ceiling and explicitly defers confirmation of the remaining Architecture section 9 full-command ceilings to V-3, V-4, V-5, V-7, P-5, and X-6. |

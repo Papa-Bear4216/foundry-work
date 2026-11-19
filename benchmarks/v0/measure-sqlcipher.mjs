@@ -29,14 +29,37 @@ if (requireBuilt && !builtBinaryExists) {
 
 const dbOptions = requireBuilt ? { nativeBinding: builtAddonPath } : {};
 
-function configureCipher(db, hexKey) {
+function configureCipher(db, hexKey, { hmacCheck = 1 } = {}) {
   db.pragma("cipher = 'sqlcipher'");
   db.pragma('legacy = 4');
   db.pragma('legacy_page_size = 4096');
-  db.pragma('hmac_check = 1');
+  db.pragma('hmac_use = 1');
+  db.pragma(`hmac_check = ${hmacCheck}`);
+  db.pragma('hmac_pgno = 1');
+  db.pragma('hmac_salt_mask = 58');
+  db.pragma('hmac_algorithm = 2');
+  db.pragma('kdf_algorithm = 2');
+  db.pragma('plaintext_header_size = 0');
   db.pragma(`key = "x'${hexKey}'"`);
   db.pragma('temp_store = MEMORY');
   db.pragma('secure_delete = ON');
+}
+
+function readPinnedConfig(db) {
+  return {
+    cipher: String(db.pragma('cipher', { simple: true })),
+    legacy: Number(db.pragma('legacy', { simple: true })),
+    pageSize: Number(db.pragma('legacy_page_size', { simple: true })),
+    hmacUse: Number(db.pragma('hmac_use', { simple: true })),
+    hmacCheck: Number(db.pragma('hmac_check', { simple: true })),
+    hmacPgno: Number(db.pragma('hmac_pgno', { simple: true })),
+    hmacSaltMask: Number(db.pragma('hmac_salt_mask', { simple: true })),
+    hmacAlgorithm: Number(db.pragma('hmac_algorithm', { simple: true })),
+    kdfAlgorithm: Number(db.pragma('kdf_algorithm', { simple: true })),
+    plaintextHeaderSize: Number(db.pragma('plaintext_header_size', { simple: true })),
+    tempStore: Number(db.pragma('temp_store', { simple: true })),
+    secureDelete: Number(db.pragma('secure_delete', { simple: true })),
+  };
 }
 
 function isExpectedAuthOrCorruptError(err) {
@@ -49,28 +72,27 @@ try {
   const t0 = performance.now();
   const db = new Database(dbPath, dbOptions);
   openDb = db;
-  configureCipher(db, keyHex);
+  configureCipher(db, keyHex, { hmacCheck: 1 });
 
   const sqliteVersion = db.prepare('SELECT sqlite_version() AS v').get().v;
   const sqlite3mcVersion = db.prepare('SELECT sqlite3mc_version() AS v').get().v;
-  const pinnedCipher = String(db.pragma('cipher', { simple: true }));
-  const pinnedLegacy = Number(db.pragma('legacy', { simple: true }));
-  const pinnedHmacCheck = Number(db.pragma('hmac_check', { simple: true }));
-  const pinnedPageSize = Number(db.pragma('legacy_page_size', { simple: true }));
-  const tempStore = Number(db.pragma('temp_store', { simple: true }));
-  const secureDelete = Number(db.pragma('secure_delete', { simple: true }));
+  const pinnedConfig = readPinnedConfig(db);
 
   if (
-    pinnedCipher !== 'sqlcipher' ||
-    pinnedLegacy !== 4 ||
-    pinnedHmacCheck !== 1 ||
-    pinnedPageSize !== 4096 ||
-    tempStore !== 2 ||
-    secureDelete !== 1
+    pinnedConfig.cipher !== 'sqlcipher' ||
+    pinnedConfig.legacy !== 4 ||
+    pinnedConfig.pageSize !== 4096 ||
+    pinnedConfig.hmacUse !== 1 ||
+    pinnedConfig.hmacCheck !== 1 ||
+    pinnedConfig.hmacPgno !== 1 ||
+    pinnedConfig.hmacSaltMask !== 58 ||
+    pinnedConfig.hmacAlgorithm !== 2 ||
+    pinnedConfig.kdfAlgorithm !== 2 ||
+    pinnedConfig.plaintextHeaderSize !== 0 ||
+    pinnedConfig.tempStore !== 2 ||
+    pinnedConfig.secureDelete !== 1
   ) {
-    throw new Error(
-      `Unexpected cipher config: cipher=${pinnedCipher} legacy=${pinnedLegacy} hmac=${pinnedHmacCheck} page=${pinnedPageSize} temp_store=${tempStore} secure_delete=${secureDelete}`,
-    );
+    throw new Error(`Unexpected cipher config: ${JSON.stringify(pinnedConfig)}`);
   }
 
   // Verify FTS5 and R-tree (rtree_i32) are compiled in and usable under SQLCipher.
@@ -89,10 +111,12 @@ try {
   const insertFts = db.prepare('INSERT INTO items_fts (rowid, title, body) VALUES (?, ?, ?)');
   const insertRtree = db.prepare('INSERT INTO places_rtree (place_id, min_lat, max_lat, min_lng, max_lng) VALUES (?, ?, ?, ?, ?)');
 
+  let expectedBodyChars = 0;
   for (let i = 1; i <= 40; i++) {
     const text = i === 1
       ? `Synthetic message containing ${MARKER} for rest scan.`
       : `Synthetic body record ${i} with searchable content ${'padding-'.repeat(24)}`;
+    expectedBodyChars += text.length;
     insertItem.run(i, `synthetic-note-${i}`, text);
     insertFts.run(i, `synthetic-note-${i}`, text);
   }
@@ -155,7 +179,7 @@ try {
   const wrongDb = new Database(dbPath, dbOptions);
   openDb = wrongDb;
   try {
-    configureCipher(wrongDb, wrongKeyHex);
+    configureCipher(wrongDb, wrongKeyHex, { hmacCheck: 1 });
     try {
       wrongDb.prepare('SELECT count(*) AS n FROM sqlite_master').get();
     } catch (err) {
@@ -173,13 +197,14 @@ try {
     throw new Error('Wrong key was not rejected by SQLCipher.');
   }
 
-  // Verify page authentication rejects a single-bit modification on page 2.
+  // Verify page authentication rejects a single-bit modification in page 2's reserved HMAC trailer
+  // (offset 8191 = last byte of page 2), while B-tree page data remains structurally intact.
   copyFileSync(dbPath, tamperedPath);
   const rawDb = readFileSync(tamperedPath);
   if (rawDb.length < 8192) {
     throw new Error(`Expected >= 2 pages (8192 bytes) for tamper check, got ${rawDb.length}`);
   }
-  rawDb[4096 + 128] ^= 0x01;
+  rawDb[8191] ^= 0x01;
   writeFileSync(tamperedPath, rawDb);
 
   let modifiedPageRejected = false;
@@ -187,11 +212,11 @@ try {
   const tamperedDb = new Database(tamperedPath, dbOptions);
   openDb = tamperedDb;
   try {
-    configureCipher(tamperedDb, keyHex);
+    configureCipher(tamperedDb, keyHex, { hmacCheck: 1 });
     try {
       tamperedDb.prepare('SELECT sum(length(body)) AS total FROM items').get();
     } catch (err) {
-      if (!isExpectedAuthOrCorruptError(err)) {
+      if (err?.code !== 'SQLITE_CORRUPT') {
         throw err;
       }
       modifiedPageRejected = true;
@@ -202,13 +227,29 @@ try {
     openDb = null;
   }
   if (!modifiedPageRejected) {
-    throw new Error('Modified page was not rejected by SQLCipher page authentication.');
+    throw new Error('Modified page HMAC trailer was not rejected by SQLCipher page authentication.');
+  }
+
+  // Control check: with hmac_check = 0, reading the same file succeeds, proving rejection was HMAC-specific.
+  let hmacControlBypassSucceeded = false;
+  const controlDb = new Database(tamperedPath, dbOptions);
+  openDb = controlDb;
+  try {
+    configureCipher(controlDb, keyHex, { hmacCheck: 0 });
+    const controlRow = controlDb.prepare('SELECT sum(length(body)) AS total FROM items').get();
+    if (controlRow?.total !== expectedBodyChars) {
+      throw new Error(`HMAC control read mismatch: ${controlRow?.total} !== ${expectedBodyChars}`);
+    }
+    hmacControlBypassSucceeded = true;
+  } finally {
+    controlDb.close();
+    openDb = null;
   }
 
   // Re-open original with the correct key and confirm FTS5 + R-tree still query cleanly.
   const verifyDb = new Database(dbPath, dbOptions);
   openDb = verifyDb;
-  configureCipher(verifyDb, keyHex);
+  configureCipher(verifyDb, keyHex, { hmacCheck: 1 });
   const reopenFts = verifyDb.prepare("SELECT count(*) AS n FROM items_fts WHERE items_fts MATCH 'synthetic'").get().n;
   const reopenRtree = verifyDb.prepare('SELECT count(*) AS n FROM places_rtree').get().n;
   verifyDb.close();
@@ -224,26 +265,20 @@ try {
   console.log(JSON.stringify({
     benchmark: 'sqlcipher-addon',
     addonLoaded: true,
-    loadedAddonVariant: requireBuilt || builtBinaryExists ? 'built-from-source' : 'prebuild',
+    loadedAddonVariant: requireBuilt ? 'built-from-source' : 'default-resolution',
     explicitNativeBindingUsed: requireBuilt,
     builtBinaryExists,
     prebuildBinaryExists,
     sqliteVersion,
     sqlite3mcVersion,
-    pinnedConfig: {
-      cipher: pinnedCipher,
-      legacy: pinnedLegacy,
-      pageSize: pinnedPageSize,
-      hmacCheck: pinnedHmacCheck,
-      tempStore,
-      secureDelete,
-    },
+    pinnedConfig,
     fts5Available: true,
     rtreeAvailable: true,
     wrongKeyRejected,
     wrongKeyErrorCode,
     modifiedPageRejected,
     modifiedPageErrorCode,
+    hmacControlBypassSucceeded,
     liveWalScan,
     markerLeakFound,
     postCloseScannedFiles,
