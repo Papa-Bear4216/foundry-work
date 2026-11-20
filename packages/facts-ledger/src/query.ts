@@ -935,6 +935,10 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
       }
     }
   }
+  if (options.freshnessPrefetch && collected.length > 0) {
+    // One batched git lookup per repository instead of one per result (A-27 item 2, A-28).
+    options.freshnessPrefetch(collected.map((c) => c.fact), nowMs);
+  }
   const results: QueryResultItem[] = collected.map(({ fact, stage, label, score }) => {
     const assessment = resolver(fact, nowMs);
     const presentation = classifyPresentation(label, fact, assessment);

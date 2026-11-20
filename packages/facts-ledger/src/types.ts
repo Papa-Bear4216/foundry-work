@@ -214,6 +214,8 @@ export interface QueryOptions {
   readonly minSemanticScore?: number;
   readonly semanticTimeoutMs?: number;
   readonly freshnessResolver?: FreshnessResolver;
+  /** Optional batch lookup run once over all results before they are assessed (A-28). */
+  readonly freshnessPrefetch?: (facts: readonly IndexedFact[], nowMs: number) => void;
   readonly nowMs?: number;
 }
 

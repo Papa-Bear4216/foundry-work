@@ -375,6 +375,14 @@ export class FreshnessChecker {
     return holds === undefined ? { status, evidence: checks } : { status, predicateHolds: holds, evidence: checks };
   }
 
+  /** `prefetch` bound to one operation's snapshot, for `QueryOptions.freshnessPrefetch`. */
+  prefetcher(): (facts: readonly IndexedFact[], nowMs: number) => void {
+    return (facts, nowMs) => {
+      this.enterSnapshot(nowMs);
+      this.prefetch(facts);
+    };
+  }
+
   resolver(): FreshnessResolver {
     return (fact, nowMs) => {
       const { status, predicateHolds } = this.assess(fact, nowMs);

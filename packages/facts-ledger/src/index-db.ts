@@ -155,69 +155,44 @@ function hashDigestRow(h: ReturnType<typeof createHash>, prefix: string, cols: r
   h.update('\n');
 }
 
+/**
+ * Hash every row of `sql` in column order. Rows are read as arrays, not objects: the hashed
+ * bytes are the same, and on Linux the per-row objects cost about 10 MiB of peak memory on
+ * the 10,000-block fixture (Step Zero 10.4 budget).
+ */
+function hashRows(h: ReturnType<typeof createHash>, db: DatabaseSync, prefix: string, sql: string): void {
+  const stmt = db.prepare(sql);
+  stmt.setReturnArrays(true);
+  for (const row of stmt.iterate() as Iterable<readonly unknown[]>) {
+    hashDigestRow(h, prefix, row);
+  }
+}
+
 function computeIndexContentDigest(db: DatabaseSync): string {
   const h = createHash('sha256');
-  for (const b of db
-    .prepare(
-      'SELECT id, ts, agent, project, parent, trace_id, status, intent, reasoning, supersedes, schema, line_number, raw_fact_count FROM blocks ORDER BY line_number ASC, id COLLATE BINARY ASC',
-    )
-    .iterate()) {
-    hashDigestRow(h, 'B:', [
-      b['id'], b['ts'], b['agent'], b['project'], b['parent'], b['trace_id'],
-      b['status'], b['intent'], b['reasoning'], b['supersedes'], b['schema'], b['line_number'], b['raw_fact_count'],
-    ]);
-  }
-  for (const f of db
-    .prepare(
-      'SELECT rowid, fact_id, block_id, project, tier, scope, check_json, claim, note, claim_fts, note_fts, sensitivity, verified_at, supersedes FROM facts ORDER BY rowid ASC',
-    )
-    .iterate()) {
-    hashDigestRow(h, 'F:', [
-      f['rowid'], f['fact_id'], f['block_id'], f['project'], f['tier'], f['scope'],
-      f['check_json'], f['claim'], f['note'], f['claim_fts'], f['note_fts'],
-      f['sensitivity'], f['verified_at'], f['supersedes'],
-    ]);
-  }
-  for (const t of db
-    .prepare('SELECT fact_id, tag FROM fact_tags ORDER BY tag COLLATE BINARY ASC, fact_id COLLATE BINARY ASC')
-    .iterate()) {
-    hashDigestRow(h, 'T:', [t['fact_id'], t['tag']]);
-  }
-  for (const e of db
-    .prepare(
-      'SELECT fact_id, evidence_idx, type, repo, path, commit_id, blob, body FROM fact_evidence ORDER BY fact_id COLLATE BINARY ASC, evidence_idx ASC',
-    )
-    .iterate()) {
-    hashDigestRow(h, 'E:', [
-      e['fact_id'], e['evidence_idx'], e['type'], e['repo'], e['path'],
-      e['commit_id'], e['blob'], e['body'],
-    ]);
-  }
-  for (const r of db
-    .prepare('SELECT fact_id, block_id, reason FROM fact_retractions ORDER BY fact_id COLLATE BINARY ASC')
-    .iterate()) {
-    hashDigestRow(h, 'R:', [r['fact_id'], r['block_id'], r['reason']]);
-  }
-  for (const s of db
-    .prepare('SELECT superseded_fact_id, block_id FROM fact_supersessions ORDER BY superseded_fact_id COLLATE BINARY ASC')
-    .iterate()) {
-    hashDigestRow(h, 'S:', [s['superseded_fact_id'], s['block_id']]);
-  }
-  for (const z of db.prepare('SELECT id, sz FROM facts_fts_docsize ORDER BY id ASC').iterate()) {
-    hashDigestRow(h, 'Z:', [z['id'], z['sz']]);
-  }
-  for (const c of db.prepare('SELECT k, v FROM facts_fts_config ORDER BY k COLLATE BINARY ASC').iterate()) {
-    hashDigestRow(h, 'C:', [c['k'], c['v']]);
-  }
+  hashRows(
+    h, db, 'B:',
+    'SELECT id, ts, agent, project, parent, trace_id, status, intent, reasoning, supersedes, schema, line_number, raw_fact_count FROM blocks ORDER BY line_number ASC, id COLLATE BINARY ASC',
+  );
+  hashRows(
+    h, db, 'F:',
+    'SELECT rowid, fact_id, block_id, project, tier, scope, check_json, claim, note, claim_fts, note_fts, sensitivity, verified_at, supersedes FROM facts ORDER BY rowid ASC',
+  );
+  hashRows(h, db, 'T:', 'SELECT fact_id, tag FROM fact_tags ORDER BY tag COLLATE BINARY ASC, fact_id COLLATE BINARY ASC');
+  hashRows(
+    h, db, 'E:',
+    'SELECT fact_id, evidence_idx, type, repo, path, commit_id, blob, body FROM fact_evidence ORDER BY fact_id COLLATE BINARY ASC, evidence_idx ASC',
+  );
+  hashRows(h, db, 'R:', 'SELECT fact_id, block_id, reason FROM fact_retractions ORDER BY fact_id COLLATE BINARY ASC');
+  hashRows(h, db, 'S:', 'SELECT superseded_fact_id, block_id FROM fact_supersessions ORDER BY superseded_fact_id COLLATE BINARY ASC');
+  hashRows(h, db, 'Z:', 'SELECT id, sz FROM facts_fts_docsize ORDER BY id ASC');
+  hashRows(h, db, 'C:', 'SELECT k, v FROM facts_fts_config ORDER BY k COLLATE BINARY ASC');
   db.exec('CREATE VIRTUAL TABLE IF NOT EXISTS temp.__facts_fts_vocab USING fts5vocab(main, facts_fts, instance);');
   try {
-    for (const v of db
-      .prepare(
-        'SELECT term, doc, col, offset FROM temp.__facts_fts_vocab ORDER BY term COLLATE BINARY ASC, doc ASC, col COLLATE BINARY ASC, offset ASC',
-      )
-      .iterate()) {
-      hashDigestRow(h, 'V:', [v['term'], v['doc'], v['col'], v['offset']]);
-    }
+    hashRows(
+      h, db, 'V:',
+      'SELECT term, doc, col, offset FROM temp.__facts_fts_vocab ORDER BY term COLLATE BINARY ASC, doc ASC, col COLLATE BINARY ASC, offset ASC',
+    );
   } finally {
     db.exec('DROP TABLE IF EXISTS temp.__facts_fts_vocab;');
   }

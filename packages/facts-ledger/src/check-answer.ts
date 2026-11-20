@@ -89,7 +89,9 @@ export async function checkAnswer(text: string, options: CheckAnswerOptions): Pr
     throw new Error(`Answer cites more than ${MAX_DISTINCT_CITATIONS} distinct facts`);
   }
   const nowMs = options.nowMs ?? Date.now();
-  const resolver = new FreshnessChecker({ repos: options.repos }).resolver();
+  const checker = new FreshnessChecker({ repos: options.repos });
+  const resolver = checker.resolver();
+  const prefetch = checker.prefetcher();
   const verdicts = new Map<string, CitationVerdict>();
   for (const id of distinct) {
     const result = await queryFacts({
@@ -101,6 +103,7 @@ export async function checkAnswer(text: string, options: CheckAnswerOptions): Pr
       ...(options.maxSensitivity ? { maxSensitivity: options.maxSensitivity } : {}),
       nowMs,
       freshnessResolver: resolver,
+      freshnessPrefetch: prefetch,
     });
     const item = result.results.find((r) => r.fact.fact_id === id);
     if (!item) {

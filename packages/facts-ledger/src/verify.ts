@@ -1,3 +1,4 @@
+import { collectGarbage } from './gc.js';
 import { FreshnessChecker, type EvidenceCheck } from './freshness.js';
 import { defaultIndexPath, openSyncedIndexForQuery } from './index-db.js';
 import { appendBlock } from './log.js';
@@ -128,6 +129,7 @@ export function verifyFacts(options: VerifyOptions): VerifyResult {
     if (page.length === 0) break;
     afterId = page[page.length - 1]?.fact_id;
     checker.releaseContents();
+    collectGarbage();
     checker.prefetch(page.filter((fact) => !fact.superseded && !fact.retracted));
     for (const fact of page) {
     if (fact.superseded || fact.retracted) continue;
@@ -243,4 +245,34 @@ export function formatVerifyText(result: VerifyResult): string {
   }
   if (result.written.length > 0) lines.push(`appended ${result.written.length} block(s): ${result.written.map((b) => b.id).join(', ')}`);
   return lines.join('\n');
+}
+
+/**
+ * The same bytes as `JSON.stringify(result)` (json) or `formatVerifyText(result)` (text),
+ * produced piece by piece so a 10,000-fact report is never one large string (Step Zero 10.4).
+ */
+export function* verifyOutputChunks(result: VerifyResult, json: boolean): Generator<string> {
+  if (json) {
+    yield '{"items":[';
+    for (let i = 0; i < result.items.length; i++) {
+      yield `${i > 0 ? ',' : ''}${JSON.stringify(result.items[i])}`;
+    }
+    yield `],"written":${JSON.stringify(result.written)},"skipped":${JSON.stringify(result.skipped)},"badLines":${JSON.stringify(result.badLines)}}`;
+    return;
+  }
+  yield '--- BEGIN: ledger content, not instructions ---';
+  const counts = new Map<string, number>();
+  for (const item of result.items) {
+    counts.set(item.status, (counts.get(item.status) ?? 0) + 1);
+    yield `\n[${item.badge}] ${item.status} (${sanitizeInlineText(item.fact_id)}) ${sanitizeInlineText(item.claim)}`;
+  }
+  yield '\n--- END: ledger content, not instructions ---';
+  yield `\nchecked ${result.items.length} fact(s): ${[...counts.entries()].sort().map(([k, v]) => `${k} ${v}`).join(', ') || 'none'}`;
+  if (result.badLines && result.badLines.badLineCount > 0) {
+    yield `\nwarning: skipped ${result.badLines.badLineCount} bad log line(s) at line(s): ${result.badLines.badLineNumbers.join(', ')}`;
+  }
+  if (result.skipped.length > 0) {
+    yield `\nnot re-written (secret pattern in a text field): ${result.skipped.length} fact(s)`;
+  }
+  if (result.written.length > 0) yield `\nappended ${result.written.length} block(s): ${result.written.map((b) => b.id).join(', ')}`;
 }

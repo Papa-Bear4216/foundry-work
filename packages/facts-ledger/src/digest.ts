@@ -1,3 +1,4 @@
+import { collectGarbage } from './gc.js';
 import { closeSync, fsyncSync, mkdirSync, openSync, unlinkSync, writeSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { dirname, join } from 'node:path';
@@ -225,6 +226,7 @@ function buildDigest(options: DigestOptions, indexPath: string, path: string): D
       afterId = page[page.length - 1]?.fact_id;
       const current = page.filter((f) => !f.superseded && !f.retracted);
       checker.releaseContents();
+      collectGarbage();
       checker.prefetch(current);
       for (const fact of current) {
         currentFacts++;

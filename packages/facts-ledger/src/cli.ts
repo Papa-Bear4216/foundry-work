@@ -7,7 +7,7 @@ import { FreshnessChecker } from './freshness.js';
 import { templateNames } from './git.js';
 import { defaultIndexPath, rebuildIndex } from './index-db.js';
 import { loadRepoMap } from './repos.js';
-import { formatVerifyText, verifyFacts } from './verify.js';
+import { verifyFacts, verifyOutputChunks } from './verify.js';
 import {
   createCommandEmbedder,
   createHttpEmbedder,
@@ -433,6 +433,7 @@ async function run(): Promise<void> {
     } else if (args.command === 'query') {
       const queryText = args.positionals.join(' ').trim();
       const embedder = buildEmbedderFromArgs(args);
+      const checker = new FreshnessChecker({ repos: loadRepoMap() });
       const result = await queryFacts({
         logPath: args.logPath,
         indexPath,
@@ -447,7 +448,8 @@ async function run(): Promise<void> {
         maxSensitivity: args.maxSensitivity,
         embedder,
         minSemanticScore: args.minSemanticScore,
-        freshnessResolver: new FreshnessChecker({ repos: loadRepoMap() }).resolver(),
+        freshnessResolver: checker.resolver(),
+        freshnessPrefetch: checker.prefetcher(),
       });
       if (args.json) {
         process.stdout.write(`${JSON.stringify(result)}\n`);
@@ -526,11 +528,16 @@ async function run(): Promise<void> {
         rerun: args.rerun,
         ...(args.write ? { writeAs: agentName(args) } : {}),
       });
-      if (args.json) {
-        process.stdout.write(`${JSON.stringify(result)}\n`);
-      } else {
-        process.stdout.write(`${formatVerifyText(result)}\n`);
+      // Written in pieces: a 10,000-fact report as one string costs several MiB (Step Zero 10.4).
+      let pending = '';
+      for (const chunk of verifyOutputChunks(result, args.json)) {
+        pending += chunk;
+        if (pending.length >= 65536) {
+          process.stdout.write(pending);
+          pending = '';
+        }
       }
+      process.stdout.write(`${pending}\n`);
     } else if (args.command === 'check-answer') {
       const file = args.positionals[0];
       if (!file || args.positionals.length > 1) throw new Error('check-answer takes exactly one answer file');

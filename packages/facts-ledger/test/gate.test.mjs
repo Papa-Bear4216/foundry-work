@@ -90,3 +90,17 @@ test('check-answer CLI: exit 0 for a good answer, 1 for a bad one', async (t) =>
   assert.equal(ko.status, 1);
   assert.match(ko.stdout, /line 1: statement without a citation/);
 });
+
+test('verify output written in pieces is byte-identical to the whole-string formats', async (t) => {
+  const { verifyFacts, verifyOutputChunks, formatVerifyText } = await import('../dist/verify.js');
+  const root = mkdtempSync(join(tmpdir(), 'facts-gate-verify-'));
+  t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
+  const fx = buildGateFixture(root);
+  const repos = loadRepoMap(fx.reposPath);
+  for (const writeAs of [undefined, 'gate-verify']) {
+    const result = verifyFacts({ logPath: fx.logPath, indexPath: fx.indexPath, repos, all: true, nowMs: NOW_MS, ...(writeAs ? { writeAs } : {}) });
+    if (writeAs) assert.ok(result.written.length > 0, 'the stale group D facts are retracted in a written block');
+    assert.equal([...verifyOutputChunks(result, true)].join(''), JSON.stringify(result));
+    assert.equal([...verifyOutputChunks(result, false)].join(''), formatVerifyText(result));
+  }
+});

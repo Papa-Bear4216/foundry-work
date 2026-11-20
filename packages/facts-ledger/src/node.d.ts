@@ -199,6 +199,7 @@ declare module 'node:sqlite' {
     get(...params: unknown[]): Record<string, unknown> | undefined;
     all(...params: unknown[]): Record<string, unknown>[];
     iterate(...params: unknown[]): IterableIterator<Record<string, unknown>>;
+    setReturnArrays(enabled: boolean): void;
   }
 
   export class DatabaseSync {
@@ -218,4 +219,12 @@ declare module 'node:util' {
   export class TextEncoder {
     encode(text: string): Uint8Array;
   }
+}
+
+declare module 'node:v8' {
+  export function setFlagsFromString(flags: string): void;
+}
+
+declare module 'node:vm' {
+  export function runInNewContext(code: string): unknown;
 }

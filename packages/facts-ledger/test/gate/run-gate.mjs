@@ -87,7 +87,7 @@ export async function runGate() {
         ...(text ? { text } : {}),
         ...rest,
         nowMs: NOW_MS,
-        freshnessResolver: new FreshnessChecker({ repos }).resolver(),
+        ...(() => { const ch = new FreshnessChecker({ repos }); return { freshnessResolver: ch.resolver(), freshnessPrefetch: ch.prefetcher() }; })(),
       });
       const rendered = formatQueryText(result);
       const ids = result.results.map((r) => r.fact.fact_id);
