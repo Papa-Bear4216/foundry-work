@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -192,4 +192,26 @@ test('round-4 fixes: dropped secret facts hide their intent, intents fill the bu
   assert.ok(o.text.indexOf('Newer by instant.') < o.text.indexOf('Older by instant.'));
   assert.ok(!o.text.includes('$ledger'), 'a flag needing shell quoting is described, not shown');
   assert.throws(() => generateDigest({ logPath: g.logPath, project: '0123456789abcdef', repos: g.repos, write: false }), /Invalid project/);
+});
+
+test('round-5 fixes: bad log lines reported, fact ids never shortened, backslash flags described', (t) => {
+  const f = fixture(t);
+  addFact({ ...base(f), claim: 'Good claim.', evidenceFiles: [{ repo: 'demo', path: 'src/a.ts' }] });
+  appendFileSync(f.logPath, 'this is not json\n');
+  addFact({ ...base(f), claim: 'Second claim.', evidenceFiles: [{ repo: 'demo', path: 'src/a.ts' }] });
+  const r = generateDigest({ logPath: f.logPath, project: 'demo', repos: f.repos, queryFlags: ['--log', './data\\ledger.jsonl'], write: false });
+  assert.equal(r.badLines.badLineCount, 1);
+  assert.ok(!r.text.includes('data\\ledger'), 'a backslash path is described, not shown');
+  const env = { ...process.env, FACTS_LEDGER_REPOS: f.mapPath };
+  const out = spawnSync(process.execPath, [cli, 'digest', '--project', 'demo', '--log', f.logPath], { env, encoding: 'utf8' });
+  assert.match(out.stderr, /skipped 1 bad log line/);
+
+  const g = fixture(t);
+  appendBlock(g.logPath, { agent: 't', project: 'demo', intent: 'i', reasoning: 'r', status: 'done', schema: 2,
+    facts: [{ fact_id: 'abcdef1234567.0', tier: 'asserted', scope: 'current', claim: 'Long id fact.', note: '', tags: [], sensitivity: 'public',
+      verified_at: new Date().toISOString(), supersedes: null,
+      evidence: [{ type: 'manual', description: 'looked', ran_at: new Date().toISOString(), ttl_s: 86400, output_sha256: 'c'.repeat(64) }] }] });
+  const o = generateDigest({ logPath: g.logPath, project: 'demo', repos: g.repos, write: false });
+  assert.ok(!o.text.includes('Long id fact.'), 'a fact whose id the format rules would shorten is left out');
+  assert.equal(o.omittedFacts, 1);
 });

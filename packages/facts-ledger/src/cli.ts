@@ -285,6 +285,13 @@ function parseCliArgs(argv: readonly string[]): ParsedArgs {
   };
 }
 
+/** Section 3.1: damaged log lines are reported on every run. */
+function warnBadLines(report: { readonly badLineCount: number; readonly badLineNumbers: readonly number[] }): void {
+  if (report.badLineCount > 0) {
+    process.stderr.write(`Warning: skipped ${report.badLineCount} bad log line(s) at line(s): ${report.badLineNumbers.join(', ')}\n`);
+  }
+}
+
 /** Storage flags the user chose, repeated in the digest's closing query command. */
 function digestQueryFlags(args: ParsedArgs): string[] {
   const flags: string[] = [];
@@ -443,8 +450,8 @@ async function run(): Promise<void> {
       } else {
         process.stdout.write(`Appended block ${block.id}: fact ${fact?.fact_id ?? '?'} (${fact?.tier ?? '?'})\n`);
       }
-      // Every acts add regenerates the project's digest (Step Zero 7).
-      generateDigest({
+      // Every facts add regenerates the project's digest (Step Zero 7).
+      const regenerated = generateDigest({
         logPath: args.logPath,
         indexPath,
         project: block.project,
@@ -452,6 +459,7 @@ async function run(): Promise<void> {
         ...(args.maxSensitivity ? { maxSensitivity: args.maxSensitivity } : {}),
         queryFlags: digestQueryFlags(args),
       });
+      warnBadLines(regenerated.badLines);
     } else if (args.command === 'digest') {
       const project = args.add['project'] || process.env['FACTS_LEDGER_PROJECT'];
       if (!project) throw new Error('--project is required');
@@ -463,6 +471,7 @@ async function run(): Promise<void> {
         ...(args.maxSensitivity ? { maxSensitivity: args.maxSensitivity } : {}),
         queryFlags: digestQueryFlags(args),
       });
+      warnBadLines(result.badLines);
       process.stdout.write(args.json ? `${JSON.stringify(result)}\n` : result.text);
     } else if (args.command === 'verify') {
       const result = verifyFacts({

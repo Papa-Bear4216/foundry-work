@@ -8,7 +8,7 @@ import { compareBytewise, replaceFileWithRetry } from './log.js';
 import { allowedSensitivities, classifyPresentation, listFactsPage } from './query.js';
 import type { RepoMap } from './repos.js';
 import { findSecret } from './secrets.js';
-import type { FreshnessStatus, Sensitivity } from './types.js';
+import type { FreshnessStatus, ScanReport, Sensitivity } from './types.js';
 
 /** Hard, deterministic budget for the complete digest file (Step Zero 7). */
 export const DIGEST_MAX_BYTES = 6000;
@@ -53,6 +53,8 @@ export interface DigestResult {
   readonly counts: Readonly<Record<FreshnessStatus, number>>;
   readonly listedFacts: number;
   readonly omittedFacts: number;
+  /** Damaged log lines skipped while reading (section 3.1: reported on every run). */
+  readonly badLines: ScanReport;
 }
 
 /**
@@ -108,8 +110,10 @@ interface ListedFact {
 function factLine(mark: 'V' | 'A', claim: string, factId: string): string | null {
   // A claim is shown exactly as recorded or not at all: shortening a hex run or
   // collapsing spaces could turn a verified claim into a different, false one.
-  if (digestLine(claim) !== claim) return null;
-  return safeLine(`${mark} ${claim} (${factId})`);
+  // The same holds for the whole line: a shortened fact id would cite another fact.
+  const line = `${mark} ${claim} (${factId})`;
+  if (digestLine(line) !== line) return null;
+  return safeLine(line);
 }
 
 /** Projects that can have a digest file: a safe file-name part with no secret pattern. */
@@ -207,7 +211,8 @@ function buildDigest(options: DigestOptions, indexPath: string, path: string): D
   let proposals: string[] = [];
   let decisions: string[] = [];
 
-  const { db } = openSyncedIndexForQuery(options.logPath, indexPath, false);
+  const { db, syncResult } = openSyncedIndexForQuery(options.logPath, indexPath, false);
+  const badLines = syncResult.badLines;
   try {
     let afterId: string | undefined;
     for (;;) {
@@ -301,12 +306,12 @@ function buildDigest(options: DigestOptions, indexPath: string, path: string): D
   // in a path, for example) is described instead of shown wrong.
   const cap = options.maxSensitivity ?? 'personal';
   const base = `facts query --repo ${options.project}${cap === 'personal' ? '' : ` --max-sensitivity ${cap}`}`;
-  // Flags are shown only when they need no shell quoting at all (no $, quotes, spaces),
+  // Flags are shown only when they need no shell quoting at all (no $, quotes, spaces, backslashes),
   // so the command means the same thing in every shell.
   const flags = options.queryFlags ?? [];
   const exact = flags.length > 0 ? `${base} ${flags.join(' ')}` : base;
   const command =
-    flags.every((f) => /^[\w./:\\-]+$/.test(f)) && digestLine(exact) === exact && byteLength(exact) <= 200
+    flags.every((f) => /^[\w./:-]+$/.test(f)) && digestLine(exact) === exact && byteLength(exact) <= 200
       ? exact
       : `${base} (with the same --log and --index as this digest)`;
   const closing = (omitted: number): string => digestLine(`${omitted} fact(s) left out. Query them with: ${command}`);
@@ -347,7 +352,7 @@ function buildDigest(options: DigestOptions, indexPath: string, path: string): D
   const text = `${out.join('\n')}\n`;
   const problems = digestFormatProblems(text);
   if (problems.length > 0) throw new Error(`Digest format check failed: ${problems.join('; ')}`);
-  return { path, text, bytes: byteLength(text), counts, listedFacts, omittedFacts };
+  return { path, text, bytes: byteLength(text), counts, listedFacts, omittedFacts, badLines };
 }
 
 /** Newest first by instant (UTC offsets honoured); unparseable times last; then id. */
