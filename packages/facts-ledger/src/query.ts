@@ -157,16 +157,19 @@ export function defaultFreshnessResolver(
   return { status: worstStatus };
 }
 
-/** Facts for `facts verify`: current (not superseded, not retracted), bytewise by id. */
-export function listCurrentFacts(
-  logPath: string,
-  indexPath: string,
+/** One page of facts for `facts verify` from an open index, bytewise by id. */
+export function listFactsPage(
+  db: DatabaseSync,
   selector: { readonly id?: string; readonly tag?: string },
+  page: { readonly afterId?: string; readonly limit?: number } = {},
 ): IndexedFact[] {
-  const { db } = openSyncedIndexForQuery(logPath, indexPath, false);
-  try {
+  {
     const clauses: string[] = [];
     const params: unknown[] = [];
+    if (page.afterId !== undefined) {
+      clauses.push('f.fact_id > ? COLLATE BINARY');
+      params.push(page.afterId);
+    }
     if (selector.id) {
       clauses.push('f.fact_id = ?');
       params.push(selector.id);
@@ -180,12 +183,11 @@ export function listCurrentFacts(
         `SELECT f.fact_id, f.block_id, f.project, f.tier, f.scope, f.check_json, f.claim, f.note, f.sensitivity, f.verified_at, f.supersedes
          FROM facts f
          ${clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : ''}
-         ORDER BY f.fact_id COLLATE BINARY ASC`,
+         ORDER BY f.fact_id COLLATE BINARY ASC
+         ${page.limit !== undefined ? 'LIMIT ?' : ''}`,
       )
-      .all(...params);
-    return hydrateFacts(db, rows).filter((fact) => !fact.superseded && !fact.retracted);
-  } finally {
-    db.close();
+      .all(...params, ...(page.limit !== undefined ? [page.limit] : []));
+    return hydrateFacts(db, rows);
   }
 }
 

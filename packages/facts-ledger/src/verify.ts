@@ -1,7 +1,7 @@
 import { FreshnessChecker, type EvidenceCheck } from './freshness.js';
-import { defaultIndexPath } from './index-db.js';
+import { defaultIndexPath, openSyncedIndexForQuery } from './index-db.js';
 import { appendBlock } from './log.js';
-import { classifyPresentation, listCurrentFacts } from './query.js';
+import { classifyPresentation, listFactsPage } from './query.js';
 import type { RepoMap } from './repos.js';
 import type {
   Block,
@@ -14,6 +14,7 @@ import type {
 } from './types.js';
 
 const FACTS_PER_BLOCK = 40;
+const PAGE_SIZE = 500;
 
 export interface VerifyOptions {
   readonly logPath: string;
@@ -69,16 +70,28 @@ export function verifyFacts(options: VerifyOptions): VerifyResult {
   const nowMs = options.nowMs ?? Date.now();
   const nowIso = isoSeconds(nowMs);
   const indexPath = options.indexPath ?? defaultIndexPath(options.logPath);
-  const facts = listCurrentFacts(options.logPath, indexPath, {
+  const selector = {
     ...(options.id ? { id: options.id } : {}),
     ...(options.tag ? { tag: options.tag } : {}),
-  });
+  };
   const checker = new FreshnessChecker({ repos: options.repos, rerun: options.rerun ?? false });
 
   const items: VerifyItem[] = [];
   const reverified = new Map<string, FactInput[]>();
   const retracted = new Map<string, FactRetraction[]>();
-  for (const fact of facts) {
+  // Page through one open index so memory stays flat on large ledgers (96 MiB budget).
+  const { db } = openSyncedIndexForQuery(options.logPath, indexPath, false);
+  try {
+  let afterId: string | undefined;
+  for (;;) {
+    const page = listFactsPage(db, selector, {
+      ...(afterId !== undefined ? { afterId } : {}),
+      limit: PAGE_SIZE,
+    });
+    if (page.length === 0) break;
+    afterId = page[page.length - 1]?.fact_id;
+    for (const fact of page) {
+    if (fact.superseded || fact.retracted) continue;
     const assessed = checker.assess(fact, nowMs);
     const view = classifyPresentation('match', fact, assessed);
     items.push({
@@ -113,6 +126,11 @@ export function verifyFacts(options: VerifyOptions): VerifyResult {
       });
       reverified.set(fact.project, list);
     }
+    }
+    if (page.length < PAGE_SIZE) break;
+  }
+  } finally {
+    db.close();
   }
 
   const written: Block[] = [];
