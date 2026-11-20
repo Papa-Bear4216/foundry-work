@@ -63,3 +63,10 @@ jobs:
       - run: npm run build
       - name: Load the built JavaScript
         run: node --input-type=module -e "await import('facts-ledger')"
+      # Step Zero 10.1, 10.2: the 50-case gate and citation checker must match expected.txt exactly.
+      - name: Tests and deterministic gate (serial)
+        run: npm test --workspace facts-ledger
+      # Step Zero 10.4: memory, time, digest size and token accounting on the 10,000-block fixture.
+      - name: Budgets (pinned runtime)
+        if: ${{ !cancelled() }}
+        run: npm run budgets --workspace facts-ledger
