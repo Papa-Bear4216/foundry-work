@@ -1,4 +1,4 @@
-import { closeSync, fsyncSync, openSync, writeSync } from 'node:fs';
+import { closeSync, fsyncSync, openSync, unlinkSync, writeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { TextEncoder } from 'node:util';
 import { FreshnessChecker } from './freshness.js';
@@ -6,11 +6,15 @@ import { defaultIndexPath, openSyncedIndexForQuery } from './index-db.js';
 import { compareBytewise, replaceFileWithRetry } from './log.js';
 import { allowedSensitivities, classifyPresentation, listFactsPage } from './query.js';
 import type { RepoMap } from './repos.js';
+import { findSecret } from './secrets.js';
 import type { FreshnessStatus, Sensitivity } from './types.js';
 
 /** Hard, deterministic budget for the complete digest file (Step Zero 7). */
 export const DIGEST_MAX_BYTES = 6000;
-const MAX_LINE_BYTES = 300;
+/** A 300-byte claim plus its badge and fact id fits; longer lines are left out, never cut. */
+const MAX_LINE_BYTES = 400;
+/** JSON anywhere in a line: a leading brace/bracket, an object key, or an array of objects/strings. */
+const JSON_RE = /^\s*[{[]|\{\s*"[^"\n]*"\s*:|\[\s*(?:\{|"[^"\n]*"\s*[,\]])/;
 const PAGE_SIZE = 500;
 const RECENT_KEEP = 200;
 const PROPOSALS_KEEP = 50;
@@ -42,23 +46,27 @@ export interface DigestResult {
 }
 
 /**
- * Make one digest line: one line, no control characters, no hex run longer than 12
- * characters (hashes tokenize badly), at most 300 bytes.
+ * Normalize one digest line: one line, no control characters, no hex run longer than 12
+ * characters (hashes tokenize badly). Never truncates; see `safeLine`.
  */
 export function digestLine(text: string): string {
-  let line = text
+  return text
     .replace(/[\u0000-\u001f\u007f]+/g, ' ')
     .replace(/[0-9a-fA-F]{13,}/g, (hex) => hex.slice(0, 12))
     .replace(/\s+/g, ' ')
     .trim();
-  if (byteLength(line) > MAX_LINE_BYTES) {
-    let out = '';
-    for (const ch of line) {
-      if (byteLength(out + ch) > MAX_LINE_BYTES - 3) break;
-      out += ch;
-    }
-    line = `${out}...`;
-  }
+}
+
+/**
+ * The line as it would appear, or null when it cannot appear whole and safe: too long,
+ * containing JSON, or matching a secret pattern. Blocks written by the Python tool are
+ * not scanned on write, so the digest scans every line again before it reaches a model.
+ */
+export function safeLine(text: string): string | null {
+  const line = digestLine(text);
+  if (byteLength(line) > MAX_LINE_BYTES) return null;
+  if (JSON_RE.test(line)) return null;
+  if (findSecret(text) !== null || findSecret(line) !== null) return null;
   return line;
 }
 
@@ -69,7 +77,7 @@ export function digestFormatProblems(text: string): string[] {
   const lines = text.split('\n');
   lines.forEach((line, i) => {
     if (/[0-9a-fA-F]{13,}/.test(line)) problems.push(`line ${i + 1}: hex string longer than 12 characters`);
-    if (/^\s*[{[]/.test(line)) problems.push(`line ${i + 1}: looks like JSON`);
+    if (JSON_RE.test(line)) problems.push(`line ${i + 1}: looks like JSON`);
     if (/[\u0000-\u0008\u000b-\u001f\u007f]/.test(line)) problems.push(`line ${i + 1}: control character`);
     if (byteLength(line) > MAX_LINE_BYTES) problems.push(`line ${i + 1}: longer than ${MAX_LINE_BYTES} bytes`);
   });
@@ -84,8 +92,8 @@ interface ListedFact {
   readonly pinned: boolean;
 }
 
-function factLine(f: ListedFact): string {
-  return digestLine(`${f.mark} ${f.claim} (${f.factId})`);
+function factLine(f: ListedFact): string | null {
+  return safeLine(`${f.mark} ${f.claim} (${f.factId})`);
 }
 
 /** `facts digest`: build (and by default write) the session digest for one project. */
@@ -209,10 +217,12 @@ export function generateDigest(options: DigestOptions): DigestResult {
     }
   };
 
-  section('## Pinned', pinned.map(factLine), () => listedFacts++);
-  section('## Open proposals', proposals.map((i) => digestLine(`- ${i}`)));
-  section('## Recent decisions', decisions.map((i) => digestLine(`- ${i}`)));
-  section('## Recently verified', recent.map(factLine), () => listedFacts++);
+  // Lines that cannot appear whole and safe are skipped; skipped facts count as left out.
+  const keep = (lines: readonly (string | null)[]): string[] => lines.filter((l): l is string => l !== null);
+  section('## Pinned', keep(pinned.map(factLine)), () => listedFacts++);
+  section('## Open proposals', keep(proposals.map((i) => safeLine(`- ${i}`))));
+  section('## Recent decisions', keep(decisions.map((i) => safeLine(`- ${i}`))));
+  section('## Recently verified', keep(recent.map(factLine)), () => listedFacts++);
   const omittedFacts = currentFacts - listedFacts;
   out.push(closing(omittedFacts));
 
@@ -222,13 +232,28 @@ export function generateDigest(options: DigestOptions): DigestResult {
 
   const path = join(dirname(indexPath), `digest.${options.project}.md`);
   if (options.write !== false) {
-    const temp = `${path}.${process.pid}.tmp`;
-    const fd = openSync(temp, 'w', 0o600);
+    // Exclusive create: never follows or truncates a file planted at the temp path.
+    const temp = `${path}.${process.pid}.${Date.now()}.tmp`;
+    const fd = openSync(temp, 'wx', 0o600);
+    let written = false;
     try {
-      writeSync(fd, encoder.encode(text));
+      const buf = encoder.encode(text);
+      for (let off = 0; off < buf.length; ) {
+        const n = writeSync(fd, buf.subarray(off));
+        if (n <= 0) throw new Error('Digest write made no progress');
+        off += n;
+      }
       fsyncSync(fd);
+      written = true;
     } finally {
       closeSync(fd);
+      if (!written) {
+        try {
+          unlinkSync(temp);
+        } catch {
+          // Best effort; the previous digest is untouched.
+        }
+      }
     }
     replaceFileWithRetry(temp, path);
   }

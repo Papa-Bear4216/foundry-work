@@ -434,7 +434,13 @@ async function run(): Promise<void> {
         process.stdout.write(`Appended block ${block.id}: fact ${fact?.fact_id ?? '?'} (${fact?.tier ?? '?'})\n`);
       }
       // Every acts add regenerates the project's digest (Step Zero 7).
-      generateDigest({ logPath: args.logPath, indexPath, project: block.project, repos });
+      generateDigest({
+        logPath: args.logPath,
+        indexPath,
+        project: block.project,
+        repos,
+        ...(args.maxSensitivity ? { maxSensitivity: args.maxSensitivity } : {}),
+      });
     } else if (args.command === 'digest') {
       const project = args.add['project'] || process.env['FACTS_LEDGER_PROJECT'];
       if (!project) throw new Error('--project is required');
