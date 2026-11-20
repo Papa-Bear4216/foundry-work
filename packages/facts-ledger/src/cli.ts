@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { addFact } from './add.js';
-import { generateDigest } from './digest.js';
+import { assertDigestProject, generateDigest } from './digest.js';
 import { FreshnessChecker } from './freshness.js';
 import { templateNames } from './git.js';
 import { defaultIndexPath, rebuildIndex } from './index-db.js';
@@ -408,6 +408,8 @@ async function run(): Promise<void> {
         throw new Error('--scope must be current or at-commit');
       }
       if (args.evidenceArgs.length > 0 && !a['evidence-cmd']) throw new Error('--evidence-arg requires --evidence-cmd');
+      // Validate before the append: the block cannot be taken back if the digest then fails.
+      assertDigestProject(a['project'] || process.env['FACTS_LEDGER_PROJECT'] || '');
       const block = addFact({
         logPath: args.logPath,
         repos,

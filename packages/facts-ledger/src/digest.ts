@@ -1,8 +1,8 @@
-import { closeSync, fsyncSync, openSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, fstatSync, fsyncSync, openSync, unlinkSync, writeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { TextEncoder } from 'node:util';
 import { FreshnessChecker } from './freshness.js';
-import { defaultIndexPath, openSyncedIndexForQuery } from './index-db.js';
+import { assertDistinctIndexPath, defaultIndexPath, openSyncedIndexForQuery } from './index-db.js';
 import { compareBytewise, replaceFileWithRetry } from './log.js';
 import { allowedSensitivities, classifyPresentation, listFactsPage } from './query.js';
 import type { RepoMap } from './repos.js';
@@ -14,7 +14,8 @@ export const DIGEST_MAX_BYTES = 6000;
 /** A 300-byte claim plus its badge and fact id fits; longer lines are left out, never cut. */
 const MAX_LINE_BYTES = 400;
 /** JSON anywhere in a line: a leading brace/bracket, an object key, or an array of objects/strings. */
-const JSON_RE = /^\s*[{[]|\{\s*"[^"\n]*"\s*:|\[\s*(?:\{|"[^"\n]*"\s*[,\]])/;
+const JSON_RE =
+  /^\s*[{[]|\{\s*\}|\[\s*\]|\{\s*"[^"\n]*"\s*:|\[\s*(?:"[^"\n]*"|-?\d[\d.eE+-]*|true|false|null|\{|\[)\s*[,\]]/;
 const PAGE_SIZE = 500;
 const RECENT_KEEP = 200;
 const PROPOSALS_KEEP = 50;
@@ -80,6 +81,7 @@ export function digestFormatProblems(text: string): string[] {
     if (JSON_RE.test(line)) problems.push(`line ${i + 1}: looks like JSON`);
     if (/[\u0000-\u0008\u000b-\u001f\u007f]/.test(line)) problems.push(`line ${i + 1}: control character`);
     if (byteLength(line) > MAX_LINE_BYTES) problems.push(`line ${i + 1}: longer than ${MAX_LINE_BYTES} bytes`);
+    if (findSecret(line) !== null) problems.push(`line ${i + 1}: matches a secret pattern`);
   });
   return problems;
 }
@@ -93,14 +95,93 @@ interface ListedFact {
 }
 
 function factLine(f: ListedFact): string | null {
+  // A claim is shown exactly as recorded or not at all: shortening a hex run or
+  // collapsing spaces could turn a verified claim into a different, false one.
+  if (digestLine(f.claim) !== f.claim) return null;
   return safeLine(`${f.mark} ${f.claim} (${f.factId})`);
 }
 
-/** `facts digest`: build (and by default write) the session digest for one project. */
+/** Projects that can have a digest file: a safe file-name part with no secret pattern. */
+export function assertDigestProject(project: string): void {
+  if (!PROJECT_FILE_RE.test(project) || findSecret(project) !== null) {
+    throw new Error('Invalid project name for a digest: use letters, digits, ".", "_" or "-" (at most 64)');
+  }
+}
+
+/** Size of the log right now (0 when it does not exist yet): the digest's source generation. */
+function logSize(logPath: string): number {
+  let fd: number;
+  try {
+    fd = openSync(logPath, 'r');
+  } catch {
+    return 0;
+  }
+  try {
+    return fstatSync(fd).size;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+const MAX_PUBLISH_ATTEMPTS = 5;
+
+/**
+ * `facts digest`: build (and by default write) the session digest for one project.
+ * When writing, a digest is republished if the log grew while it was built, so a slower
+ * writer never leaves an older snapshot in place after a newer one.
+ */
 export function generateDigest(options: DigestOptions): DigestResult {
-  if (!PROJECT_FILE_RE.test(options.project)) throw new Error(`Invalid project name: ${JSON.stringify(options.project)}`);
-  const nowMs = options.nowMs ?? Date.now();
+  assertDigestProject(options.project);
   const indexPath = options.indexPath ?? defaultIndexPath(options.logPath);
+  const path = join(dirname(indexPath), `digest.${options.project}.md`);
+  if (options.write === false) return buildDigest(options, indexPath, path);
+  // The digest must never replace the log, the index or their lock files.
+  for (const reserved of [options.logPath, indexPath]) {
+    try {
+      assertDistinctIndexPath(reserved, path);
+    } catch {
+      throw new Error(`Refusing to write the digest over the ledger log, index or a lock file: ${path}`);
+    }
+  }
+  let result: DigestResult | undefined;
+  for (let attempt = 0; attempt < MAX_PUBLISH_ATTEMPTS; attempt++) {
+    const before = logSize(options.logPath);
+    result = buildDigest(options, indexPath, path);
+    publish(path, result.text);
+    if (logSize(options.logPath) === before) break;
+  }
+  return result as DigestResult;
+}
+
+function publish(path: string, text: string): void {
+  // Exclusive create: never follows or truncates a file planted at the temp path.
+  const temp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  const fd = openSync(temp, 'wx', 0o600);
+  let written = false;
+  try {
+    const buf = encoder.encode(text);
+    for (let off = 0; off < buf.length; ) {
+      const n = writeSync(fd, buf.subarray(off));
+      if (n <= 0) throw new Error('Digest write made no progress');
+      off += n;
+    }
+    fsyncSync(fd);
+    written = true;
+  } finally {
+    closeSync(fd);
+    if (!written) {
+      try {
+        unlinkSync(temp);
+      } catch {
+        // Best effort; the previous digest is untouched.
+      }
+    }
+  }
+  replaceFileWithRetry(temp, path);
+}
+
+function buildDigest(options: DigestOptions, indexPath: string, path: string): DigestResult {
+  const nowMs = options.nowMs ?? Date.now();
   const allowed = allowedSensitivities(options.maxSensitivity ?? 'personal');
   const checker = new FreshnessChecker({ repos: options.repos });
 
@@ -151,24 +232,30 @@ export function generateDigest(options: DigestOptions): DigestResult {
       if (page.length < PAGE_SIZE) break;
     }
 
+    // An intent can repeat its facts' claims, so a block carrying any fact above the
+    // sensitivity cap contributes no intent either.
+    const capped = `AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.block_id = b.id
+                     AND f.sensitivity NOT IN (${allowed.map(() => '?').join(', ')}))`;
     proposals = db
       .prepare(
         `SELECT b.intent FROM blocks b
          WHERE b.project = ? AND b.status = 'proposed'
            AND NOT EXISTS (SELECT 1 FROM blocks s WHERE s.supersedes = b.id)
+           ${capped}
          ORDER BY b.ts COLLATE BINARY DESC, b.id COLLATE BINARY ASC
          LIMIT ?`,
       )
-      .all(options.project, PROPOSALS_KEEP)
+      .all(options.project, ...allowed, PROPOSALS_KEEP)
       .map((r) => String(r['intent']));
     decisions = db
       .prepare(
         `SELECT b.intent FROM blocks b
          WHERE b.project = ? AND b.status = 'done'
+           ${capped}
          ORDER BY b.ts COLLATE BINARY DESC, b.id COLLATE BINARY ASC
          LIMIT ?`,
       )
-      .all(options.project, DECISIONS_KEEP)
+      .all(options.project, ...allowed, DECISIONS_KEEP)
       .map((r) => String(r['intent']));
   } finally {
     db.close();
@@ -229,34 +316,6 @@ export function generateDigest(options: DigestOptions): DigestResult {
   const text = `${out.join('\n')}\n`;
   const problems = digestFormatProblems(text);
   if (problems.length > 0) throw new Error(`Digest format check failed: ${problems.join('; ')}`);
-
-  const path = join(dirname(indexPath), `digest.${options.project}.md`);
-  if (options.write !== false) {
-    // Exclusive create: never follows or truncates a file planted at the temp path.
-    const temp = `${path}.${process.pid}.${Date.now()}.tmp`;
-    const fd = openSync(temp, 'wx', 0o600);
-    let written = false;
-    try {
-      const buf = encoder.encode(text);
-      for (let off = 0; off < buf.length; ) {
-        const n = writeSync(fd, buf.subarray(off));
-        if (n <= 0) throw new Error('Digest write made no progress');
-        off += n;
-      }
-      fsyncSync(fd);
-      written = true;
-    } finally {
-      closeSync(fd);
-      if (!written) {
-        try {
-          unlinkSync(temp);
-        } catch {
-          // Best effort; the previous digest is untouched.
-        }
-      }
-    }
-    replaceFileWithRetry(temp, path);
-  }
   return { path, text, bytes: byteLength(text), counts, listedFacts, omittedFacts };
 }
 
