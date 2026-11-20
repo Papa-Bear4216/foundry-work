@@ -159,6 +159,7 @@ declare module 'node:fs' {
     path: string,
     options: { bigint: true },
   ): { ino: bigint; dev: bigint };
+  export function statSync(path: string): { size: number; isFile(): boolean };
   export function realpathSync(path: string): string;
   export function fsyncSync(fd: number): void;
   export function mkdirSync(path: string, options: { recursive: true }): string | undefined;

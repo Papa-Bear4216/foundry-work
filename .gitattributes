@@ -1,0 +1,2 @@
+# The Step Zero 10.1 gate compares bytes exactly: keep its expected output LF on every platform.
+packages/facts-ledger/test/gate/expected.txt text eol=lf
