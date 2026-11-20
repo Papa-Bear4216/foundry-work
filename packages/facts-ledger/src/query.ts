@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { TextDecoder, TextEncoder } from 'node:util';
 import { defaultIndexPath, openSyncedIndexForQuery } from './index-db.js';
+import { conflictSubject, factsConflict } from './conflicts.js';
 import { compareBytewise } from './log.js';
 import {
   formatCheckedPredicateClaim,
@@ -400,6 +401,57 @@ function buildFactFilterClause(
   }
 
   return clauses.join(' AND ');
+}
+
+/** Most conflict partners pulled in for one query, so a crowded subject cannot flood the output. */
+const MAX_CONFLICT_PARTNERS = 20;
+
+function addConflictPartners(
+  db: DatabaseSync,
+  options: QueryOptions,
+  collected: Array<{ fact: IndexedFact; stage: QueryStage; label: QueryLabel; score?: number }>,
+  seenIds: Set<string>,
+): void {
+  const subjects = new Map<string, { kind: 'file' | 'command'; repo: string; key: string }>();
+  for (const { fact } of collected) {
+    const subject = conflictSubject(fact);
+    if (subject) subjects.set(`${subject.kind}\u0000${subject.repo}\u0000${subject.key}`, subject);
+  }
+  if (subjects.size === 0) return;
+  // Partners are live facts within the same sensitivity cap; superseded and retracted facts never conflict.
+  const live: QueryOptions = { logPath: options.logPath, history: false, ...(options.maxSensitivity ? { maxSensitivity: options.maxSensitivity } : {}) };
+  const originals = collected.map((c) => c.fact);
+  let added = 0;
+  const sortedKeys = [...subjects.keys()].sort(compareBytewise);
+  for (const subjectKey of sortedKeys) {
+    const subject = subjects.get(subjectKey)!;
+    const params: unknown[] = [];
+    const where = buildFactFilterClause(live, params);
+    let subjectClause: string;
+    if (subject.kind === 'command') {
+      subjectClause = "json_extract(f.check_json, '$.predicate') = 'command_output_is' AND json_extract(f.check_json, '$.template') = ?";
+      params.push(subject.key);
+    } else {
+      subjectClause = "json_extract(f.check_json, '$.predicate') <> 'command_output_is' AND json_extract(f.check_json, '$.repo') = ? AND json_extract(f.check_json, '$.path') = ?";
+      params.push(subject.repo, subject.key);
+    }
+    const rows = db
+      .prepare(
+        `SELECT f.fact_id, f.block_id, f.project, f.tier, f.scope, f.check_json, f.claim, f.note, f.sensitivity, f.verified_at, f.supersedes
+         FROM facts f
+         WHERE f.tier = 'checked' AND f.check_json IS NOT NULL AND json_valid(f.check_json) AND ${subjectClause} AND ${where}
+         ORDER BY f.fact_id COLLATE BINARY ASC`,
+      )
+      .all(...params);
+    for (const candidate of hydrateFacts(db, rows)) {
+      if (seenIds.has(candidate.fact_id)) continue;
+      if (!originals.some((o) => factsConflict(o, candidate))) continue;
+      if (added >= MAX_CONFLICT_PARTNERS) return;
+      seenIds.add(candidate.fact_id);
+      collected.push({ fact: candidate, stage: 'conflict', label: 'related' });
+      added++;
+    }
+  }
 }
 
 function hydrateFacts(db: DatabaseSync, rows: readonly Record<string, unknown>[]): IndexedFact[] {
@@ -837,6 +889,8 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
           });
         }
       }
+      // Conflicts (A-28): pull in live checked facts that contradict a returned one.
+      addConflictPartners(db, options, collected, seenIds);
       break;
     } catch (error) {
       if (db) {
@@ -871,9 +925,20 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
     }
   }
 
+  const conflictMap = new Map<string, string[]>();
+  for (const a of collected) {
+    for (const b of collected) {
+      if (factsConflict(a.fact, b.fact)) {
+        const list = conflictMap.get(a.fact.fact_id) ?? [];
+        list.push(b.fact.fact_id);
+        conflictMap.set(a.fact.fact_id, list);
+      }
+    }
+  }
   const results: QueryResultItem[] = collected.map(({ fact, stage, label, score }) => {
     const assessment = resolver(fact, nowMs);
     const presentation = classifyPresentation(label, fact, assessment);
+    const conflictsWith = conflictMap.get(fact.fact_id);
     return {
       fact,
       stage,
@@ -884,6 +949,7 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
       citable: presentation.citable,
       citationRule: presentation.citationRule,
       ...(score !== undefined ? { score } : {}),
+      ...(conflictsWith ? { conflictsWith: [...conflictsWith].sort(compareBytewise) } : {}),
     };
   });
 
@@ -936,6 +1002,9 @@ export function formatQueryText(result: QueryResult): string {
     }
     if (item.fact.retracted && item.fact.retractionReason) {
       lines.push(`  retracted: ${sanitizeInlineText(item.fact.retractionReason)}`);
+    }
+    if (item.conflictsWith && item.conflictsWith.length > 0) {
+      lines.push(`  conflict: cannot hold together with ${item.conflictsWith.map(sanitizeInlineText).join(', ')}`);
     }
     lines.push(`  rule: ${item.citationRule}`);
   }
