@@ -171,3 +171,25 @@ test('round-3 fixes: escaped-quote JSON caught, budget filled past 200 short fac
   assert.ok(r.bytes > DIGEST_MAX_BYTES - 40, `digest filled to ${r.bytes} bytes`);
   assert.match(r.text, /Query them with: facts query --repo demo --max-sensitivity private --log alt\.jsonl\n$/);
 });
+
+test('round-4 fixes: dropped secret facts hide their intent, intents fill the budget, instant ordering, safe query flags', (t) => {
+  const f = fixture(t);
+  appendBlock(f.logPath, { agent: 't', project: 'demo', intent: 'Confidential plan Q', reasoning: 'r', status: 'done', schema: 2,
+    facts: [{ fact_id: '', tier: 'asserted', scope: 'current', claim: 'Confidential plan Q', note: '', tags: [], sensitivity: 'secret',
+      verified_at: new Date().toISOString(), supersedes: null, evidence: [] }] });
+  for (let i = 0; i < 80; i++) appendBlock(f.logPath, { agent: 't', project: 'demo', intent: `P${i}`, reasoning: 'r' });
+  const r = generateDigest({ logPath: f.logPath, project: 'demo', repos: f.repos, write: false });
+  assert.ok(!r.text.includes('Confidential plan Q'), 'intent of a block whose secret fact was dropped is hidden');
+  assert.equal((r.text.match(/^- P\d+$/gm) ?? []).length, 80, 'all 80 short proposals fit and are listed');
+
+  const g = fixture(t);
+  const mk = (claim, ts) => ({ fact_id: '', tier: 'asserted', scope: 'current', claim, note: '', tags: [], sensitivity: 'public',
+    verified_at: ts, supersedes: null,
+    evidence: [{ type: 'manual', description: 'looked', ran_at: new Date().toISOString(), ttl_s: 86400, output_sha256: 'c'.repeat(64) }] });
+  appendBlock(g.logPath, { agent: 't', project: 'demo', intent: 'i', reasoning: 'r', status: 'done', schema: 2,
+    facts: [mk('Older by instant.', '2026-11-20T11:00:00+02:00'), mk('Newer by instant.', '2026-11-20T10:00:00+00:00')] });
+  const o = generateDigest({ logPath: g.logPath, project: 'demo', repos: g.repos, queryFlags: ['--log', './$ledger.jsonl'], write: false });
+  assert.ok(o.text.indexOf('Newer by instant.') < o.text.indexOf('Older by instant.'));
+  assert.ok(!o.text.includes('$ledger'), 'a flag needing shell quoting is described, not shown');
+  assert.throws(() => generateDigest({ logPath: g.logPath, project: '0123456789abcdef', repos: g.repos, write: false }), /Invalid project/);
+});

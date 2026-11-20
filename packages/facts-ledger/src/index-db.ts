@@ -28,7 +28,7 @@ import {
   type ScanReport,
 } from './types.js';
 
-export const INDEX_SCHEMA_VERSION = 6;
+export const INDEX_SCHEMA_VERSION = 7;
 const EMPTY_SHA256 = createHash('sha256').update('').digest('hex');
 
 const REQUIRED_INDEX_TABLES = [
@@ -159,12 +159,12 @@ function computeIndexContentDigest(db: DatabaseSync): string {
   const h = createHash('sha256');
   for (const b of db
     .prepare(
-      'SELECT id, ts, agent, project, parent, trace_id, status, intent, reasoning, supersedes, schema, line_number FROM blocks ORDER BY line_number ASC, id COLLATE BINARY ASC',
+      'SELECT id, ts, agent, project, parent, trace_id, status, intent, reasoning, supersedes, schema, line_number, raw_fact_count FROM blocks ORDER BY line_number ASC, id COLLATE BINARY ASC',
     )
     .iterate()) {
     hashDigestRow(h, 'B:', [
       b['id'], b['ts'], b['agent'], b['project'], b['parent'], b['trace_id'],
-      b['status'], b['intent'], b['reasoning'], b['supersedes'], b['schema'], b['line_number'],
+      b['status'], b['intent'], b['reasoning'], b['supersedes'], b['schema'], b['line_number'], b['raw_fact_count'],
     ]);
   }
   for (const f of db
@@ -340,7 +340,10 @@ function createSchema(db: DatabaseSync): void {
       reasoning TEXT NOT NULL COLLATE BINARY,
       supersedes TEXT COLLATE BINARY,
       schema INTEGER,
-      line_number INTEGER NOT NULL
+      line_number INTEGER NOT NULL,
+      -- Entries in the block's raw facts array, before normalization drops any (a secret
+      -- fact, a malformed entry). The digest shows an intent only when none were dropped.
+      raw_fact_count INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE facts (
@@ -445,8 +448,8 @@ function prepareIngest(db: DatabaseSync): PreparedIngest {
   return {
     insertBlock: db.prepare(
       `INSERT OR IGNORE INTO blocks
-        (id, ts, agent, project, parent, trace_id, status, intent, reasoning, supersedes, schema, line_number)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (id, ts, agent, project, parent, trace_id, status, intent, reasoning, supersedes, schema, line_number, raw_fact_count)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ),
     insertFact: db.prepare(
       `INSERT OR IGNORE INTO facts
@@ -483,6 +486,7 @@ function ingestBlock(stmts: PreparedIngest, block: Block, lineNumber: number): n
     block.supersedes ?? null,
     typeof block.schema === 'number' ? block.schema : null,
     lineNumber,
+    Array.isArray(block.facts) ? block.facts.length : 0,
   );
   if (blockRes.changes === 0) {
     return 0;

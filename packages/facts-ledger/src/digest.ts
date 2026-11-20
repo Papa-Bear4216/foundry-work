@@ -27,8 +27,6 @@ const PAGE_SIZE = 500;
  * are kept, so trimming never drops a fact that would have fit.
  */
 const RECENT_KEEP = Math.ceil(6000 / 16);
-const PROPOSALS_KEEP = 50;
-const DECISIONS_KEEP = 20;
 const PROJECT_FILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const STATUS_ORDER: readonly FreshnessStatus[] = ['supported', 'moved', 'stale', 'expired', 'unverifiable'];
 
@@ -116,8 +114,12 @@ function factLine(mark: 'V' | 'A', claim: string, factId: string): string | null
 
 /** Projects that can have a digest file: a safe file-name part with no secret pattern. */
 export function assertDigestProject(project: string): void {
-  if (!PROJECT_FILE_RE.test(project) || findSecret(project) !== null) {
-    throw new Error('Invalid project name for a digest: use letters, digits, ".", "_" or "-" (at most 64)');
+  // A hex run over 12 characters would be shortened by the format rules, so the digest's
+  // header and query command would name a different project.
+  if (!PROJECT_FILE_RE.test(project) || findSecret(project) !== null || /[0-9a-fA-F]{13,}/.test(project)) {
+    throw new Error(
+      'Invalid project name for a digest: use letters, digits, ".", "_" or "-" (at most 64, no hex run over 12)',
+    );
   }
 }
 
@@ -249,31 +251,33 @@ function buildDigest(options: DigestOptions, indexPath: string, path: string): D
       if (page.length < PAGE_SIZE) break;
     }
 
-    // An intent can repeat its facts' claims, so a block carrying any fact above the
-    // sensitivity cap contributes no intent either.
-    const capped = `AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.block_id = b.id
-                     AND f.sensitivity NOT IN (${allowed.map(() => '?').join(', ')}))`;
-    proposals = db
-      .prepare(
-        `SELECT b.intent FROM blocks b
-         WHERE b.project = ? AND b.status = 'proposed'
-           AND NOT EXISTS (SELECT 1 FROM blocks s WHERE s.supersedes = b.id)
-           ${capped}
-         ORDER BY b.ts COLLATE BINARY DESC, b.id COLLATE BINARY ASC
-         LIMIT ?`,
-      )
-      .all(options.project, ...allowed, PROPOSALS_KEEP)
-      .map((r) => String(r['intent']));
-    decisions = db
-      .prepare(
-        `SELECT b.intent FROM blocks b
-         WHERE b.project = ? AND b.status = 'done'
-           ${capped}
-         ORDER BY b.ts COLLATE BINARY DESC, b.id COLLATE BINARY ASC
-         LIMIT ?`,
-      )
-      .all(options.project, ...allowed, DECISIONS_KEEP)
-      .map((r) => String(r['intent']));
+    // An intent can repeat its facts' claims. It is shown only when every entry of the
+    // block's raw facts array is indexed and within the cap: a secret or malformed fact
+    // was dropped at indexing, so its block's intent is never shown.
+    const capped = `AND b.raw_fact_count = (SELECT COUNT(*) FROM facts f WHERE f.block_id = b.id
+                     AND f.sensitivity IN (${allowed.map(() => '?').join(', ')}))`;
+    // Newest first by instant (julianday honours UTC offsets), then id; intents are
+    // filtered before they are kept, and only as many as could ever fit are kept.
+    const intents = (status: string, extra: string): string[] => {
+      const kept: string[] = [];
+      let bytes = 0;
+      for (const r of db
+        .prepare(
+          `SELECT b.intent FROM blocks b
+           WHERE b.project = ? AND b.status = ? ${extra} ${capped}
+           ORDER BY julianday(b.ts) DESC, b.id COLLATE BINARY ASC`,
+        )
+        .iterate(options.project, status, ...allowed)) {
+        const line = safeLine(`- ${String(r['intent'])}`);
+        if (line === null) continue;
+        kept.push(line);
+        bytes += byteLength(line) + 1;
+        if (bytes > DIGEST_MAX_BYTES) break;
+      }
+      return kept;
+    };
+    proposals = intents('proposed', 'AND NOT EXISTS (SELECT 1 FROM blocks s WHERE s.supersedes = b.id)');
+    decisions = intents('done', '');
   } finally {
     db.close();
   }
@@ -297,10 +301,14 @@ function buildDigest(options: DigestOptions, indexPath: string, path: string): D
   // in a path, for example) is described instead of shown wrong.
   const cap = options.maxSensitivity ?? 'personal';
   const base = `facts query --repo ${options.project}${cap === 'personal' ? '' : ` --max-sensitivity ${cap}`}`;
-  const extra = (options.queryFlags ?? []).map((f) => (/^[\w./:\\-]+$/.test(f) ? f : JSON.stringify(f))).join(' ');
-  const exact = extra ? `${base} ${extra}` : base;
+  // Flags are shown only when they need no shell quoting at all (no $, quotes, spaces),
+  // so the command means the same thing in every shell.
+  const flags = options.queryFlags ?? [];
+  const exact = flags.length > 0 ? `${base} ${flags.join(' ')}` : base;
   const command =
-    digestLine(exact) === exact && byteLength(exact) <= 200 ? exact : `${base} (with the same --log and --index as this digest)`;
+    flags.every((f) => /^[\w./:\\-]+$/.test(f)) && digestLine(exact) === exact && byteLength(exact) <= 200
+      ? exact
+      : `${base} (with the same --log and --index as this digest)`;
   const closing = (omitted: number): string => digestLine(`${omitted} fact(s) left out. Query them with: ${command}`);
   const reserve = byteLength(closing(currentFacts)) + 1;
 
@@ -329,11 +337,9 @@ function buildDigest(options: DigestOptions, indexPath: string, path: string): D
     }
   };
 
-  // Lines that cannot appear whole and safe are skipped; skipped facts count as left out.
-  const keep = (lines: readonly (string | null)[]): string[] => lines.filter((l): l is string => l !== null);
   section('## Pinned', pinned.map((f) => f.line), () => listedFacts++);
-  section('## Open proposals', keep(proposals.map((i) => safeLine(`- ${i}`))));
-  section('## Recent decisions', keep(decisions.map((i) => safeLine(`- ${i}`))));
+  section('## Open proposals', proposals);
+  section('## Recent decisions', decisions);
   section('## Recently verified', recent.map((f) => f.line), () => listedFacts++);
   const omittedFacts = currentFacts - listedFacts;
   out.push(closing(omittedFacts));
@@ -344,7 +350,12 @@ function buildDigest(options: DigestOptions, indexPath: string, path: string): D
   return { path, text, bytes: byteLength(text), counts, listedFacts, omittedFacts };
 }
 
+/** Newest first by instant (UTC offsets honoured); unparseable times last; then id. */
 function newestFirst(a: ListedFact, b: ListedFact): number {
-  const t = compareBytewise(b.verifiedAt, a.verifiedAt);
-  return t !== 0 ? t : compareBytewise(a.factId, b.factId);
+  const ta = Date.parse(a.verifiedAt);
+  const tb = Date.parse(b.verifiedAt);
+  const va = Number.isFinite(ta) ? ta : -Infinity;
+  const vb = Number.isFinite(tb) ? tb : -Infinity;
+  if (va !== vb) return vb > va ? 1 : -1;
+  return compareBytewise(a.factId, b.factId);
 }
