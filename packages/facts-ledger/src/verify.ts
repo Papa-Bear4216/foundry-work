@@ -24,15 +24,25 @@ const utf8Bytes = (value: unknown): number => new TextEncoder().encode(JSON.stri
 
 /** Every string a re-verified copy would carry into a new block (claim, note, check, all evidence fields). */
 function secretIn(fact: { claim: string; note?: string | null; check?: unknown; tags?: readonly string[]; evidence: readonly FactEvidence[] }): boolean {
-  const strings: string[] = [];
-  const collect = (value: unknown, depth: number): void => {
-    if (depth > 8) return;
-    if (typeof value === 'string') strings.push(value);
-    else if (Array.isArray(value)) for (const v of value) collect(v, depth + 1);
-    else if (value !== null && typeof value === 'object') for (const v of Object.values(value)) collect(v, depth + 1);
-  };
-  collect([fact.claim, fact.note ?? '', fact.check ?? null, fact.tags ?? [], fact.evidence], 0);
-  return strings.some((t) => t.length > 0 && findSecret(t) !== null);
+  // Iterative, unbounded walk; a structure nested deeper than any real fact fails closed.
+  const stack: { value: unknown; depth: number }[] = [
+    { value: [fact.claim, fact.note ?? '', fact.check ?? null, fact.tags ?? [], fact.evidence], depth: 0 },
+  ];
+  while (stack.length > 0) {
+    const { value, depth } = stack.pop() as { value: unknown; depth: number };
+    if (depth > 64) return true;
+    if (typeof value === 'string') {
+      if (value.length > 0 && findSecret(value) !== null) return true;
+    } else if (Array.isArray(value)) {
+      for (const v of value) stack.push({ value: v, depth: depth + 1 });
+    } else if (value !== null && typeof value === 'object') {
+      for (const [k, v] of Object.entries(value)) {
+        if (findSecret(k) !== null) return true;
+        stack.push({ value: v, depth: depth + 1 });
+      }
+    }
+  }
+  return false;
 }
 const PAGE_SIZE = 500;
 
