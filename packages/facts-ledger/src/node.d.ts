@@ -9,8 +9,10 @@ declare const console: {
 declare const process: {
   readonly argv: string[];
   readonly pid: number;
+  readonly platform: string;
   readonly env: Record<string, string | undefined>;
   exitCode: number | undefined;
+  kill(pid: number, signal?: string | number): boolean;
   resourceUsage(): { maxRSS: number };
   readonly hrtime: {
     bigint(): bigint;
@@ -65,19 +67,25 @@ declare module 'node:child_process' {
   export interface ChildReadable {
     on(event: 'data', listener: (chunk: string | Uint8Array) => void): this;
     on(event: 'error', listener: (err: Error) => void): this;
+    destroy(): void;
   }
 
   export interface ChildWritable {
     on(event: 'error', listener: (err: Error) => void): this;
     end(data: string): void;
+    destroy(): void;
   }
 
   export interface ChildProcess {
+    readonly pid?: number;
+    readonly exitCode: number | null;
+    readonly signalCode: string | null;
     readonly stdin: ChildWritable | null;
     readonly stdout: ChildReadable | null;
     readonly stderr: ChildReadable | null;
-    kill(): boolean;
+    kill(signal?: string | number): boolean;
     on(event: 'error', listener: (err: Error) => void): this;
+    on(event: 'exit', listener: (code: number | null, signal: string | null) => void): this;
     on(event: 'close', listener: (code: number | null, signal: string | null) => void): this;
   }
 
@@ -100,6 +108,7 @@ declare module 'node:child_process' {
       stdio: readonly ['pipe', 'pipe', 'pipe'];
       windowsHide?: boolean;
       shell?: boolean;
+      detached?: boolean;
     },
   ): ChildProcess;
 }

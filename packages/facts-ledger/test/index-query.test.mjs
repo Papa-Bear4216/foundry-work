@@ -47,7 +47,7 @@ function dumpAllTables(indexPath) {
       fact_supersessions: db.prepare('SELECT * FROM fact_supersessions ORDER BY superseded_fact_id COLLATE BINARY ASC').all(),
       fts_updated: db.prepare("SELECT f.rowid, f.fact_id, bm25(facts_fts) AS rank FROM facts_fts JOIN facts f ON f.rowid = facts_fts.rowid WHERE facts_fts MATCH 'Updated' ORDER BY f.fact_id COLLATE BINARY ASC").all(),
       fts_schema: db.prepare("SELECT f.rowid, f.fact_id, bm25(facts_fts) AS rank FROM facts_fts JOIN facts f ON f.rowid = facts_fts.rowid WHERE facts_fts MATCH 'schema' ORDER BY f.fact_id COLLATE BINARY ASC").all(),
-      state: db.prepare('SELECT schema_version, log_bytes, head_sha256, tail_sha256, log_mtime_ns, log_ctime_ns, log_ino, indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete, blocks_count, facts_count, fact_tags_count, fact_evidence_count, fact_retractions_count, fact_supersessions_count, content_sha256 FROM state').all(),
+      state: db.prepare('SELECT * FROM state').all(),
     };
   } finally {
     db.close();
@@ -2005,4 +2005,146 @@ test('non-Latin (Devanagari/Arabic) and underscore tokenization align Stage 2 an
     assert.equal(partial.results[0]?.stage, 'partial');
     assert.equal(partial.results[0]?.fact.fact_id, expectedId);
   }
+});
+
+test('command embedder terminates descendant process tree on timeout and stdout limit', async (t) => {
+  const dir = makeTempDir(t);
+  const logPath = join(dir, 'ledger.jsonl');
+  const nowMs = Date.UTC(2026, 10, 20, 0, 1, 0);
+  const freshAt = new Date(nowMs - 10_000).toISOString();
+  const cleanupPids = [];
+  t.after(() => {
+    for (const pid of cleanupPids) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        // Already exited.
+      }
+    }
+  });
+
+  appendBlock(logPath, {
+    agent: 'z3-test',
+    project: 'foundry',
+    intent: 'Process tree cleanup fixture',
+    reasoning: 'Ensure failing wrapper embedders leave no resident worker processes.',
+    facts: [
+      {
+        fact_id: 'tree-cleanup-1',
+        tier: 'asserted',
+        scope: 'at-commit',
+        claim: 'Cleanup verification fixture fact.',
+        tags: ['tree'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
+      },
+    ],
+  });
+
+  const wrapperPath = join(dir, 'wrapper-worker.mjs');
+  writeFileSync(
+    wrapperPath,
+    [
+      "import { spawn } from 'node:child_process';",
+      "import { writeFileSync } from 'node:fs';",
+      'const [, , pidFile, mode] = process.argv;',
+      "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000);'], { stdio: 'ignore', windowsHide: true });",
+      "writeFileSync(pidFile, String(child.pid), 'utf8');",
+      "if (mode === 'flood') {",
+      "  const chunk = ' '.repeat(65536);",
+      '  for (let i = 0; i < 80; i++) process.stdout.write(chunk);',
+      '}',
+      'setInterval(() => {}, 1000);',
+    ].join('\n'),
+    'utf8',
+  );
+
+  // 1) Direct createCommandEmbedder timeout kills descendant process before settling.
+  const hangPidFile = join(dir, 'hang.pid');
+  await assert.rejects(
+    () => createCommandEmbedder(process.execPath, [wrapperPath, hangPidFile, 'hang'], 'cmd', 600).embed(['probe']),
+    /timed out/,
+  );
+  assert.equal(existsSync(hangPidFile), true);
+  const hangPid = Number(readFileSync(hangPidFile, 'utf8'));
+  cleanupPids.push(hangPid);
+  assert.throws(() => process.kill(hangPid, 0), { code: 'ESRCH' });
+
+  // 2) Stdout >4 MiB cap kills descendant process before settling.
+  const floodPidFile = join(dir, 'flood.pid');
+  await assert.rejects(
+    () => createCommandEmbedder(process.execPath, [wrapperPath, floodPidFile, 'flood'], 'cmd', 15_000).embed(['probe']),
+    /exceeded 4194304 bytes/,
+  );
+  assert.equal(existsSync(floodPidFile), true);
+  const floodPid = Number(readFileSync(floodPidFile, 'utf8'));
+  cleanupPids.push(floodPid);
+  assert.throws(() => process.kill(floodPid, 0), { code: 'ESRCH' });
+
+  // 3) queryFacts semanticTimeoutMs still awaits command cleanup without early Promise.race leak.
+  const queryPidFile = join(dir, 'query-hang.pid');
+  await assert.rejects(
+    () =>
+      queryFacts({
+        logPath,
+        text: 'unrelated semantic trigger',
+        embedder: createCommandEmbedder(process.execPath, [wrapperPath, queryPidFile, 'hang'], 'cmd', 10_000),
+        semanticTimeoutMs: 600,
+        nowMs,
+      }),
+    /timed out/,
+  );
+  assert.equal(existsSync(queryPidFile), true);
+  const queryPid = Number(readFileSync(queryPidFile, 'utf8'));
+  cleanupPids.push(queryPid);
+  assert.throws(() => process.kill(queryPid, 0), { code: 'ESRCH' });
+});
+
+test('semantic Stage 3 rejects cross-batch embedding dimension mismatches without retry', async (t) => {
+  const dir = makeTempDir(t);
+  const logPath = join(dir, 'ledger.jsonl');
+  const nowMs = Date.UTC(2026, 10, 20, 0, 1, 0);
+  const freshAt = new Date(nowMs - 10_000).toISOString();
+
+  appendBlock(logPath, {
+    agent: 'z3-test',
+    project: 'foundry',
+    intent: 'Cross-batch dimension mismatch check',
+    reasoning: 'Reject mismatched query vs candidate embedding dimensions instead of truncating.',
+    facts: [
+      {
+        fact_id: 'dim-mismatch-1',
+        tier: 'asserted',
+        scope: 'at-commit',
+        claim: 'Semantic dimension mismatch candidate entry.',
+        tags: ['dims'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
+      },
+    ],
+  });
+
+  let calls = 0;
+  const mismatchEmbedder = {
+    model: 'mismatch',
+    async embed(texts) {
+      calls++;
+      if (calls === 1) {
+        return texts.map(() => Float32Array.from([1]));
+      }
+      return texts.map(() => Float32Array.from([1, 100]));
+    },
+  };
+
+  await assert.rejects(
+    () =>
+      queryFacts({
+        logPath,
+        text: 'unrelated concept xyzzy',
+        embedder: mismatchEmbedder,
+        nowMs,
+      }),
+    /dimension mismatch/,
+  );
+  assert.equal(calls, 2);
 });

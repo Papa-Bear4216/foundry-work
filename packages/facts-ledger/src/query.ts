@@ -1,4 +1,5 @@
-import { spawn } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { TextDecoder, TextEncoder } from 'node:util';
 import { defaultIndexPath, openSyncedIndexForQuery } from './index-db.js';
@@ -459,13 +460,35 @@ function insertTopK<T>(
   }
 }
 
+const deadlineAwareEmbedders = new WeakSet<Embedder>();
+
+function assertValidEmbeddingVector(
+  vec: unknown,
+  expectedDims: number | null,
+  label: string,
+): Float32Array {
+  if (!(vec instanceof Float32Array) || vec.length === 0 || vec.length > MAX_EMBED_VECTOR_DIMS) {
+    throw new Error(`${label} vector must be a non-empty Float32Array`);
+  }
+  if (expectedDims !== null && vec.length !== expectedDims) {
+    throw new Error(`Embedding vector dimension mismatch (${vec.length} vs ${expectedDims})`);
+  }
+  for (let i = 0; i < vec.length; i++) {
+    if (!Number.isFinite(vec[i])) {
+      throw new Error(`${label} vector contains non-finite value`);
+    }
+  }
+  return vec;
+}
+
 function cosineSimilarity(a: Float32Array, b: Float32Array): number {
-  const len = Math.min(a.length, b.length);
-  if (len === 0) return 0;
+  if (a.length === 0 || a.length !== b.length) {
+    throw new Error(`Embedding vector dimension mismatch (${a.length} vs ${b.length})`);
+  }
   let dot = 0;
   let normA = 0;
   let normB = 0;
-  for (let i = 0; i < len; i++) {
+  for (let i = 0; i < a.length; i++) {
     dot += a[i] * b[i];
     normA += a[i] * a[i];
     normB += b[i] * b[i];
@@ -496,6 +519,13 @@ async function invokeEmbedWithDeadline(
   const remainingMs = deadlineMs - Date.now();
   if (remainingMs <= 0) {
     throw new EmbedderInvocationError(new Error('Semantic lookup exceeded query deadline'));
+  }
+  if (deadlineAwareEmbedders.has(embedder)) {
+    try {
+      return await embedder.embed(texts, { timeoutMs: remainingMs });
+    } catch (err) {
+      throw err instanceof EmbedderInvocationError ? err : new EmbedderInvocationError(err);
+    }
   }
   let timer: unknown;
   try {
@@ -690,10 +720,15 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
               [trimmedText],
               semanticDeadlineMs,
             );
-            queryVec = queryEmbeddings[0];
-            if (!queryVec) {
-              batch = [];
-              return;
+            if (queryEmbeddings.length !== 1) {
+              throw new EmbedderInvocationError(
+                new Error('Embedder returned mismatched query embedding count'),
+              );
+            }
+            try {
+              queryVec = assertValidEmbeddingVector(queryEmbeddings[0], null, 'Query embedding');
+            } catch (err) {
+              throw new EmbedderInvocationError(err);
             }
           }
           const vecs = await invokeEmbedWithDeadline(
@@ -702,11 +737,22 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
             semanticDeadlineMs,
           );
           if (vecs.length !== batch.length) {
-            batch = [];
-            return;
+            throw new EmbedderInvocationError(
+              new Error('Embedder returned mismatched candidate embedding count'),
+            );
           }
           for (let i = 0; i < batch.length; i++) {
-            const sim = cosineSimilarity(queryVec, vecs[i]);
+            let candidateVec: Float32Array;
+            try {
+              candidateVec = assertValidEmbeddingVector(
+                vecs[i],
+                queryVec.length,
+                'Candidate embedding',
+              );
+            } catch (err) {
+              throw new EmbedderInvocationError(err);
+            }
+            const sim = cosineSimilarity(queryVec, candidateVec);
             if (sim >= minScore) {
               insertTopK(
                 topSemantic,
@@ -973,7 +1019,7 @@ export function createHttpEmbedder(
     throw new Error(`Embedder HTTP endpoint must target a loopback host, got ${parsed.hostname}`);
   }
 
-  return {
+  const embedder: Embedder = {
     model,
     async embed(
       texts: readonly string[],
@@ -1027,6 +1073,102 @@ export function createHttpEmbedder(
       return parseAndValidateVectors(rawVectors, texts.length, 'HTTP embedder');
     },
   };
+  deadlineAwareEmbedders.add(embedder);
+  return embedder;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function isProcessGroupAlivePosix(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (err) {
+    return (err as { code?: string }).code !== 'ESRCH';
+  }
+}
+
+async function terminateProcessTree(
+  child: ChildProcess,
+  childExited: Promise<void>,
+): Promise<void> {
+  try {
+    child.stdin?.destroy();
+  } catch {
+    // Ignore stream destroy failure.
+  }
+  try {
+    child.stdout?.destroy();
+  } catch {
+    // Ignore stream destroy failure.
+  }
+  try {
+    child.stderr?.destroy();
+  } catch {
+    // Ignore stream destroy failure.
+  }
+
+  const pid = child.pid;
+  if (typeof pid !== 'number' || pid <= 0) {
+    try {
+      child.kill();
+    } catch {
+      // Ignore kill error when child failed to spawn.
+    }
+    await Promise.race([childExited, delay(200)]);
+    return;
+  }
+
+  const waitExit = Promise.race([childExited, delay(3000)]);
+  if (process.platform === 'win32') {
+    const systemRoot = process.env['SystemRoot'] || process.env['WINDIR'] || 'C:\\Windows';
+    const taskkillPath = join(systemRoot, 'System32', 'taskkill.exe');
+    const taskkillPromise = new Promise<void>((resolve) => {
+      execFile(
+        taskkillPath,
+        ['/PID', String(pid), '/T', '/F'],
+        { encoding: 'utf8', timeout: 5000, windowsHide: true },
+        (err) => {
+          if (err) {
+            try {
+              child.kill();
+            } catch {
+              // Child already exited.
+            }
+          }
+          resolve();
+        },
+      );
+    });
+    await Promise.all([taskkillPromise, waitExit]);
+    return;
+  }
+
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    // Process group may already be gone.
+  }
+  try {
+    child.kill('SIGKILL');
+  } catch {
+    // Child may already be gone.
+  }
+  await waitExit;
+
+  const pollDeadline = Date.now() + 2000;
+  while (Date.now() < pollDeadline && isProcessGroupAlivePosix(pid)) {
+    try {
+      process.kill(-pid, 'SIGKILL');
+    } catch {
+      break;
+    }
+    await delay(15);
+  }
 }
 
 /** Optional command embedder adapter (`Embedder` port passing JSON input over `stdin`, never argv/shell). */
@@ -1036,7 +1178,7 @@ export function createCommandEmbedder(
   model = 'command',
   timeoutMs = 15000,
 ): Embedder {
-  return {
+  const embedder: Embedder = {
     model,
     embed(
       texts: readonly string[],
@@ -1044,52 +1186,63 @@ export function createCommandEmbedder(
     ): Promise<readonly Float32Array[]> {
       const effectiveTimeoutMs = Math.max(1, Math.min(timeoutMs, callOptions?.timeoutMs ?? timeoutMs));
       return new Promise((resolvePromise, rejectPromise) => {
+        const useDetachedGroup = process.platform !== 'win32';
         const child = spawn(executablePath, [...baseArgs], {
           stdio: ['pipe', 'pipe', 'pipe'],
           windowsHide: true,
           shell: false,
+          detached: useDetachedGroup,
         });
         const stdoutChunks: Uint8Array[] = [];
         let stdoutBytes = 0;
         let settled = false;
+        let terminating = false;
 
-        const fail = (message: string): void => {
-          if (settled) return;
-          settled = true;
+        let resolveExit!: () => void;
+        const childExited = new Promise<void>((resolve) => {
+          resolveExit = resolve;
+        });
+        if (child.exitCode !== null || child.signalCode !== null) {
+          resolveExit();
+        }
+        child.on('exit', () => resolveExit());
+        child.on('close', () => resolveExit());
+        child.on('error', () => resolveExit());
+
+        const terminateAndFail = (message: string): void => {
+          if (settled || terminating) return;
+          terminating = true;
           clearTimeout(timer);
-          rejectPromise(new Error(message));
+          void terminateProcessTree(child, childExited).finally(() => {
+            if (settled) return;
+            settled = true;
+            rejectPromise(new Error(message));
+          });
         };
 
         const timer = setTimeout(() => {
-          try {
-            child.kill();
-          } catch {
-            // Best-effort kill on timeout.
-          }
-          fail('Command embedder timed out');
+          terminateAndFail('Command embedder timed out');
         }, effectiveTimeoutMs);
 
         child.on('error', (err) => {
+          if (settled || terminating) return;
           const code = (err as { code?: string }).code ?? 'error';
-          fail(`Command embedder could not be started (${code})`);
+          terminateAndFail(`Command embedder could not be started (${code})`);
         });
         child.stdin?.on('error', (err) => {
+          if (settled || terminating) return;
           const code = (err as { code?: string }).code;
-          if (!settled && code !== 'EPIPE') {
-            fail(`Command embedder stdin failed (${code ?? 'error'})`);
+          if (code !== 'EPIPE') {
+            terminateAndFail(`Command embedder stdin failed (${code ?? 'error'})`);
           }
         });
 
         child.stdout?.on('data', (chunk) => {
+          if (settled || terminating) return;
           const bytes = typeof chunk === 'string' ? embedEncoder.encode(chunk) : chunk;
           stdoutBytes += bytes.length;
           if (stdoutBytes > MAX_EMBED_RESPONSE_BYTES) {
-            try {
-              child.kill();
-            } catch {
-              // Best-effort kill on stdout cap.
-            }
-            fail(`Command embedder stdout exceeded ${MAX_EMBED_RESPONSE_BYTES} bytes`);
+            terminateAndFail(`Command embedder stdout exceeded ${MAX_EMBED_RESPONSE_BYTES} bytes`);
             return;
           }
           stdoutChunks.push(bytes);
@@ -1101,9 +1254,9 @@ export function createCommandEmbedder(
 
         child.on('close', (code, signal) => {
           clearTimeout(timer);
-          if (settled) return;
+          if (settled || terminating) return;
           if (code !== 0) {
-            fail(
+            terminateAndFail(
               `Command embedder failed (${signal ? `signal ${signal}` : `exit code ${code ?? 'unknown'}`})`,
             );
             return;
@@ -1115,12 +1268,26 @@ export function createCommandEmbedder(
             try {
               parsed = JSON.parse(stdout);
             } catch {
-              fail('Command embedder returned invalid JSON');
+              terminateAndFail('Command embedder returned invalid JSON');
               return;
             }
             vectors = parseAndValidateVectors(parsed, texts.length, 'Command embedder');
           } catch (err) {
-            fail(err instanceof Error ? err.message : 'Command embedder returned invalid output');
+            terminateAndFail(err instanceof Error ? err.message : 'Command embedder returned invalid output');
+            return;
+          }
+          if (
+            useDetachedGroup &&
+            typeof child.pid === 'number' &&
+            child.pid > 0 &&
+            isProcessGroupAlivePosix(child.pid)
+          ) {
+            terminating = true;
+            void terminateProcessTree(child, childExited).finally(() => {
+              if (settled) return;
+              settled = true;
+              resolvePromise(vectors);
+            });
             return;
           }
           settled = true;
@@ -1128,11 +1295,13 @@ export function createCommandEmbedder(
         });
 
         if (!child.stdin) {
-          fail('Command embedder stdin pipe unavailable');
+          terminateAndFail('Command embedder stdin pipe unavailable');
           return;
         }
         child.stdin.end(JSON.stringify(texts));
       });
     },
   };
+  deadlineAwareEmbedders.add(embedder);
+  return embedder;
 }

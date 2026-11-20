@@ -134,7 +134,6 @@ export interface IndexState {
   readonly factRetractionsCount: number;
   readonly factSupersessionsCount: number;
   readonly contentSha256: string;
-  readonly ftsShadowSha256: string;
 }
 
 export interface IndexSyncResult {

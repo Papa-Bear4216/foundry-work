@@ -206,21 +206,20 @@ function computeIndexContentDigest(db: DatabaseSync): string {
   for (const z of db.prepare('SELECT id, sz FROM facts_fts_docsize ORDER BY id ASC').iterate()) {
     hashDigestRow(h, 'Z:', [z['id'], z['sz']]);
   }
-  return h.digest('hex');
-}
-
-function computeFtsShadowDigest(db: DatabaseSync): string {
-  const h = createHash('sha256');
   for (const c of db.prepare('SELECT k, v FROM facts_fts_config ORDER BY k COLLATE BINARY ASC').iterate()) {
     hashDigestRow(h, 'C:', [c['k'], c['v']]);
   }
-  for (const d of db.prepare('SELECT id, block FROM facts_fts_data ORDER BY id ASC').iterate()) {
-    hashDigestRow(h, 'D:', [d['id'], d['block']]);
-  }
-  for (const x of db
-    .prepare('SELECT segid, term, pgno FROM facts_fts_idx ORDER BY segid COLLATE BINARY ASC, term COLLATE BINARY ASC, pgno COLLATE BINARY ASC')
-    .iterate()) {
-    hashDigestRow(h, 'X:', [x['segid'], x['term'], x['pgno']]);
+  db.exec('CREATE VIRTUAL TABLE IF NOT EXISTS temp.__facts_fts_vocab USING fts5vocab(main, facts_fts, instance);');
+  try {
+    for (const v of db
+      .prepare(
+        'SELECT term, doc, col, offset FROM temp.__facts_fts_vocab ORDER BY term COLLATE BINARY ASC, doc ASC, col COLLATE BINARY ASC, offset ASC',
+      )
+      .iterate()) {
+      hashDigestRow(h, 'V:', [v['term'], v['doc'], v['col'], v['offset']]);
+    }
+  } finally {
+    db.exec('DROP TABLE IF EXISTS temp.__facts_fts_vocab;');
   }
   return h.digest('hex');
 }
@@ -256,10 +255,7 @@ function verifyReadOnlyIntegrity(db: DatabaseSync, saved: IndexState): boolean {
     if (Number(ftsDocRow?.['c'] ?? -1) !== saved.factsCount) {
       return false;
     }
-    return (
-      computeIndexContentDigest(db) === saved.contentSha256 &&
-      computeFtsShadowDigest(db) === saved.ftsShadowSha256
-    );
+    return computeIndexContentDigest(db) === saved.contentSha256;
   } catch {
     return false;
   }
@@ -314,10 +310,7 @@ function verifyIndexIntegrity(db: DatabaseSync, saved: IndexState): boolean {
       }
     }
 
-    if (
-      computeIndexContentDigest(db) !== saved.contentSha256 ||
-      computeFtsShadowDigest(db) !== saved.ftsShadowSha256
-    ) {
+    if (computeIndexContentDigest(db) !== saved.contentSha256) {
       return false;
     }
 
@@ -433,8 +426,7 @@ function createSchema(db: DatabaseSync): void {
       fact_evidence_count INTEGER NOT NULL,
       fact_retractions_count INTEGER NOT NULL,
       fact_supersessions_count INTEGER NOT NULL,
-      content_sha256 TEXT NOT NULL COLLATE BINARY,
-      fts_shadow_sha256 TEXT NOT NULL COLLATE BINARY
+      content_sha256 TEXT NOT NULL COLLATE BINARY
     );
   `);
 }
@@ -593,7 +585,7 @@ function readStateRow(db: DatabaseSync): IndexState | null {
         `SELECT schema_version, log_bytes, head_sha256, tail_sha256, log_mtime_ns, log_ctime_ns, log_ino,
                 indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete,
                 blocks_count, facts_count, fact_tags_count, fact_evidence_count, fact_retractions_count, fact_supersessions_count,
-                content_sha256, fts_shadow_sha256
+                content_sha256
          FROM state WHERE id = 1`,
       )
       .get();
@@ -619,8 +611,7 @@ function readStateRow(db: DatabaseSync): IndexState | null {
       !isNonNegativeSafeInt(row['fact_evidence_count']) ||
       !isNonNegativeSafeInt(row['fact_retractions_count']) ||
       !isNonNegativeSafeInt(row['fact_supersessions_count']) ||
-      typeof row['content_sha256'] !== 'string' ||
-      typeof row['fts_shadow_sha256'] !== 'string'
+      typeof row['content_sha256'] !== 'string'
     ) {
       return null;
     }
@@ -647,7 +638,6 @@ function readStateRow(db: DatabaseSync): IndexState | null {
       factRetractionsCount: row['fact_retractions_count'],
       factSupersessionsCount: row['fact_supersessions_count'],
       contentSha256: row['content_sha256'],
-      ftsShadowSha256: row['fts_shadow_sha256'],
     };
   } catch {
     return null;
@@ -673,7 +663,6 @@ function saveState(
   },
   counts: DerivedTableCounts,
   contentSha256: string,
-  ftsShadowSha256: string,
   indexedOffset: number,
   nextLineNumber: number,
   completeBadLines: readonly number[],
@@ -685,8 +674,8 @@ function saveState(
       (id, schema_version, log_bytes, head_sha256, tail_sha256, log_mtime_ns, log_ctime_ns, log_ino,
        indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete,
        blocks_count, facts_count, fact_tags_count, fact_evidence_count, fact_retractions_count, fact_supersessions_count,
-       content_sha256, fts_shadow_sha256)
-     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       content_sha256)
+     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     INDEX_SCHEMA_VERSION,
     header.size,
@@ -706,7 +695,6 @@ function saveState(
     counts.factRetractionsCount,
     counts.factSupersessionsCount,
     contentSha256,
-    ftsShadowSha256,
   );
 }
 
@@ -750,18 +738,14 @@ function rebuildIndexUnlocked(logPath: string, indexPath: string): IndexSyncResu
       closeSync(logFd);
       logFd = null;
     }
-    db.exec('COMMIT');
 
     const counts = readDerivedTableCounts(db);
     const contentSha256 = computeIndexContentDigest(db);
-    const ftsShadowSha256 = computeFtsShadowDigest(db);
-    db.exec('BEGIN');
     saveState(
       db,
       header,
       counts,
       contentSha256,
-      ftsShadowSha256,
       scanState.lastCompleteOffset,
       scanState.nextLineNumber,
       scanState.completeBadLineNumbers,
@@ -1002,7 +986,6 @@ function syncIndexUnlocked(
       return rebuildIndexUnlocked(logPath, indexPath);
     }
 
-    db.prepare('DELETE FROM state').run();
     const stmts = prepareIngest(db);
     const scanState = scanFdRange(
       logFd,
@@ -1016,8 +999,6 @@ function syncIndexUnlocked(
       onReadRange,
     );
     closeLogFd();
-    db.exec('COMMIT');
-    inTxn = false;
 
     const combinedBadLines = [
       ...saved.completeBadLines,
@@ -1025,15 +1006,11 @@ function syncIndexUnlocked(
     ];
     const counts = readDerivedTableCounts(db);
     const contentSha256 = computeIndexContentDigest(db);
-    const ftsShadowSha256 = computeFtsShadowDigest(db);
-    db.exec('BEGIN IMMEDIATE');
-    inTxn = true;
     saveState(
       db,
       header,
       counts,
       contentSha256,
-      ftsShadowSha256,
       scanState.lastCompleteOffset,
       scanState.nextLineNumber,
       combinedBadLines,
