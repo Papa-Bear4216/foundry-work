@@ -403,6 +403,34 @@ function buildFactFilterClause(
   return clauses.join(' AND ');
 }
 
+/**
+ * Facts by id from an open index, including superseded and retracted ones (their flags are
+ * set), limited to the sensitivity cap. Used by `facts check-answer` to resolve every cited
+ * id through one index open.
+ */
+export function lookupFactsByIds(
+  db: DatabaseSync,
+  ids: readonly string[],
+  maxSensitivity?: Exclude<Sensitivity, 'secret'>,
+): IndexedFact[] {
+  const out: IndexedFact[] = [];
+  const allowed = allowedSensitivities(maxSensitivity ?? 'child');
+  for (let i = 0; i < ids.length; i += 200) {
+    const chunk = ids.slice(i, i + 200);
+    const rows = db
+      .prepare(
+        `SELECT f.fact_id, f.block_id, f.project, f.tier, f.scope, f.check_json, f.claim, f.note, f.sensitivity, f.verified_at, f.supersedes
+         FROM facts f
+         WHERE f.fact_id IN (${chunk.map(() => '?').join(', ')})
+           AND f.sensitivity IN (${allowed.map(() => '?').join(', ')})
+         ORDER BY f.fact_id COLLATE BINARY ASC`,
+      )
+      .all(...chunk, ...allowed);
+    out.push(...hydrateFacts(db, rows));
+  }
+  return out;
+}
+
 /** Most conflict partners pulled in for one query, so a crowded subject cannot flood the output. */
 const MAX_CONFLICT_PARTNERS = 20;
 

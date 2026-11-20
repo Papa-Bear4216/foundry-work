@@ -1,6 +1,7 @@
 import { TextEncoder } from 'node:util';
 import { FreshnessChecker } from './freshness.js';
-import { queryFacts } from './query.js';
+import { defaultIndexPath, openSyncedIndexForQuery } from './index-db.js';
+import { classifyPresentation, lookupFactsByIds } from './query.js';
 import { type RepoMap } from './repos.js';
 import { type Sensitivity } from './types.js';
 
@@ -91,32 +92,30 @@ export async function checkAnswer(text: string, options: CheckAnswerOptions): Pr
   const nowMs = options.nowMs ?? Date.now();
   const checker = new FreshnessChecker({ repos: options.repos });
   const resolver = checker.resolver();
-  const prefetch = checker.prefetcher();
+  // One index open, one batched lookup and one git prefetch for every cited id.
+  const { db } = openSyncedIndexForQuery(options.logPath, options.indexPath ?? defaultIndexPath(options.logPath), false);
+  let facts;
+  try {
+    facts = lookupFactsByIds(db, distinct, options.maxSensitivity);
+  } finally {
+    db.close();
+  }
+  if (facts.length > 0) checker.prefetcher()(facts, nowMs);
+  const byId = new Map(facts.map((f) => [f.fact_id, f]));
   const verdicts = new Map<string, CitationVerdict>();
   for (const id of distinct) {
-    const result = await queryFacts({
-      logPath: options.logPath,
-      ...(options.indexPath ? { indexPath: options.indexPath } : {}),
-      id,
-      history: true,
-      limit: 1,
-      ...(options.maxSensitivity ? { maxSensitivity: options.maxSensitivity } : {}),
-      nowMs,
-      freshnessResolver: resolver,
-      freshnessPrefetch: prefetch,
-    });
-    const item = result.results.find((r) => r.fact.fact_id === id);
-    if (!item) {
+    const fact = byId.get(id);
+    if (!fact) {
       verdicts.set(id, { asFact: 'cited fact does not exist', asAsserted: 'cited fact does not exist' });
       continue;
     }
+    const view = classifyPresentation('match', fact, resolver(fact, nowMs));
     let reason: string | null = null;
-    if (item.fact.retracted) reason = 'cited fact is retracted';
-    else if (item.fact.superseded) reason = 'cited fact is superseded';
-    else if (!item.citable) reason = `cited fact is not currently fresh (${item.freshness})`;
-    const asFact = reason ?? (item.badge === 'VERIFIED' ? null : `cited fact is ${item.badge}, not VERIFIED; cite it as asserted:`);
-    const asAsserted = reason;
-    verdicts.set(id, { asFact, asAsserted });
+    if (fact.retracted) reason = 'cited fact is retracted';
+    else if (fact.superseded) reason = 'cited fact is superseded';
+    else if (!view.citable) reason = `cited fact is not currently fresh (${view.effectiveFreshness})`;
+    const asFact = reason ?? (view.badge === 'VERIFIED' ? null : `cited fact is ${view.badge}, not VERIFIED; cite it as asserted:`);
+    verdicts.set(id, { asFact, asAsserted: reason });
   }
   for (const p of pending) {
     const v = verdicts.get(p.id) as CitationVerdict;

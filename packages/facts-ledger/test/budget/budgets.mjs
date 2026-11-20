@@ -127,7 +127,9 @@ try {
   }
   const store = ['--log', logPath, '--index', indexPath];
   const answerPath = join(root, 'answer.txt');
-  writeFileSync(answerPath, 'Probe statement. [asserted:000000000001.0] [asserted:000000002710.0]\nABSTAIN: nothing else.\n');
+  // 100 distinct citations: the cost of check-answer must not grow with one index open per citation.
+  const cited = Array.from({ length: 100 }, (_, i) => `[asserted:${(i * 97 + 1).toString(16).padStart(12, '0')}.0]`);
+  writeFileSync(answerPath, `Probe statement. ${cited.join(' ')}\nABSTAIN: nothing else.\n`);
   const firstId = '000000000001';
 
   const steps = [
