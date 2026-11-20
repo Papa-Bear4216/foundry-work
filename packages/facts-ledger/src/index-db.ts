@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   closeSync,
   existsSync,
@@ -17,7 +17,10 @@ import {
   replaceFileWithRetry,
   scanFdRange,
 } from './log.js';
-import { normalizeBlockFactsAndRetractions } from './normalize.js';
+import {
+  normalizeBlockFactsAndRetractions,
+  normalizeTextForFts,
+} from './normalize.js';
 import {
   type Block,
   type IndexState,
@@ -25,7 +28,7 @@ import {
   type ScanReport,
 } from './types.js';
 
-export const INDEX_SCHEMA_VERSION = 4;
+export const INDEX_SCHEMA_VERSION = 5;
 
 const REQUIRED_INDEX_TABLES = [
   'blocks',
@@ -67,31 +70,123 @@ function safeBigIntStat(target: string): { dev: bigint; ino: bigint } | null {
   }
 }
 
-/** Reject index paths that resolve to the source ledger log or its lock file. */
+/** Reject index paths (or their sidecar lock paths) that resolve to the source ledger log or its lock file. */
 export function assertDistinctIndexPath(logPath: string, indexPath: string): void {
-  const lockPath = `${logPath}.lock.sqlite`;
-  const idxResolved = resolve(indexPath);
-  if (idxResolved === resolve(logPath) || idxResolved === resolve(lockPath)) {
-    throw new Error(`Refusing to use log or lock path as indexPath: ${indexPath}`);
-  }
+  const logLockPath = `${logPath}.lock.sqlite`;
+  const indexLockPath = `${indexPath}.lock.sqlite`;
+  const reservedPaths = [logPath, logLockPath] as const;
 
-  const idxCanon = canonicalPath(indexPath);
-  for (const reserved of [logPath, lockPath]) {
-    const reservedCanon = canonicalPath(reserved);
-    if (idxCanon === reservedCanon) {
-      throw new Error(`Refusing to overwrite log or lock path as indexPath: ${indexPath}`);
+  for (const candidate of [indexPath, indexLockPath]) {
+    const candResolved = resolve(candidate);
+    for (const reserved of reservedPaths) {
+      if (candResolved === resolve(reserved)) {
+        throw new Error(`Refusing to use log or lock path as indexPath: ${indexPath}`);
+      }
     }
-    const idxStat = safeBigIntStat(indexPath);
-    const resStat = safeBigIntStat(reserved);
-    if (
-      idxStat &&
-      resStat &&
-      idxStat.ino !== 0n &&
-      idxStat.dev === resStat.dev &&
-      idxStat.ino === resStat.ino
-    ) {
-      throw new Error(`Refusing to overwrite log or lock path sharing inode: ${indexPath}`);
+
+    const candCanon = canonicalPath(candidate);
+    for (const reserved of reservedPaths) {
+      const reservedCanon = canonicalPath(reserved);
+      if (candCanon === reservedCanon) {
+        throw new Error(`Refusing to overwrite log or lock path as indexPath: ${indexPath}`);
+      }
+      const candStat = safeBigIntStat(candidate);
+      const resStat = safeBigIntStat(reserved);
+      if (
+        candStat &&
+        resStat &&
+        candStat.ino !== 0n &&
+        candStat.dev === resStat.dev &&
+        candStat.ino === resStat.ino
+      ) {
+        throw new Error(`Refusing to overwrite log or lock path sharing inode: ${indexPath}`);
+      }
     }
+  }
+}
+
+function withIndexLock<T>(indexPath: string, fn: () => T): T {
+  mkdirSync(dirname(indexPath), { recursive: true });
+  const lockDb = new DatabaseSync(`${indexPath}.lock.sqlite`, { timeout: 5000 });
+  try {
+    lockDb.exec('BEGIN IMMEDIATE');
+    try {
+      const result = fn();
+      lockDb.exec('COMMIT');
+      return result;
+    } catch (err) {
+      try {
+        lockDb.exec('ROLLBACK');
+      } catch {
+        // Ignore rollback failure on lock handle.
+      }
+      throw err;
+    }
+  } finally {
+    lockDb.close();
+  }
+}
+
+function computeVisibilityDigest(db: DatabaseSync): string {
+  const h = createHash('sha256');
+  for (const r of db
+    .prepare('SELECT fact_id, block_id, reason FROM fact_retractions ORDER BY fact_id COLLATE BINARY ASC')
+    .iterate()) {
+    h.update(`R\0${String(r['fact_id'])}\0${String(r['block_id'])}\0${String(r['reason'])}\n`);
+  }
+  for (const s of db
+    .prepare('SELECT superseded_fact_id, block_id FROM fact_supersessions ORDER BY superseded_fact_id COLLATE BINARY ASC')
+    .iterate()) {
+    h.update(`S\0${String(s['superseded_fact_id'])}\0${String(s['block_id'])}\n`);
+  }
+  for (const t of db
+    .prepare('SELECT fact_id, tag FROM fact_tags ORDER BY tag COLLATE BINARY ASC, fact_id COLLATE BINARY ASC')
+    .iterate()) {
+    h.update(`T\0${String(t['fact_id'])}\0${String(t['tag'])}\n`);
+  }
+  for (const f of db
+    .prepare('SELECT fact_id, sensitivity, supersedes FROM facts ORDER BY fact_id COLLATE BINARY ASC')
+    .iterate()) {
+    const sup = typeof f['supersedes'] === 'string' ? f['supersedes'] : '';
+    h.update(`F\0${String(f['fact_id'])}\0${String(f['sensitivity'])}\0${sup}\n`);
+  }
+  return h.digest('hex');
+}
+
+function hasRequiredTables(db: DatabaseSync): boolean {
+  const rows = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+    .all();
+  const present = new Set(rows.map((r) => String(r['name'])));
+  for (const table of REQUIRED_INDEX_TABLES) {
+    if (!present.has(table)) return false;
+  }
+  return true;
+}
+
+function countsMatchSaved(db: DatabaseSync, saved: IndexState): boolean {
+  const counts = readDerivedTableCounts(db);
+  return (
+    counts.blocksCount === saved.blocksCount &&
+    counts.factsCount === saved.factsCount &&
+    counts.factTagsCount === saved.factTagsCount &&
+    counts.factEvidenceCount === saved.factEvidenceCount &&
+    counts.factRetractionsCount === saved.factRetractionsCount &&
+    counts.factSupersessionsCount === saved.factSupersessionsCount
+  );
+}
+
+function verifyReadOnlyIntegrity(db: DatabaseSync, saved: IndexState): boolean {
+  try {
+    if (!hasRequiredTables(db)) return false;
+    if (!countsMatchSaved(db, saved)) return false;
+    const ftsDocRow = db.prepare('SELECT count(*) AS c FROM facts_fts_docsize').get();
+    if (Number(ftsDocRow?.['c'] ?? -1) !== saved.factsCount) {
+      return false;
+    }
+    return computeVisibilityDigest(db) === saved.visibilitySha256;
+  } catch {
+    return false;
   }
 }
 
@@ -119,13 +214,7 @@ function readDerivedTableCounts(db: DatabaseSync): DerivedTableCounts {
 
 function verifySchemaAndQuickCheck(db: DatabaseSync): boolean {
   try {
-    const rows = db
-      .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
-      .all();
-    const present = new Set(rows.map((r) => String(r['name'])));
-    for (const table of REQUIRED_INDEX_TABLES) {
-      if (!present.has(table)) return false;
-    }
+    if (!hasRequiredTables(db)) return false;
     const qc = db.prepare('PRAGMA quick_check').get();
     return Boolean(qc && qc['quick_check'] === 'ok');
   } catch {
@@ -135,17 +224,7 @@ function verifySchemaAndQuickCheck(db: DatabaseSync): boolean {
 
 function verifyIndexIntegrity(db: DatabaseSync, saved: IndexState): boolean {
   try {
-    const counts = readDerivedTableCounts(db);
-    if (
-      counts.blocksCount !== saved.blocksCount ||
-      counts.factsCount !== saved.factsCount ||
-      counts.factTagsCount !== saved.factTagsCount ||
-      counts.factEvidenceCount !== saved.factEvidenceCount ||
-      counts.factRetractionsCount !== saved.factRetractionsCount ||
-      counts.factSupersessionsCount !== saved.factSupersessionsCount
-    ) {
-      return false;
-    }
+    if (!countsMatchSaved(db, saved)) return false;
 
     const orphanQueries = [
       'SELECT 1 FROM facts f WHERE NOT EXISTS (SELECT 1 FROM blocks b WHERE b.id = f.block_id) LIMIT 1',
@@ -158,6 +237,10 @@ function verifyIndexIntegrity(db: DatabaseSync, saved: IndexState): boolean {
       if (db.prepare(sql).get()) {
         return false;
       }
+    }
+
+    if (computeVisibilityDigest(db) !== saved.visibilitySha256) {
+      return false;
     }
 
     db.exec("INSERT INTO facts_fts(facts_fts, rank) VALUES('integrity-check', 1);");
@@ -198,6 +281,8 @@ function createSchema(db: DatabaseSync): void {
       check_json TEXT COLLATE BINARY,
       claim TEXT NOT NULL COLLATE BINARY,
       note TEXT NOT NULL COLLATE BINARY,
+      claim_fts TEXT NOT NULL COLLATE BINARY,
+      note_fts TEXT NOT NULL COLLATE BINARY,
       sensitivity TEXT NOT NULL COLLATE BINARY,
       verified_at TEXT NOT NULL COLLATE BINARY,
       supersedes TEXT COLLATE BINARY
@@ -244,8 +329,8 @@ function createSchema(db: DatabaseSync): void {
     );
 
     CREATE VIRTUAL TABLE facts_fts USING fts5(
-      claim,
-      note,
+      claim_fts,
+      note_fts,
       content='facts',
       content_rowid='rowid'
     );
@@ -268,7 +353,8 @@ function createSchema(db: DatabaseSync): void {
       fact_tags_count INTEGER NOT NULL,
       fact_evidence_count INTEGER NOT NULL,
       fact_retractions_count INTEGER NOT NULL,
-      fact_supersessions_count INTEGER NOT NULL
+      fact_supersessions_count INTEGER NOT NULL,
+      visibility_sha256 TEXT NOT NULL COLLATE BINARY
     );
   `);
 }
@@ -292,8 +378,8 @@ function prepareIngest(db: DatabaseSync): PreparedIngest {
     ),
     insertFact: db.prepare(
       `INSERT OR IGNORE INTO facts
-        (fact_id, block_id, project, tier, scope, check_json, claim, note, sensitivity, verified_at, supersedes)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (fact_id, block_id, project, tier, scope, check_json, claim, note, claim_fts, note_fts, sensitivity, verified_at, supersedes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ),
     insertTag: db.prepare('INSERT OR IGNORE INTO fact_tags (fact_id, tag) VALUES (?, ?)'),
     insertEvidence: db.prepare(
@@ -307,7 +393,7 @@ function prepareIngest(db: DatabaseSync): PreparedIngest {
     insertSupersession: db.prepare(
       'INSERT OR IGNORE INTO fact_supersessions (superseded_fact_id, block_id) VALUES (?, ?)',
     ),
-    insertFts: db.prepare('INSERT INTO facts_fts (rowid, claim, note) VALUES (?, ?, ?)'),
+    insertFts: db.prepare('INSERT INTO facts_fts (rowid, claim_fts, note_fts) VALUES (?, ?, ?)'),
   };
 }
 
@@ -336,6 +422,8 @@ function ingestBlock(stmts: PreparedIngest, block: Block, lineNumber: number): n
     stmts.insertSupersession.run(sup.superseded_fact_id, block.id);
   }
   for (const fact of facts) {
+    const claimFts = normalizeTextForFts(fact.claim);
+    const noteFts = normalizeTextForFts(fact.note);
     const factRes = stmts.insertFact.run(
       fact.fact_id,
       block.id,
@@ -345,13 +433,15 @@ function ingestBlock(stmts: PreparedIngest, block: Block, lineNumber: number): n
       fact.checkJson,
       fact.claim,
       fact.note,
+      claimFts,
+      noteFts,
       fact.sensitivity,
       fact.verified_at,
       fact.supersedes,
     );
     if (factRes.changes === 0) continue;
     factsAdded++;
-    stmts.insertFts.run(factRes.lastInsertRowid, fact.claim, fact.note);
+    stmts.insertFts.run(factRes.lastInsertRowid, claimFts, noteFts);
 
     const uniqueTags = [...new Set(fact.tags)].sort(compareBytewise);
     for (const tag of uniqueTags) {
@@ -402,7 +492,8 @@ function readStateRow(db: DatabaseSync): IndexState | null {
       .prepare(
         `SELECT schema_version, log_bytes, head_sha256, tail_sha256, log_mtime_ns, log_ctime_ns, log_ino,
                 indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete,
-                blocks_count, facts_count, fact_tags_count, fact_evidence_count, fact_retractions_count, fact_supersessions_count
+                blocks_count, facts_count, fact_tags_count, fact_evidence_count, fact_retractions_count, fact_supersessions_count,
+                visibility_sha256
          FROM state WHERE id = 1`,
       )
       .get();
@@ -427,7 +518,8 @@ function readStateRow(db: DatabaseSync): IndexState | null {
       !isNonNegativeSafeInt(row['fact_tags_count']) ||
       !isNonNegativeSafeInt(row['fact_evidence_count']) ||
       !isNonNegativeSafeInt(row['fact_retractions_count']) ||
-      !isNonNegativeSafeInt(row['fact_supersessions_count'])
+      !isNonNegativeSafeInt(row['fact_supersessions_count']) ||
+      typeof row['visibility_sha256'] !== 'string'
     ) {
       return null;
     }
@@ -453,6 +545,7 @@ function readStateRow(db: DatabaseSync): IndexState | null {
       factEvidenceCount: row['fact_evidence_count'],
       factRetractionsCount: row['fact_retractions_count'],
       factSupersessionsCount: row['fact_supersessions_count'],
+      visibilitySha256: row['visibility_sha256'],
     };
   } catch {
     return null;
@@ -477,6 +570,7 @@ function saveState(
     readonly ino: string;
   },
   counts: DerivedTableCounts,
+  visibilitySha256: string,
   indexedOffset: number,
   nextLineNumber: number,
   completeBadLines: readonly number[],
@@ -487,8 +581,9 @@ function saveState(
     `INSERT INTO state
       (id, schema_version, log_bytes, head_sha256, tail_sha256, log_mtime_ns, log_ctime_ns, log_ino,
        indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete,
-       blocks_count, facts_count, fact_tags_count, fact_evidence_count, fact_retractions_count, fact_supersessions_count)
-     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       blocks_count, facts_count, fact_tags_count, fact_evidence_count, fact_retractions_count, fact_supersessions_count,
+       visibility_sha256)
+     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     INDEX_SCHEMA_VERSION,
     header.size,
@@ -507,17 +602,11 @@ function saveState(
     counts.factEvidenceCount,
     counts.factRetractionsCount,
     counts.factSupersessionsCount,
+    visibilitySha256,
   );
 }
 
-/**
- * Rebuild the SQLite index from scratch in a temporary sibling file and atomically replace `indexPath`.
- * Ledger logs are append-only; run `facts rebuild` after any out-of-band manual edit or repair of historical lines.
- */
-export function rebuildIndex(
-  logPath: string,
-  indexPath: string = defaultIndexPath(logPath),
-): IndexSyncResult {
+function rebuildIndexUnlocked(logPath: string, indexPath: string): IndexSyncResult {
   assertDistinctIndexPath(logPath, indexPath);
   mkdirSync(dirname(indexPath), { recursive: true });
   const header = readLogHeaderState(logPath);
@@ -558,10 +647,12 @@ export function rebuildIndex(
     }
 
     const counts = readDerivedTableCounts(db);
+    const visibilitySha256 = computeVisibilityDigest(db);
     saveState(
       db,
       header,
       counts,
+      visibilitySha256,
       scanState.lastCompleteOffset,
       scanState.nextLineNumber,
       scanState.completeBadLineNumbers,
@@ -609,6 +700,18 @@ export function rebuildIndex(
   }
 }
 
+/**
+ * Rebuild the SQLite index from scratch under the sidecar index lock and atomically replace `indexPath`.
+ * Ledger logs are append-only; run `facts rebuild` after any out-of-band manual edit or repair of historical lines.
+ */
+export function rebuildIndex(
+  logPath: string,
+  indexPath: string = defaultIndexPath(logPath),
+): IndexSyncResult {
+  assertDistinctIndexPath(logPath, indexPath);
+  return withIndexLock(indexPath, () => rebuildIndexUnlocked(logPath, indexPath));
+}
+
 function isWarmStateMatch(
   saved: IndexState,
   header: {
@@ -631,26 +734,86 @@ function isWarmStateMatch(
   );
 }
 
-/**
- * Incrementally ingest only new appended bytes from `saved.indexedOffset` when the log grew cleanly
- * with matching first-4-KiB head hash and file inode; otherwise rebuild from scratch.
- * Ledger files are append-only — run `facts rebuild` after any manual edit to historical lines.
- */
-export function syncIndex(
+function tryOpenWarmReadOnly(
   logPath: string,
-  indexPath: string = defaultIndexPath(logPath),
+  indexPath: string,
+  onReadRange?: (offset: number, length: number) => void,
+): { readonly db: DatabaseSync; readonly syncResult: IndexSyncResult } | null {
+  if (!existsSync(indexPath)) {
+    return null;
+  }
+
+  let db: DatabaseSync | undefined;
+  let inReadTxn = false;
+  try {
+    db = new DatabaseSync(indexPath, { readOnly: true, timeout: 5000 });
+    db.exec('BEGIN');
+    inReadTxn = true;
+
+    const saved = readStateRow(db);
+    if (!saved || saved.schemaVersion !== INDEX_SCHEMA_VERSION) {
+      db.exec('ROLLBACK');
+      inReadTxn = false;
+      db.close();
+      return null;
+    }
+
+    const header = readLogHeaderState(logPath, onReadRange);
+    if (!isWarmStateMatch(saved, header) || !verifyReadOnlyIntegrity(db, saved)) {
+      db.exec('ROLLBACK');
+      inReadTxn = false;
+      db.close();
+      return null;
+    }
+
+    const badLines = makeScanReport(
+      saved.completeBadLines,
+      saved.tailIncomplete,
+      saved.nextLineNumber,
+    );
+    return {
+      db,
+      syncResult: {
+        indexPath,
+        rebuilt: false,
+        indexedBlocks: saved.blocksCount,
+        indexedFacts: saved.factsCount,
+        badLines,
+      },
+    };
+  } catch {
+    if (db) {
+      if (inReadTxn) {
+        try {
+          db.exec('ROLLBACK');
+        } catch {
+          // Ignore rollback cleanup failure on read-only fallback.
+        }
+      }
+      try {
+        db.close();
+      } catch {
+        // Ignore close failure before falling back to locked sync/rebuild.
+      }
+    }
+    return null;
+  }
+}
+
+function syncIndexUnlocked(
+  logPath: string,
+  indexPath: string,
   options?: { readonly onReadRange?: (offset: number, length: number) => void },
 ): IndexSyncResult {
-  assertDistinctIndexPath(logPath, indexPath);
   if (!existsSync(indexPath)) {
-    return rebuildIndex(logPath, indexPath);
+    return rebuildIndexUnlocked(logPath, indexPath);
   }
 
   let db: DatabaseSync;
   try {
     db = new DatabaseSync(indexPath, { timeout: 5000 });
   } catch {
-    return rebuildIndex(logPath, indexPath);
+    return rebuildIndexUnlocked(logPath, indexPath);
   }
 
   let inTxn = false;
@@ -679,7 +842,7 @@ export function syncIndex(
       inTxn = false;
       db.close();
       dbClosed = true;
-      return rebuildIndex(logPath, indexPath);
+      return rebuildIndexUnlocked(logPath, indexPath);
     }
 
     const saved = readStateRow(db);
@@ -688,7 +851,7 @@ export function syncIndex(
       inTxn = false;
       db.close();
       dbClosed = true;
-      return rebuildIndex(logPath, indexPath);
+      return rebuildIndexUnlocked(logPath, indexPath);
     }
 
     logFd = openReadOnlyIfExists(logPath);
@@ -727,7 +890,7 @@ export function syncIndex(
       inTxn = false;
       db.close();
       dbClosed = true;
-      return rebuildIndex(logPath, indexPath);
+      return rebuildIndexUnlocked(logPath, indexPath);
     }
 
     const stmts = prepareIngest(db);
@@ -749,10 +912,12 @@ export function syncIndex(
       ...scanState.completeBadLineNumbers,
     ];
     const counts = readDerivedTableCounts(db);
+    const visibilitySha256 = computeVisibilityDigest(db);
     saveState(
       db,
       header,
       counts,
+      visibilitySha256,
       scanState.lastCompleteOffset,
       scanState.nextLineNumber,
       combinedBadLines,
@@ -790,7 +955,7 @@ export function syncIndex(
         // Fall back to clean rebuild on any corrupt or schema-mismatched index.
       }
     }
-    return rebuildIndex(logPath, indexPath);
+    return rebuildIndexUnlocked(logPath, indexPath);
   } finally {
     closeLogFd();
     if (inTxn) {
@@ -808,4 +973,70 @@ export function syncIndex(
       }
     }
   }
+}
+
+/**
+ * Incrementally ingest only new appended bytes from `saved.indexedOffset` when the log grew cleanly
+ * with matching first-4-KiB head hash and file inode; otherwise rebuild from scratch under sidecar lock.
+ * Warm queries validate cleanly in read-only mode without taking a write lock.
+ * Ledger files are append-only — run `facts rebuild` after any manual edit to historical lines.
+ */
+export function syncIndex(
+  logPath: string,
+  indexPath: string = defaultIndexPath(logPath),
+  options?: { readonly onReadRange?: (offset: number, length: number) => void },
+): IndexSyncResult {
+  assertDistinctIndexPath(logPath, indexPath);
+  const warm = tryOpenWarmReadOnly(logPath, indexPath, options?.onReadRange);
+  if (warm) {
+    try {
+      warm.db.exec('ROLLBACK');
+    } catch {
+      // Ignore rollback cleanup failure.
+    } finally {
+      warm.db.close();
+    }
+    return warm.syncResult;
+  }
+
+  return withIndexLock(indexPath, () => syncIndexUnlocked(logPath, indexPath, options));
+}
+
+/**
+ * Synchronize the index (read-only when warm, otherwise under the cross-generation sidecar lock)
+ * and return an open read-only snapshot handle pinned to that exact SQLite generation.
+ */
+export function openSyncedIndexForQuery(
+  logPath: string,
+  indexPath: string = defaultIndexPath(logPath),
+  forceRebuild = false,
+): { readonly db: DatabaseSync; readonly syncResult: IndexSyncResult } {
+  assertDistinctIndexPath(logPath, indexPath);
+  if (!forceRebuild) {
+    const warm = tryOpenWarmReadOnly(logPath, indexPath);
+    if (warm) {
+      return warm;
+    }
+  }
+
+  return withIndexLock(indexPath, () => {
+    const syncResult = forceRebuild
+      ? rebuildIndexUnlocked(logPath, indexPath)
+      : syncIndexUnlocked(logPath, indexPath);
+    const db = new DatabaseSync(indexPath, { readOnly: true, timeout: 5000 });
+    try {
+      db.exec('BEGIN');
+      // Force SQLite to acquire its SHARED read snapshot on this exact inode before releasing sidecar lock.
+      db.prepare('SELECT 1 FROM state WHERE id = 1').get();
+      return { db, syncResult };
+    } catch (err) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // Ignore rollback cleanup failure.
+      }
+      db.close();
+      throw err;
+    }
+  });
 }

@@ -234,7 +234,10 @@ export function readLogHeaderFromFd(
 }
 
 /** Compute the file size, stat metadata, and head/tail 4 KiB SHA-256 digests for incremental validation. */
-export function readLogHeaderState(logPath: string): {
+export function readLogHeaderState(
+  logPath: string,
+  onReadRange?: (offset: number, length: number) => void,
+): {
   exists: boolean;
   size: number;
   headSha256: string;
@@ -262,7 +265,7 @@ export function readLogHeaderState(logPath: string): {
     throw error;
   }
   try {
-    return readLogHeaderFromFd(fd);
+    return readLogHeaderFromFd(fd, onReadRange);
   } finally {
     closeSync(fd);
   }

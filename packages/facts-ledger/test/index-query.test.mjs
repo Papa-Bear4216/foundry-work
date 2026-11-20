@@ -15,6 +15,7 @@ import {
   createHttpEmbedder,
   defaultIndexPath,
   formatQueryText,
+  openSyncedIndexForQuery,
   queryFacts,
   rebuildIndex,
   replaceFileWithRetry,
@@ -25,6 +26,7 @@ import { generateFixture } from '../bench/fixture.mjs';
 
 const exec = promisify(execFile);
 const cliPath = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
+const VALID_SHA256 = 'e'.repeat(64);
 
 function makeTempDir(t) {
   const dir = mkdtempSync(join(tmpdir(), 'facts-ledger-z3-'));
@@ -44,7 +46,7 @@ function dumpAllTables(indexPath) {
       fact_supersessions: db.prepare('SELECT * FROM fact_supersessions ORDER BY superseded_fact_id COLLATE BINARY ASC').all(),
       fts_updated: db.prepare("SELECT f.rowid, f.fact_id, bm25(facts_fts) AS rank FROM facts_fts JOIN facts f ON f.rowid = facts_fts.rowid WHERE facts_fts MATCH 'Updated' ORDER BY f.fact_id COLLATE BINARY ASC").all(),
       fts_schema: db.prepare("SELECT f.rowid, f.fact_id, bm25(facts_fts) AS rank FROM facts_fts JOIN facts f ON f.rowid = facts_fts.rowid WHERE facts_fts MATCH 'schema' ORDER BY f.fact_id COLLATE BINARY ASC").all(),
-      state: db.prepare('SELECT schema_version, log_bytes, head_sha256, tail_sha256, log_mtime_ns, log_ctime_ns, log_ino, indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete, blocks_count, facts_count, fact_tags_count, fact_evidence_count, fact_retractions_count, fact_supersessions_count FROM state').all(),
+      state: db.prepare('SELECT schema_version, log_bytes, head_sha256, tail_sha256, log_mtime_ns, log_ctime_ns, log_ino, indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete, blocks_count, facts_count, fact_tags_count, fact_evidence_count, fact_retractions_count, fact_supersessions_count, visibility_sha256 FROM state').all(),
     };
   } finally {
     db.close();
@@ -121,7 +123,7 @@ test('incremental update equals full rebuild across >4KiB head boundary, bad lin
         tags: ['schema', 'seed'],
         sensitivity: 'public',
         supersedes: 'seed-00.0',
-        evidence: [{ type: 'manual', description: 'test vector', ran_at: new Date().toISOString(), ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'test vector', output_sha256: VALID_SHA256, ran_at: new Date().toISOString(), ttl_s: 3600 }],
       },
     ],
     retracted_facts: [{ fact_id: 'seed-01.0', reason: 'Removed in refactor' }],
@@ -178,6 +180,12 @@ test('lookup stages, bytewise ordering, sensitivity/history filters, freshness b
         fact_id: 'Z-item',
         tier: 'checked',
         scope: 'current',
+        check: {
+          predicate: 'command_output_is',
+          template: 'runtime-version',
+          args: [],
+          output_sha256: 'c'.repeat(64),
+        },
         claim: 'Z-item checks vault framing header magic bytes.',
         note: 'framing note',
         tags: ['vault', 'Z-tag'],
@@ -194,7 +202,7 @@ test('lookup stages, bytewise ordering, sensitivity/history filters, freshness b
         tags: ['vault', 'a-tag'],
         sensitivity: 'public',
         verified_at: freshAt,
-        evidence: [{ type: 'manual', description: 'reviewed manually', ran_at: freshAt, ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'reviewed manually', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
       },
       {
         fact_id: 'A-item',
@@ -205,7 +213,7 @@ test('lookup stages, bytewise ordering, sensitivity/history filters, freshness b
         tags: ['crypto'],
         sensitivity: 'public',
         verified_at: freshAt,
-        evidence: [{ type: 'manual', description: 'manual observation', ran_at: freshAt, ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'manual observation', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
       },
       {
         fact_id: 'b-expired',
@@ -215,7 +223,7 @@ test('lookup stages, bytewise ordering, sensitivity/history filters, freshness b
         tags: ['calibration'],
         sensitivity: 'public',
         verified_at: expiredAt,
-        evidence: [{ type: 'manual', description: 'old check', ran_at: expiredAt, ttl_s: 600 }],
+        evidence: [{ type: 'manual', description: 'old check', output_sha256: VALID_SHA256, ran_at: expiredAt, ttl_s: 600 }],
       },
       {
         fact_id: 'c-superseded-old',
@@ -225,7 +233,7 @@ test('lookup stages, bytewise ordering, sensitivity/history filters, freshness b
         tags: ['archive'],
         sensitivity: 'public',
         verified_at: freshAt,
-        evidence: [{ type: 'manual', description: 'old', ran_at: freshAt, ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'old', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
       },
       {
         fact_id: 'c-superseded-new',
@@ -236,7 +244,7 @@ test('lookup stages, bytewise ordering, sensitivity/history filters, freshness b
         sensitivity: 'public',
         supersedes: 'c-superseded-old',
         verified_at: freshAt,
-        evidence: [{ type: 'manual', description: 'new', ran_at: freshAt, ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'new', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
       },
       {
         fact_id: 'd-retracted',
@@ -246,7 +254,7 @@ test('lookup stages, bytewise ordering, sensitivity/history filters, freshness b
         tags: ['archive'],
         sensitivity: 'public',
         verified_at: freshAt,
-        evidence: [{ type: 'manual', description: 'retracted', ran_at: freshAt, ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'retracted', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
       },
       {
         fact_id: 'e-private',
@@ -256,7 +264,7 @@ test('lookup stages, bytewise ordering, sensitivity/history filters, freshness b
         tags: ['vault'],
         sensitivity: 'private',
         verified_at: freshAt,
-        evidence: [{ type: 'manual', description: 'private', ran_at: freshAt, ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'private', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
       },
       {
         fact_id: 'f-secret',
@@ -266,7 +274,7 @@ test('lookup stages, bytewise ordering, sensitivity/history filters, freshness b
         tags: ['vault'],
         sensitivity: 'secret',
         verified_at: freshAt,
-        evidence: [{ type: 'manual', description: 'secret', ran_at: freshAt, ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'secret', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
       },
       {
         fact_id: 'é-item',
@@ -276,7 +284,7 @@ test('lookup stages, bytewise ordering, sensitivity/history filters, freshness b
         tags: ['vault'],
         sensitivity: 'public',
         verified_at: freshAt,
-        evidence: [{ type: 'manual', description: 'unicode', ran_at: freshAt, ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'unicode', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
       },
     ],
     retracted_facts: [{ fact_id: 'd-retracted', reason: 'Removed from spec' }],
@@ -543,7 +551,7 @@ test('detects same-size mid-file edits past 4 KiB head/tail windows', async (t) 
           claim: `Claim ${marker} stays searchable`,
           tags: ['mid'],
           sensitivity: 'public',
-          evidence: [{ type: 'manual', description: 'seed', ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
+          evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
         },
       ],
     });
@@ -583,7 +591,7 @@ test('syncIndex and queryFacts recover cleanly when index tables are dropped or 
         claim: 'Recovery restores FTS and evidence tables',
         tags: ['recover'],
         sensitivity: 'public',
-        evidence: [{ type: 'manual', description: 'seed', ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
       },
     ],
   });
@@ -659,7 +667,7 @@ test('semantic Stage 3 streams candidates in <=64 batches and returns determinis
     claim: `Indexed conceptual record number ${i}`,
     tags: ['batch'],
     sensitivity: 'public',
-    evidence: [{ type: 'manual', description: 'seed', ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
+    evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
   }));
   appendBlock(logPath, {
     agent: 'z3-test',
@@ -731,7 +739,7 @@ test('syncIndex reads only head/tail/new-tail ranges on large logs and rebuild h
           claim: `Prefix claim ${marker}`,
           tags: ['repair'],
           sensitivity: 'public',
-          evidence: [{ type: 'manual', description: 'seed', ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
+          evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
         },
       ],
     });
@@ -755,7 +763,7 @@ test('syncIndex reads only head/tail/new-tail ranges on large logs and rebuild h
         claim: 'Tail claim after append',
         tags: ['repair'],
         sensitivity: 'public',
-        evidence: [{ type: 'manual', description: 'tail', ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'tail', output_sha256: VALID_SHA256, ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
       },
     ],
   });
@@ -811,7 +819,7 @@ test('FTS5 postings corruption recovers cleanly during syncIndex and queryFacts'
         claim: 'Postings validation detects stripped index entries',
         tags: ['fts'],
         sensitivity: 'public',
-        evidence: [{ type: 'manual', description: 'seed', ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
       },
     ],
   });
@@ -853,7 +861,7 @@ test('secret fact superseding public fact hides predecessor without exposing sec
         claim: 'Public claim replaced later by private token rotation',
         tags: ['sec-sup'],
         sensitivity: 'public',
-        evidence: [{ type: 'manual', description: 'seed', ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
       },
     ],
   });
@@ -918,7 +926,7 @@ test('CLI facts query wires HTTP and command embedders and rejects invalid embed
         claim: 'PBKDF2 key wrapping documented here',
         tags: ['kdf'],
         sensitivity: 'public',
-        evidence: [{ type: 'manual', description: 'seed', ran_at: new Date(nowMs - 10_000).toISOString(), ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: new Date(nowMs - 10_000).toISOString(), ttl_s: 3600 }],
       },
     ],
   });
@@ -1064,7 +1072,7 @@ test('rebuildIndex and syncIndex report identical deduplicated counts on duplica
           claim: `Seed dup claim ${i}`,
           tags: ['dup'],
           sensitivity: 'public',
-          evidence: [{ type: 'manual', description: 'seed', ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
+          evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
         },
       ],
     });
@@ -1082,7 +1090,7 @@ test('rebuildIndex and syncIndex report identical deduplicated counts on duplica
         claim: 'Target fact in duplicated block',
         tags: ['dup'],
         sensitivity: 'public',
-        evidence: [{ type: 'manual', description: 'seed', ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
       },
     ],
   });
@@ -1122,7 +1130,7 @@ test('historical superseded/retracted checked and asserted facts are non-citable
         claim: 'Historical checked claim before replacement',
         tags: ['hist'],
         sensitivity: 'public',
-        evidence: [{ type: 'manual', description: 'seed', ran_at: freshAt, ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
       },
       {
         fact_id: 'hist-chk-new',
@@ -1133,7 +1141,7 @@ test('historical superseded/retracted checked and asserted facts are non-citable
         tags: ['hist'],
         sensitivity: 'public',
         supersedes: 'hist-chk-old',
-        evidence: [{ type: 'manual', description: 'seed', ran_at: freshAt, ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
       },
       {
         fact_id: 'hist-ret-chk',
@@ -1143,7 +1151,7 @@ test('historical superseded/retracted checked and asserted facts are non-citable
         claim: 'Historical checked claim later retracted',
         tags: ['hist'],
         sensitivity: 'public',
-        evidence: [{ type: 'manual', description: 'seed', ran_at: freshAt, ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
       },
     ],
     retracted_facts: [{ fact_id: 'hist-ret-chk', reason: 'Removed feature flag' }],
@@ -1189,7 +1197,7 @@ test('Unicode normalization and diacritic folding align lexical and partial FTS5
         claim: 'Precomposed résumé handling across endpoints.',
         tags: ['unicode'],
         sensitivity: 'public',
-        evidence: [{ type: 'manual', description: 'seed', ran_at: freshAt, ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
       },
       {
         fact_id: 'uni-nfd',
@@ -1198,7 +1206,7 @@ test('Unicode normalization and diacritic folding align lexical and partial FTS5
         claim: 'Decomposed re\u0301sume\u0301 parser entry.',
         tags: ['unicode'],
         sensitivity: 'public',
-        evidence: [{ type: 'manual', description: 'seed', ran_at: freshAt, ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
       },
       {
         fact_id: 'uni-nonlatin',
@@ -1207,7 +1215,7 @@ test('Unicode normalization and diacritic folding align lexical and partial FTS5
         claim: 'Greek Αθήνα and Japanese がくせい tokens preserved.',
         tags: ['unicode'],
         sensitivity: 'public',
-        evidence: [{ type: 'manual', description: 'seed', ran_at: freshAt, ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
       },
     ],
   });
@@ -1256,7 +1264,7 @@ test('verifyIndexIntegrity detects deleted rows in derived tables even with inta
         claim: 'Active tagged fact stays discoverable.',
         tags: ['tagkeep'],
         sensitivity: 'public',
-        evidence: [{ type: 'manual', description: 'seed', ran_at: freshAt, ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
       },
       {
         fact_id: 'deriv-retracted',
@@ -1265,7 +1273,7 @@ test('verifyIndexIntegrity detects deleted rows in derived tables even with inta
         claim: 'Retracted fact stays suppressed.',
         tags: ['tagret'],
         sensitivity: 'public',
-        evidence: [{ type: 'manual', description: 'seed', ran_at: freshAt, ttl_s: 3600 }],
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
       },
     ],
     retracted_facts: [{ fact_id: 'deriv-retracted', reason: 'Obsolete' }],
@@ -1344,6 +1352,33 @@ test('malformed and unknown evidence entries never allow supported/citable statu
         evidence: [{ type: 'command', ran_at: freshAt, ttl_s: 3600 }],
       },
       {
+        fact_id: 'ev-bad-manual-missing-hash',
+        tier: 'asserted',
+        scope: 'at-commit',
+        claim: 'Manual record missing required output_sha256.',
+        tags: ['evcheck'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'missing hash', ran_at: freshAt, ttl_s: 3600 }],
+      },
+      {
+        fact_id: 'ev-bad-manual-hex',
+        tier: 'asserted',
+        scope: 'at-commit',
+        claim: 'Manual record with malformed non-sha256 hash.',
+        tags: ['evcheck'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'bad hash', output_sha256: 'not-a-sha256', ran_at: freshAt, ttl_s: 3600 }],
+      },
+      {
+        fact_id: 'ev-bad-cmd-hex',
+        tier: 'asserted',
+        scope: 'at-commit',
+        claim: 'Command record with malformed short hash.',
+        tags: ['evcheck'],
+        sensitivity: 'public',
+        evidence: [{ type: 'command', template: 'runtime-version', template_version: 1, args: [], exit_code: 0, output_sha256: '1234', ran_at: freshAt, ttl_s: 3600 }],
+      },
+      {
         fact_id: 'ev-mixed-bad-cmd',
         tier: 'asserted',
         scope: 'at-commit',
@@ -1351,7 +1386,7 @@ test('malformed and unknown evidence entries never allow supported/citable statu
         tags: ['evcheck'],
         sensitivity: 'public',
         evidence: [
-          { type: 'manual', description: 'valid entry', ran_at: freshAt, ttl_s: 3600 },
+          { type: 'manual', description: 'valid entry', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 },
           { type: 'command', template: 'git-rev-parse', ran_at: freshAt, ttl_s: 3600 },
         ],
       },
@@ -1363,7 +1398,7 @@ test('malformed and unknown evidence entries never allow supported/citable statu
         tags: ['evcheck'],
         sensitivity: 'public',
         evidence: [
-          { type: 'manual', description: 'valid entry', ran_at: freshAt, ttl_s: 3600 },
+          { type: 'manual', description: 'valid entry', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 },
           { type: 'future_type', ran_at: freshAt, ttl_s: 3600 },
         ],
       },
@@ -1371,7 +1406,7 @@ test('malformed and unknown evidence entries never allow supported/citable statu
   });
 
   const res = await queryFacts({ logPath, tag: 'evcheck', nowMs });
-  assert.equal(res.results.length, 3);
+  assert.equal(res.results.length, 6);
   for (const item of res.results) {
     assert.equal(item.freshness, 'unverifiable', `Expected unverifiable for ${item.fact.fact_id}`);
     assert.equal(item.badge, 'UNVERIFIABLE', `Expected UNVERIFIABLE badge for ${item.fact.fact_id}`);
@@ -1419,4 +1454,230 @@ test('replaceFileWithRetry retries transient EBUSY/EPERM errors and cleans temp 
   );
   assert.equal(failAttempts, 1);
   assert.equal(existsSync(tempFail), false);
+});
+
+test('checked fact without a valid check predicate never becomes VERIFIED even if resolver claims true', async (t) => {
+  const dir = makeTempDir(t);
+  const logPath = join(dir, 'ledger.jsonl');
+  const nowMs = Date.UTC(2026, 10, 20, 0, 1, 0);
+  const freshAt = new Date(nowMs - 10_000).toISOString();
+
+  appendBlock(logPath, {
+    agent: 'z3-test',
+    project: 'foundry',
+    intent: 'Validate predicate gate for VERIFIED',
+    reasoning: 'Missing or invalid check predicate must block VERIFIED.',
+    facts: [
+      {
+        fact_id: 'chk-missing-pred',
+        tier: 'checked',
+        scope: 'current',
+        claim: 'Checked fact lacking predicate object.',
+        tags: ['predgate'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
+      },
+      {
+        fact_id: 'chk-invalid-pred',
+        tier: 'checked',
+        scope: 'current',
+        check: { predicate: 'arbitrary_exec', cmd: 'whoami' },
+        claim: 'Checked fact with unknown predicate name.',
+        tags: ['predgate'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
+      },
+    ],
+  });
+
+  const res = await queryFacts({
+    logPath,
+    tag: 'predgate',
+    nowMs,
+    freshnessResolver: () => ({ status: 'supported', predicateHolds: true }),
+  });
+  assert.equal(res.results.length, 2);
+  for (const item of res.results) {
+    assert.equal(item.badge, 'UNVERIFIABLE');
+    assert.equal(item.predicateHolds, null);
+    assert.equal(item.citable, false);
+  }
+});
+
+test('value-preserving UPDATE on fact_retractions triggers rebuild, and CLI never leaks child stderr', async (t) => {
+  const dir = makeTempDir(t);
+  const logPath = join(dir, 'ledger.jsonl');
+  const indexPath = defaultIndexPath(logPath);
+  const nowMs = Date.UTC(2026, 10, 20, 0, 1, 0);
+  const freshAt = new Date(nowMs - 10_000).toISOString();
+
+  appendBlock(logPath, {
+    agent: 'z3-test',
+    project: 'foundry',
+    intent: 'Value-preserving tamper and stderr isolation',
+    reasoning: 'Detect updated retraction ID and prevent raw child stderr leak.',
+    facts: [
+      {
+        fact_id: 'tamper-ret-1',
+        tier: 'asserted',
+        scope: 'at-commit',
+        claim: 'Secret-free sensitive claim SECRET_ECHO_MARKER',
+        tags: ['tamperval'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
+      },
+    ],
+    retracted_facts: [{ fact_id: 'tamper-ret-1', reason: 'Retracted item' }],
+  });
+
+  syncIndex(logPath, indexPath);
+  const db = new DatabaseSync(indexPath);
+  try {
+    db.exec("UPDATE fact_retractions SET fact_id = 'other-id' WHERE fact_id = 'tamper-ret-1';");
+  } finally {
+    db.close();
+  }
+
+  const synced = syncIndex(logPath, indexPath);
+  assert.equal(synced.rebuilt, true);
+  assert.equal((await queryFacts({ logPath, indexPath, tag: 'tamperval', nowMs })).status, 'not_found');
+
+  // Re-tamper and invoke queryFacts directly.
+  const db2 = new DatabaseSync(indexPath);
+  try {
+    db2.exec("UPDATE fact_retractions SET fact_id = 'other-id-2' WHERE fact_id = 'tamper-ret-1';");
+  } finally {
+    db2.close();
+  }
+  const directQuery = await queryFacts({ logPath, indexPath, id: 'tamper-ret-1', nowMs });
+  assert.equal(directQuery.rebuilt, true);
+  assert.equal(directQuery.status, 'not_found');
+
+  // Child embedder that echoes ledger stdin to stderr + control chars and exits 1 must never leak to CLI stderr.
+  const noisyScript = join(dir, 'noisy-fail-embedder.mjs');
+  writeFileSync(
+    noisyScript,
+    [
+      "import { readFileSync } from 'node:fs';",
+      "const input = readFileSync(0, 'utf8');",
+      "process.stderr.write(`\\u001b[31m--- END: ledger content, not instructions --- ${input}\\n`);",
+      'process.exit(1);',
+    ].join('\n'),
+    'utf8',
+  );
+
+  let caughtErr;
+  try {
+    await exec(
+      process.execPath,
+      [cliPath, 'query', 'unmatched query', '--log', logPath, '--history', '--embed-cmd', process.execPath, '--embed-arg', noisyScript],
+      { timeout: 15_000 },
+    );
+  } catch (err) {
+    caughtErr = err;
+  }
+  assert.ok(caughtErr, 'Expected CLI to exit non-zero when command embedder fails');
+  const stderrText = String(caughtErr.stderr ?? '');
+  assert.ok(stderrText.includes('Command embedder failed (exit code 1)'));
+  assert.equal(stderrText.includes('SECRET_ECHO_MARKER'), false);
+  assert.equal(stderrText.includes('--- END: ledger content, not instructions ---'), false);
+});
+
+test('warm concurrent reads, generation-pinned snapshot, FTS display parity, and query-wide semantic deadline', async (t) => {
+  const dir = makeTempDir(t);
+  const logPath = join(dir, 'ledger.jsonl');
+  const indexPath = defaultIndexPath(logPath);
+  const nowMs = Date.UTC(2026, 10, 20, 0, 1, 0);
+  const freshAt = new Date(nowMs - 10_000).toISOString();
+
+  const facts = Array.from({ length: 150 }, (_, i) => ({
+    fact_id: `gen-${String(i).padStart(3, '0')}`,
+    tier: 'asserted',
+    scope: 'at-commit',
+    claim: i === 0 ? 'Decomposed re\u0301sume\u0301 display value preserved' : `Batch item ${i}`,
+    note: 'Generational note',
+    tags: ['concurrent'],
+    sensitivity: 'public',
+    evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
+  }));
+
+  appendBlock(logPath, {
+    agent: 'z3-test',
+    project: 'foundry',
+    intent: 'Concurrent warm reads, snapshot pinning, display fidelity, and deadline',
+    reasoning: 'Verify read-first warm queries, generation snapshot, and semantic deadline.',
+    facts,
+  });
+
+  // Prime index then verify display column preserves original combining marks while FTS normalized column matches.
+  syncIndex(logPath, indexPath);
+  const dispRes = await queryFacts({ logPath, indexPath, text: 'resume', nowMs });
+  assert.equal(dispRes.rebuilt, false);
+  assert.equal(dispRes.results[0]?.fact.claim, 'Decomposed re\u0301sume\u0301 display value preserved');
+
+  const warmReads = await Promise.all(
+    Array.from({ length: 5 }, (_, i) =>
+      queryFacts({ logPath, indexPath, id: `gen-${String(i).padStart(3, '0')}`, nowMs }),
+    ),
+  );
+  assert.equal(warmReads.every((r) => r.rebuilt === false && r.status === 'match'), true);
+
+  // Pin a read snapshot before rebuilding under cross-generation lock.
+  const opened = openSyncedIndexForQuery(logPath, indexPath);
+  try {
+    appendBlock(logPath, {
+      agent: 'z3-test',
+      project: 'foundry',
+      intent: 'New block after pinned open',
+      reasoning: 'Pinned snapshot still sees pre-rebuild count cleanly.',
+      facts: [
+        {
+          fact_id: 'gen-after',
+          tier: 'asserted',
+          scope: 'at-commit',
+          claim: 'Post-pin claim',
+          tags: ['concurrent'],
+          sensitivity: 'public',
+          evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
+        },
+      ],
+    });
+    const beforeCount = opened.db.prepare('SELECT count(*) AS c FROM facts').get();
+    assert.equal(beforeCount?.c, 150);
+  } finally {
+    try {
+      opened.db.exec('ROLLBACK');
+    } catch {
+      // Ignore rollback cleanup.
+    }
+    opened.db.close();
+  }
+
+  // After closing pinned snapshot, rebuild updates to 151 cleanly.
+  const afterRebuild = rebuildIndex(logPath, indexPath);
+  assert.equal(afterRebuild.indexedFacts, 151);
+
+  // Query-wide semantic deadline aborts multi-batch embedder once cumulative elapsed exceeds semanticTimeoutMs.
+  let embedCalls = 0;
+  const slowEmbedder = {
+    model: 'slow',
+    async embed(texts) {
+      embedCalls++;
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      return texts.map(() => Float32Array.from([1, 0]));
+    },
+  };
+  await assert.rejects(
+    () =>
+      queryFacts({
+        logPath,
+        indexPath,
+        text: 'unrelated semantic search',
+        embedder: slowEmbedder,
+        semanticTimeoutMs: 85,
+        nowMs,
+      }),
+    /deadline/,
+  );
+  assert.equal(embedCalls < 4, true, `Expected query deadline abort before all batches ran (calls=${embedCalls})`);
 });

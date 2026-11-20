@@ -5,6 +5,7 @@ import {
   createHttpEmbedder,
   formatQueryText,
   queryFacts,
+  sanitizeInlineText,
 } from './query.js';
 import { type Embedder, type Sensitivity } from './types.js';
 
@@ -246,7 +247,7 @@ async function run(): Promise<void> {
   try {
     args = parseCliArgs(process.argv.slice(2));
   } catch (err) {
-    process.stderr.write(`${(err as Error).message}\n${usageText()}\n`);
+    process.stderr.write(`${sanitizeInlineText((err as Error).message)}\n${usageText()}\n`);
     process.exitCode = 2;
     return;
   }
@@ -301,7 +302,7 @@ async function run(): Promise<void> {
       process.exitCode = 2;
     }
   } catch (err) {
-    process.stderr.write(`Error: ${(err as Error).message}\n`);
+    process.stderr.write(`Error: ${sanitizeInlineText((err as Error).message)}\n`);
     process.exitCode = 1;
   } finally {
     if (args.stats) {

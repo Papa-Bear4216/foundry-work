@@ -1,10 +1,62 @@
 import { SENSITIVITY_LEVELS, type Block, type CheckedPredicate, type FactEvidence, type FactScope, type FactTier, type Sensitivity } from './types.js';
 
 export const FACT_EVIDENCE_VALID_TYPES = new Set(['file', 'command', 'manual']);
+export const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
 
 const TIER_SET = new Set<string>(['checked', 'asserted']);
 const SCOPE_SET = new Set<string>(['current', 'at-commit']);
 const SENSITIVITY_SET = new Set<string>(SENSITIVITY_LEVELS);
+
+/** Normalize text identically across FTS5 indexing and query tokenization (Latin diacritic folding). */
+export function normalizeTextForFts(text: string): string {
+  return text
+    .normalize('NFD')
+    .replace(/([A-Za-z])[\u0300-\u036f]+/g, '$1')
+    .normalize('NFC')
+    .toLowerCase();
+}
+
+function isNonEmptyTrimmed(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+/** Validate a checked fact predicate per specification section 3.4. */
+export function isValidCheckedPredicate(value: unknown): value is CheckedPredicate {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const obj = value as Record<string, unknown>;
+  switch (obj['predicate']) {
+    case 'file_exists':
+    case 'file_absent':
+      return isNonEmptyTrimmed(obj['repo']) && isNonEmptyTrimmed(obj['path']);
+    case 'file_blob_is':
+      return (
+        isNonEmptyTrimmed(obj['repo']) &&
+        isNonEmptyTrimmed(obj['path']) &&
+        isNonEmptyTrimmed(obj['blob'])
+      );
+    case 'file_contains':
+    case 'file_lacks':
+      return (
+        isNonEmptyTrimmed(obj['repo']) &&
+        isNonEmptyTrimmed(obj['path']) &&
+        typeof obj['text'] === 'string' &&
+        obj['text'].length > 0
+      );
+    case 'command_output_is': {
+      const args = obj['args'];
+      const outHash = obj['output_sha256'];
+      return (
+        isNonEmptyTrimmed(obj['template']) &&
+        Array.isArray(args) &&
+        args.every((a) => typeof a === 'string') &&
+        typeof outHash === 'string' &&
+        SHA256_HEX_RE.test(outHash)
+      );
+    }
+    default:
+      return false;
+  }
+}
 
 export interface NormalizedFactRecord {
   readonly fact_id: string;
@@ -63,10 +115,9 @@ export function normalizeBlockFactsAndRetractions(block: Block): {
       const rawScope = typeof item['scope'] === 'string' && SCOPE_SET.has(item['scope'])
         ? (item['scope'] as FactScope)
         : 'current';
-      const checkVal =
-        item['check'] && typeof item['check'] === 'object' && !Array.isArray(item['check'])
-          ? JSON.stringify(item['check'] as CheckedPredicate)
-          : null;
+      const checkVal = isValidCheckedPredicate(item['check'])
+        ? JSON.stringify(item['check'])
+        : null;
       const tags = Array.isArray(item['tags'])
         ? item['tags'].filter((t): t is string => typeof t === 'string')
         : [];

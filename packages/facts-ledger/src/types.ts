@@ -38,7 +38,7 @@ export interface CommandEvidence {
 export interface ManualEvidence {
   readonly type: 'manual';
   readonly description: string;
-  readonly output_sha256?: string;
+  readonly output_sha256: string;
   readonly ran_at: string;
   readonly ttl_s: number;
 }
@@ -133,6 +133,7 @@ export interface IndexState {
   readonly factEvidenceCount: number;
   readonly factRetractionsCount: number;
   readonly factSupersessionsCount: number;
+  readonly visibilitySha256: string;
 }
 
 export interface IndexSyncResult {
@@ -178,7 +179,10 @@ export type FreshnessResolver = (fact: IndexedFact, nowMs: number) => FreshnessA
 
 export interface Embedder {
   readonly model: string;
-  embed(texts: readonly string[]): Promise<readonly Float32Array[]>;
+  embed(
+    texts: readonly string[],
+    options?: { readonly timeoutMs?: number },
+  ): Promise<readonly Float32Array[]>;
 }
 
 export type QueryStage = 'exact' | 'lexical' | 'partial' | 'semantic';
@@ -208,6 +212,7 @@ export interface QueryOptions {
   readonly limit?: number;
   readonly embedder?: Embedder;
   readonly minSemanticScore?: number;
+  readonly semanticTimeoutMs?: number;
   readonly freshnessResolver?: FreshnessResolver;
   readonly nowMs?: number;
 }

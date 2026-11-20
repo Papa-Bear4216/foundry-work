@@ -1,8 +1,13 @@
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { TextDecoder, TextEncoder } from 'node:util';
-import { defaultIndexPath, rebuildIndex, syncIndex } from './index-db.js';
+import { defaultIndexPath, openSyncedIndexForQuery } from './index-db.js';
 import { compareBytewise } from './log.js';
+import {
+  isValidCheckedPredicate,
+  normalizeTextForFts,
+  SHA256_HEX_RE,
+} from './normalize.js';
 import {
   type CheckedPredicate,
   type DisplayBadge,
@@ -56,15 +61,8 @@ function allowedSensitivities(maxSensitivity: Exclude<Sensitivity, 'secret'>): r
 
 /** Extract search content words aligned with FTS5 unicode61 diacritic folding. */
 export function extractSearchTokens(text: string): readonly string[] {
-  const rawTokens = text
+  const rawTokens = normalizeTextForFts(text)
     .split(/[^\p{L}\p{N}\p{M}]+/u)
-    .map((token) =>
-      token
-        .normalize('NFD')
-        .replace(/([A-Za-z])[\u0300-\u036f]+/g, '$1')
-        .normalize('NFC')
-        .toLowerCase(),
-    )
     .filter((token) => token.length > 0);
   if (rawTokens.length === 0) return [];
   const filtered = rawTokens.filter((token) => !STOP_WORDS.has(token));
@@ -96,6 +94,7 @@ function isValidEvidenceEntry(ev: FactEvidence): boolean {
     const exitCode = rec['exit_code'];
     const ttl = rec['ttl_s'];
     const args = rec['args'];
+    const outHash = rec['output_sha256'];
     return (
       isNonEmptyString(rec['template']) &&
       typeof ver === 'number' &&
@@ -105,7 +104,8 @@ function isValidEvidenceEntry(ev: FactEvidence): boolean {
       args.every((a) => typeof a === 'string') &&
       typeof exitCode === 'number' &&
       Number.isSafeInteger(exitCode) &&
-      isNonEmptyString(rec['output_sha256']) &&
+      typeof outHash === 'string' &&
+      SHA256_HEX_RE.test(outHash) &&
       Number.isFinite(ranMs) &&
       typeof ttl === 'number' &&
       Number.isFinite(ttl) &&
@@ -118,7 +118,8 @@ function isValidEvidenceEntry(ev: FactEvidence): boolean {
     const outHash = rec['output_sha256'];
     return (
       isNonEmptyString(rec['description']) &&
-      (outHash == null || typeof outHash === 'string') &&
+      typeof outHash === 'string' &&
+      SHA256_HEX_RE.test(outHash) &&
       Number.isFinite(ranMs) &&
       typeof ttl === 'number' &&
       Number.isFinite(ttl) &&
@@ -222,6 +223,14 @@ function classifyPresentation(
   }
 
   if (fact.tier === 'checked') {
+    if (!isValidCheckedPredicate(fact.check)) {
+      return {
+        badge: 'UNVERIFIABLE',
+        predicateHolds: null,
+        citable: false,
+        citationRule: 'Must not be cited. Checked fact lacks a valid predicate.',
+      };
+    }
     if ((freshness === 'supported' || freshness === 'moved') && predicateHolds === true) {
       return {
         badge: 'VERIFIED',
@@ -418,7 +427,8 @@ function cosineSimilarity(a: Float32Array, b: Float32Array): number {
   return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
-function sanitizeInlineText(text: string): string {
+/** Collapse whitespace/newlines and escape control or bidi formatting characters in ledger display fields. */
+export function sanitizeInlineText(text: string): string {
   return text
     .replace(
       /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g,
@@ -431,10 +441,37 @@ function sanitizeInlineText(text: string): string {
     .trim();
 }
 
+async function invokeEmbedWithDeadline(
+  embedder: Embedder,
+  texts: readonly string[],
+  deadlineMs: number,
+): Promise<readonly Float32Array[]> {
+  const remainingMs = deadlineMs - Date.now();
+  if (remainingMs <= 0) {
+    throw new EmbedderInvocationError(new Error('Semantic lookup exceeded query deadline'));
+  }
+  let timer: unknown;
+  try {
+    return await Promise.race([
+      embedder.embed(texts, { timeoutMs: remainingMs }),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error('Semantic lookup exceeded query deadline'));
+        }, remainingMs);
+      }),
+    ]);
+  } catch (err) {
+    throw err instanceof EmbedderInvocationError ? err : new EmbedderInvocationError(err);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
 /** Synchronize the index if needed and run the 4-stage facts lookup. */
 export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
   const indexPath = options.indexPath ?? defaultIndexPath(options.logPath);
-  let syncResult = syncIndex(options.logPath, indexPath);
   const limit = Math.max(1, options.limit ?? 20);
   const nowMs = options.nowMs ?? Date.now();
   const resolver: FreshnessResolver = options.freshnessResolver ?? defaultFreshnessResolver;
@@ -443,14 +480,18 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
     options.id || options.tag || options.path || options.commit || options.repo,
   );
   const tokens = trimmedText.length > 0 ? extractSearchTokens(trimmedText) : [];
+  const semanticDeadlineMs = Date.now() + Math.max(1, options.semanticTimeoutMs ?? 30_000);
 
+  let syncResult!: ReturnType<typeof openSyncedIndexForQuery>['syncResult'];
   let collected: Array<{ fact: IndexedFact; stage: QueryStage; label: QueryLabel; score?: number }> = [];
   for (let attempt = 0; attempt < 2; attempt++) {
     collected = [];
     const seenIds = new Set<string>();
     let db: DatabaseSync | undefined;
     try {
-      db = new DatabaseSync(indexPath, { readOnly: true, timeout: 5000 });
+      const opened = openSyncedIndexForQuery(options.logPath, indexPath, attempt > 0);
+      db = opened.db;
+      syncResult = opened.syncResult;
       // Stage 1: Exact metadata match (runs first whenever any metadata selector is supplied).
       if (hasExactFilter) {
         const params: unknown[] = [];
@@ -591,24 +632,22 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
         const flushBatch = async (): Promise<void> => {
           if (batch.length === 0) return;
           if (!queryVec) {
-            let queryEmbeddings: readonly Float32Array[];
-            try {
-              queryEmbeddings = await options.embedder!.embed([trimmedText]);
-            } catch (err) {
-              throw new EmbedderInvocationError(err);
-            }
+            const queryEmbeddings = await invokeEmbedWithDeadline(
+              options.embedder!,
+              [trimmedText],
+              semanticDeadlineMs,
+            );
             queryVec = queryEmbeddings[0];
             if (!queryVec) {
               batch = [];
               return;
             }
           }
-          let vecs: readonly Float32Array[];
-          try {
-            vecs = await options.embedder!.embed(batch.map((b) => b.text));
-          } catch (err) {
-            throw new EmbedderInvocationError(err);
-          }
+          const vecs = await invokeEmbedWithDeadline(
+            options.embedder!,
+            batch.map((b) => b.text),
+            semanticDeadlineMs,
+          );
           if (vecs.length !== batch.length) {
             batch = [];
             return;
@@ -655,6 +694,11 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
     } catch (error) {
       if (db) {
         try {
+          db.exec('ROLLBACK');
+        } catch {
+          // Ignore rollback cleanup failure on retry/rethrow.
+        }
+        try {
           db.close();
         } catch {
           // Ignore close error before retry/rethrow.
@@ -665,12 +709,16 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
         throw error.cause;
       }
       if (attempt === 0) {
-        syncResult = rebuildIndex(options.logPath, indexPath);
         continue;
       }
       throw error;
     } finally {
       if (db) {
+        try {
+          db.exec('ROLLBACK');
+        } catch {
+          // Ignore rollback cleanup failure.
+        }
         db.close();
       }
     }
@@ -769,13 +817,17 @@ export function createHttpEmbedder(
 
   return {
     model,
-    async embed(texts: readonly string[]): Promise<readonly Float32Array[]> {
+    async embed(
+      texts: readonly string[],
+      callOptions?: { readonly timeoutMs?: number },
+    ): Promise<readonly Float32Array[]> {
+      const effectiveTimeoutMs = Math.max(1, Math.min(timeoutMs, callOptions?.timeoutMs ?? timeoutMs));
       const response = await fetch(endpointUrl, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ model, input: texts }),
         redirect: 'error',
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: AbortSignal.timeout(effectiveTimeoutMs),
       });
       if (!response.ok) {
         throw new Error(`Embedder HTTP ${response.status}`);
@@ -821,7 +873,11 @@ export function createCommandEmbedder(
 ): Embedder {
   return {
     model,
-    embed(texts: readonly string[]): Promise<readonly Float32Array[]> {
+    embed(
+      texts: readonly string[],
+      callOptions?: { readonly timeoutMs?: number },
+    ): Promise<readonly Float32Array[]> {
+      const effectiveTimeoutMs = Math.max(1, Math.min(timeoutMs, callOptions?.timeoutMs ?? timeoutMs));
       return new Promise((resolvePromise, rejectPromise) => {
         const child = spawn(executablePath, [...baseArgs], {
           stdio: ['pipe', 'pipe', 'pipe'],
@@ -829,16 +885,14 @@ export function createCommandEmbedder(
           shell: false,
         });
         const stdoutChunks: Uint8Array[] = [];
-        const stderrChunks: Uint8Array[] = [];
         let stdoutBytes = 0;
-        let stderrBytes = 0;
         let settled = false;
 
-        const fail = (err: unknown): void => {
+        const fail = (message: string): void => {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
-          rejectPromise(err instanceof Error ? err : new Error(String(err)));
+          rejectPromise(new Error(message));
         };
 
         const timer = setTimeout(() => {
@@ -847,13 +901,17 @@ export function createCommandEmbedder(
           } catch {
             // Best-effort kill on timeout.
           }
-          fail(new Error(`Command embedder timed out after ${timeoutMs} ms`));
-        }, timeoutMs);
+          fail('Command embedder timed out');
+        }, effectiveTimeoutMs);
 
-        child.on('error', fail);
+        child.on('error', (err) => {
+          const code = (err as { code?: string }).code ?? 'error';
+          fail(`Command embedder could not be started (${code})`);
+        });
         child.stdin?.on('error', (err) => {
-          if (!settled && (err as { code?: string }).code !== 'EPIPE') {
-            fail(err);
+          const code = (err as { code?: string }).code;
+          if (!settled && code !== 'EPIPE') {
+            fail(`Command embedder stdin failed (${code ?? 'error'})`);
           }
         });
 
@@ -866,51 +924,48 @@ export function createCommandEmbedder(
             } catch {
               // Best-effort kill on stdout cap.
             }
-            fail(new Error(`Command embedder stdout exceeded ${MAX_COMMAND_STDOUT_BYTES} bytes`));
+            fail(`Command embedder stdout exceeded ${MAX_COMMAND_STDOUT_BYTES} bytes`);
             return;
           }
           stdoutChunks.push(bytes);
         });
 
-        child.stderr?.on('data', (chunk) => {
-          const bytes = typeof chunk === 'string' ? embedEncoder.encode(chunk) : chunk;
-          if (stderrBytes < 65536) {
-            const remaining = 65536 - stderrBytes;
-            const slice = bytes.length > remaining ? bytes.subarray(0, remaining) : bytes;
-            stderrChunks.push(slice);
-            stderrBytes += slice.length;
-          }
-        });
+        // Drain stderr so a noisy child process cannot stall on pipe backpressure,
+        // without ever echoing unframed child diagnostics into CLI errors.
+        child.stderr?.on('data', () => {});
 
         child.on('close', (code, signal) => {
           clearTimeout(timer);
           if (settled) return;
           if (code !== 0) {
             settled = true;
-            const errDetail = concatAndDecode(stderrChunks).trim();
             rejectPromise(
               new Error(
-                `Command embedder exited with ${signal ? `signal ${signal}` : `code ${code}`}${errDetail ? `: ${errDetail}` : ''}`,
+                `Command embedder failed (${signal ? `signal ${signal}` : `exit code ${code ?? 'unknown'}`})`,
               ),
             );
             return;
           }
+          let parsed: unknown;
           try {
             const stdout = concatAndDecode(stdoutChunks);
-            const parsed = JSON.parse(stdout) as readonly (readonly number[])[];
-            if (!Array.isArray(parsed)) {
-              throw new Error('Command embedder did not return a JSON array of vectors');
-            }
+            parsed = JSON.parse(stdout);
+          } catch {
             settled = true;
-            resolvePromise(parsed.map((vec) => Float32Array.from(vec)));
-          } catch (parseErr) {
-            settled = true;
-            rejectPromise(parseErr);
+            rejectPromise(new Error('Command embedder returned invalid JSON'));
+            return;
           }
+          if (!Array.isArray(parsed)) {
+            settled = true;
+            rejectPromise(new Error('Command embedder did not return a JSON array of vectors'));
+            return;
+          }
+          settled = true;
+          resolvePromise((parsed as readonly (readonly number[])[]).map((vec) => Float32Array.from(vec)));
         });
 
         if (!child.stdin) {
-          fail(new Error('Command embedder stdin pipe unavailable'));
+          fail('Command embedder stdin pipe unavailable');
           return;
         }
         child.stdin.end(JSON.stringify(texts));

@@ -48,9 +48,16 @@ export {
 export {
   INDEX_SCHEMA_VERSION,
   defaultIndexPath,
+  openSyncedIndexForQuery,
   rebuildIndex,
   syncIndex,
 } from './index-db.js';
+
+export {
+  SHA256_HEX_RE,
+  isValidCheckedPredicate,
+  normalizeTextForFts,
+} from './normalize.js';
 
 export {
   createCommandEmbedder,
@@ -59,4 +66,5 @@ export {
   extractSearchTokens,
   formatQueryText,
   queryFacts,
+  sanitizeInlineText,
 } from './query.js';
