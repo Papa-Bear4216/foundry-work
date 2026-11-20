@@ -299,3 +299,14 @@ test('review fixes: forged ids stay on one line, tree paths exist, reused checke
   assert.ok(r.written.length >= 2, '30 facts with 1,900-byte notes need more than one block');
   for (const b of r.written) assert.ok(!JSON.stringify(b).includes(token));
 });
+
+test('verify reports damaged log lines (section 3.1)', async (t) => {
+  const { formatVerifyText } = await import('../dist/index.js');
+  const f = fixture(t);
+  addFact({ ...base(f), claim: 'Before damage.', evidenceFiles: [{ repo: 'demo', path: 'src/schema.ts' }] });
+  appendFileSync(f.logPath, 'not json at all\n');
+  addFact({ ...base(f), claim: 'After damage.', evidenceFiles: [{ repo: 'demo', path: 'src/schema.ts' }] });
+  const r = verifyFacts({ logPath: f.logPath, repos: f.repos, all: true });
+  assert.equal(r.badLines.badLineCount, 1);
+  assert.match(formatVerifyText(r), /warning: skipped 1 bad log line/);
+});
