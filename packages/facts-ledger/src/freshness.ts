@@ -10,6 +10,7 @@ import {
   runGit,
   runTemplate,
   templateVersion,
+  validateTemplateCall,
 } from './git.js';
 import { isValidCheckedPredicate } from './normalize.js';
 import { isValidEvidenceEntry } from './query.js';
@@ -194,6 +195,11 @@ export class FreshnessChecker {
       const template = String(rec['template']);
       // Only today's fixed templates at their recorded version count as evidence.
       if (templateVersion(template) !== rec['template_version']) return { status: 'unverifiable' };
+      try {
+        validateTemplateCall(template, rec['args']);
+      } catch {
+        return { status: 'unverifiable' };
+      }
       if (!this.templateRepoUsable(rec['args'])) return { status: 'unverifiable' };
     }
     switch (ev.type) {
