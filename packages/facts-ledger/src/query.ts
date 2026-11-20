@@ -54,7 +54,7 @@ const STOP_WORDS = new Set([
   'with',
 ]);
 
-function allowedSensitivities(maxSensitivity: Exclude<Sensitivity, 'secret'>): readonly Sensitivity[] {
+export function allowedSensitivities(maxSensitivity: Exclude<Sensitivity, 'secret'>): readonly Sensitivity[] {
   const cap = SENSITIVITY_RANK[maxSensitivity];
   return (['public', 'personal', 'private', 'clinical', 'child'] as const).filter(
     (s) => SENSITIVITY_RANK[s] <= cap,
@@ -160,7 +160,12 @@ export function defaultFreshnessResolver(
 /** One page of facts for `facts verify` from an open index, bytewise by id. */
 export function listFactsPage(
   db: DatabaseSync,
-  selector: { readonly id?: string; readonly tag?: string },
+  selector: {
+    readonly id?: string;
+    readonly tag?: string;
+    readonly project?: string;
+    readonly sensitivities?: readonly string[];
+  },
   page: { readonly afterId?: string; readonly limit?: number } = {},
 ): IndexedFact[] {
   {
@@ -177,6 +182,14 @@ export function listFactsPage(
     if (selector.tag) {
       clauses.push('EXISTS (SELECT 1 FROM fact_tags t WHERE t.fact_id = f.fact_id AND t.tag = ?)');
       params.push(selector.tag);
+    }
+    if (selector.project) {
+      clauses.push('f.project = ?');
+      params.push(selector.project);
+    }
+    if (selector.sensitivities) {
+      clauses.push(`f.sensitivity IN (${selector.sensitivities.map(() => '?').join(', ')})`);
+      params.push(...selector.sensitivities);
     }
     const rows = db
       .prepare(

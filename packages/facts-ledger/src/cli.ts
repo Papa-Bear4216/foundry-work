@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { addFact } from './add.js';
+import { generateDigest } from './digest.js';
 import { FreshnessChecker } from './freshness.js';
 import { templateNames } from './git.js';
 import { defaultIndexPath, rebuildIndex } from './index-db.js';
@@ -304,6 +305,7 @@ function usageText(): string {
     '            [--evidence-cmd <template> [--evidence-arg <arg>]...] [--manual <description>]',
     '            [--note <text>] [--tag <tag>]... [--sensitivity <tier>] [--scope current|at-commit] [--supersedes-fact <id>]',
     '  facts verify (--fact <id> | --tag <tag> | --all) [--rerun] [--write [--agent <name>]] [--json]',
+    '  facts digest --project <p> [--max-sensitivity <tier>] [--json]   (writes digest.<project>.md beside the index; at most 6,000 bytes)',
     '',
     `Command templates: ${templateNames().join(', ')}. Git templates take the repo name first.`,
     'Repo names map to local checkouts in a per-machine file outside any repository (FACTS_LEDGER_REPOS).',
@@ -431,6 +433,19 @@ async function run(): Promise<void> {
       } else {
         process.stdout.write(`Appended block ${block.id}: fact ${fact?.fact_id ?? '?'} (${fact?.tier ?? '?'})\n`);
       }
+      // Every acts add regenerates the project's digest (Step Zero 7).
+      generateDigest({ logPath: args.logPath, indexPath, project: block.project, repos });
+    } else if (args.command === 'digest') {
+      const project = args.add['project'] || process.env['FACTS_LEDGER_PROJECT'];
+      if (!project) throw new Error('--project is required');
+      const result = generateDigest({
+        logPath: args.logPath,
+        indexPath,
+        project,
+        repos: loadRepoMap(),
+        ...(args.maxSensitivity ? { maxSensitivity: args.maxSensitivity } : {}),
+      });
+      process.stdout.write(args.json ? `${JSON.stringify(result)}\n` : result.text);
     } else if (args.command === 'verify') {
       const result = verifyFacts({
         logPath: args.logPath,

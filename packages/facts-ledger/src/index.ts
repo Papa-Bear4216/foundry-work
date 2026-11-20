@@ -77,3 +77,4 @@ export { RepoUnavailableError, resolveGitExecutable, runTemplate, templateNames,
 export { assertRelativePath, assertRepoName, defaultRepoMapPath, loadRepoMap, type RepoMap } from './repos.js';
 export { assertNoSecrets, findSecret } from './secrets.js';
 export { formatVerifyText, verifyFacts, type VerifyItem, type VerifyOptions, type VerifyResult } from './verify.js';
+export { DIGEST_MAX_BYTES, digestFormatProblems, digestLine, generateDigest, type DigestOptions, type DigestResult } from './digest.js';
