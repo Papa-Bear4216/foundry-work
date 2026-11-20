@@ -13,6 +13,7 @@ import type {
   FactRetraction,
   FreshnessStatus,
   IndexedFact,
+  ScanReport,
 } from './types.js';
 
 /**
@@ -75,6 +76,8 @@ export interface VerifyResult {
   readonly written: readonly Block[];
   /** Citable facts not re-written because a text field matches a secret pattern. */
   readonly skipped: readonly string[];
+  /** Damaged log lines skipped while reading (section 3.1: reported on every run). */
+  readonly badLines: ScanReport;
 }
 
 function isoSeconds(ms: number): string {
@@ -113,7 +116,8 @@ export function verifyFacts(options: VerifyOptions): VerifyResult {
   const retracted = new Map<string, FactRetraction[]>();
   const skipped: string[] = [];
   // Page through one open index so memory stays flat on large ledgers (96 MiB budget).
-  const { db } = openSyncedIndexForQuery(options.logPath, indexPath, false);
+  const { db, syncResult } = openSyncedIndexForQuery(options.logPath, indexPath, false);
+  const badLines = syncResult.badLines;
   try {
   let afterId: string | undefined;
   for (;;) {
@@ -214,7 +218,7 @@ export function verifyFacts(options: VerifyOptions): VerifyResult {
       );
     }
   }
-  return { items, written, skipped };
+  return { items, written, skipped, badLines };
 }
 
 export function formatVerifyText(result: VerifyResult): string {
@@ -229,6 +233,11 @@ export function formatVerifyText(result: VerifyResult): string {
   lines.push(
     `checked ${result.items.length} fact(s): ${[...counts.entries()].sort().map(([k, v]) => `${k} ${v}`).join(', ') || 'none'}`,
   );
+  if (result.badLines && result.badLines.badLineCount > 0) {
+    lines.push(
+      `warning: skipped ${result.badLines.badLineCount} bad log line(s) at line(s): ${result.badLines.badLineNumbers.join(', ')}`,
+    );
+  }
   if (result.skipped.length > 0) {
     lines.push(`not re-written (secret pattern in a text field): ${result.skipped.length} fact(s)`);
   }
