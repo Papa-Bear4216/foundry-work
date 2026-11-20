@@ -111,6 +111,7 @@ export interface IndexState {
   readonly logBytes: number;
   readonly headSha256: string;
   readonly tailSha256: string;
+  readonly logSha256: string;
   readonly logMtimeNs: string;
   readonly logCtimeNs: string;
   readonly logIno: string;

@@ -1,7 +1,12 @@
 #!/usr/bin/env node
 import { defaultIndexPath, rebuildIndex } from './index-db.js';
-import { formatQueryText, queryFacts } from './query.js';
-import { type Sensitivity } from './types.js';
+import {
+  createCommandEmbedder,
+  createHttpEmbedder,
+  formatQueryText,
+  queryFacts,
+} from './query.js';
+import { type Embedder, type Sensitivity } from './types.js';
 
 interface ParsedArgs {
   readonly command: string | undefined;
@@ -15,12 +20,41 @@ interface ParsedArgs {
   readonly history: boolean;
   readonly limit: number | undefined;
   readonly maxSensitivity: Exclude<Sensitivity, 'secret'> | undefined;
+  readonly embedUrl: string | undefined;
+  readonly embedCmd: string | undefined;
+  readonly embedArgs: readonly string[];
+  readonly embedModel: string | undefined;
+  readonly minSemanticScore: number | undefined;
   readonly json: boolean;
   readonly stats: boolean;
   readonly positionals: readonly string[];
 }
 
 const VALID_MAX_SENSITIVITY = new Set(['public', 'personal', 'private', 'clinical', 'child']);
+
+function parseJsonStringArrayEnv(raw: string, varName: string): string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`${varName} must be a JSON array of strings`);
+  }
+  if (!Array.isArray(parsed) || !parsed.every((item) => typeof item === 'string')) {
+    throw new Error(`${varName} must be a JSON array of strings`);
+  }
+  return parsed;
+}
+
+function parseMinSemanticScore(raw: string): number {
+  if (raw.trim().length === 0) {
+    throw new Error('--min-semantic-score must be a finite number in [-1, 1]');
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < -1 || value > 1) {
+    throw new Error('--min-semantic-score must be a finite number in [-1, 1]');
+  }
+  return value;
+}
 
 function parseCliArgs(argv: readonly string[]): ParsedArgs {
   const command = argv[0];
@@ -34,6 +68,15 @@ function parseCliArgs(argv: readonly string[]): ParsedArgs {
   let history = false;
   let limit: number | undefined;
   let maxSensitivity: Exclude<Sensitivity, 'secret'> | undefined;
+  let cliEmbedUrl: string | undefined;
+  let cliEmbedCmd: string | undefined;
+  const cliEmbedArgs: string[] = [];
+  let embedModel = process.env['FACTS_LEDGER_EMBED_MODEL'] || undefined;
+  let minSemanticScore =
+    process.env['FACTS_LEDGER_MIN_SEMANTIC_SCORE'] !== undefined &&
+    process.env['FACTS_LEDGER_MIN_SEMANTIC_SCORE'].trim().length > 0
+      ? parseMinSemanticScore(process.env['FACTS_LEDGER_MIN_SEMANTIC_SCORE'])
+      : undefined;
   let json = false;
   let stats = false;
   const positionals: string[] = [];
@@ -87,6 +130,21 @@ function parseCliArgs(argv: readonly string[]): ParsedArgs {
         maxSensitivity = val as Exclude<Sensitivity, 'secret'>;
         break;
       }
+      case '--embed-url':
+        cliEmbedUrl = next();
+        break;
+      case '--embed-cmd':
+        cliEmbedCmd = next();
+        break;
+      case '--embed-arg':
+        cliEmbedArgs.push(next());
+        break;
+      case '--embed-model':
+        embedModel = next();
+        break;
+      case '--min-semantic-score':
+        minSemanticScore = parseMinSemanticScore(next());
+        break;
       case '--json':
         json = true;
         break;
@@ -102,6 +160,43 @@ function parseCliArgs(argv: readonly string[]): ParsedArgs {
     }
   }
 
+  if (cliEmbedUrl !== undefined && cliEmbedCmd !== undefined) {
+    throw new Error('Specify at most one of --embed-url or --embed-cmd');
+  }
+
+  const envEmbedUrl = process.env['FACTS_LEDGER_EMBED_URL'] || undefined;
+  const envEmbedCmd = process.env['FACTS_LEDGER_EMBED_CMD'] || undefined;
+
+  let embedUrl: string | undefined;
+  let embedCmd: string | undefined;
+  if (cliEmbedUrl !== undefined) {
+    embedUrl = cliEmbedUrl;
+  } else if (cliEmbedCmd !== undefined) {
+    embedCmd = cliEmbedCmd;
+  } else {
+    if (envEmbedUrl && envEmbedCmd) {
+      throw new Error('Conflicting FACTS_LEDGER_EMBED_URL and FACTS_LEDGER_EMBED_CMD environment variables');
+    }
+    embedUrl = envEmbedUrl;
+    embedCmd = envEmbedCmd;
+  }
+
+  if (cliEmbedArgs.length > 0 && !embedCmd) {
+    throw new Error('--embed-arg requires --embed-cmd or FACTS_LEDGER_EMBED_CMD');
+  }
+
+  let embedArgs: string[] = [];
+  if (embedCmd) {
+    if (cliEmbedArgs.length > 0) {
+      embedArgs = cliEmbedArgs;
+    } else if (process.env['FACTS_LEDGER_EMBED_ARGS'] && process.env['FACTS_LEDGER_EMBED_ARGS'].trim().length > 0) {
+      embedArgs = parseJsonStringArrayEnv(
+        process.env['FACTS_LEDGER_EMBED_ARGS'],
+        'FACTS_LEDGER_EMBED_ARGS',
+      );
+    }
+  }
+
   return {
     command,
     logPath,
@@ -114,17 +209,32 @@ function parseCliArgs(argv: readonly string[]): ParsedArgs {
     history,
     limit,
     maxSensitivity,
+    embedUrl,
+    embedCmd,
+    embedArgs,
+    embedModel,
+    minSemanticScore,
     json,
     stats,
     positionals,
   };
 }
 
+function buildEmbedderFromArgs(args: ParsedArgs): Embedder | undefined {
+  if (args.embedUrl !== undefined) {
+    return createHttpEmbedder(args.embedUrl, args.embedModel);
+  }
+  if (args.embedCmd !== undefined) {
+    return createCommandEmbedder(args.embedCmd, args.embedArgs, args.embedModel);
+  }
+  return undefined;
+}
+
 function usageText(): string {
   return [
     'Usage:',
     '  facts rebuild [--log <file>] [--index <file>] [--json] [--stats]',
-    '  facts query [text] [--id <id>] [--tag <tag>] [--path <path>] [--commit <sha>] [--repo <name>] [--history] [--limit <n>] [--max-sensitivity <tier>] [--log <file>] [--index <file>] [--json] [--stats]',
+    '  facts query [text] [--id <id>] [--tag <tag>] [--path <path>] [--commit <sha>] [--repo <name>] [--history] [--limit <n>] [--max-sensitivity <tier>] [--embed-url <url> | --embed-cmd <exe> [--embed-arg <arg>]] [--embed-model <name>] [--min-semantic-score <float>] [--log <file>] [--index <file>] [--json] [--stats]',
   ].join('\n');
 }
 
@@ -163,6 +273,7 @@ async function run(): Promise<void> {
       }
     } else if (args.command === 'query') {
       const queryText = args.positionals.join(' ').trim();
+      const embedder = buildEmbedderFromArgs(args);
       const result = await queryFacts({
         logPath: args.logPath,
         indexPath,
@@ -175,6 +286,8 @@ async function run(): Promise<void> {
         history: args.history,
         limit: args.limit,
         maxSensitivity: args.maxSensitivity,
+        embedder,
+        minSemanticScore: args.minSemanticScore,
       });
       if (args.json) {
         process.stdout.write(`${JSON.stringify(result)}\n`);

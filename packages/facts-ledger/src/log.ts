@@ -176,6 +176,69 @@ export function scanLog(logPath: string, onBlock: (block: Block) => void): ScanR
   }
 }
 
+/** Stream `[startOffset, endOffset)` from an open fd into a SHA-256 hasher using a fixed buffer. */
+export function updateSha256FromFdRange(
+  fd: number,
+  hasher: { update(data: Uint8Array): unknown },
+  startOffset: number,
+  endOffset: number,
+): void {
+  if (endOffset <= startOffset) return;
+  const chunk = new Uint8Array(MAX_LINE_BYTES);
+  let pos = startOffset;
+  while (pos < endOffset) {
+    const toRead = Math.min(chunk.length, endOffset - pos);
+    const n = readSync(fd, chunk, 0, toRead, pos);
+    if (n === 0) break;
+    hasher.update(n === chunk.length ? chunk : chunk.subarray(0, n));
+    pos += n;
+  }
+}
+
+/** Read size, stat metadata, and head/tail 4 KiB SHA-256 digests from an already-open log fd. */
+export function readLogHeaderFromFd(fd: number): {
+  exists: true;
+  size: number;
+  headSha256: string;
+  tailSha256: string;
+  mtimeNs: string;
+  ctimeNs: string;
+  ino: string;
+} {
+  const stat = fstatSync(fd, { bigint: true });
+  const size = Number(stat.size);
+  const headLen = Math.min(LOG_HEAD_HASH_BYTES, size);
+  const headBuf = new Uint8Array(headLen);
+  let totalHead = 0;
+  while (totalHead < headLen) {
+    const n = readSync(fd, headBuf, totalHead, headLen - totalHead, totalHead);
+    if (n === 0) break;
+    totalHead += n;
+  }
+  const headSha256 = createHash('sha256').update(headBuf.subarray(0, totalHead)).digest('hex');
+
+  const tailOffset = Math.max(0, size - LOG_HEAD_HASH_BYTES);
+  const tailLen = size - tailOffset;
+  const tailBuf = new Uint8Array(tailLen);
+  let totalTail = 0;
+  while (totalTail < tailLen) {
+    const n = readSync(fd, tailBuf, totalTail, tailLen - totalTail, tailOffset + totalTail);
+    if (n === 0) break;
+    totalTail += n;
+  }
+  const tailSha256 = createHash('sha256').update(tailBuf.subarray(0, totalTail)).digest('hex');
+
+  return {
+    exists: true,
+    size,
+    headSha256,
+    tailSha256,
+    mtimeNs: stat.mtimeNs.toString(),
+    ctimeNs: stat.ctimeNs.toString(),
+    ino: stat.ino.toString(),
+  };
+}
+
 /** Compute the file size, stat metadata, and head/tail 4 KiB SHA-256 digests for incremental validation. */
 export function readLogHeaderState(logPath: string): {
   exists: boolean;
@@ -205,38 +268,7 @@ export function readLogHeaderState(logPath: string): {
     throw error;
   }
   try {
-    const stat = fstatSync(fd, { bigint: true });
-    const size = Number(stat.size);
-    const headLen = Math.min(LOG_HEAD_HASH_BYTES, size);
-    const headBuf = new Uint8Array(headLen);
-    let totalHead = 0;
-    while (totalHead < headLen) {
-      const n = readSync(fd, headBuf, totalHead, headLen - totalHead, totalHead);
-      if (n === 0) break;
-      totalHead += n;
-    }
-    const headSha256 = createHash('sha256').update(headBuf.subarray(0, totalHead)).digest('hex');
-
-    const tailOffset = Math.max(0, size - LOG_HEAD_HASH_BYTES);
-    const tailLen = size - tailOffset;
-    const tailBuf = new Uint8Array(tailLen);
-    let totalTail = 0;
-    while (totalTail < tailLen) {
-      const n = readSync(fd, tailBuf, totalTail, tailLen - totalTail, tailOffset + totalTail);
-      if (n === 0) break;
-      totalTail += n;
-    }
-    const tailSha256 = createHash('sha256').update(tailBuf.subarray(0, totalTail)).digest('hex');
-
-    return {
-      exists: true,
-      size,
-      headSha256,
-      tailSha256,
-      mtimeNs: stat.mtimeNs.toString(),
-      ctimeNs: stat.ctimeNs.toString(),
-      ino: stat.ino.toString(),
-    };
+    return readLogHeaderFromFd(fd);
   } finally {
     closeSync(fd);
   }

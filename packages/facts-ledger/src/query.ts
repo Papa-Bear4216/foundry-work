@@ -148,7 +148,7 @@ function classifyPresentation(
   }
 
   if (fact.tier === 'checked') {
-    if (freshness === 'supported' && predicateHolds === true) {
+    if ((freshness === 'supported' || freshness === 'moved') && predicateHolds === true) {
       return {
         badge: 'VERIFIED',
         predicateHolds: true,
@@ -193,6 +193,7 @@ function buildFactFilterClause(
 
   if (!options.history) {
     clauses.push('NOT EXISTS (SELECT 1 FROM facts newer WHERE newer.supersedes = f.fact_id)');
+    clauses.push('NOT EXISTS (SELECT 1 FROM fact_supersessions s WHERE s.superseded_fact_id = f.fact_id)');
     clauses.push('NOT EXISTS (SELECT 1 FROM fact_retractions r WHERE r.fact_id = f.fact_id)');
   }
 
@@ -231,7 +232,10 @@ function hydrateFacts(db: DatabaseSync, rows: readonly Record<string, unknown>[]
     'SELECT body FROM fact_evidence WHERE fact_id = ? ORDER BY evidence_idx ASC',
   );
   const supersededStmt = db.prepare(
-    'SELECT 1 AS hit FROM facts WHERE supersedes = ? LIMIT 1',
+    `SELECT 1 AS hit FROM fact_supersessions WHERE superseded_fact_id = ?
+     UNION ALL
+     SELECT 1 AS hit FROM facts WHERE supersedes = ?
+     LIMIT 1`,
   );
   const retractionStmt = db.prepare(
     'SELECT reason FROM fact_retractions WHERE fact_id = ? LIMIT 1',
@@ -249,7 +253,7 @@ function hydrateFacts(db: DatabaseSync, rows: readonly Record<string, unknown>[]
         // Ignore unparseable serialized evidence.
       }
     }
-    const superseded = Boolean(supersededStmt.get(factId));
+    const superseded = Boolean(supersededStmt.get(factId, factId));
     const retRow = retractionStmt.get(factId);
     const retracted = Boolean(retRow);
     const retractionReason = retRow ? String(retRow['reason']) : null;
@@ -342,7 +346,11 @@ function cosineSimilarity(a: Float32Array, b: Float32Array): number {
 
 function sanitizeInlineText(text: string): string {
   return text
-    .replace(/[\u0000-\u001F\u007F]+/g, ' ')
+    .replace(
+      /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g,
+      (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`,
+    )
+    .replace(/[\r\n\t\u2028\u2029]+/g, ' ')
     .replace(/\s+/g, ' ')
     .replaceAll('--- BEGIN:', '- - - BEGIN:')
     .replaceAll('--- END:', '- - - END:')
@@ -366,8 +374,9 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
   for (let attempt = 0; attempt < 2; attempt++) {
     collected = [];
     const seenIds = new Set<string>();
-    const db = new DatabaseSync(indexPath, { readOnly: true, timeout: 5000 });
+    let db: DatabaseSync | undefined;
     try {
+      db = new DatabaseSync(indexPath, { readOnly: true, timeout: 5000 });
       // Stage 1: Exact metadata match (runs first whenever any metadata selector is supplied).
       if (hasExactFilter) {
         const params: unknown[] = [];
@@ -569,6 +578,14 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
       }
       break;
     } catch (error) {
+      if (db) {
+        try {
+          db.close();
+        } catch {
+          // Ignore close error before retry/rethrow.
+        }
+        db = undefined;
+      }
       if (error instanceof EmbedderInvocationError) {
         throw error.cause;
       }
@@ -578,7 +595,9 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
       }
       throw error;
     } finally {
-      db.close();
+      if (db) {
+        db.close();
+      }
     }
   }
 

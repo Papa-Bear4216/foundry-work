@@ -37,10 +37,12 @@ export {
   MAX_LINE_BYTES,
   appendBlock,
   compareBytewise,
+  readLogHeaderFromFd,
   readLogHeaderState,
   replaceFileWithRetry,
   scanFdRange,
   scanLog,
+  updateSha256FromFdRange,
   type StreamScanState,
 } from './log.js';
 

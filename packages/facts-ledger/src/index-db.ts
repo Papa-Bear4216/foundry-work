@@ -1,8 +1,7 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   closeSync,
   existsSync,
-  fstatSync,
   mkdirSync,
   openSync,
   realpathSync,
@@ -13,9 +12,10 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { DatabaseSync, type SqlStatementSync } from 'node:sqlite';
 import {
   compareBytewise,
-  readLogHeaderState,
+  readLogHeaderFromFd,
   replaceFileWithRetry,
   scanFdRange,
+  updateSha256FromFdRange,
 } from './log.js';
 import {
   FACT_EVIDENCE_VALID_TYPES,
@@ -28,7 +28,9 @@ import {
   type ScanReport,
 } from './types.js';
 
-export const INDEX_SCHEMA_VERSION = 2;
+export const INDEX_SCHEMA_VERSION = 3;
+
+const EMPTY_SHA256 = createHash('sha256').update('').digest('hex');
 
 const REQUIRED_INDEX_TABLES = [
   'blocks',
@@ -36,6 +38,7 @@ const REQUIRED_INDEX_TABLES = [
   'fact_tags',
   'fact_evidence',
   'fact_retractions',
+  'fact_supersessions',
   'facts_fts',
   'state',
 ] as const;
@@ -98,6 +101,7 @@ function verifyIndexIntegrity(db: DatabaseSync): boolean {
       if (!present.has(table)) return false;
       db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get();
     }
+    db.exec("INSERT INTO facts_fts(facts_fts, rank) VALUES('integrity-check', 1);");
     return true;
   } catch {
     return false;
@@ -175,6 +179,11 @@ function createSchema(db: DatabaseSync): void {
       reason TEXT NOT NULL COLLATE BINARY
     );
 
+    CREATE TABLE fact_supersessions (
+      superseded_fact_id TEXT PRIMARY KEY COLLATE BINARY,
+      block_id TEXT NOT NULL COLLATE BINARY
+    );
+
     CREATE VIRTUAL TABLE facts_fts USING fts5(
       claim,
       note,
@@ -188,6 +197,7 @@ function createSchema(db: DatabaseSync): void {
       log_bytes INTEGER NOT NULL,
       head_sha256 TEXT NOT NULL COLLATE BINARY,
       tail_sha256 TEXT NOT NULL COLLATE BINARY,
+      log_sha256 TEXT NOT NULL COLLATE BINARY,
       log_mtime_ns TEXT NOT NULL COLLATE BINARY,
       log_ctime_ns TEXT NOT NULL COLLATE BINARY,
       log_ino TEXT NOT NULL COLLATE BINARY,
@@ -205,6 +215,7 @@ interface PreparedIngest {
   readonly insertTag: SqlStatementSync;
   readonly insertEvidence: SqlStatementSync;
   readonly insertRetraction: SqlStatementSync;
+  readonly insertSupersession: SqlStatementSync;
   readonly insertFts: SqlStatementSync;
 }
 
@@ -228,6 +239,9 @@ function prepareIngest(db: DatabaseSync): PreparedIngest {
     ),
     insertRetraction: db.prepare(
       'INSERT OR IGNORE INTO fact_retractions (fact_id, block_id, reason) VALUES (?, ?, ?)',
+    ),
+    insertSupersession: db.prepare(
+      'INSERT OR IGNORE INTO fact_supersessions (superseded_fact_id, block_id) VALUES (?, ?)',
     ),
     insertFts: db.prepare('INSERT INTO facts_fts (rowid, claim, note) VALUES (?, ?, ?)'),
   };
@@ -253,7 +267,10 @@ function ingestBlock(stmts: PreparedIngest, block: Block, lineNumber: number): n
   }
 
   let factsAdded = 0;
-  const { facts, retractions } = normalizeBlockFactsAndRetractions(block);
+  const { facts, retractions, supersessions } = normalizeBlockFactsAndRetractions(block);
+  for (const sup of supersessions) {
+    stmts.insertSupersession.run(sup.superseded_fact_id, block.id);
+  }
   for (const fact of facts) {
     const factRes = stmts.insertFact.run(
       fact.fact_id,
@@ -301,11 +318,44 @@ function ingestBlock(stmts: PreparedIngest, block: Block, lineNumber: number): n
   return factsAdded;
 }
 
+interface LogHeaderMeta {
+  readonly exists: boolean;
+  readonly size: number;
+  readonly headSha256: string;
+  readonly tailSha256: string;
+  readonly mtimeNs: string;
+  readonly ctimeNs: string;
+  readonly ino: string;
+}
+
+function emptyLogHeaderState(): LogHeaderMeta {
+  return {
+    exists: false,
+    size: 0,
+    headSha256: EMPTY_SHA256,
+    tailSha256: EMPTY_SHA256,
+    mtimeNs: '0',
+    ctimeNs: '0',
+    ino: '0',
+  };
+}
+
+function openReadOnlyIfExists(logPath: string): number | null {
+  try {
+    return openSync(logPath, 'r');
+  } catch (error) {
+    if ((error as { code?: string }).code === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+}
+
 function readStateRow(db: DatabaseSync): IndexState | null {
   try {
     const row = db
       .prepare(
-        `SELECT schema_version, log_bytes, head_sha256, tail_sha256, log_mtime_ns, log_ctime_ns, log_ino,
+        `SELECT schema_version, log_bytes, head_sha256, tail_sha256, log_sha256, log_mtime_ns, log_ctime_ns, log_ino,
                 indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete
          FROM state WHERE id = 1`,
       )
@@ -316,6 +366,7 @@ function readStateRow(db: DatabaseSync): IndexState | null {
       typeof row['log_bytes'] !== 'number' ||
       typeof row['head_sha256'] !== 'string' ||
       typeof row['tail_sha256'] !== 'string' ||
+      typeof row['log_sha256'] !== 'string' ||
       typeof row['log_mtime_ns'] !== 'string' ||
       typeof row['log_ctime_ns'] !== 'string' ||
       typeof row['log_ino'] !== 'string' ||
@@ -335,6 +386,7 @@ function readStateRow(db: DatabaseSync): IndexState | null {
       logBytes: row['log_bytes'],
       headSha256: row['head_sha256'],
       tailSha256: row['tail_sha256'],
+      logSha256: row['log_sha256'],
       logMtimeNs: row['log_mtime_ns'],
       logCtimeNs: row['log_ctime_ns'],
       logIno: row['log_ino'],
@@ -357,14 +409,8 @@ function makeScanReport(completeBadLines: readonly number[], tailIncomplete: boo
 
 function saveState(
   db: DatabaseSync,
-  header: {
-    readonly size: number;
-    readonly headSha256: string;
-    readonly tailSha256: string;
-    readonly mtimeNs: string;
-    readonly ctimeNs: string;
-    readonly ino: string;
-  },
+  header: LogHeaderMeta,
+  logSha256: string,
   indexedOffset: number,
   nextLineNumber: number,
   completeBadLines: readonly number[],
@@ -373,14 +419,15 @@ function saveState(
   db.prepare('DELETE FROM state').run();
   db.prepare(
     `INSERT INTO state
-      (id, schema_version, log_bytes, head_sha256, tail_sha256, log_mtime_ns, log_ctime_ns, log_ino,
+      (id, schema_version, log_bytes, head_sha256, tail_sha256, log_sha256, log_mtime_ns, log_ctime_ns, log_ino,
        indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete)
-     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     INDEX_SCHEMA_VERSION,
     header.size,
     header.headSha256,
     header.tailSha256,
+    logSha256,
     header.mtimeNs,
     header.ctimeNs,
     header.ino,
@@ -398,12 +445,10 @@ export function rebuildIndex(
 ): IndexSyncResult {
   assertDistinctIndexPath(logPath, indexPath);
   mkdirSync(dirname(indexPath), { recursive: true });
-  const header = readLogHeaderState(logPath);
   const tempPath = `${indexPath}.tmp.${process.pid}.${randomUUID().replaceAll('-', '').slice(0, 8)}`;
   const db = new DatabaseSync(tempPath);
   let dbClosed = false;
-  let totalBlocks = 0;
-  let totalFacts = 0;
+  let logFd: number | null = null;
   let scanState = {
     completeBadLineNumbers: [] as readonly number[],
     tailIncomplete: false,
@@ -417,36 +462,45 @@ export function rebuildIndex(
     createSchema(db);
     const stmts = prepareIngest(db);
 
+    logFd = openReadOnlyIfExists(logPath);
+    const header = logFd !== null ? readLogHeaderFromFd(logFd) : emptyLogHeaderState();
+    let logSha256 = EMPTY_SHA256;
+
     db.exec('BEGIN');
-    if (header.exists && header.size > 0) {
-      const fd = openSync(logPath, 'r');
-      try {
-        const currentSize = Math.min(header.size, fstatSync(fd).size);
-        scanState = scanFdRange(
-          fd,
-          0,
-          1,
-          currentSize,
-          (block, lineNumber) => {
-            totalBlocks++;
-            totalFacts += ingestBlock(stmts, block, lineNumber);
-          },
-          false,
-        );
-      } finally {
-        closeSync(fd);
-      }
+    if (logFd !== null && header.size > 0) {
+      const hasher = createHash('sha256');
+      updateSha256FromFdRange(logFd, hasher, 0, header.size);
+      logSha256 = hasher.digest('hex');
+      scanState = scanFdRange(
+        logFd,
+        0,
+        1,
+        header.size,
+        (block, lineNumber) => {
+          ingestBlock(stmts, block, lineNumber);
+        },
+        false,
+      );
+    }
+    if (logFd !== null) {
+      closeSync(logFd);
+      logFd = null;
     }
 
     saveState(
       db,
       header,
+      logSha256,
       scanState.lastCompleteOffset,
       scanState.nextLineNumber,
       scanState.completeBadLineNumbers,
       scanState.tailIncomplete,
     );
     db.exec('COMMIT');
+
+    const counts = db
+      .prepare('SELECT (SELECT count(*) FROM blocks) AS b, (SELECT count(*) FROM facts) AS f')
+      .get();
     db.close();
     dbClosed = true;
 
@@ -455,8 +509,8 @@ export function rebuildIndex(
     return {
       indexPath,
       rebuilt: true,
-      indexedBlocks: totalBlocks,
-      indexedFacts: totalFacts,
+      indexedBlocks: Number(counts?.['b'] ?? 0),
+      indexedFacts: Number(counts?.['f'] ?? 0),
       badLines: makeScanReport(
         scanState.completeBadLineNumbers,
         scanState.tailIncomplete,
@@ -464,6 +518,13 @@ export function rebuildIndex(
       ),
     };
   } finally {
+    if (logFd !== null) {
+      try {
+        closeSync(logFd);
+      } catch {
+        // Ignore cleanup errors on log fd.
+      }
+    }
     if (!dbClosed) {
       try {
         db.close();
@@ -481,10 +542,7 @@ export function rebuildIndex(
   }
 }
 
-function isWarmStateMatch(
-  saved: IndexState,
-  header: ReturnType<typeof readLogHeaderState>,
-): boolean {
+function isWarmStateMatch(saved: IndexState, header: LogHeaderMeta): boolean {
   return (
     saved.schemaVersion === INDEX_SCHEMA_VERSION &&
     header.size === saved.logBytes &&
@@ -496,7 +554,7 @@ function isWarmStateMatch(
   );
 }
 
-/** Incrementally ingest only new appended bytes if log grew cleanly on same file; otherwise rebuild. */
+/** Incrementally ingest only new appended bytes when verified unchanged in [0, saved.logBytes); otherwise rebuild. */
 export function syncIndex(
   logPath: string,
   indexPath: string = defaultIndexPath(logPath),
@@ -515,6 +573,19 @@ export function syncIndex(
 
   let inTxn = false;
   let dbClosed = false;
+  let logFd: number | null = null;
+
+  const closeLogFd = (): void => {
+    if (logFd !== null) {
+      try {
+        closeSync(logFd);
+      } catch {
+        // Ignore cleanup close errors on log fd.
+      }
+      logFd = null;
+    }
+  };
+
   try {
     db.exec('PRAGMA journal_mode = DELETE;');
     db.exec('BEGIN IMMEDIATE');
@@ -529,7 +600,6 @@ export function syncIndex(
     }
 
     const saved = readStateRow(db);
-    const header = readLogHeaderState(logPath);
     if (!saved || saved.schemaVersion !== INDEX_SCHEMA_VERSION) {
       db.exec('ROLLBACK');
       inTxn = false;
@@ -537,6 +607,9 @@ export function syncIndex(
       dbClosed = true;
       return rebuildIndex(logPath, indexPath);
     }
+
+    logFd = openReadOnlyIfExists(logPath);
+    const header = logFd !== null ? readLogHeaderFromFd(logFd) : emptyLogHeaderState();
 
     if (isWarmStateMatch(saved, header)) {
       const counts = db
@@ -547,6 +620,7 @@ export function syncIndex(
         saved.tailIncomplete,
         saved.nextLineNumber,
       );
+      closeLogFd();
       db.exec('ROLLBACK');
       inTxn = false;
       return {
@@ -561,11 +635,13 @@ export function syncIndex(
     const sameFileInode =
       saved.logIno === header.ino || saved.logIno === '0' || header.ino === '0';
     if (
+      logFd === null ||
       !header.exists ||
       header.size <= saved.logBytes ||
       header.headSha256 !== saved.headSha256 ||
       !sameFileInode
     ) {
+      closeLogFd();
       db.exec('ROLLBACK');
       inTxn = false;
       db.close();
@@ -573,24 +649,32 @@ export function syncIndex(
       return rebuildIndex(logPath, indexPath);
     }
 
-    const stmts = prepareIngest(db);
-    const fd = openSync(logPath, 'r');
-    let scanState;
-    try {
-      const safeOffset = Math.min(saved.indexedOffset, header.size);
-      scanState = scanFdRange(
-        fd,
-        safeOffset,
-        saved.nextLineNumber,
-        header.size,
-        (block, lineNumber) => {
-          ingestBlock(stmts, block, lineNumber);
-        },
-        false,
-      );
-    } finally {
-      closeSync(fd);
+    const hasher = createHash('sha256');
+    updateSha256FromFdRange(logFd, hasher, 0, saved.logBytes);
+    if (hasher.copy().digest('hex') !== saved.logSha256) {
+      closeLogFd();
+      db.exec('ROLLBACK');
+      inTxn = false;
+      db.close();
+      dbClosed = true;
+      return rebuildIndex(logPath, indexPath);
     }
+    updateSha256FromFdRange(logFd, hasher, saved.logBytes, header.size);
+    const newLogSha256 = hasher.digest('hex');
+
+    const stmts = prepareIngest(db);
+    const safeOffset = Math.min(saved.indexedOffset, header.size);
+    const scanState = scanFdRange(
+      logFd,
+      safeOffset,
+      saved.nextLineNumber,
+      header.size,
+      (block, lineNumber) => {
+        ingestBlock(stmts, block, lineNumber);
+      },
+      false,
+    );
+    closeLogFd();
 
     const combinedBadLines = [
       ...saved.completeBadLines,
@@ -599,6 +683,7 @@ export function syncIndex(
     saveState(
       db,
       header,
+      newLogSha256,
       scanState.lastCompleteOffset,
       scanState.nextLineNumber,
       combinedBadLines,
@@ -623,6 +708,7 @@ export function syncIndex(
       ),
     };
   } catch {
+    closeLogFd();
     if (inTxn) {
       try {
         db.exec('ROLLBACK');
@@ -641,6 +727,7 @@ export function syncIndex(
     }
     return rebuildIndex(logPath, indexPath);
   } finally {
+    closeLogFd();
     if (inTxn) {
       try {
         db.exec('ROLLBACK');

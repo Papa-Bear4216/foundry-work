@@ -25,18 +25,32 @@ export interface NormalizedRetractionRecord {
   readonly reason: string;
 }
 
-/** Extract structurally valid fact and retraction records from a parsed ledger block. */
+export interface NormalizedSupersessionRecord {
+  readonly superseded_fact_id: string;
+}
+
+/** Extract structurally valid fact, retraction, and supersession records from a parsed ledger block. */
 export function normalizeBlockFactsAndRetractions(block: Block): {
   readonly facts: readonly NormalizedFactRecord[];
   readonly retractions: readonly NormalizedRetractionRecord[];
+  readonly supersessions: readonly NormalizedSupersessionRecord[];
 } {
   const facts: NormalizedFactRecord[] = [];
+  const supersessions: NormalizedSupersessionRecord[] = [];
   if (Array.isArray(block.facts)) {
     for (const raw of block.facts as readonly unknown[]) {
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
       const item = raw as Record<string, unknown>;
       if (typeof item['fact_id'] !== 'string' || item['fact_id'].length === 0) continue;
       if (typeof item['claim'] !== 'string') continue;
+
+      const supersedes =
+        typeof item['supersedes'] === 'string' && item['supersedes'].length > 0
+          ? item['supersedes']
+          : null;
+      if (supersedes !== null) {
+        supersessions.push({ superseded_fact_id: supersedes });
+      }
 
       const rawTier = typeof item['tier'] === 'string' && TIER_SET.has(item['tier'])
         ? (item['tier'] as FactTier)
@@ -77,10 +91,7 @@ export function normalizeBlockFactsAndRetractions(block: Block): {
         tags,
         sensitivity: rawSensitivity,
         verified_at: typeof item['verified_at'] === 'string' ? item['verified_at'] : block.ts,
-        supersedes:
-          typeof item['supersedes'] === 'string' && item['supersedes'].length > 0
-            ? item['supersedes']
-            : null,
+        supersedes,
         evidence,
       });
     }
@@ -99,5 +110,5 @@ export function normalizeBlockFactsAndRetractions(block: Block): {
     }
   }
 
-  return { facts, retractions };
+  return { facts, retractions, supersessions };
 }
