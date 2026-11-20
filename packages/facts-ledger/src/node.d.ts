@@ -29,6 +29,7 @@ declare function fetch(
     method?: string;
     headers?: Record<string, string>;
     body?: string;
+    redirect?: 'error' | 'follow' | 'manual';
     signal?: unknown;
   },
 ): Promise<{
@@ -41,6 +42,12 @@ declare function fetch(
 declare const AbortSignal: {
   timeout(ms: number): unknown;
 };
+
+declare class URL {
+  constructor(input: string);
+  readonly protocol: string;
+  readonly hostname: string;
+}
 
 declare module 'node:child_process' {
   export function execFile(
@@ -69,6 +76,15 @@ declare module 'node:fs' {
   export function openSync(path: string, flags: string, mode?: number): number;
   export function closeSync(fd: number): void;
   export function fstatSync(fd: number): { size: number };
+  export function fstatSync(
+    fd: number,
+    options: { bigint: true },
+  ): { size: bigint; mtimeNs: bigint; ctimeNs: bigint; ino: bigint; dev: bigint };
+  export function statSync(
+    path: string,
+    options: { bigint: true },
+  ): { ino: bigint; dev: bigint };
+  export function realpathSync(path: string): string;
   export function fsyncSync(fd: number): void;
   export function mkdirSync(path: string, options: { recursive: true }): string | undefined;
   export function readSync(
@@ -87,6 +103,7 @@ declare module 'node:fs' {
 declare module 'node:path' {
   export function dirname(path: string): string;
   export function join(...paths: string[]): string;
+  export function resolve(...paths: string[]): string;
   export function basename(path: string): string;
 }
 

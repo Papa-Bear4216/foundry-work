@@ -5,9 +5,11 @@ import {
   fstatSync,
   mkdirSync,
   openSync,
+  realpathSync,
+  statSync,
   unlinkSync,
 } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { DatabaseSync, type SqlStatementSync } from 'node:sqlite';
 import {
   compareBytewise,
@@ -26,7 +28,81 @@ import {
   type ScanReport,
 } from './types.js';
 
-export const INDEX_SCHEMA_VERSION = 1;
+export const INDEX_SCHEMA_VERSION = 2;
+
+const REQUIRED_INDEX_TABLES = [
+  'blocks',
+  'facts',
+  'fact_tags',
+  'fact_evidence',
+  'fact_retractions',
+  'facts_fts',
+  'state',
+] as const;
+
+function canonicalPath(target: string): string {
+  if (existsSync(target)) {
+    return realpathSync(target);
+  }
+  const dir = dirname(target);
+  if (existsSync(dir)) {
+    return join(realpathSync(dir), basename(target));
+  }
+  return resolve(target);
+}
+
+function safeBigIntStat(target: string): { dev: bigint; ino: bigint } | null {
+  try {
+    const stat = statSync(target, { bigint: true });
+    return { dev: stat.dev, ino: stat.ino };
+  } catch {
+    return null;
+  }
+}
+
+/** Reject index paths that resolve to the source ledger log or its lock file. */
+export function assertDistinctIndexPath(logPath: string, indexPath: string): void {
+  const lockPath = `${logPath}.lock.sqlite`;
+  const idxResolved = resolve(indexPath);
+  if (idxResolved === resolve(logPath) || idxResolved === resolve(lockPath)) {
+    throw new Error(`Refusing to use log or lock path as indexPath: ${indexPath}`);
+  }
+
+  const idxCanon = canonicalPath(indexPath);
+  for (const reserved of [logPath, lockPath]) {
+    const reservedCanon = canonicalPath(reserved);
+    if (idxCanon === reservedCanon) {
+      throw new Error(`Refusing to overwrite log or lock path as indexPath: ${indexPath}`);
+    }
+    const idxStat = safeBigIntStat(indexPath);
+    const resStat = safeBigIntStat(reserved);
+    if (
+      idxStat &&
+      resStat &&
+      idxStat.ino !== 0n &&
+      idxStat.dev === resStat.dev &&
+      idxStat.ino === resStat.ino
+    ) {
+      throw new Error(`Refusing to overwrite log or lock path sharing inode: ${indexPath}`);
+    }
+  }
+}
+
+function verifyIndexIntegrity(db: DatabaseSync): boolean {
+  try {
+    const rows = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+      .all();
+    const present = new Set(rows.map((r) => String(r['name'])));
+    for (const table of REQUIRED_INDEX_TABLES) {
+      if (!present.has(table)) return false;
+      db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get();
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /** Return the default sidecar index filename (`facts.index.sqlite`) next to `logPath`. */
 export function defaultIndexPath(logPath: string): string {
@@ -111,6 +187,10 @@ function createSchema(db: DatabaseSync): void {
       schema_version INTEGER NOT NULL,
       log_bytes INTEGER NOT NULL,
       head_sha256 TEXT NOT NULL COLLATE BINARY,
+      tail_sha256 TEXT NOT NULL COLLATE BINARY,
+      log_mtime_ns TEXT NOT NULL COLLATE BINARY,
+      log_ctime_ns TEXT NOT NULL COLLATE BINARY,
+      log_ino TEXT NOT NULL COLLATE BINARY,
       indexed_offset INTEGER NOT NULL,
       next_line_number INTEGER NOT NULL,
       complete_bad_lines_json TEXT NOT NULL COLLATE BINARY,
@@ -225,7 +305,8 @@ function readStateRow(db: DatabaseSync): IndexState | null {
   try {
     const row = db
       .prepare(
-        `SELECT schema_version, log_bytes, head_sha256, indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete
+        `SELECT schema_version, log_bytes, head_sha256, tail_sha256, log_mtime_ns, log_ctime_ns, log_ino,
+                indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete
          FROM state WHERE id = 1`,
       )
       .get();
@@ -234,6 +315,10 @@ function readStateRow(db: DatabaseSync): IndexState | null {
       typeof row['schema_version'] !== 'number' ||
       typeof row['log_bytes'] !== 'number' ||
       typeof row['head_sha256'] !== 'string' ||
+      typeof row['tail_sha256'] !== 'string' ||
+      typeof row['log_mtime_ns'] !== 'string' ||
+      typeof row['log_ctime_ns'] !== 'string' ||
+      typeof row['log_ino'] !== 'string' ||
       typeof row['indexed_offset'] !== 'number' ||
       typeof row['next_line_number'] !== 'number' ||
       typeof row['complete_bad_lines_json'] !== 'string' ||
@@ -249,6 +334,10 @@ function readStateRow(db: DatabaseSync): IndexState | null {
       schemaVersion: row['schema_version'],
       logBytes: row['log_bytes'],
       headSha256: row['head_sha256'],
+      tailSha256: row['tail_sha256'],
+      logMtimeNs: row['log_mtime_ns'],
+      logCtimeNs: row['log_ctime_ns'],
+      logIno: row['log_ino'],
       indexedOffset: row['indexed_offset'],
       nextLineNumber: row['next_line_number'],
       completeBadLines: parsedBad,
@@ -268,8 +357,14 @@ function makeScanReport(completeBadLines: readonly number[], tailIncomplete: boo
 
 function saveState(
   db: DatabaseSync,
-  logBytes: number,
-  headSha256: string,
+  header: {
+    readonly size: number;
+    readonly headSha256: string;
+    readonly tailSha256: string;
+    readonly mtimeNs: string;
+    readonly ctimeNs: string;
+    readonly ino: string;
+  },
   indexedOffset: number,
   nextLineNumber: number,
   completeBadLines: readonly number[],
@@ -278,12 +373,17 @@ function saveState(
   db.prepare('DELETE FROM state').run();
   db.prepare(
     `INSERT INTO state
-      (id, schema_version, log_bytes, head_sha256, indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete)
-     VALUES (1, ?, ?, ?, ?, ?, ?, ?)`,
+      (id, schema_version, log_bytes, head_sha256, tail_sha256, log_mtime_ns, log_ctime_ns, log_ino,
+       indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete)
+     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     INDEX_SCHEMA_VERSION,
-    logBytes,
-    headSha256,
+    header.size,
+    header.headSha256,
+    header.tailSha256,
+    header.mtimeNs,
+    header.ctimeNs,
+    header.ino,
     indexedOffset,
     nextLineNumber,
     JSON.stringify(completeBadLines),
@@ -296,6 +396,7 @@ export function rebuildIndex(
   logPath: string,
   indexPath: string = defaultIndexPath(logPath),
 ): IndexSyncResult {
+  assertDistinctIndexPath(logPath, indexPath);
   mkdirSync(dirname(indexPath), { recursive: true });
   const header = readLogHeaderState(logPath);
   const tempPath = `${indexPath}.tmp.${process.pid}.${randomUUID().replaceAll('-', '').slice(0, 8)}`;
@@ -339,8 +440,7 @@ export function rebuildIndex(
 
     saveState(
       db,
-      header.size,
-      header.headSha256,
+      header,
       scanState.lastCompleteOffset,
       scanState.nextLineNumber,
       scanState.completeBadLineNumbers,
@@ -381,16 +481,31 @@ export function rebuildIndex(
   }
 }
 
-/** Incrementally ingest only new appended bytes if log size grew with matching 4 KiB head hash; otherwise rebuild. */
+function isWarmStateMatch(
+  saved: IndexState,
+  header: ReturnType<typeof readLogHeaderState>,
+): boolean {
+  return (
+    saved.schemaVersion === INDEX_SCHEMA_VERSION &&
+    header.size === saved.logBytes &&
+    header.headSha256 === saved.headSha256 &&
+    header.tailSha256 === saved.tailSha256 &&
+    header.mtimeNs === saved.logMtimeNs &&
+    header.ctimeNs === saved.logCtimeNs &&
+    header.ino === saved.logIno
+  );
+}
+
+/** Incrementally ingest only new appended bytes if log grew cleanly on same file; otherwise rebuild. */
 export function syncIndex(
   logPath: string,
   indexPath: string = defaultIndexPath(logPath),
 ): IndexSyncResult {
+  assertDistinctIndexPath(logPath, indexPath);
   if (!existsSync(indexPath)) {
     return rebuildIndex(logPath, indexPath);
   }
 
-  const header = readLogHeaderState(logPath);
   let db: DatabaseSync;
   try {
     db = new DatabaseSync(indexPath, { timeout: 5000 });
@@ -398,21 +513,32 @@ export function syncIndex(
     return rebuildIndex(logPath, indexPath);
   }
 
-  let saved: IndexState | null = null;
+  let inTxn = false;
+  let dbClosed = false;
   try {
     db.exec('PRAGMA journal_mode = DELETE;');
-    saved = readStateRow(db);
-    if (
-      !saved ||
-      saved.schemaVersion !== INDEX_SCHEMA_VERSION ||
-      saved.headSha256 !== header.headSha256 ||
-      header.size < saved.logBytes
-    ) {
+    db.exec('BEGIN IMMEDIATE');
+    inTxn = true;
+
+    if (!verifyIndexIntegrity(db)) {
+      db.exec('ROLLBACK');
+      inTxn = false;
       db.close();
+      dbClosed = true;
       return rebuildIndex(logPath, indexPath);
     }
 
-    if (header.size === saved.logBytes) {
+    const saved = readStateRow(db);
+    const header = readLogHeaderState(logPath);
+    if (!saved || saved.schemaVersion !== INDEX_SCHEMA_VERSION) {
+      db.exec('ROLLBACK');
+      inTxn = false;
+      db.close();
+      dbClosed = true;
+      return rebuildIndex(logPath, indexPath);
+    }
+
+    if (isWarmStateMatch(saved, header)) {
       const counts = db
         .prepare('SELECT (SELECT count(*) FROM blocks) AS b, (SELECT count(*) FROM facts) AS f')
         .get();
@@ -421,6 +547,8 @@ export function syncIndex(
         saved.tailIncomplete,
         saved.nextLineNumber,
       );
+      db.exec('ROLLBACK');
+      inTxn = false;
       return {
         indexPath,
         rebuilt: false,
@@ -430,12 +558,26 @@ export function syncIndex(
       };
     }
 
+    const sameFileInode =
+      saved.logIno === header.ino || saved.logIno === '0' || header.ino === '0';
+    if (
+      !header.exists ||
+      header.size <= saved.logBytes ||
+      header.headSha256 !== saved.headSha256 ||
+      !sameFileInode
+    ) {
+      db.exec('ROLLBACK');
+      inTxn = false;
+      db.close();
+      dbClosed = true;
+      return rebuildIndex(logPath, indexPath);
+    }
+
     const stmts = prepareIngest(db);
     const fd = openSync(logPath, 'r');
     let scanState;
     try {
       const safeOffset = Math.min(saved.indexedOffset, header.size);
-      db.exec('BEGIN IMMEDIATE');
       scanState = scanFdRange(
         fd,
         safeOffset,
@@ -456,14 +598,14 @@ export function syncIndex(
     ];
     saveState(
       db,
-      header.size,
-      header.headSha256,
+      header,
       scanState.lastCompleteOffset,
       scanState.nextLineNumber,
       combinedBadLines,
       scanState.tailIncomplete,
     );
     db.exec('COMMIT');
+    inTxn = false;
 
     const counts = db
       .prepare('SELECT (SELECT count(*) FROM blocks) AS b, (SELECT count(*) FROM facts) AS f')
@@ -481,17 +623,37 @@ export function syncIndex(
       ),
     };
   } catch {
-    try {
-      db.close();
-    } catch {
-      // Fall back to clean rebuild on any corrupt or schema-mismatched index.
+    if (inTxn) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // Ignore rollback failure on corrupt db before rebuild.
+      }
+      inTxn = false;
+    }
+    if (!dbClosed) {
+      try {
+        db.close();
+        dbClosed = true;
+      } catch {
+        // Fall back to clean rebuild on any corrupt or schema-mismatched index.
+      }
     }
     return rebuildIndex(logPath, indexPath);
   } finally {
-    try {
-      db.close();
-    } catch {
-      // Already closed on rebuild fallback.
+    if (inTxn) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // Ignore cleanup rollback errors.
+      }
+    }
+    if (!dbClosed) {
+      try {
+        db.close();
+      } catch {
+        // Ignore cleanup close errors.
+      }
     }
   }
 }

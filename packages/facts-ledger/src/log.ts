@@ -40,7 +40,10 @@ export function compareBytewise(a: string, b: string): number {
       return bytesA[i] < bytesB[i] ? -1 : 1;
     }
   }
-  return bytesA.length < bytesB.length ? -1 : 1;
+  if (bytesA.length !== bytesB.length) {
+    return bytesA.length < bytesB.length ? -1 : 1;
+  }
+  return 0;
 }
 
 function parseBlock(bytes: Uint8Array): Block | undefined {
@@ -54,7 +57,12 @@ function parseBlock(bytes: Uint8Array): Block | undefined {
         (field) => typeof value[field] === 'string',
       ) ||
       (value['status'] != null &&
-        !(BLOCK_STATUSES as readonly unknown[]).includes(value['status']))
+        !(BLOCK_STATUSES as readonly unknown[]).includes(value['status'])) ||
+      (value['parent'] != null && typeof value['parent'] !== 'string') ||
+      (value['trace_id'] != null && typeof value['trace_id'] !== 'string') ||
+      (value['supersedes'] != null && typeof value['supersedes'] !== 'string') ||
+      (value['schema'] != null &&
+        (typeof value['schema'] !== 'number' || !Number.isSafeInteger(value['schema'])))
     ) {
       return undefined;
     }
@@ -168,36 +176,67 @@ export function scanLog(logPath: string, onBlock: (block: Block) => void): ScanR
   }
 }
 
-/** Compute the file size and SHA-256 of the first 4 KiB used for incremental index validation. */
+/** Compute the file size, stat metadata, and head/tail 4 KiB SHA-256 digests for incremental validation. */
 export function readLogHeaderState(logPath: string): {
   exists: boolean;
   size: number;
   headSha256: string;
+  tailSha256: string;
+  mtimeNs: string;
+  ctimeNs: string;
+  ino: string;
 } {
   let fd: number;
   try {
     fd = openSync(logPath, 'r');
   } catch (error) {
     if ((error as { code?: string }).code === 'ENOENT') {
+      const emptySha = createHash('sha256').update('').digest('hex');
       return {
         exists: false,
         size: 0,
-        headSha256: createHash('sha256').update('').digest('hex'),
+        headSha256: emptySha,
+        tailSha256: emptySha,
+        mtimeNs: '0',
+        ctimeNs: '0',
+        ino: '0',
       };
     }
     throw error;
   }
   try {
-    const size = fstatSync(fd).size;
-    const headBuf = new Uint8Array(Math.min(LOG_HEAD_HASH_BYTES, size));
-    let totalRead = 0;
-    while (totalRead < headBuf.length) {
-      const n = readSync(fd, headBuf, totalRead, headBuf.length - totalRead, totalRead);
+    const stat = fstatSync(fd, { bigint: true });
+    const size = Number(stat.size);
+    const headLen = Math.min(LOG_HEAD_HASH_BYTES, size);
+    const headBuf = new Uint8Array(headLen);
+    let totalHead = 0;
+    while (totalHead < headLen) {
+      const n = readSync(fd, headBuf, totalHead, headLen - totalHead, totalHead);
       if (n === 0) break;
-      totalRead += n;
+      totalHead += n;
     }
-    const headSha256 = createHash('sha256').update(headBuf.subarray(0, totalRead)).digest('hex');
-    return { exists: true, size, headSha256 };
+    const headSha256 = createHash('sha256').update(headBuf.subarray(0, totalHead)).digest('hex');
+
+    const tailOffset = Math.max(0, size - LOG_HEAD_HASH_BYTES);
+    const tailLen = size - tailOffset;
+    const tailBuf = new Uint8Array(tailLen);
+    let totalTail = 0;
+    while (totalTail < tailLen) {
+      const n = readSync(fd, tailBuf, totalTail, tailLen - totalTail, tailOffset + totalTail);
+      if (n === 0) break;
+      totalTail += n;
+    }
+    const tailSha256 = createHash('sha256').update(tailBuf.subarray(0, totalTail)).digest('hex');
+
+    return {
+      exists: true,
+      size,
+      headSha256,
+      tailSha256,
+      mtimeNs: stat.mtimeNs.toString(),
+      ctimeNs: stat.ctimeNs.toString(),
+      ino: stat.ino.toString(),
+    };
   } finally {
     closeSync(fd);
   }

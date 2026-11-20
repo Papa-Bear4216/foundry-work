@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
-import { defaultIndexPath, syncIndex } from './index-db.js';
+import { defaultIndexPath, rebuildIndex, syncIndex } from './index-db.js';
 import { compareBytewise } from './log.js';
 import {
   type CheckedPredicate,
@@ -75,7 +75,7 @@ export function defaultFreshnessResolver(
   nowMs: number,
 ): FreshnessAssessment {
   if (fact.evidence.length === 0) {
-    return { status: 'unverifiable', predicateHolds: false };
+    return { status: 'unverifiable' };
   }
 
   let worstStatus: FreshnessStatus = 'supported';
@@ -96,11 +96,7 @@ export function defaultFreshnessResolver(
     }
   }
 
-  // Checked facts are VERIFIED only when the predicate verifier executes and succeeds.
-  return {
-    status: worstStatus,
-    predicateHolds: false,
-  };
+  return { status: worstStatus };
 }
 
 function classifyPresentation(
@@ -109,17 +105,18 @@ function classifyPresentation(
   assessment: FreshnessAssessment,
 ): {
   readonly badge: DisplayBadge;
-  readonly predicateHolds: boolean;
+  readonly predicateHolds: boolean | null;
   readonly citable: boolean;
   readonly citationRule: string;
 } {
   const freshness = assessment.status;
-  const predicateHolds = Boolean(assessment.predicateHolds);
+  const predicateHolds: boolean | null =
+    typeof assessment.predicateHolds === 'boolean' ? assessment.predicateHolds : null;
 
   if (freshness === 'stale') {
     return {
       badge: 'STALE',
-      predicateHolds: false,
+      predicateHolds,
       citable: false,
       citationRule: 'Must not be cited. Re-verify or abstain.',
     };
@@ -127,7 +124,7 @@ function classifyPresentation(
   if (freshness === 'expired') {
     return {
       badge: 'EXPIRED',
-      predicateHolds: false,
+      predicateHolds,
       citable: false,
       citationRule: 'Must not be cited. Re-verify or abstain.',
     };
@@ -135,7 +132,7 @@ function classifyPresentation(
   if (freshness === 'unverifiable') {
     return {
       badge: 'UNVERIFIABLE',
-      predicateHolds: false,
+      predicateHolds,
       citable: false,
       citationRule: 'Must not be cited. Re-verify or abstain.',
     };
@@ -144,14 +141,14 @@ function classifyPresentation(
   if (label === 'related') {
     return {
       badge: 'RELATED',
-      predicateHolds: false,
+      predicateHolds,
       citable: false,
       citationRule: 'Context only. It is not evidence for the question asked.',
     };
   }
 
   if (fact.tier === 'checked') {
-    if (freshness === 'supported' && predicateHolds) {
+    if (freshness === 'supported' && predicateHolds === true) {
       return {
         badge: 'VERIFIED',
         predicateHolds: true,
@@ -159,17 +156,25 @@ function classifyPresentation(
         citationRule: 'May be cited as fact.',
       };
     }
+    if (predicateHolds === false) {
+      return {
+        badge: 'STALE',
+        predicateHolds: false,
+        citable: false,
+        citationRule: 'Must not be cited. Predicate did not hold; re-verify or abstain.',
+      };
+    }
     return {
-      badge: 'STALE',
-      predicateHolds: false,
+      badge: 'UNVERIFIABLE',
+      predicateHolds: null,
       citable: false,
-      citationRule: 'Must not be cited. Predicate did not hold; re-verify or abstain.',
+      citationRule: 'Must not be cited. Predicate verifier did not run; re-verify or abstain.',
     };
   }
 
   return {
     badge: 'ASSERTED',
-    predicateHolds: false,
+    predicateHolds,
     citable: true,
     citationRule:
       'May be cited only with the word "asserted", and should be re-checked before anything costly is built on it.',
@@ -279,13 +284,45 @@ function hydrateFacts(db: DatabaseSync, rows: readonly Record<string, unknown>[]
   return out;
 }
 
-function buildAddCommandHint(options: QueryOptions): string {
-  const parts = ['facts add', '--intent "<what was verified>"', '--reasoning "<why>"'];
-  const claimHint = sanitizeInlineText(options.text ?? options.id ?? '<verified claim>') || '<verified claim>';
-  parts.push(`--claim ${JSON.stringify(claimHint)}`);
-  const pathHint = sanitizeInlineText(options.path ?? '') || '<path>';
-  parts.push(`--evidence-file ${JSON.stringify(`${pathHint}:1`)}`);
-  return parts.join(' ');
+const SEMANTIC_BATCH_SIZE = 64;
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+
+class EmbedderInvocationError extends Error {
+  readonly cause: unknown;
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.cause = cause;
+  }
+}
+
+function buildAddCommandHint(): string {
+  return 'facts add --intent "<what was verified>" --reasoning "<why>" --claim "<verified claim>" --evidence-file "<path>:<lines>"';
+}
+
+function insertTopK<T>(
+  top: T[],
+  item: T,
+  k: number,
+  compareBestFirst: (a: T, b: T) => number,
+): void {
+  if (k <= 0) return;
+  if (top.length === k && compareBestFirst(item, top[top.length - 1]) >= 0) {
+    return;
+  }
+  let lo = 0;
+  let hi = top.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (compareBestFirst(item, top[mid]) < 0) {
+      hi = mid;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  top.splice(lo, 0, item);
+  if (top.length > k) {
+    top.pop();
+  }
 }
 
 function cosineSimilarity(a: Float32Array, b: Float32Array): number {
@@ -315,7 +352,7 @@ function sanitizeInlineText(text: string): string {
 /** Synchronize the index if needed and run the 4-stage facts lookup. */
 export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
   const indexPath = options.indexPath ?? defaultIndexPath(options.logPath);
-  const syncResult = syncIndex(options.logPath, indexPath);
+  let syncResult = syncIndex(options.logPath, indexPath);
   const limit = Math.max(1, options.limit ?? 20);
   const nowMs = options.nowMs ?? Date.now();
   const resolver: FreshnessResolver = options.freshnessResolver ?? defaultFreshnessResolver;
@@ -325,159 +362,224 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
   );
   const tokens = trimmedText.length > 0 ? extractSearchTokens(trimmedText) : [];
 
-  const db = new DatabaseSync(indexPath, { readOnly: true, timeout: 5000 });
-  const collected: Array<{ fact: IndexedFact; stage: QueryStage; label: QueryLabel; score?: number }> = [];
-  const seenIds = new Set<string>();
-
-  try {
-    // Stage 1: Exact metadata match (runs directly when no free text is supplied, or when --id is specified).
-    if (hasExactFilter && (tokens.length === 0 || Boolean(options.id))) {
-      const params: unknown[] = [];
-      const where = buildFactFilterClause(options, params);
-      params.push(limit);
-      const rows = db
-        .prepare(
-          `SELECT f.fact_id, f.block_id, f.project, f.tier, f.scope, f.check_json, f.claim, f.note, f.sensitivity, f.verified_at, f.supersedes
-           FROM facts f
-           WHERE ${where}
-           ORDER BY f.fact_id COLLATE BINARY ASC
-           LIMIT ?`,
-        )
-        .all(...params);
-      for (const fact of hydrateFacts(db, rows)) {
-        seenIds.add(fact.fact_id);
-        collected.push({ fact, stage: 'exact', label: 'match' });
-      }
-    }
-
-    // Stage 2: Lexical FTS5 match (all content words required).
-    if (tokens.length > 0 && collected.length < limit && !options.id) {
-      const params: unknown[] = [];
-      const where = buildFactFilterClause(options, params);
-      const matchExpr = tokens.map(quoteFtsToken).join(' AND ');
-      const rows = db
-        .prepare(
-          `SELECT f.fact_id, f.block_id, f.project, f.tier, f.scope, f.check_json, f.claim, f.note, f.sensitivity, f.verified_at, f.supersedes,
-                  bm25(facts_fts) AS rank_score
-           FROM facts_fts
-           JOIN facts f ON f.rowid = facts_fts.rowid
-           WHERE facts_fts MATCH ? AND ${where}
-           ORDER BY rank_score ASC, f.fact_id COLLATE BINARY ASC
-           LIMIT ?`,
-        )
-        .all(matchExpr, ...params, limit - collected.length);
-      for (const row of rows) {
-        const fact = hydrateFacts(db, [row])[0];
-        if (!seenIds.has(fact.fact_id)) {
+  let collected: Array<{ fact: IndexedFact; stage: QueryStage; label: QueryLabel; score?: number }> = [];
+  for (let attempt = 0; attempt < 2; attempt++) {
+    collected = [];
+    const seenIds = new Set<string>();
+    const db = new DatabaseSync(indexPath, { readOnly: true, timeout: 5000 });
+    try {
+      // Stage 1: Exact metadata match (runs first whenever any metadata selector is supplied).
+      if (hasExactFilter) {
+        const params: unknown[] = [];
+        const where = buildFactFilterClause(options, params);
+        params.push(limit);
+        const rows = db
+          .prepare(
+            `SELECT f.fact_id, f.block_id, f.project, f.tier, f.scope, f.check_json, f.claim, f.note, f.sensitivity, f.verified_at, f.supersedes
+             FROM facts f
+             WHERE ${where}
+             ORDER BY f.fact_id COLLATE BINARY ASC
+             LIMIT ?`,
+          )
+          .all(...params);
+        for (const fact of hydrateFacts(db, rows)) {
           seenIds.add(fact.fact_id);
-          collected.push({
-            fact,
-            stage: 'lexical',
-            label: 'match',
-            score: typeof row['rank_score'] === 'number' ? row['rank_score'] : undefined,
-          });
+          collected.push({ fact, stage: 'exact', label: 'match' });
         }
       }
-    }
 
-    // Stage 2b: Partial lexical match (some content words missing -> `related`).
-    if (tokens.length >= 2 && collected.length < limit && !options.id) {
-      const params: unknown[] = [];
-      const where = buildFactFilterClause(options, params);
-      const matchExpr = tokens.map(quoteFtsToken).join(' OR ');
-      const candidateRows = db
-        .prepare(
-          `SELECT f.fact_id, f.block_id, f.project, f.tier, f.scope, f.check_json, f.claim, f.note, f.sensitivity, f.verified_at, f.supersedes,
-                  bm25(facts_fts) AS rank_score
-           FROM facts_fts
-           JOIN facts f ON f.rowid = facts_fts.rowid
-           WHERE facts_fts MATCH ? AND ${where}
-           ORDER BY rank_score ASC, f.fact_id COLLATE BINARY ASC`,
-        )
-        .all(matchExpr, ...params);
-
-      const partials: Array<{ fact: IndexedFact; tokenHits: number; bm25: number }> = [];
-      for (const row of candidateRows) {
-        const factId = String(row['fact_id']);
-        if (seenIds.has(factId)) continue;
-        const fact = hydrateFacts(db, [row])[0];
-        const haystackTokens = new Set(extractSearchTokens(`${fact.claim} ${fact.note}`));
-        let tokenHits = 0;
-        for (const t of tokens) {
-          if (haystackTokens.has(t)) tokenHits++;
-        }
-        partials.push({
-          fact,
-          tokenHits,
-          bm25: typeof row['rank_score'] === 'number' ? row['rank_score'] : 0,
-        });
-      }
-
-      partials.sort((a, b) => {
-        if (b.tokenHits !== a.tokenHits) return b.tokenHits - a.tokenHits;
-        if (a.bm25 !== b.bm25) return a.bm25 - b.bm25;
-        return compareBytewise(a.fact.fact_id, b.fact.fact_id);
-      });
-
-      for (const entry of partials) {
-        if (collected.length >= limit) break;
-        seenIds.add(entry.fact.fact_id);
-        collected.push({
-          fact: entry.fact,
-          stage: 'partial',
-          label: 'related',
-          score: entry.bm25,
-        });
-      }
-    }
-
-    // Stage 3: Optional semantic lookup (`related` only, never `match`).
-    if (options.embedder && trimmedText.length > 0 && collected.length < limit) {
-      const params: unknown[] = [];
-      const where = buildFactFilterClause(options, params);
-      const allRows = db
-        .prepare(
-          `SELECT f.fact_id, f.block_id, f.project, f.tier, f.scope, f.check_json, f.claim, f.note, f.sensitivity, f.verified_at, f.supersedes
-           FROM facts f
-           WHERE ${where}
-           ORDER BY f.fact_id COLLATE BINARY ASC`,
-        )
-        .all(...params);
-      const remaining = hydrateFacts(db, allRows).filter((f) => !seenIds.has(f.fact_id));
-      if (remaining.length > 0) {
-        const embeddings = await options.embedder.embed([
-          trimmedText,
-          ...remaining.map((f) => (f.note ? `${f.claim}\n${f.note}` : f.claim)),
-        ]);
-        const queryVec = embeddings[0];
-        const minScore = options.minSemanticScore ?? 0.2;
-        if (queryVec && embeddings.length === remaining.length + 1) {
-          const scored: Array<{ fact: IndexedFact; similarity: number }> = [];
-          for (let i = 0; i < remaining.length; i++) {
-            const sim = cosineSimilarity(queryVec, embeddings[i + 1]);
-            if (sim >= minScore) {
-              scored.push({ fact: remaining[i], similarity: sim });
-            }
-          }
-          scored.sort((a, b) => {
-            if (b.similarity !== a.similarity) return b.similarity - a.similarity;
-            return compareBytewise(a.fact.fact_id, b.fact.fact_id);
-          });
-          for (const entry of scored) {
-            if (collected.length >= limit) break;
-            seenIds.add(entry.fact.fact_id);
+      // Stage 2: Lexical FTS5 match (all content words required).
+      if (tokens.length > 0 && collected.length < limit && !options.id) {
+        const params: unknown[] = [];
+        const where = buildFactFilterClause(options, params);
+        const matchExpr = tokens.map(quoteFtsToken).join(' AND ');
+        const rows = db
+          .prepare(
+            `SELECT f.fact_id, f.block_id, f.project, f.tier, f.scope, f.check_json, f.claim, f.note, f.sensitivity, f.verified_at, f.supersedes,
+                    bm25(facts_fts) AS rank_score
+             FROM facts_fts
+             JOIN facts f ON f.rowid = facts_fts.rowid
+             WHERE facts_fts MATCH ? AND ${where}
+             ORDER BY rank_score ASC, f.fact_id COLLATE BINARY ASC
+             LIMIT ?`,
+          )
+          .all(matchExpr, ...params, limit - collected.length);
+        const hydrated = hydrateFacts(db, rows);
+        for (let i = 0; i < rows.length; i++) {
+          const fact = hydrated[i];
+          if (!seenIds.has(fact.fact_id)) {
+            seenIds.add(fact.fact_id);
+            const rankScore = rows[i]['rank_score'];
             collected.push({
-              fact: entry.fact,
-              stage: 'semantic',
-              label: 'related',
-              score: entry.similarity,
+              fact,
+              stage: 'lexical',
+              label: 'match',
+              score: typeof rankScore === 'number' ? rankScore : undefined,
             });
           }
         }
       }
+
+      // Stage 2b: Partial lexical match (some content words missing -> `related`).
+      if (tokens.length >= 2 && collected.length < limit && !options.id) {
+        const need = limit - collected.length;
+        const params: unknown[] = [];
+        const where = buildFactFilterClause(options, params);
+        const matchExpr = tokens.map(quoteFtsToken).join(' OR ');
+        const stmt = db.prepare(
+          `SELECT f.fact_id, f.block_id, f.project, f.tier, f.scope, f.check_json, f.claim, f.note, f.sensitivity, f.verified_at, f.supersedes,
+                  bm25(facts_fts) AS rank_score
+           FROM facts_fts
+           JOIN facts f ON f.rowid = facts_fts.rowid
+           WHERE facts_fts MATCH ? AND ${where}`,
+        );
+
+        const topPartials: Array<{
+          row: Record<string, unknown>;
+          factId: string;
+          tokenHits: number;
+          bm25: number;
+        }> = [];
+        const comparePartials = (
+          a: { factId: string; tokenHits: number; bm25: number },
+          b: { factId: string; tokenHits: number; bm25: number },
+        ): number => {
+          if (b.tokenHits !== a.tokenHits) return b.tokenHits - a.tokenHits;
+          if (a.bm25 !== b.bm25) return a.bm25 - b.bm25;
+          return compareBytewise(a.factId, b.factId);
+        };
+
+        for (const row of stmt.iterate(matchExpr, ...params)) {
+          const factId = String(row['fact_id']);
+          if (seenIds.has(factId)) continue;
+          const claim = String(row['claim'] ?? '');
+          const note = String(row['note'] ?? '');
+          const haystackTokens = new Set(extractSearchTokens(`${claim} ${note}`));
+          let tokenHits = 0;
+          for (const t of tokens) {
+            if (haystackTokens.has(t)) tokenHits++;
+          }
+          const bm25 = typeof row['rank_score'] === 'number' ? row['rank_score'] : 0;
+          insertTopK(topPartials, { row, factId, tokenHits, bm25 }, need, comparePartials);
+        }
+
+        const hydrated = hydrateFacts(db, topPartials.map((p) => p.row));
+        for (let i = 0; i < hydrated.length; i++) {
+          const fact = hydrated[i];
+          seenIds.add(fact.fact_id);
+          collected.push({
+            fact,
+            stage: 'partial',
+            label: 'related',
+            score: topPartials[i].bm25,
+          });
+        }
+      }
+
+      // Stage 3: Optional semantic lookup (`related` only, never `match`).
+      if (options.embedder && trimmedText.length > 0 && collected.length < limit) {
+        const need = limit - collected.length;
+        const params: unknown[] = [];
+        const where = buildFactFilterClause(options, params);
+        const stmt = db.prepare(
+          `SELECT f.fact_id, f.block_id, f.project, f.tier, f.scope, f.check_json, f.claim, f.note, f.sensitivity, f.verified_at, f.supersedes
+           FROM facts f
+           WHERE ${where}
+           ORDER BY f.fact_id COLLATE BINARY ASC`,
+        );
+
+        const minScore = options.minSemanticScore ?? 0.2;
+        let queryVec: Float32Array | undefined;
+        const topSemantic: Array<{
+          row: Record<string, unknown>;
+          factId: string;
+          similarity: number;
+        }> = [];
+        const compareSemantic = (
+          a: { factId: string; similarity: number },
+          b: { factId: string; similarity: number },
+        ): number => {
+          if (b.similarity !== a.similarity) return b.similarity - a.similarity;
+          return compareBytewise(a.factId, b.factId);
+        };
+
+        let batch: Array<{ row: Record<string, unknown>; factId: string; text: string }> = [];
+        const flushBatch = async (): Promise<void> => {
+          if (batch.length === 0) return;
+          if (!queryVec) {
+            let queryEmbeddings: readonly Float32Array[];
+            try {
+              queryEmbeddings = await options.embedder!.embed([trimmedText]);
+            } catch (err) {
+              throw new EmbedderInvocationError(err);
+            }
+            queryVec = queryEmbeddings[0];
+            if (!queryVec) {
+              batch = [];
+              return;
+            }
+          }
+          let vecs: readonly Float32Array[];
+          try {
+            vecs = await options.embedder!.embed(batch.map((b) => b.text));
+          } catch (err) {
+            throw new EmbedderInvocationError(err);
+          }
+          if (vecs.length !== batch.length) {
+            batch = [];
+            return;
+          }
+          for (let i = 0; i < batch.length; i++) {
+            const sim = cosineSimilarity(queryVec, vecs[i]);
+            if (sim >= minScore) {
+              insertTopK(
+                topSemantic,
+                { row: batch[i].row, factId: batch[i].factId, similarity: sim },
+                need,
+                compareSemantic,
+              );
+            }
+          }
+          batch = [];
+        };
+
+        for (const row of stmt.iterate(...params)) {
+          const factId = String(row['fact_id']);
+          if (seenIds.has(factId)) continue;
+          const claim = String(row['claim'] ?? '');
+          const note = String(row['note'] ?? '');
+          batch.push({ row, factId, text: note ? `${claim}\n${note}` : claim });
+          if (batch.length >= SEMANTIC_BATCH_SIZE) {
+            await flushBatch();
+          }
+        }
+        await flushBatch();
+
+        const hydrated = hydrateFacts(db, topSemantic.map((s) => s.row));
+        for (let i = 0; i < hydrated.length; i++) {
+          const fact = hydrated[i];
+          seenIds.add(fact.fact_id);
+          collected.push({
+            fact,
+            stage: 'semantic',
+            label: 'related',
+            score: topSemantic[i].similarity,
+          });
+        }
+      }
+      break;
+    } catch (error) {
+      if (error instanceof EmbedderInvocationError) {
+        throw error.cause;
+      }
+      if (attempt === 0) {
+        syncResult = rebuildIndex(options.logPath, indexPath);
+        continue;
+      }
+      throw error;
+    } finally {
+      db.close();
     }
-  } finally {
-    db.close();
   }
 
   const results: QueryResultItem[] = collected.map(({ fact, stage, label, score }) => {
@@ -509,7 +611,7 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
     badLines: syncResult.badLines,
     indexPath: syncResult.indexPath,
     rebuilt: syncResult.rebuilt,
-    ...(status === 'not_found' ? { addCommand: buildAddCommandHint(options) } : {}),
+    ...(status === 'not_found' ? { addCommand: buildAddCommandHint() } : {}),
   };
 }
 
@@ -549,12 +651,25 @@ export function formatQueryText(result: QueryResult): string {
   return lines.join('\n');
 }
 
-/** Optional local HTTP embedder adapter (`Embedder` port using built-in `fetch`). */
+/** Optional local loopback HTTP embedder adapter (`Embedder` port using built-in `fetch`). */
 export function createHttpEmbedder(
   endpointUrl: string,
   model = 'default',
   timeoutMs = 15000,
 ): Embedder {
+  let parsed: URL;
+  try {
+    parsed = new URL(endpointUrl);
+  } catch {
+    throw new Error(`Invalid embedder URL: ${endpointUrl}`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`Embedder URL must use http: or https:, got ${parsed.protocol}`);
+  }
+  if (!LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase())) {
+    throw new Error(`Embedder HTTP endpoint must target a loopback host, got ${parsed.hostname}`);
+  }
+
   return {
     model,
     async embed(texts: readonly string[]): Promise<readonly Float32Array[]> {
@@ -562,6 +677,7 @@ export function createHttpEmbedder(
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ model, input: texts }),
+        redirect: 'error',
         signal: AbortSignal.timeout(timeoutMs),
       });
       if (!response.ok) {

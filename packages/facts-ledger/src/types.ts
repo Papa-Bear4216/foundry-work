@@ -110,6 +110,10 @@ export interface IndexState {
   readonly schemaVersion: number;
   readonly logBytes: number;
   readonly headSha256: string;
+  readonly tailSha256: string;
+  readonly logMtimeNs: string;
+  readonly logCtimeNs: string;
+  readonly logIno: string;
   readonly indexedOffset: number;
   readonly nextLineNumber: number;
   readonly completeBadLines: readonly number[];
@@ -196,7 +200,7 @@ export interface QueryResultItem {
   readonly stage: QueryStage;
   readonly label: QueryLabel;
   readonly freshness: FreshnessStatus;
-  readonly predicateHolds: boolean;
+  readonly predicateHolds: boolean | null;
   readonly badge: DisplayBadge;
   readonly citable: boolean;
   readonly citationRule: string;

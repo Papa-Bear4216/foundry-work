@@ -7,7 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { appendBlock, MAX_LINE_BYTES, scanLog } from '../dist/index.js';
+import { appendBlock, compareBytewise, MAX_LINE_BYTES, scanLog } from '../dist/index.js';
 
 const exec = promisify(execFile);
 const writer = fileURLToPath(new URL('./writer.py', import.meta.url));
@@ -182,4 +182,8 @@ test('treats UTF-8 BOM lines as bad lines and normalizes explicit undefined/empt
   const bomLine = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(JSON.stringify(first) + '\n')]);
   writeFileSync(path, bomLine);
   assert.deepEqual(read(path), { blocks: [], report: { badLineCount: 1, badLineNumbers: [1] } });
+
+  // Lone surrogates encode identically as U+FFFD in UTF-8 and must compare equal (total order).
+  assert.equal(compareBytewise('\uD800', '\uD801'), 0);
+  assert.equal(compareBytewise('\uD801', '\uD800'), 0);
 });

@@ -16,6 +16,7 @@ import {
   formatQueryText,
   queryFacts,
   rebuildIndex,
+  scanLog,
   syncIndex,
 } from '../dist/index.js';
 import { generateFixture } from '../bench/fixture.mjs';
@@ -34,11 +35,13 @@ function dumpAllTables(indexPath) {
   try {
     return {
       blocks: db.prepare('SELECT * FROM blocks ORDER BY line_number ASC, id COLLATE BINARY ASC').all(),
-      facts: db.prepare('SELECT * FROM facts ORDER BY fact_id COLLATE BINARY ASC').all(),
+      facts: db.prepare('SELECT rowid, * FROM facts ORDER BY fact_id COLLATE BINARY ASC').all(),
       fact_tags: db.prepare('SELECT * FROM fact_tags ORDER BY tag COLLATE BINARY ASC, fact_id COLLATE BINARY ASC').all(),
       fact_evidence: db.prepare('SELECT * FROM fact_evidence ORDER BY fact_id COLLATE BINARY ASC, evidence_idx ASC').all(),
       fact_retractions: db.prepare('SELECT * FROM fact_retractions ORDER BY fact_id COLLATE BINARY ASC').all(),
-      state: db.prepare('SELECT schema_version, log_bytes, head_sha256, indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete FROM state').all(),
+      fts_updated: db.prepare("SELECT f.rowid, f.fact_id, bm25(facts_fts) AS rank FROM facts_fts JOIN facts f ON f.rowid = facts_fts.rowid WHERE facts_fts MATCH 'Updated' ORDER BY f.fact_id COLLATE BINARY ASC").all(),
+      fts_schema: db.prepare("SELECT f.rowid, f.fact_id, bm25(facts_fts) AS rank FROM facts_fts JOIN facts f ON f.rowid = facts_fts.rowid WHERE facts_fts MATCH 'schema' ORDER BY f.fact_id COLLATE BINARY ASC").all(),
+      state: db.prepare('SELECT schema_version, log_bytes, head_sha256, tail_sha256, log_mtime_ns, log_ctime_ns, log_ino, indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete FROM state').all(),
     };
   } finally {
     db.close();
@@ -281,10 +284,22 @@ test('lookup stages, bytewise ordering, sensitivity/history filters, freshness b
     ['Z-item', 'a-item', 'e-private', 'é-item'],
   );
 
-  // Default resolver NEVER labels checked fact VERIFIED without predicateHolds: true.
+  // Default resolver leaves predicateHolds null -> checked fact displays UNVERIFIABLE (never VERIFIED).
   const checkedItem = exactRes.results.find((r) => r.fact.fact_id === 'Z-item');
-  assert.equal(checkedItem?.badge, 'STALE');
+  assert.equal(checkedItem?.badge, 'UNVERIFIABLE');
+  assert.equal(checkedItem?.predicateHolds, null);
   assert.equal(checkedItem?.citable, false);
+
+  // Explicit resolver returning predicateHolds: false yields STALE with citable: false.
+  const failedPredicateRes = await queryFacts({
+    logPath,
+    id: 'Z-item',
+    nowMs,
+    freshnessResolver: () => ({ status: 'supported', predicateHolds: false }),
+  });
+  assert.equal(failedPredicateRes.results[0]?.badge, 'STALE');
+  assert.equal(failedPredicateRes.results[0]?.predicateHolds, false);
+  assert.equal(failedPredicateRes.results[0]?.citable, false);
 
   // Injected verifier proving predicate holds promotes checked+supported to VERIFIED, while asserted stays ASSERTED.
   const verifiedRes = await queryFacts({
@@ -402,4 +417,241 @@ test('CLI rebuild/query --json/--stats and 10,000-block performance/memory check
   assert.ok(rssMatch, 'Expected maxRssKiB in --stats stderr output');
   const rssKiB = Number(rssMatch[1]);
   assert.equal(rssKiB <= 96 * 1024, true, `Peak RSS ${rssKiB} KiB exceeded 96 MiB (98304 KiB)`);
+});
+
+test('refuses to overwrite ledger log or lock file as indexPath', (t) => {
+  const dir = makeTempDir(t);
+  const logPath = join(dir, 'ledger.jsonl');
+  appendBlock(logPath, {
+    agent: 'z3-test',
+    project: 'foundry',
+    intent: 'Protect source log',
+    reasoning: 'Index creation must never clobber log or lock files.',
+  });
+  const original = readFileSync(logPath);
+
+  for (const dangerous of [logPath, join(dir, '.', 'ledger.jsonl'), `${logPath}.lock.sqlite`]) {
+    assert.throws(() => rebuildIndex(logPath, dangerous), /Refusing/);
+    assert.throws(() => syncIndex(logPath, dangerous), /Refusing/);
+  }
+  assert.deepEqual(readFileSync(logPath), original);
+});
+
+test('malformed non-string block fields are treated identically as bad lines across scan and index', async (t) => {
+  const dir = makeTempDir(t);
+  const logPath = join(dir, 'ledger.jsonl');
+  const malformed = JSON.stringify({
+    id: 'bad-types-1',
+    ts: '2026-11-20T00:00:00.000Z',
+    agent: 'z3-test',
+    project: 'foundry',
+    intent: 'Bad optional field types',
+    reasoning: 'Should be skipped without throwing SQLite bind error.',
+    parent: {},
+    trace_id: [],
+    facts: [{ fact_id: 'bad-fact-1', tier: 'asserted', scope: 'current', claim: 'Unreachable claim', tags: ['bad'], sensitivity: 'public', evidence: [] }],
+  });
+  writeFileSync(logPath, `${malformed}\n`, 'utf8');
+
+  const scannedBlocks = [];
+  const scanReport = scanLog(logPath, (block) => scannedBlocks.push(block));
+  assert.equal(scannedBlocks.length, 0);
+  assert.deepEqual(scanReport, { badLineCount: 1, badLineNumbers: [1] });
+
+  const rebuilt = rebuildIndex(logPath);
+  assert.equal(rebuilt.indexedBlocks, 0);
+  assert.deepEqual(rebuilt.badLines, { badLineCount: 1, badLineNumbers: [1] });
+
+  const synced = syncIndex(logPath);
+  assert.equal(synced.rebuilt, false);
+  assert.equal(synced.indexedBlocks, 0);
+  assert.deepEqual(synced.badLines, { badLineCount: 1, badLineNumbers: [1] });
+
+  const queried = await queryFacts({ logPath, text: 'Unreachable' });
+  assert.equal(queried.status, 'not_found');
+  assert.deepEqual(queried.badLines, { badLineCount: 1, badLineNumbers: [1] });
+});
+
+test('detects same-size mid-file edits past 4 KiB head/tail windows', async (t) => {
+  const dir = makeTempDir(t);
+  const logPath = join(dir, 'ledger.jsonl');
+  for (let i = 0; i < 24; i++) {
+    const marker = i === 12 ? 'ALPHA_FIRST_MARKER' : `pad-${i}`;
+    appendBlock(logPath, {
+      agent: 'z3-test',
+      project: 'foundry',
+      intent: `Midfile block ${i} ${'p'.repeat(300)}`,
+      reasoning: 'Exceed 8 KiB so middle block falls outside head and tail 4 KiB windows.',
+      facts: [
+        {
+          fact_id: `mid-${String(i).padStart(2, '0')}`,
+          tier: 'asserted',
+          scope: 'current',
+          claim: `Claim ${marker} stays searchable`,
+          tags: ['mid'],
+          sensitivity: 'public',
+          evidence: [{ type: 'manual', description: 'seed', ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
+        },
+      ],
+    });
+  }
+
+  const warm = syncIndex(logPath);
+  assert.equal(warm.rebuilt, true);
+  assert.equal((await queryFacts({ logPath, text: 'ALPHA_FIRST_MARKER' })).status, 'match');
+
+  // Wait briefly so file mtime/ctime reliably advances across filesystems, then mutate mid-file bytes with exact same length.
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const raw = readFileSync(logPath, 'utf8');
+  const updated = raw.replace('ALPHA_FIRST_MARKER', 'OMEGA_SECOND_BADGE');
+  assert.equal(Buffer.byteLength(updated, 'utf8'), Buffer.byteLength(raw, 'utf8'));
+  writeFileSync(logPath, updated, 'utf8');
+
+  const afterEdit = syncIndex(logPath);
+  assert.equal(afterEdit.rebuilt, true);
+  assert.equal((await queryFacts({ logPath, text: 'ALPHA_FIRST_MARKER' })).status, 'not_found');
+  assert.equal((await queryFacts({ logPath, text: 'OMEGA_SECOND_BADGE' })).status, 'match');
+});
+
+test('syncIndex and queryFacts recover cleanly when index tables are dropped or corrupt', async (t) => {
+  const dir = makeTempDir(t);
+  const logPath = join(dir, 'ledger.jsonl');
+  const indexPath = defaultIndexPath(logPath);
+  appendBlock(logPath, {
+    agent: 'z3-test',
+    project: 'foundry',
+    intent: 'Recover dropped tables',
+    reasoning: 'Verify missing schema tables force clean rebuild.',
+    facts: [
+      {
+        fact_id: 'recover-1',
+        tier: 'asserted',
+        scope: 'current',
+        claim: 'Recovery restores FTS and evidence tables',
+        tags: ['recover'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'seed', ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
+      },
+    ],
+  });
+
+  syncIndex(logPath, indexPath);
+  const corruptAndDrop = () => {
+    const db = new DatabaseSync(indexPath);
+    try {
+      db.exec('DROP TABLE facts_fts; DROP TABLE fact_evidence;');
+    } finally {
+      db.close();
+    }
+  };
+
+  corruptAndDrop();
+  const resynced = syncIndex(logPath, indexPath);
+  assert.equal(resynced.rebuilt, true);
+
+  corruptAndDrop();
+  const queried = await queryFacts({ logPath, indexPath, text: 'Recovery restores', nowMs: Date.UTC(2026, 10, 20, 0, 1, 0) });
+  assert.equal(queried.rebuilt, true);
+  assert.equal(queried.status, 'match');
+  assert.equal(queried.results[0]?.fact.fact_id, 'recover-1');
+});
+
+test('mixed metadata selectors keep Stage 1 exact precedence and not_found never interpolates query text', async (t) => {
+  const dir = makeTempDir(t);
+  const logPath = join(dir, 'ledger.jsonl');
+  const nowMs = Date.UTC(2026, 10, 20, 0, 1, 0);
+  appendBlock(logPath, {
+    agent: 'z3-test',
+    project: 'foundry-core',
+    intent: 'Mixed selector precedence',
+    reasoning: 'Selectors combined with free text still match Stage 1 first.',
+    facts: [
+      {
+        fact_id: 'mix-1',
+        tier: 'asserted',
+        scope: 'at-commit',
+        claim: 'Argon parameters remain documented.',
+        tags: ['crypto'],
+        sensitivity: 'public',
+        evidence: [{ type: 'file', repo: 'foundry-core', path: 'src/kdf.ts', commit: 'deadbeef' }],
+      },
+    ],
+  });
+
+  for (const filter of [
+    { tag: 'crypto' },
+    { path: 'src/kdf.ts' },
+    { commit: 'deadbeef' },
+    { repo: 'foundry-core' },
+  ]) {
+    const res = await queryFacts({ logPath, ...filter, text: 'completely unrelated phrase', nowMs });
+    assert.equal(res.status, 'match');
+    assert.equal(res.results[0]?.stage, 'exact');
+    assert.equal(res.results[0]?.label, 'match');
+  }
+
+  const missing = await queryFacts({ logPath, text: '$(whoami) && rm -rf /', nowMs });
+  assert.equal(missing.status, 'not_found');
+  assert.equal(missing.addCommand?.includes('whoami'), false);
+  assert.equal(missing.addCommand?.includes('rm -rf'), false);
+});
+
+test('semantic Stage 3 streams candidates in <=64 batches and returns deterministic top-K', async (t) => {
+  const dir = makeTempDir(t);
+  const logPath = join(dir, 'ledger.jsonl');
+  const facts = Array.from({ length: 150 }, (_, i) => ({
+    fact_id: `sem-${String(i).padStart(3, '0')}`,
+    tier: 'asserted',
+    scope: 'current',
+    claim: `Indexed conceptual record number ${i}`,
+    tags: ['batch'],
+    sensitivity: 'public',
+    evidence: [{ type: 'manual', description: 'seed', ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
+  }));
+  appendBlock(logPath, {
+    agent: 'z3-test',
+    project: 'foundry',
+    intent: 'Batch semantic test',
+    reasoning: 'Verify streaming candidate batches stay bounded.',
+    facts,
+  });
+
+  const batchSizes = [];
+  const embedder = {
+    model: 'mock-batch',
+    async embed(texts) {
+      batchSizes.push(texts.length);
+      return texts.map((text) => {
+        if (text === 'target concept') return Float32Array.from([1, 0]);
+        if (text.includes('number 142')) return Float32Array.from([0.99, 0.01]);
+        if (text.includes('number 77')) return Float32Array.from([0.95, 0.05]);
+        return Float32Array.from([0, 1]);
+      });
+    },
+  };
+
+  const res = await queryFacts({ logPath, text: 'target concept', limit: 2, embedder });
+  assert.equal(res.status, 'related');
+  assert.deepEqual(
+    res.results.map((r) => r.fact.fact_id),
+    ['sem-142', 'sem-077'],
+  );
+  assert.equal(batchSizes.every((len) => len <= 64), true, `Unexpected batch sizes: ${batchSizes}`);
+  assert.deepEqual(batchSizes, [1, 64, 64, 22]);
+});
+
+test('createHttpEmbedder rejects non-loopback hosts synchronously and blocks redirects', async (t) => {
+  assert.throws(() => createHttpEmbedder('https://example.com/embed'), /loopback/);
+  assert.throws(() => createHttpEmbedder('http://169.254.169.254/latest/meta-data'), /loopback/);
+  assert.throws(() => createHttpEmbedder('ftp://localhost:8080/embed'), /http:/);
+
+  const server = createServer((_req, res) => {
+    res.writeHead(302, { location: 'http://127.0.0.1:9/redirected' });
+    res.end();
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+  const addr = server.address();
+  const embedder = createHttpEmbedder(`http://localhost:${addr.port}/embed`);
+  await assert.rejects(() => embedder.embed(['hello']));
 });
