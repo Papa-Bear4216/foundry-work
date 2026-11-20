@@ -9,8 +9,10 @@ import {
   RepoUnavailableError,
   runGit,
   runTemplate,
+  templateVersion,
 } from './git.js';
 import { isValidCheckedPredicate } from './normalize.js';
+import { isValidEvidenceEntry } from './query.js';
 import type { RepoMap } from './repos.js';
 import type {
   CheckedPredicate,
@@ -151,7 +153,19 @@ export class FreshnessChecker {
     return text;
   }
 
+  /**
+   * Repository templates take the repository name first. A partial clone is refused for
+   * them too (A-27 item 5); `runtime-version` takes no repository and always passes.
+   */
+  private templateRepoUsable(args: unknown): boolean {
+    if (!Array.isArray(args) || args.length === 0) return true;
+    const repo = args[0];
+    if (typeof repo !== 'string' || !this.repos.has(repo)) return true; // runTemplate validates it
+    return this.dir(repo) !== null;
+  }
+
   private runCached(template: string, args: readonly unknown[]): { exitCode: number; outputSha256: string } | null {
+    if (!this.templateRepoUsable(args)) return null;
     const key = JSON.stringify([template, args]);
     if (!this.templateRuns.has(key)) {
       try {
@@ -174,6 +188,14 @@ export class FreshnessChecker {
 
   checkEvidence(ev: FactEvidence, scope: string, nowMs: number, forceRerun = false): EvidenceCheck {
     const rec = ev as unknown as Record<string, unknown>;
+    // Structure first: a malformed entry is never `supported`, whatever its lifetime says.
+    if (!isValidEvidenceEntry(ev)) return { status: 'unverifiable' };
+    if (ev.type === 'command') {
+      const template = String(rec['template']);
+      // Only today's fixed templates at their recorded version count as evidence.
+      if (templateVersion(template) !== rec['template_version']) return { status: 'unverifiable' };
+      if (!this.templateRepoUsable(rec['args'])) return { status: 'unverifiable' };
+    }
     switch (ev.type) {
       case 'file': {
         const dir = this.dir(rec['repo']);

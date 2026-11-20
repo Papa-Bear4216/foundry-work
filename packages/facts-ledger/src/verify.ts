@@ -22,14 +22,17 @@ import type {
 const BLOCK_PAYLOAD_BYTES = 48 * 1024;
 const utf8Bytes = (value: unknown): number => new TextEncoder().encode(JSON.stringify(value)).length;
 
-/** Text fields a re-verified copy would carry into a new block. */
-function secretIn(fact: { claim: string; note?: string | null; evidence: readonly FactEvidence[] }): boolean {
-  const texts = [fact.claim, fact.note ?? ''];
-  for (const ev of fact.evidence) {
-    const quote = (ev as unknown as Record<string, unknown>)['quote'];
-    if (typeof quote === 'string') texts.push(quote);
-  }
-  return texts.some((t) => t.length > 0 && findSecret(t) !== null);
+/** Every string a re-verified copy would carry into a new block (claim, note, check, all evidence fields). */
+function secretIn(fact: { claim: string; note?: string | null; check?: unknown; tags?: readonly string[]; evidence: readonly FactEvidence[] }): boolean {
+  const strings: string[] = [];
+  const collect = (value: unknown, depth: number): void => {
+    if (depth > 8) return;
+    if (typeof value === 'string') strings.push(value);
+    else if (Array.isArray(value)) for (const v of value) collect(v, depth + 1);
+    else if (value !== null && typeof value === 'object') for (const v of Object.values(value)) collect(v, depth + 1);
+  };
+  collect([fact.claim, fact.note ?? '', fact.check ?? null, fact.tags ?? [], fact.evidence], 0);
+  return strings.some((t) => t.length > 0 && findSecret(t) !== null);
 }
 const PAGE_SIZE = 500;
 

@@ -78,7 +78,8 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-function isValidEvidenceEntry(ev: FactEvidence): boolean {
+/** Structural check of one evidence entry; malformed entries are never supported. */
+export function isValidEvidenceEntry(ev: FactEvidence): boolean {
   const rec = ev as unknown as Record<string, unknown>;
   if (ev.type === 'file') {
     return (

@@ -282,13 +282,20 @@ test('review fixes: forged ids stay on one line, tree paths exist, reused checke
     agent: 'other', project: 'demo', intent: 'foreign', reasoning: 'test', status: 'done', schema: 2,
     facts: [{ fact_id: '', tier: 'asserted', scope: 'current', claim: `Token is ${token}`, note: '', tags: ['s'], sensitivity: 'public',
       verified_at: new Date().toISOString(), supersedes: null,
-      evidence: [{ type: 'manual', description: 'looked', ran_at: new Date().toISOString(), ttl_s: 86400 }] }],
+      evidence: [{ type: 'manual', description: 'looked', ran_at: new Date().toISOString(), ttl_s: 86400, output_sha256: 'c'.repeat(64) }] },
+      { fact_id: '', tier: 'asserted', scope: 'current', claim: 'Plain claim.', note: '', tags: ['s'], sensitivity: 'public',
+      verified_at: new Date().toISOString(), supersedes: null,
+      evidence: [{ type: 'manual', description: `saw ${token}`, ran_at: new Date().toISOString(), ttl_s: 86400, output_sha256: 'c'.repeat(64) }] },
+      { fact_id: '', tier: 'asserted', scope: 'current', claim: 'Malformed manual evidence.', note: '', tags: ['s'], sensitivity: 'public',
+      verified_at: new Date().toISOString(), supersedes: null,
+      evidence: [{ type: 'manual', description: 'no hash', ran_at: new Date().toISOString(), ttl_s: 86400 }] }],
   });
   for (let i = 0; i < 30; i++) {
     addFact({ ...base(f), claim: `Big note fact ${i}.`, note: 'n'.repeat(1900), tags: ['big'], manual: { description: 'looked' } });
   }
   const r = verifyFacts({ logPath: f.logPath, repos: f.repos, all: true, writeAs: 'tester' });
-  assert.equal(r.skipped.length, 1);
+  assert.equal(r.skipped.length, 2, 'secrets in a claim and in a manual description are both caught');
+  assert.equal(r.items.find((i) => i.claim === 'Malformed manual evidence.').status, 'unverifiable');
   assert.ok(r.written.length >= 2, '30 facts with 1,900-byte notes need more than one block');
   for (const b of r.written) assert.ok(!JSON.stringify(b).includes(token));
 });
