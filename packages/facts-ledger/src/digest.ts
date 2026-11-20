@@ -1,4 +1,5 @@
-import { closeSync, fstatSync, fsyncSync, openSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, fsyncSync, mkdirSync, openSync, unlinkSync, writeSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { dirname, join } from 'node:path';
 import { TextEncoder } from 'node:util';
 import { FreshnessChecker } from './freshness.js';
@@ -14,10 +15,18 @@ export const DIGEST_MAX_BYTES = 6000;
 /** A 300-byte claim plus its badge and fact id fits; longer lines are left out, never cut. */
 const MAX_LINE_BYTES = 400;
 /** JSON anywhere in a line: a leading brace/bracket, an object key, or an array of objects/strings. */
-const JSON_RE =
-  /^\s*[{[]|\{\s*\}|\[\s*\]|\{\s*"[^"\n]*"\s*:|\[\s*(?:"[^"\n]*"|-?\d[\d.eE+-]*|true|false|null|\{|\[)\s*[,\]]/;
+// A JSON string, escapes included: "a\"b" is one string.
+const JSON_STR = String.raw`"(?:[^"\\\n]|\\.)*"`;
+const JSON_RE = new RegExp(
+  String.raw`^\s*[{[]|\{\s*\}|\[\s*\]|\{\s*${JSON_STR}\s*:|\[\s*(?:${JSON_STR}|-?\d[\d.eE+-]*|true|false|null|\{|\[)\s*[,\]]`,
+);
 const PAGE_SIZE = 500;
-const RECENT_KEEP = 200;
+/**
+ * Candidates kept for "Recently verified": more than can ever fit, since the shortest
+ * fact line ("A x (<12 hex>.0)" plus newline) is over 16 bytes. Only format-safe lines
+ * are kept, so trimming never drops a fact that would have fit.
+ */
+const RECENT_KEEP = Math.ceil(6000 / 16);
 const PROPOSALS_KEEP = 50;
 const DECISIONS_KEEP = 20;
 const PROJECT_FILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -35,6 +44,8 @@ export interface DigestOptions {
   readonly nowMs?: number;
   /** Write `digest.<project>.md` beside the index (default true). */
   readonly write?: boolean;
+  /** Storage flags (`--log`, `--index`) to repeat in the closing query command. */
+  readonly queryFlags?: readonly string[];
 }
 
 export interface DigestResult {
@@ -87,6 +98,8 @@ export function digestFormatProblems(text: string): string[] {
 }
 
 interface ListedFact {
+  /** The complete, format-safe line, decided when the fact is collected. */
+  readonly line: string;
   readonly factId: string;
   readonly mark: 'V' | 'A';
   readonly claim: string;
@@ -94,11 +107,11 @@ interface ListedFact {
   readonly pinned: boolean;
 }
 
-function factLine(f: ListedFact): string | null {
+function factLine(mark: 'V' | 'A', claim: string, factId: string): string | null {
   // A claim is shown exactly as recorded or not at all: shortening a hex run or
   // collapsing spaces could turn a verified claim into a different, false one.
-  if (digestLine(f.claim) !== f.claim) return null;
-  return safeLine(`${f.mark} ${f.claim} (${f.factId})`);
+  if (digestLine(claim) !== claim) return null;
+  return safeLine(`${mark} ${claim} (${factId})`);
 }
 
 /** Projects that can have a digest file: a safe file-name part with no secret pattern. */
@@ -108,27 +121,13 @@ export function assertDigestProject(project: string): void {
   }
 }
 
-/** Size of the log right now (0 when it does not exist yet): the digest's source generation. */
-function logSize(logPath: string): number {
-  let fd: number;
-  try {
-    fd = openSync(logPath, 'r');
-  } catch {
-    return 0;
-  }
-  try {
-    return fstatSync(fd).size;
-  } finally {
-    closeSync(fd);
-  }
-}
-
-const MAX_PUBLISH_ATTEMPTS = 5;
+/** A waiting regeneration outlasts one full build on the 10,000-block fixture. */
+const DIGEST_LOCK_TIMEOUT_MS = 60_000;
 
 /**
  * `facts digest`: build (and by default write) the session digest for one project.
- * When writing, a digest is republished if the log grew while it was built, so a slower
- * writer never leaves an older snapshot in place after a newer one.
+ * When writing, reading the log and publishing happen under one lock, so a slower writer
+ * never leaves an older snapshot in place after a newer one.
  */
 export function generateDigest(options: DigestOptions): DigestResult {
   assertDigestProject(options.project);
@@ -143,14 +142,28 @@ export function generateDigest(options: DigestOptions): DigestResult {
       throw new Error(`Refusing to write the digest over the ledger log, index or a lock file: ${path}`);
     }
   }
-  let result: DigestResult | undefined;
-  for (let attempt = 0; attempt < MAX_PUBLISH_ATTEMPTS; attempt++) {
-    const before = logSize(options.logPath);
-    result = buildDigest(options, indexPath, path);
-    publish(path, result.text);
-    if (logSize(options.logPath) === before) break;
+  // Snapshot through publication runs under one lock per digest file, so regenerations
+  // publish in the order they read the log and an older snapshot never lands last.
+  mkdirSync(dirname(path), { recursive: true });
+  const lockDb = new DatabaseSync(`${path}.lock.sqlite`, { timeout: DIGEST_LOCK_TIMEOUT_MS });
+  try {
+    lockDb.exec('BEGIN IMMEDIATE');
+    try {
+      const result = buildDigest(options, indexPath, path);
+      publish(path, result.text);
+      lockDb.exec('COMMIT');
+      return result;
+    } catch (err) {
+      try {
+        lockDb.exec('ROLLBACK');
+      } catch {
+        // Ignore rollback failure on the lock handle.
+      }
+      throw err;
+    }
+  } finally {
+    lockDb.close();
   }
-  return result as DigestResult;
 }
 
 function publish(path: string, text: string): void {
@@ -212,9 +225,13 @@ function buildDigest(options: DigestOptions, indexPath: string, path: string): D
         counts[view.effectiveFreshness]++;
         // Only facts an agent may cite are listed; stale/expired/unverifiable are only counted.
         if (!view.citable || (view.badge !== 'VERIFIED' && view.badge !== 'ASSERTED')) continue;
+        const mark = view.badge === 'VERIFIED' ? 'V' : 'A';
+        const line = factLine(mark, fact.claim, fact.fact_id);
+        if (line === null) continue; // cannot appear whole and safe: counted as left out
         const listed: ListedFact = {
+          line,
           factId: fact.fact_id,
-          mark: view.badge === 'VERIFIED' ? 'V' : 'A',
+          mark,
           claim: fact.claim,
           verifiedAt: fact.verified_at,
           pinned: fact.tags.includes('pinned'),
@@ -275,8 +292,16 @@ function buildDigest(options: DigestOptions, indexPath: string, path: string): D
   let used = byteLength(head.join('\n')) + 1;
   let listedFacts = 0;
   let full = false;
-  const closing = (omitted: number): string =>
-    digestLine(`${omitted} fact(s) left out. Query them with: facts query --repo ${options.project}`);
+  // The closing command repeats the cap and the storage flags this digest was built with,
+  // so it reaches the omitted facts. A flag the format rules would alter (a long hex run
+  // in a path, for example) is described instead of shown wrong.
+  const cap = options.maxSensitivity ?? 'personal';
+  const base = `facts query --repo ${options.project}${cap === 'personal' ? '' : ` --max-sensitivity ${cap}`}`;
+  const extra = (options.queryFlags ?? []).map((f) => (/^[\w./:\\-]+$/.test(f) ? f : JSON.stringify(f))).join(' ');
+  const exact = extra ? `${base} ${extra}` : base;
+  const command =
+    digestLine(exact) === exact && byteLength(exact) <= 200 ? exact : `${base} (with the same --log and --index as this digest)`;
+  const closing = (omitted: number): string => digestLine(`${omitted} fact(s) left out. Query them with: ${command}`);
   const reserve = byteLength(closing(currentFacts)) + 1;
 
   const push = (line: string): boolean => {
@@ -306,10 +331,10 @@ function buildDigest(options: DigestOptions, indexPath: string, path: string): D
 
   // Lines that cannot appear whole and safe are skipped; skipped facts count as left out.
   const keep = (lines: readonly (string | null)[]): string[] => lines.filter((l): l is string => l !== null);
-  section('## Pinned', keep(pinned.map(factLine)), () => listedFacts++);
+  section('## Pinned', pinned.map((f) => f.line), () => listedFacts++);
   section('## Open proposals', keep(proposals.map((i) => safeLine(`- ${i}`))));
   section('## Recent decisions', keep(decisions.map((i) => safeLine(`- ${i}`))));
-  section('## Recently verified', keep(recent.map(factLine)), () => listedFacts++);
+  section('## Recently verified', recent.map((f) => f.line), () => listedFacts++);
   const omittedFacts = currentFacts - listedFacts;
   out.push(closing(omittedFacts));
 

@@ -155,3 +155,19 @@ test('round-2 fixes: claims never rewritten, JSON values caught, intents capped,
   assert.throws(() => execFileSync(process.execPath, [cli, 'add', '--project', 'My project', '--intent', 'p', '--reasoning', 'r', '--repo', 'demo', '--claim', 'x.', '--evidence-file', 'src/a.ts', '--log', f.logPath], { env, encoding: 'utf8', stdio: 'pipe' }));
   assert.equal(readFileSync(f.logPath, 'utf8'), before, 'an invalid project name is refused before anything is appended');
 });
+
+test('round-3 fixes: escaped-quote JSON caught, budget filled past 200 short facts, closing command repeats cap and flags', (t) => {
+  for (const s of ['x {"a\\"b":1}', 'x ["a\\"b"]']) assert.ok(digestFormatProblems(`${s}\n`).some((p) => p.includes('JSON')), s);
+  const f = fixture(t);
+  const facts = [];
+  for (let i = 0; i < 400; i++) {
+    facts.push({ fact_id: '', tier: 'asserted', scope: 'current', claim: 'x', note: '', tags: [], sensitivity: 'public',
+      verified_at: new Date(Date.now() - i * 1000).toISOString(), supersedes: null,
+      evidence: [{ type: 'manual', description: 'looked', ran_at: new Date().toISOString(), ttl_s: 86400, output_sha256: 'c'.repeat(64) }] });
+    if (facts.length === 40) { appendBlock(f.logPath, { agent: 't', project: 'demo', intent: 'batch', reasoning: 'r', status: 'done', schema: 2, facts: facts.splice(0) }); }
+  }
+  const r = generateDigest({ logPath: f.logPath, project: 'demo', repos: f.repos, maxSensitivity: 'private', queryFlags: ['--log', 'alt.jsonl'], write: false });
+  assert.ok(r.listedFacts > 200, `listed ${r.listedFacts}`);
+  assert.ok(r.bytes > DIGEST_MAX_BYTES - 40, `digest filled to ${r.bytes} bytes`);
+  assert.match(r.text, /Query them with: facts query --repo demo --max-sensitivity private --log alt\.jsonl\n$/);
+});

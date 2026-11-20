@@ -285,6 +285,14 @@ function parseCliArgs(argv: readonly string[]): ParsedArgs {
   };
 }
 
+/** Storage flags the user chose, repeated in the digest's closing query command. */
+function digestQueryFlags(args: ParsedArgs): string[] {
+  const flags: string[] = [];
+  if (args.logPath !== (process.env['FACTS_LEDGER_LOG'] || 'ledger.jsonl')) flags.push('--log', args.logPath);
+  if (args.indexPath) flags.push('--index', args.indexPath);
+  return flags;
+}
+
 function buildEmbedderFromArgs(args: ParsedArgs): Embedder | undefined {
   if (args.embedUrl !== undefined) {
     return createHttpEmbedder(args.embedUrl, args.embedModel);
@@ -442,6 +450,7 @@ async function run(): Promise<void> {
         project: block.project,
         repos,
         ...(args.maxSensitivity ? { maxSensitivity: args.maxSensitivity } : {}),
+        queryFlags: digestQueryFlags(args),
       });
     } else if (args.command === 'digest') {
       const project = args.add['project'] || process.env['FACTS_LEDGER_PROJECT'];
@@ -452,6 +461,7 @@ async function run(): Promise<void> {
         project,
         repos: loadRepoMap(),
         ...(args.maxSensitivity ? { maxSensitivity: args.maxSensitivity } : {}),
+        queryFlags: digestQueryFlags(args),
       });
       process.stdout.write(args.json ? `${JSON.stringify(result)}\n` : result.text);
     } else if (args.command === 'verify') {
