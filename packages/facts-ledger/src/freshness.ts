@@ -1,13 +1,13 @@
 import { assertRelativePath } from './repos.js';
 import {
   batchCheck,
-  blobIds,
   commitExists,
   decodeUtf8,
   headCommit,
   readBlob,
   repoDirFor,
   RepoUnavailableError,
+  runGit,
   runTemplate,
 } from './git.js';
 import { isValidCheckedPredicate } from './normalize.js';
@@ -57,23 +57,61 @@ export class FreshnessChecker {
   private readonly repos: RepoMap;
   private readonly rerun: boolean;
   private readonly heads = new Map<string, string | null>();
-  private readonly blobs = new Map<string, string | null>();
+  /** Tree entry at `rev:path` (blob, tree or gitlink), or null when the path is not in the tree. */
+  private readonly entries = new Map<string, { id: string; type: string } | null>();
   private readonly contents = new Map<string, string>();
   private readonly commits = new Map<string, boolean>();
+  private readonly partial = new Map<string, boolean>();
   private readonly templateRuns = new Map<string, { exitCode: number; outputSha256: string } | null>();
+  /** The `nowMs` of the operation the caches belong to; a new `nowMs` starts a new snapshot. */
+  private snapshotNowMs: number | undefined;
 
   constructor(options: FreshnessCheckerOptions) {
     this.repos = options.repos;
     this.rerun = options.rerun ?? false;
   }
 
+  /** Drop every state-dependent cache: HEADs, tree entries, commits, contents, command runs. */
+  reset(): void {
+    this.heads.clear();
+    this.entries.clear();
+    this.contents.clear();
+    this.commits.clear();
+    this.partial.clear();
+    this.templateRuns.clear();
+    this.snapshotNowMs = undefined;
+  }
+
+  /**
+   * One query or verification is one snapshot (one `nowMs`). A reused checker called
+   * with a different `nowMs` re-reads HEAD and re-runs commands instead of answering
+   * from an earlier operation's state.
+   */
+  private enterSnapshot(nowMs: number): void {
+    if (this.snapshotNowMs !== undefined && this.snapshotNowMs !== nowMs) this.reset();
+    this.snapshotNowMs = nowMs;
+  }
+
   private dir(repo: unknown): string | null {
     if (typeof repo !== 'string') return null;
     try {
-      return repoDirFor(this.repos, repo);
+      const dir = repoDirFor(this.repos, repo);
+      // A partial clone cannot tell a missing object from an absent path without fetching,
+      // and fetching is never allowed, so its facts are unverifiable (A-27).
+      return this.isPartialClone(dir) ? null : dir;
     } catch {
       return null;
     }
+  }
+
+  private isPartialClone(dir: string): boolean {
+    let known = this.partial.get(dir);
+    if (known === undefined) {
+      const r = runGit(dir, ['config', '--get-regexp', '^(extensions\\.partialclone|remote\\..*\\.promisor)$']);
+      known = r.exitCode === 0 && decodeUtf8(r.output).trim().length > 0;
+      this.partial.set(dir, known);
+    }
+    return known;
   }
 
   head(dir: string): string | null {
@@ -87,13 +125,20 @@ export class FreshnessChecker {
     return this.commits.get(key) ?? false;
   }
 
-  blob(dir: string, rev: string, path: string): string | null {
+  /** The tree entry at `rev:path`, or null when the path is not in the tree. */
+  entry(dir: string, rev: string, path: string): { id: string; type: string } | null {
     const key = `${dir}\u0000${rev}\u0000${path}`;
-    if (!this.blobs.has(key)) {
-      const ids = blobIds(dir, rev, [path]);
-      this.blobs.set(key, ids.get(path) ?? null);
+    if (!this.entries.has(key)) {
+      assertRelativePath(path);
+      this.entries.set(key, batchCheck(dir, [`${rev}:${path}`])[0] ?? null);
     }
-    return this.blobs.get(key) ?? null;
+    return this.entries.get(key) ?? null;
+  }
+
+  /** Blob id at `rev:path`; null when absent or when the path is a directory or submodule. */
+  blob(dir: string, rev: string, path: string): string | null {
+    const hit = this.entry(dir, rev, path);
+    return hit && hit.type === 'blob' ? hit.id : null;
   }
 
   content(dir: string, blob: string): string {
@@ -193,12 +238,14 @@ export class FreshnessChecker {
       const rev = this.revisionFor(dir, scope, pinnedCommit);
       if (!rev) return undefined;
       const path = String(c['path']);
-      const blob = this.blob(dir, rev, path);
+      // Section 3.4: existence is membership in the tree, whatever the entry's type.
+      const entry = this.entry(dir, rev, path);
+      const blob = entry && entry.type === 'blob' ? entry.id : null;
       switch (c['predicate']) {
         case 'file_exists':
-          return blob !== null;
+          return entry !== null;
         case 'file_absent':
-          return blob === null;
+          return entry === null;
         case 'file_blob_is':
           return blob === c['blob'];
         case 'file_contains':
@@ -271,13 +318,13 @@ export class FreshnessChecker {
         const rev = this.revisionFor(w.dir, fact.scope, w.commit);
         if (!rev) continue;
         const key = `${rev}\u0000${w.path}`;
-        if (this.blobs.has(`${w.dir}\u0000${key}`)) continue;
+        if (this.entries.has(`${w.dir}\u0000${key}`)) continue;
         const g = blobGroups.get(w.dir) ?? new Map<string, string>();
         g.set(key, `${rev}:${w.path}`);
         blobGroups.set(w.dir, g);
       }
     }
-    run(blobGroups, (dir, key, hit) => this.blobs.set(`${dir}\u0000${key}`, hit && hit.type === 'blob' ? hit.id : null));
+    run(blobGroups, (dir, key, hit) => this.entries.set(`${dir}\u0000${key}`, hit));
   }
 
   /** Drop cached file contents (bounded memory between pages). */
@@ -288,6 +335,7 @@ export class FreshnessChecker {
   assess(fact: IndexedFact, nowMs: number): FreshnessAssessment & { readonly evidence: readonly EvidenceCheck[] } {
     // A checked fact is VERIFIED only after its predicate is re-run (section 6), so its
     // expired command evidence (fixed read-only templates) is always re-run too (A-27).
+    this.enterSnapshot(nowMs);
     const forceRerun = fact.tier === 'checked';
     const checks = fact.evidence.map((ev) => this.checkEvidence(ev, fact.scope, nowMs, forceRerun));
     let status: FreshnessStatus = checks.length === 0 ? 'unverifiable' : 'supported';

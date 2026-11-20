@@ -72,6 +72,10 @@ function gitEnv(repoDir: string): Record<string, string> {
   env['GIT_TERMINAL_PROMPT'] = '0';
   env['GIT_PAGER'] = 'cat';
   env['GIT_NO_REPLACE_OBJECTS'] = '1';
+  // Partial clones would otherwise lazily fetch missing objects, running transport and
+  // repository-configured helpers. A missing object is reported as unavailable instead.
+  env['GIT_NO_LAZY_FETCH'] = '1';
+  env['GIT_PROTOCOL_FROM_USER'] = '0';
   env['GIT_CEILING_DIRECTORIES'] = dirname(repoDir);
   env['LC_ALL'] = 'C';
   return env;
@@ -85,6 +89,8 @@ const GIT_READ_ONLY_PREFIX: readonly string[] = [
   '-c', 'diff.external=',
   '-c', 'core.untrackedCache=false',
   '-c', 'log.showSignature=false',
+  // Defense in depth with GIT_NO_LAZY_FETCH: no transport of any kind may run.
+  '-c', 'protocol.allow=never',
 ];
 
 /** Run git read-only in `repoDir`: argument vector only, never a shell; capped and timed. */
