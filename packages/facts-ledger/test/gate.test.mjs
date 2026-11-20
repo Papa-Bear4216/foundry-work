@@ -104,3 +104,69 @@ test('verify output written in pieces is byte-identical to the whole-string form
     assert.equal([...verifyOutputChunks(result, false)].join(''), formatVerifyText(result));
   }
 });
+
+test('gate validator rejects a tampered expected file (unsafe rows, rendered text, conflict lines)', () => {
+  const expected = readFileSync(EXPECTED_PATH, 'utf8');
+  const fails = (mutated, why) => assert.equal(gateScore(mutated).meetsThresholds, false, why);
+  // A related row turned into a citable VERIFIED one (the reviewer's probe).
+  fails(
+    expected.replace(/(\n {2}3 a10000000001\.6 tier=checked label=related stage=partial) badge=RELATED freshness=supported citable=false/, '$1 badge=VERIFIED freshness=supported citable=true'),
+    'related row shown as citable VERIFIED',
+  );
+  // An asserted fact labelled VERIFIED in the row.
+  fails(expected.replace('tier=asserted label=match stage=lexical badge=ASSERTED', 'tier=asserted label=match stage=lexical badge=VERIFIED'), 'asserted shown as VERIFIED');
+  // The rendered text disagrees with the row.
+  fails(expected.replace('  > [ASSERTED] [match/lexical] [supported] (a10000000001.3)', '  > [VERIFIED] [match/lexical] [supported] (a10000000001.3)'), 'rendered badge changed');
+  // A conflict warning dropped from the rendered text.
+  fails(expected.replace('  >   conflict: cannot hold together with a10000000001.10\n', ''), 'conflict line removed');
+  // A not-found case that no longer tells the agent how to record a fact.
+  fails(expected.replace(/ {2}> Verify from source first, then record with: facts add [^\n]*\n/, ''), 'not_found guidance removed');
+  // A stale row made citable.
+  fails(expected.replace(/badge=STALE freshness=stale citable=false/, 'badge=STALE freshness=stale citable=true'), 'stale row citable');
+});
+
+function checkedFact(id, check, extra = {}) {
+  return {
+    fact_id: id, tier: 'checked', scope: 'current', check, claim: '', note: null, tags: ['cap'], sensitivity: 'public',
+    verified_at: '2026-11-18T12:00:00+00:00', supersedes: null,
+    evidence: [{ type: 'manual', description: 'probe', output_sha256: 'a'.repeat(64), ran_at: '2026-11-18T12:00:00+00:00', ttl_s: 3600 }],
+    ...extra,
+  };
+}
+
+test('conflict partners: complement-filtered, capped at 20, never historical facts', async (t) => {
+  const { formatCheckedPredicateClaim } = await import('../dist/normalize.js');
+  const { factsConflict } = await import('../dist/conflicts.js');
+  const root = mkdtempSync(join(tmpdir(), 'facts-gate-cap-'));
+  t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
+  const mk = (id, check, extra) => {
+    const f = checkedFact(id, check, extra);
+    return { ...f, claim: formatCheckedPredicateClaim(check) };
+  };
+  const p = { repo: 'gate', path: 'src/x.ts' };
+  const facts = [mk('b00000000001.0', { predicate: 'file_exists', ...p })];
+  for (let i = 0; i < 25; i++) facts.push(mk(`b00000000001.${i + 1}`, { predicate: 'file_absent', ...p }));
+  for (let i = 0; i < 50; i++) facts.push(mk(`b00000000001.${i + 26}`, { predicate: 'file_contains', ...p, text: `line ${i}` }));
+  const block = (id, fs, extra = {}) => ({
+    schema: 2, agent: 'cap', project: 'cap', intent: 'cap', reasoning: 'cap', facts: fs, actions: [], verification: null, touches: [],
+    supersedes: null, status: 'done', trace_id: 'f00000000000', id, ts: '2026-11-18T12:00:00+00:00', parent: null, ...extra,
+  });
+  const logPath = join(root, 'ledger.jsonl');
+  writeFileSync(logPath, `${JSON.stringify(block('b00000000001', facts))}\n${JSON.stringify(block('b00000000002', [], { parent: 'b00000000001', retracted_facts: [{ fact_id: 'b00000000001.1', reason: 'cap test' }] }))}\n`);
+  const r = await queryFacts({ logPath, id: 'b00000000001.0', limit: 1, nowMs: NOW_MS });
+  const partners = r.results.filter((x) => x.stage === 'conflict');
+  assert.equal(partners.length, 20);
+  assert.ok(partners.every((x) => x.fact.check.predicate === 'file_absent'));
+  assert.ok(!partners.some((x) => x.fact.fact_id === 'b00000000001.1'), 'retracted fact is never a partner');
+  // With --history the retracted fact is shown, but it is not flagged as a current conflict.
+  const h = await queryFacts({ logPath, id: 'b00000000001.1', history: true, nowMs: NOW_MS });
+  assert.equal(h.results[0].fact.retracted, true);
+  assert.equal(h.results[0].conflictsWith, undefined);
+  assert.equal(h.results.filter((x) => x.stage === 'conflict').length, 0);
+  // Unit: a retracted or superseded fact never conflicts.
+  const live = { ...facts[0], superseded: false, retracted: false };
+  const gone = { ...facts[2], superseded: false, retracted: true };
+  assert.equal(factsConflict(live, { ...gone, retracted: false }), true);
+  assert.equal(factsConflict(live, gone), false);
+  assert.equal(factsConflict(live, { ...gone, retracted: false, superseded: true }), false);
+});

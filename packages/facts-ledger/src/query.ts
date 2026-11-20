@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { TextDecoder, TextEncoder } from 'node:util';
 import { defaultIndexPath, openSyncedIndexForQuery } from './index-db.js';
-import { conflictSubject, factsConflict } from './conflicts.js';
+import { complementClause, conflictSubject, factsConflict } from './conflicts.js';
 import { compareBytewise } from './log.js';
 import {
   formatCheckedPredicateClaim,
@@ -440,41 +440,27 @@ function addConflictPartners(
   collected: Array<{ fact: IndexedFact; stage: QueryStage; label: QueryLabel; score?: number }>,
   seenIds: Set<string>,
 ): void {
-  const subjects = new Map<string, { kind: 'file' | 'command'; repo: string; key: string }>();
-  for (const { fact } of collected) {
-    const subject = conflictSubject(fact);
-    if (subject) subjects.set(`${subject.kind}\u0000${subject.repo}\u0000${subject.key}`, subject);
-  }
-  if (subjects.size === 0) return;
   // Partners are live facts within the same sensitivity cap; superseded and retracted facts never conflict.
   const live: QueryOptions = { logPath: options.logPath, history: false, ...(options.maxSensitivity ? { maxSensitivity: options.maxSensitivity } : {}) };
-  const originals = collected.map((c) => c.fact);
+  const originals = collected.map((c) => c.fact).filter((f) => conflictSubject(f) !== null);
   let added = 0;
-  const sortedKeys = [...subjects.keys()].sort(compareBytewise);
-  for (const subjectKey of sortedKeys) {
-    const subject = subjects.get(subjectKey)!;
+  for (const original of originals) {
     const params: unknown[] = [];
+    const complement = complementClause(original, params);
+    if (!complement) continue;
     const where = buildFactFilterClause(live, params);
-    let subjectClause: string;
-    if (subject.kind === 'command') {
-      subjectClause = "json_extract(f.check_json, '$.predicate') = 'command_output_is' AND json_extract(f.check_json, '$.template') = ?";
-      params.push(subject.key);
-    } else {
-      subjectClause = "json_extract(f.check_json, '$.predicate') <> 'command_output_is' AND json_extract(f.check_json, '$.repo') = ? AND json_extract(f.check_json, '$.path') = ?";
-      params.push(subject.repo, subject.key);
-    }
-    const rows = db
-      .prepare(
-        `SELECT f.fact_id, f.block_id, f.project, f.tier, f.scope, f.check_json, f.claim, f.note, f.sensitivity, f.verified_at, f.supersedes
-         FROM facts f
-         WHERE f.tier = 'checked' AND f.check_json IS NOT NULL AND json_valid(f.check_json) AND ${subjectClause} AND ${where}
-         ORDER BY f.fact_id COLLATE BINARY ASC`,
-      )
-      .all(...params);
-    for (const candidate of hydrateFacts(db, rows)) {
-      if (seenIds.has(candidate.fact_id)) continue;
-      if (!originals.some((o) => factsConflict(o, candidate))) continue;
+    const stmt = db.prepare(
+      `SELECT f.fact_id, f.block_id, f.project, f.tier, f.scope, f.check_json, f.claim, f.note, f.sensitivity, f.verified_at, f.supersedes
+       FROM facts f
+       WHERE f.tier = 'checked' AND f.check_json IS NOT NULL AND json_valid(f.check_json) AND ${complement} AND ${where}
+       ORDER BY f.fact_id COLLATE BINARY ASC`,
+    );
+    // Streamed and hydrated one row at a time: memory stays flat however many facts share the path.
+    for (const row of stmt.iterate(...params)) {
       if (added >= MAX_CONFLICT_PARTNERS) return;
+      if (seenIds.has(String(row['fact_id']))) continue;
+      const [candidate] = hydrateFacts(db, [row]);
+      if (!candidate || !factsConflict(original, candidate)) continue;
       seenIds.add(candidate.fact_id);
       collected.push({ fact: candidate, stage: 'conflict', label: 'related' });
       added++;

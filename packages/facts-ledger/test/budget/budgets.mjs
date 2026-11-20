@@ -14,7 +14,8 @@ import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { generateFixture, blockCount, project } from '../../bench/fixture.mjs';
+import { blockCount, project } from '../../bench/fixture.mjs';
+import { formatCheckedPredicateClaim } from '../../dist/normalize.js';
 import { DIGEST_MAX_BYTES, digestFormatProblems } from '../../dist/digest.js';
 
 const MIB = 1024;
@@ -98,18 +99,92 @@ function check(ok, message) {
   if (!ok) failures.push(message);
 }
 
+function blockId(number) {
+  return number.toString(16).padStart(12, '0');
+}
+
+const COMPONENTS = 100;
+const FIXTURE_EMAIL = ['budget', 'example.invalid'].join('@');
+
+/** A real repository with 100 committed files and a 10,000-block ledger whose evidence resolves in it. */
+function buildRealisticFixture(root, work) {
+  const repoDir = join(root, 'repo');
+  mkdirSync(join(repoDir, 'fixtures'), { recursive: true });
+  for (let c = 0; c < COMPONENTS; c++) {
+    writeFileSync(join(repoDir, 'fixtures', `component-${c}.txt`), Buffer.from(`Reference signal is stable.\nComponent ${c}.\n`));
+  }
+  const git = (args) => {
+    const r = spawnSync('git', ['-c', 'core.autocrlf=false', '-c', 'commit.gpgsign=false', '-c', 'user.name=Budget Fixture', '-c', `user.email=${FIXTURE_EMAIL}`, ...args], { cwd: repoDir, encoding: 'utf8', windowsHide: true });
+    if (r.status !== 0) throw new Error(`git ${args[0]} failed: ${r.stderr}`);
+    return r.stdout;
+  };
+  git(['init', '--quiet', '--template=']);
+  git(['add', '--all']);
+  git(['commit', '--quiet', '--no-verify', '-m', 'fixture']);
+  const commit = git(['rev-parse', 'HEAD']).trim();
+  const blobs = new Map();
+  for (const line of git(['ls-tree', '-r', 'HEAD']).split('\n')) {
+    const m = /^\d+ blob ([0-9a-f]+)\t(.+)$/.exec(line);
+    if (m) blobs.set(m[2], m[1]);
+  }
+  const logPath = join(work, 'ledger.jsonl');
+  const lines = [];
+  for (let n = 1; n <= blockCount; n++) {
+    const id = blockId(n);
+    const ts = new Date(Date.UTC(2026, 0, 1, 0, n)).toISOString();
+    const component = `component-${n % COMPONENTS}`;
+    const path = `fixtures/${component}.txt`;
+    const evidence = [{ type: 'file', repo: project, path, commit, blob: blobs.get(path), lines: '1', quote: 'Reference signal is stable.' }];
+    const base = { fact_id: `${id}.0`, tags: ['calibration', n % 101 === 0 ? 'pinned' : component], sensitivity: 'public', verified_at: ts, supersedes: null, evidence };
+    let fact;
+    if (n % 3 === 0) {
+      const check = { predicate: 'file_contains', repo: project, path, text: 'Reference signal is stable.' };
+      fact = { ...base, tier: 'checked', scope: 'current', check, claim: formatCheckedPredicateClaim(check), note: `Calibration sample ${n} passed for ${component}.` };
+    } else {
+      fact = { ...base, tier: 'asserted', scope: n % 3 === 1 ? 'current' : 'at-commit', claim: `Calibration sample ${n} passed for ${component}.`, note: 'The synthetic test fixture uses a constant reference signal.' };
+    }
+    lines.push(JSON.stringify({
+      id, ts, agent: 'fixture-builder', project, parent: n === 1 ? null : blockId(n - 1), trace_id: id,
+      status: n % 101 === 0 ? 'proposed' : 'done',
+      intent: `Record calibration for ${component} at sample ${n}`,
+      reasoning: 'A deterministic sample exercises the ledger index and summary.',
+      actions: [], verification: 'Synthetic fixture', touches: [path], supersedes: null, schema: 2,
+      facts: [fact], retracted_facts: [],
+      token_usage: { model: 'fixture-model', task: 'calibration', input: 500, output: 120, measured: false },
+    }));
+  }
+  writeFileSync(logPath, `${lines.join('\n')}\n`);
+  return { logPath, repoDir };
+}
+
+/** The success paths really ran: every fact holds, a third are VERIFIED. */
+function verifyOutcome(result) {
+  const by = {};
+  for (const item of result.items) by[item.badge] = (by[item.badge] ?? 0) + 1;
+  if (result.items.length !== blockCount) return `expected ${blockCount} items, got ${result.items.length}`;
+  if ((by.VERIFIED ?? 0) < 3000 || (by.ASSERTED ?? 0) < 6000) return `unexpected badges ${JSON.stringify(by)}`;
+  return null;
+}
+
+function digestOutcome(result) {
+  if (result.counts.supported < blockCount - 1) return `only ${result.counts.supported} supported facts`;
+  if (result.listedFacts < 10) return `only ${result.listedFacts} facts listed`;
+  return null;
+}
+
+function answerOutcome(result) {
+  if (!result.ok || result.citations !== 100) return `answer not accepted: ${JSON.stringify(result.problems.slice(0, 3))}`;
+  return null;
+}
+
 const root = mkdtempSync(join(tmpdir(), 'facts-budgets-'));
 try {
-  // 10,000-block fixture plus a real repository for its repo name, so git really runs.
+  // 10,000 blocks whose evidence resolves in a real repository, so the success paths run:
+  // blob reads, VERIFIED predicates, ASSERTED facts and a full digest (review finding 4).
   const work = join(root, 'work');
   mkdirSync(work);
-  generateFixture(work);
-  const logPath = join(work, 'ledger.jsonl');
+  const { logPath, repoDir } = buildRealisticFixture(root, work);
   const indexPath = join(work, 'ledger.index.sqlite');
-  const repoDir = join(root, 'repo');
-  mkdirSync(repoDir);
-  const g = spawnSync('git', ['init', '--quiet', '--template='], { cwd: repoDir, windowsHide: true });
-  if (g.status !== 0) throw new Error('git init failed');
   const reposPath = join(root, 'repos.json');
   writeFileSync(reposPath, JSON.stringify({ [project]: repoDir }));
 
@@ -127,17 +202,20 @@ try {
   }
   const store = ['--log', logPath, '--index', indexPath];
   const answerPath = join(root, 'answer.txt');
-  // 100 distinct citations: the cost of check-answer must not grow with one index open per citation.
-  const cited = Array.from({ length: 100 }, (_, i) => `[asserted:${(i * 97 + 1).toString(16).padStart(12, '0')}.0]`);
+  // 100 distinct citations of facts that hold: 50 asserted (cited asserted:), 50 checked (cited fact:).
+  const cited = [];
+  for (let i = 0; i < 50; i++) {
+    cited.push(`[asserted:${blockId(3 * i * 61 + 1)}.0]`);
+    cited.push(`[fact:${blockId(3 * (i * 61 + 1))}.0]`);
+  }
   writeFileSync(answerPath, `Probe statement. ${cited.join(' ')}\nABSTAIN: nothing else.\n`);
-  const firstId = '000000000001';
 
   const steps = [
     { name: 'rebuild', args: ['rebuild', ...store] },
     { name: 'query (warm)', args: ['query', 'calibration sample', ...store, '--json'], maxMs: WARM_QUERY_MS },
-    { name: 'verify --all', args: ['verify', '--all', ...store, '--json'] },
-    { name: 'digest', args: ['digest', '--project', project, ...store] },
-    { name: 'check-answer', args: ['check-answer', answerPath, ...store], codes: [0, 1] },
+    { name: 'verify --all', args: ['verify', '--all', ...store, '--json'], outcome: verifyOutcome },
+    { name: 'digest', args: ['digest', '--project', project, ...store, '--json'], outcome: digestOutcome },
+    { name: 'check-answer', args: ['check-answer', answerPath, ...store, '--json'], outcome: answerOutcome },
     {
       name: 'add --from-agent',
       args: [
@@ -170,6 +248,10 @@ try {
       check(r.innerKiB + gitKiB <= TREE_KIB, `${step.name}: process tree ${r.innerKiB + gitKiB} KiB > 192 MiB`);
     }
     rows.push(row);
+    if (step.outcome && r.code === 0) {
+      const problem = step.outcome(JSON.parse(r.stdout));
+      if (problem) failures.push(`${step.name}: ${problem}`);
+    }
     if (step.name === 'add --from-agent' && r.code === 0) {
       const block = JSON.parse(r.stdout.trim().split('\n')[0]);
       check(block.token_usage?.model === 'probe-model' && block.token_usage?.input === 10, 'add --from-agent: block lacks token_usage');
@@ -198,7 +280,6 @@ try {
   check(refused.status === 1 && /--from-agent requires token usage/.test(refused.stderr), `add --from-agent without tokens: exit ${refused.status} ${refused.stderr}`);
   check(readFileSync(logPath).length === before, 'add --from-agent without tokens appended a block');
   check(blockCount === 10_000, 'fixture is not 10,000 blocks');
-  void firstId;
 } finally {
   rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 }
