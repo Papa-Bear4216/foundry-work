@@ -10,6 +10,7 @@ declare const process: {
   readonly argv: string[];
   readonly pid: number;
   readonly platform: string;
+  readonly execPath: string;
   readonly env: Record<string, string | undefined>;
   exitCode: number | undefined;
   kill(pid: number, signal?: string | number): boolean;
@@ -101,6 +102,29 @@ declare module 'node:child_process' {
     callback: (error: Error | null, stdout: string, stderr: string) => void,
   ): void;
 
+  export interface SpawnSyncResult {
+    readonly status: number | null;
+    readonly signal: string | null;
+    readonly error?: Error;
+    readonly stdout: Uint8Array;
+    readonly stderr: Uint8Array;
+  }
+
+  export function spawnSync(
+    file: string,
+    args: readonly string[],
+    options: {
+      cwd?: string;
+      env?: Record<string, string>;
+      input?: string | Uint8Array;
+      timeout?: number;
+      maxBuffer?: number;
+      windowsHide?: boolean;
+      shell?: false;
+      killSignal?: string;
+    },
+  ): SpawnSyncResult;
+
   export function spawn(
     file: string,
     args: readonly string[],
@@ -149,9 +173,19 @@ declare module 'node:fs' {
   export function renameSync(oldPath: string, newPath: string): void;
   export function unlinkSync(path: string): void;
   export function existsSync(path: string): boolean;
+  export function readFileSync(path: string): Uint8Array;
+  export function readFileSync(path: string, encoding: 'utf8'): string;
+}
+
+declare module 'node:os' {
+  export function homedir(): string;
 }
 
 declare module 'node:path' {
+  export const delimiter: string;
+  export const sep: string;
+  export function isAbsolute(path: string): boolean;
+  export function relative(from: string, to: string): string;
   export function dirname(path: string): string;
   export function join(...paths: string[]): string;
   export function resolve(...paths: string[]): string;

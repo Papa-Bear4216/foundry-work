@@ -351,15 +351,21 @@ export function appendBlock(logPath: string, input: BlockInput): Block {
         }
       }
 
+      const id = shortId();
+      // A fact written with an empty `fact_id` gets `<block id>.<position>` (Step Zero 3.2).
+      const facts = input.facts?.map((fact, position) =>
+        fact.fact_id === '' ? { ...fact, fact_id: `${id}.${position}` } : fact,
+      );
       const block: Block = {
         ...input,
+        ...(facts ? { facts } : {}),
         actions: input.actions ?? [],
         verification: input.verification ?? null,
         touches: input.touches ?? [],
         supersedes,
         status: input.status ?? 'proposed',
         trace_id: input.trace_id ?? target?.trace_id ?? shortId(),
-        id: shortId(),
+        id,
         ts: new Date().toISOString().replace(/\.\d{3}Z$/, '+00:00'),
         parent,
       };

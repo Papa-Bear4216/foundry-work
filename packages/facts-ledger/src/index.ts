@@ -70,3 +70,10 @@ export {
   queryFacts,
   sanitizeInlineText,
 } from './query.js';
+
+export { addFact, buildFact, assertValidClaim, MAX_CLAIM_BYTES, MAX_QUOTE_BYTES, type AddFactOptions } from './add.js';
+export { FreshnessChecker, createRepoFreshnessResolver, pinnedCommitOf, type FreshnessCheckerOptions } from './freshness.js';
+export { RepoUnavailableError, resolveGitExecutable, runTemplate, templateNames, validateTemplateCall, type TemplateRun } from './git.js';
+export { assertRelativePath, assertRepoName, defaultRepoMapPath, loadRepoMap, type RepoMap } from './repos.js';
+export { assertNoSecrets, findSecret } from './secrets.js';
+export { formatVerifyText, verifyFacts, type VerifyItem, type VerifyOptions, type VerifyResult } from './verify.js';

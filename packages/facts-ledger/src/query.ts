@@ -78,7 +78,8 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-function isValidEvidenceEntry(ev: FactEvidence): boolean {
+/** Structural check of one evidence entry; malformed entries are never supported. */
+export function isValidEvidenceEntry(ev: FactEvidence): boolean {
   const rec = ev as unknown as Record<string, unknown>;
   if (ev.type === 'file') {
     return (
@@ -157,7 +158,41 @@ export function defaultFreshnessResolver(
   return { status: worstStatus };
 }
 
-function classifyPresentation(
+/** One page of facts for `facts verify` from an open index, bytewise by id. */
+export function listFactsPage(
+  db: DatabaseSync,
+  selector: { readonly id?: string; readonly tag?: string },
+  page: { readonly afterId?: string; readonly limit?: number } = {},
+): IndexedFact[] {
+  {
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    if (page.afterId !== undefined) {
+      clauses.push('f.fact_id > ? COLLATE BINARY');
+      params.push(page.afterId);
+    }
+    if (selector.id) {
+      clauses.push('f.fact_id = ?');
+      params.push(selector.id);
+    }
+    if (selector.tag) {
+      clauses.push('EXISTS (SELECT 1 FROM fact_tags t WHERE t.fact_id = f.fact_id AND t.tag = ?)');
+      params.push(selector.tag);
+    }
+    const rows = db
+      .prepare(
+        `SELECT f.fact_id, f.block_id, f.project, f.tier, f.scope, f.check_json, f.claim, f.note, f.sensitivity, f.verified_at, f.supersedes
+         FROM facts f
+         ${clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : ''}
+         ORDER BY f.fact_id COLLATE BINARY ASC
+         ${page.limit !== undefined ? 'LIMIT ?' : ''}`,
+      )
+      .all(...params, ...(page.limit !== undefined ? [page.limit] : []));
+    return hydrateFacts(db, rows);
+  }
+}
+
+export function classifyPresentation(
   label: QueryLabel,
   fact: IndexedFact,
   assessment: FreshnessAssessment,
