@@ -157,7 +157,39 @@ export function defaultFreshnessResolver(
   return { status: worstStatus };
 }
 
-function classifyPresentation(
+/** Facts for `facts verify`: current (not superseded, not retracted), bytewise by id. */
+export function listCurrentFacts(
+  logPath: string,
+  indexPath: string,
+  selector: { readonly id?: string; readonly tag?: string },
+): IndexedFact[] {
+  const { db } = openSyncedIndexForQuery(logPath, indexPath, false);
+  try {
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    if (selector.id) {
+      clauses.push('f.fact_id = ?');
+      params.push(selector.id);
+    }
+    if (selector.tag) {
+      clauses.push('EXISTS (SELECT 1 FROM fact_tags t WHERE t.fact_id = f.fact_id AND t.tag = ?)');
+      params.push(selector.tag);
+    }
+    const rows = db
+      .prepare(
+        `SELECT f.fact_id, f.block_id, f.project, f.tier, f.scope, f.check_json, f.claim, f.note, f.sensitivity, f.verified_at, f.supersedes
+         FROM facts f
+         ${clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : ''}
+         ORDER BY f.fact_id COLLATE BINARY ASC`,
+      )
+      .all(...params);
+    return hydrateFacts(db, rows).filter((fact) => !fact.superseded && !fact.retracted);
+  } finally {
+    db.close();
+  }
+}
+
+export function classifyPresentation(
   label: QueryLabel,
   fact: IndexedFact,
   assessment: FreshnessAssessment,

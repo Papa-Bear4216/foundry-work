@@ -1,5 +1,10 @@
 #!/usr/bin/env node
+import { addFact } from './add.js';
+import { FreshnessChecker } from './freshness.js';
+import { templateNames } from './git.js';
 import { defaultIndexPath, rebuildIndex } from './index-db.js';
+import { loadRepoMap } from './repos.js';
+import { formatVerifyText, verifyFacts } from './verify.js';
 import {
   createCommandEmbedder,
   createHttpEmbedder,
@@ -7,7 +12,7 @@ import {
   queryFacts,
   sanitizeInlineText,
 } from './query.js';
-import { type Embedder, type Sensitivity } from './types.js';
+import { type CheckedPredicate, type Embedder, type FactScope, type Sensitivity } from './types.js';
 
 interface ParsedArgs {
   readonly command: string | undefined;
@@ -29,6 +34,14 @@ interface ParsedArgs {
   readonly json: boolean;
   readonly stats: boolean;
   readonly positionals: readonly string[];
+  readonly tags: readonly string[];
+  readonly add: Record<string, string>;
+  readonly evidenceFiles: readonly string[];
+  readonly evidenceArgs: readonly string[];
+  readonly fact: string | undefined;
+  readonly all: boolean;
+  readonly rerun: boolean;
+  readonly write: boolean;
 }
 
 const VALID_MAX_SENSITIVITY = new Set(['public', 'personal', 'private', 'clinical', 'child']);
@@ -81,6 +94,14 @@ function parseCliArgs(argv: readonly string[]): ParsedArgs {
   let json = false;
   let stats = false;
   const positionals: string[] = [];
+  const tags: string[] = [];
+  const add: Record<string, string> = {};
+  const evidenceFiles: string[] = [];
+  const evidenceArgs: string[] = [];
+  let fact: string | undefined;
+  let all = false;
+  let rerun = false;
+  let write = false;
 
   for (let i = 1; i < argv.length; i++) {
     const arg = argv[i];
@@ -102,6 +123,40 @@ function parseCliArgs(argv: readonly string[]): ParsedArgs {
         break;
       case '--tag':
         tag = next();
+        tags.push(tag);
+        break;
+      case '--check':
+      case '--claim':
+      case '--note':
+      case '--sensitivity':
+      case '--scope':
+      case '--manual':
+      case '--supersedes-fact':
+      case '--agent':
+      case '--project':
+      case '--intent':
+      case '--reasoning':
+      case '--trace-id':
+      case '--evidence-cmd':
+        add[arg.slice(2)] = next();
+        break;
+      case '--evidence-file':
+        evidenceFiles.push(next());
+        break;
+      case '--evidence-arg':
+        evidenceArgs.push(next());
+        break;
+      case '--fact':
+        fact = next();
+        break;
+      case '--all':
+        all = true;
+        break;
+      case '--rerun':
+        rerun = true;
+        break;
+      case '--write':
+        write = true;
         break;
       case '--path':
         path = next();
@@ -218,6 +273,14 @@ function parseCliArgs(argv: readonly string[]): ParsedArgs {
     json,
     stats,
     positionals,
+    tags,
+    add,
+    evidenceFiles,
+    evidenceArgs,
+    fact,
+    all,
+    rerun,
+    write,
   };
 }
 
@@ -236,9 +299,45 @@ function usageText(): string {
     'Usage:',
     '  facts rebuild [--log <file>] [--index <file>] [--json] [--stats]',
     '  facts query [text] [--id <id>] [--tag <tag>] [--path <path>] [--commit <sha>] [--repo <name>] [--history] [--limit <n>] [--max-sensitivity <tier>] [--embed-url <url> | --embed-cmd <exe> [--embed-arg <arg>]] [--embed-model <name>] [--min-semantic-score <float>] [--log <file>] [--index <file>] [--json] [--stats]',
+    '  facts add --project <p> --intent <text> --reasoning <text> [--agent <name>]',
+    '            (--check <predicate json> | --claim <sentence>) [--repo <name>] [--evidence-file <path>[:N[-M]]]...',
+    '            [--evidence-cmd <template> [--evidence-arg <arg>]...] [--manual <description>]',
+    '            [--note <text>] [--tag <tag>]... [--sensitivity <tier>] [--scope current|at-commit] [--supersedes-fact <id>]',
+    '  facts verify (--fact <id> | --tag <tag> | --all) [--rerun] [--write [--agent <name>]] [--json]',
+    '',
+    `Command templates: ${templateNames().join(', ')}. Git templates take the repo name first.`,
+    'Repo names map to local checkouts in a per-machine file outside any repository (FACTS_LEDGER_REPOS).',
+    '',
+    'Known limits: an asserted claim can become false while its quote stays intact; a claim about absence',
+    'across a whole repository cannot be pinned to one file and should use command evidence; a renamed file',
+    'reads as stale until re-verified; uncommitted changes are not seen (facts are checked against HEAD);',
+    'submodules are separate repositories.',
     '',
     'Note: Ledger files are append-only; run `facts rebuild` after any manual edit or repair of historical lines.',
   ].join('\n');
+}
+
+function parseEvidenceFile(raw: string, repo: string | undefined): { repo: string; path: string; lines?: string } {
+  if (!repo) throw new Error('--evidence-file needs --repo <name>');
+  const m = /^(.*):(\d+(?:-\d+)?)$/.exec(raw);
+  return m ? { repo, path: m[1] as string, lines: m[2] as string } : { repo, path: raw };
+}
+
+function parseCheck(raw: string): CheckedPredicate {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('--check must be a JSON predicate object');
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('--check must be a JSON predicate object');
+  }
+  return parsed as CheckedPredicate;
+}
+
+function agentName(args: ParsedArgs): string {
+  return args.add['agent'] || process.env['FACTS_LEDGER_AGENT'] || 'facts-cli';
 }
 
 async function run(): Promise<void> {
@@ -291,11 +390,62 @@ async function run(): Promise<void> {
         maxSensitivity: args.maxSensitivity,
         embedder,
         minSemanticScore: args.minSemanticScore,
+        freshnessResolver: new FreshnessChecker({ repos: loadRepoMap() }).resolver(),
       });
       if (args.json) {
         process.stdout.write(`${JSON.stringify(result)}\n`);
       } else {
         process.stdout.write(`${formatQueryText(result)}\n`);
+      }
+    } else if (args.command === 'add') {
+      const repos = loadRepoMap();
+      const a = args.add;
+      const sensitivity = a['sensitivity'] as Sensitivity | undefined;
+      const scope = a['scope'] as FactScope | undefined;
+      if (scope !== undefined && scope !== 'current' && scope !== 'at-commit') {
+        throw new Error('--scope must be current or at-commit');
+      }
+      if (args.evidenceArgs.length > 0 && !a['evidence-cmd']) throw new Error('--evidence-arg requires --evidence-cmd');
+      const block = addFact({
+        logPath: args.logPath,
+        repos,
+        agent: agentName(args),
+        project: a['project'] || process.env['FACTS_LEDGER_PROJECT'] || '',
+        intent: a['intent'] ?? '',
+        reasoning: a['reasoning'] ?? '',
+        ...(a['trace-id'] ? { traceId: a['trace-id'] } : {}),
+        ...(a['check'] !== undefined ? { check: parseCheck(a['check']) } : {}),
+        ...(a['claim'] !== undefined ? { claim: a['claim'] } : {}),
+        ...(a['note'] !== undefined ? { note: a['note'] } : {}),
+        tags: args.tags,
+        ...(sensitivity ? { sensitivity } : {}),
+        ...(scope ? { scope } : {}),
+        ...(a['supersedes-fact'] ? { supersedesFact: a['supersedes-fact'] } : {}),
+        evidenceFiles: args.evidenceFiles.map((raw) => parseEvidenceFile(raw, args.repo)),
+        evidenceCommands: a['evidence-cmd'] ? [{ template: a['evidence-cmd'], args: args.evidenceArgs }] : [],
+        ...(a['manual'] !== undefined ? { manual: { description: a['manual'] } } : {}),
+      });
+      const fact = block.facts?.[0];
+      if (args.json) {
+        process.stdout.write(`${JSON.stringify(block)}\n`);
+      } else {
+        process.stdout.write(`Appended block ${block.id}: fact ${fact?.fact_id ?? '?'} (${fact?.tier ?? '?'})\n`);
+      }
+    } else if (args.command === 'verify') {
+      const result = verifyFacts({
+        logPath: args.logPath,
+        indexPath,
+        repos: loadRepoMap(),
+        ...(args.fact ? { id: args.fact } : {}),
+        ...(args.tag ? { tag: args.tag } : {}),
+        all: args.all,
+        rerun: args.rerun,
+        ...(args.write ? { writeAs: agentName(args) } : {}),
+      });
+      if (args.json) {
+        process.stdout.write(`${JSON.stringify(result)}\n`);
+      } else {
+        process.stdout.write(`${formatVerifyText(result)}\n`);
       }
     } else {
       process.stderr.write(`Unknown command: ${args.command}\n${usageText()}\n`);
