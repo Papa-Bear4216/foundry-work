@@ -324,7 +324,7 @@ test('lookup stages, bytewise ordering, sensitivity/history filters, freshness b
     req.on('end', () => {
       const { input } = JSON.parse(body);
       const embeddings = input.map((text) =>
-        text.includes('kdf') || text.includes('scrypt') ? [1, 0] : [0, 1],
+        text.includes('passphrase') || text.includes('scrypt') ? [1, 0] : [0, 1],
       );
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ embeddings }));
@@ -336,7 +336,7 @@ test('lookup stages, bytewise ordering, sensitivity/history filters, freshness b
   try {
     const semanticRes = await queryFacts({
       logPath,
-      text: 'kdf tuning',
+      text: 'passphrase workfactor',
       embedder: createHttpEmbedder(embedUrl),
       nowMs,
     });
