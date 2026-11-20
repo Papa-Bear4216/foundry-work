@@ -90,6 +90,8 @@ export function verifyFacts(options: VerifyOptions): VerifyResult {
     });
     if (page.length === 0) break;
     afterId = page[page.length - 1]?.fact_id;
+    checker.releaseContents();
+    checker.prefetch(page.filter((fact) => !fact.superseded && !fact.retracted));
     for (const fact of page) {
     if (fact.superseded || fact.retracted) continue;
     const assessed = checker.assess(fact, nowMs);

@@ -159,6 +159,21 @@ test('verify reports supported, moved, stale, unverifiable and expired', (t) => 
   assert.equal(s[quoted.fact_id], 'stale');
 });
 
+test('checked facts re-run expired command evidence; asserted ones need --rerun (A-27)', (t) => {
+  const f = fixture(t);
+  const checked = addFact({ ...base(f), check: { predicate: 'file_absent', repo: 'demo', path: 'gone.ts' } }).facts[0];
+  const asserted = addFact({ ...base(f), claim: 'Schema file is tracked.', evidenceCommands: [{ template: 'git-ls-files', args: ['demo', 'src/schema.ts'] }] }).facts[0];
+  const later = Date.now() + 8 * DAY;
+  const items = Object.fromEntries(verifyFacts({ logPath: f.logPath, repos: f.repos, all: true, nowMs: later }).items.map((i) => [i.fact_id, i]));
+  assert.equal(items[checked.fact_id].status, 'supported');
+  assert.equal(items[checked.fact_id].badge, 'VERIFIED');
+  assert.equal(items[asserted.fact_id].status, 'expired');
+  commitFile(f.repo, 'gone.ts', 'now present\n');
+  const after = verifyFacts({ logPath: f.logPath, repos: f.repos, fact: undefined, id: checked.fact_id, nowMs: later }).items[0];
+  assert.equal(after.status, 'stale');
+  assert.notEqual(after.badge, 'VERIFIED');
+});
+
 test('verify --write retracts stale facts and re-verifies holding ones; nothing is edited in place', (t) => {
   const f = fixture(t);
   const keep = addFact({ ...base(f), claim: 'Schema line exists.', evidenceFiles: [{ repo: 'demo', path: 'src/schema.ts', lines: '1' }] }).facts[0];

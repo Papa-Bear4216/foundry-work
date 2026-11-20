@@ -84,6 +84,7 @@ const GIT_READ_ONLY_PREFIX: readonly string[] = [
   '-c', 'core.pager=cat',
   '-c', 'diff.external=',
   '-c', 'core.untrackedCache=false',
+  '-c', 'log.showSignature=false',
 ];
 
 /** Run git read-only in `repoDir`: argument vector only, never a shell; capped and timed. */
@@ -126,18 +127,32 @@ export function commitExists(repoDir: string, commit: string): boolean {
   return r.exitCode === 0;
 }
 
+/**
+ * Resolve many object specs (`<rev>:<path>`, `<sha>^{commit}`) in ONE
+ * `git cat-file --batch-check` process. Each result is `{ id, type }` or null if missing.
+ */
+export function batchCheck(repoDir: string, specs: readonly string[]): ({ id: string; type: string } | null)[] {
+  if (specs.length === 0) return [];
+  for (const spec of specs) {
+    if (/[\r\n\u0000]/.test(spec)) throw new Error('Invalid object spec');
+  }
+  const r = runGit(repoDir, ['cat-file', '--batch-check=%(objectname) %(objecttype)'], specs.map((s) => `${s}\n`).join(''));
+  if (r.exitCode !== 0) throw new Error('git cat-file --batch-check failed');
+  const lines = decodeUtf8(r.output).split('\n');
+  return specs.map((_, i) => {
+    const [id, type] = (lines[i] ?? '').split(' ');
+    return /^[0-9a-f]{40,64}$/.test(id ?? '') && type ? { id: id as string, type } : null;
+  });
+}
+
 /** Blob ids for `rev:path` in one `git cat-file --batch-check` process; null when absent. */
 export function blobIds(repoDir: string, rev: string, paths: readonly string[]): Map<string, string | null> {
   const out = new Map<string, string | null>();
-  if (paths.length === 0) return out;
   for (const p of paths) assertRelativePath(p);
-  const input = paths.map((p) => `${rev}:${p}\n`).join('');
-  const r = runGit(repoDir, ['cat-file', '--batch-check=%(objectname) %(objecttype)'], input);
-  if (r.exitCode !== 0) throw new Error('git cat-file --batch-check failed');
-  const lines = decodeUtf8(r.output).split('\n');
+  const results = batchCheck(repoDir, paths.map((p) => `${rev}:${p}`));
   paths.forEach((p, i) => {
-    const [id, type] = (lines[i] ?? '').split(' ');
-    out.set(p, type === 'blob' && /^[0-9a-f]{40,64}$/.test(id ?? '') ? (id as string) : null);
+    const hit = results[i];
+    out.set(p, hit && hit.type === 'blob' ? hit.id : null);
   });
   return out;
 }

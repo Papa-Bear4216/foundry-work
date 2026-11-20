@@ -1,4 +1,6 @@
+import { assertRelativePath } from './repos.js';
 import {
+  batchCheck,
   blobIds,
   commitExists,
   decodeUtf8,
@@ -125,7 +127,7 @@ export class FreshnessChecker {
     return this.head(dir);
   }
 
-  checkEvidence(ev: FactEvidence, scope: string, nowMs: number): EvidenceCheck {
+  checkEvidence(ev: FactEvidence, scope: string, nowMs: number, forceRerun = false): EvidenceCheck {
     const rec = ev as unknown as Record<string, unknown>;
     switch (ev.type) {
       case 'file': {
@@ -152,7 +154,7 @@ export class FreshnessChecker {
         const ttl = Number(rec['ttl_s']);
         if (!Number.isFinite(ranMs) || !Number.isFinite(ttl)) return { status: 'unverifiable' };
         if (ranMs + ttl * 1000 > nowMs) return { status: 'supported' };
-        if (!this.rerun) return { status: 'expired' };
+        if (!this.rerun && !forceRerun) return { status: 'expired' };
         const run = this.runCached(String(rec['template']), Array.isArray(rec['args']) ? rec['args'] : []);
         if (!run) return { status: 'unverifiable' };
         const same = run.outputSha256 === rec['output_sha256'] && run.exitCode === rec['exit_code'];
@@ -212,8 +214,82 @@ export class FreshnessChecker {
     }
   }
 
+  /**
+   * Resolve every commit and blob lookup a page of facts needs with one
+   * `git cat-file --batch-check` process per repository per kind, filling the caches.
+   */
+  prefetch(facts: readonly IndexedFact[]): void {
+    const wanted = (fact: IndexedFact): { dir: string; path: unknown; commit: unknown }[] => {
+      const out: { dir: string; path: unknown; commit: unknown }[] = [];
+      for (const ev of fact.evidence) {
+        if (ev.type !== 'file') continue;
+        const rec = ev as unknown as Record<string, unknown>;
+        const dir = this.dir(rec['repo']);
+        if (dir) out.push({ dir, path: rec['path'], commit: rec['commit'] });
+      }
+      if (fact.tier === 'checked' && fact.check && isValidCheckedPredicate(fact.check)) {
+        const c = fact.check as Record<string, unknown>;
+        const dir = this.dir(c['repo']);
+        if (dir && typeof c['path'] === 'string') out.push({ dir, path: c['path'], commit: pinnedCommitOf(fact) });
+      }
+      return out;
+    };
+    const run = (groups: Map<string, Map<string, string>>, store: (dir: string, key: string, hit: { id: string; type: string } | null) => void): void => {
+      for (const [dir, specs] of groups) {
+        const keys = [...specs.keys()];
+        try {
+          const results = batchCheck(dir, keys.map((k) => specs.get(k) as string));
+          keys.forEach((k, i) => store(dir, k, results[i] ?? null));
+        } catch {
+          // Leave uncached; the per-item path reports `unverifiable` on failure.
+        }
+      }
+    };
+
+    const commitGroups = new Map<string, Map<string, string>>();
+    for (const fact of facts) {
+      if (fact.scope !== 'at-commit') continue;
+      for (const w of wanted(fact)) {
+        if (typeof w.commit !== 'string' || !/^[0-9a-f]{40,64}$/.test(w.commit)) continue;
+        if (this.commits.has(`${w.dir}\u0000${w.commit}`)) continue;
+        const g = commitGroups.get(w.dir) ?? new Map<string, string>();
+        g.set(w.commit, `${w.commit}^{commit}`);
+        commitGroups.set(w.dir, g);
+      }
+    }
+    run(commitGroups, (dir, commit, hit) => this.commits.set(`${dir}\u0000${commit}`, hit?.type === 'commit'));
+
+    const blobGroups = new Map<string, Map<string, string>>();
+    for (const fact of facts) {
+      for (const w of wanted(fact)) {
+        if (typeof w.path !== 'string') continue;
+        try {
+          assertRelativePath(w.path);
+        } catch {
+          continue;
+        }
+        const rev = this.revisionFor(w.dir, fact.scope, w.commit);
+        if (!rev) continue;
+        const key = `${rev}\u0000${w.path}`;
+        if (this.blobs.has(`${w.dir}\u0000${key}`)) continue;
+        const g = blobGroups.get(w.dir) ?? new Map<string, string>();
+        g.set(key, `${rev}:${w.path}`);
+        blobGroups.set(w.dir, g);
+      }
+    }
+    run(blobGroups, (dir, key, hit) => this.blobs.set(`${dir}\u0000${key}`, hit && hit.type === 'blob' ? hit.id : null));
+  }
+
+  /** Drop cached file contents (bounded memory between pages). */
+  releaseContents(): void {
+    this.contents.clear();
+  }
+
   assess(fact: IndexedFact, nowMs: number): FreshnessAssessment & { readonly evidence: readonly EvidenceCheck[] } {
-    const checks = fact.evidence.map((ev) => this.checkEvidence(ev, fact.scope, nowMs));
+    // A checked fact is VERIFIED only after its predicate is re-run (section 6), so its
+    // expired command evidence (fixed read-only templates) is always re-run too (A-27).
+    const forceRerun = fact.tier === 'checked';
+    const checks = fact.evidence.map((ev) => this.checkEvidence(ev, fact.scope, nowMs, forceRerun));
     let status: FreshnessStatus = checks.length === 0 ? 'unverifiable' : 'supported';
     for (const ch of checks) status = worseOf(status, ch.status);
     if (fact.tier !== 'checked' || !fact.check) return { status, evidence: checks };
