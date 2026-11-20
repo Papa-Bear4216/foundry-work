@@ -14,6 +14,7 @@ import {
   createCommandEmbedder,
   createHttpEmbedder,
   defaultIndexPath,
+  formatCheckedPredicateClaim,
   formatQueryText,
   openSyncedIndexForQuery,
   queryFacts,
@@ -46,7 +47,7 @@ function dumpAllTables(indexPath) {
       fact_supersessions: db.prepare('SELECT * FROM fact_supersessions ORDER BY superseded_fact_id COLLATE BINARY ASC').all(),
       fts_updated: db.prepare("SELECT f.rowid, f.fact_id, bm25(facts_fts) AS rank FROM facts_fts JOIN facts f ON f.rowid = facts_fts.rowid WHERE facts_fts MATCH 'Updated' ORDER BY f.fact_id COLLATE BINARY ASC").all(),
       fts_schema: db.prepare("SELECT f.rowid, f.fact_id, bm25(facts_fts) AS rank FROM facts_fts JOIN facts f ON f.rowid = facts_fts.rowid WHERE facts_fts MATCH 'schema' ORDER BY f.fact_id COLLATE BINARY ASC").all(),
-      state: db.prepare('SELECT schema_version, log_bytes, head_sha256, tail_sha256, log_mtime_ns, log_ctime_ns, log_ino, indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete, blocks_count, facts_count, fact_tags_count, fact_evidence_count, fact_retractions_count, fact_supersessions_count, visibility_sha256 FROM state').all(),
+      state: db.prepare('SELECT schema_version, log_bytes, head_sha256, tail_sha256, log_mtime_ns, log_ctime_ns, log_ino, indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete, blocks_count, facts_count, fact_tags_count, fact_evidence_count, fact_retractions_count, fact_supersessions_count, content_sha256 FROM state').all(),
     };
   } finally {
     db.close();
@@ -118,8 +119,8 @@ test('incremental update equals full rebuild across >4KiB head boundary, bad lin
         tier: 'checked',
         scope: 'current',
         check: { predicate: 'file_contains', repo: 'foundry', path: 'packages/index/file-0.ts', text: 'SCHEMA' },
-        claim: 'Updated schema version constant.',
-        note: 'Incremental checked fact.',
+        claim: formatCheckedPredicateClaim({ predicate: 'file_contains', repo: 'foundry', path: 'packages/index/file-0.ts', text: 'SCHEMA' }),
+        note: 'Updated incremental checked fact.',
         tags: ['schema', 'seed'],
         sensitivity: 'public',
         supersedes: 'seed-00.0',
@@ -186,7 +187,12 @@ test('lookup stages, bytewise ordering, sensitivity/history filters, freshness b
           args: [],
           output_sha256: 'c'.repeat(64),
         },
-        claim: 'Z-item checks vault framing header magic bytes.',
+        claim: formatCheckedPredicateClaim({
+          predicate: 'command_output_is',
+          template: 'runtime-version',
+          args: [],
+          output_sha256: 'c'.repeat(64),
+        }),
         note: 'framing note',
         tags: ['vault', 'Z-tag'],
         sensitivity: 'public',
@@ -1001,8 +1007,8 @@ test('moved evidence with proven checked predicate yields VERIFIED, and control/
         tier: 'checked',
         scope: 'current',
         check: { predicate: 'file_exists', repo: 'foundry', path: 'src/ok.ts' },
-        claim: 'Claim \u001b[31mred\u009b2J\u202eoverride\u2066 stay literal',
-        note: 'Note \u0085ctrl \u200fmark',
+        claim: formatCheckedPredicateClaim({ predicate: 'file_exists', repo: 'foundry', path: 'src/ok.ts' }),
+        note: 'Note \u001b[31mred\u0085ctrl \u200fmark',
         tags: ['ctrl\u009b', 'bidi\u2066'],
         sensitivity: 'public',
         evidence: [{ type: 'file', repo: 'foundry', path: 'src/ok.ts', commit: 'a'.repeat(40), blob: 'b'.repeat(40), quote: 'ok' }],
@@ -1127,7 +1133,7 @@ test('historical superseded/retracted checked and asserted facts are non-citable
         tier: 'checked',
         scope: 'current',
         check: { predicate: 'file_exists', repo: 'foundry', path: 'src/a.ts' },
-        claim: 'Historical checked claim before replacement',
+        claim: formatCheckedPredicateClaim({ predicate: 'file_exists', repo: 'foundry', path: 'src/a.ts' }),
         tags: ['hist'],
         sensitivity: 'public',
         evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
@@ -1137,7 +1143,7 @@ test('historical superseded/retracted checked and asserted facts are non-citable
         tier: 'checked',
         scope: 'current',
         check: { predicate: 'file_exists', repo: 'foundry', path: 'src/b.ts' },
-        claim: 'Current checked claim replacing historical one',
+        claim: formatCheckedPredicateClaim({ predicate: 'file_exists', repo: 'foundry', path: 'src/b.ts' }),
         tags: ['hist'],
         sensitivity: 'public',
         supersedes: 'hist-chk-old',
@@ -1148,7 +1154,7 @@ test('historical superseded/retracted checked and asserted facts are non-citable
         tier: 'checked',
         scope: 'current',
         check: { predicate: 'file_exists', repo: 'foundry', path: 'src/c.ts' },
-        claim: 'Historical checked claim later retracted',
+        claim: formatCheckedPredicateClaim({ predicate: 'file_exists', repo: 'foundry', path: 'src/c.ts' }),
         tags: ['hist'],
         sensitivity: 'public',
         evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
@@ -1680,4 +1686,323 @@ test('warm concurrent reads, generation-pinned snapshot, FTS display parity, and
     /deadline/,
   );
   assert.equal(embedCalls < 4, true, `Expected query deadline abort before all batches ran (calls=${embedCalls})`);
+});
+
+test('checked claims must match canonical predicate format and keep degraded freshness consistent', async (t) => {
+  const dir = makeTempDir(t);
+  const logPath = join(dir, 'ledger.jsonl');
+  const nowMs = Date.UTC(2026, 10, 20, 0, 1, 0);
+  const freshAt = new Date(nowMs - 10_000).toISOString();
+
+  const predicates = [
+    { predicate: 'file_exists', repo: 'foundry', path: 'src/a.ts' },
+    { predicate: 'file_absent', repo: 'foundry', path: 'src/b.ts' },
+    { predicate: 'file_blob_is', repo: 'foundry', path: 'src/c.ts', blob: 'd'.repeat(40) },
+    { predicate: 'file_contains', repo: 'foundry', path: 'src/d.ts', text: 'SCHEMA' },
+    { predicate: 'file_lacks', repo: 'foundry', path: 'src/e.ts', text: 'TODO' },
+    { predicate: 'command_output_is', template: 'runtime-version', args: [], output_sha256: VALID_SHA256 },
+  ];
+
+  appendBlock(logPath, {
+    agent: 'z3-test',
+    project: 'foundry',
+    intent: 'Canonical checked claim binding',
+    reasoning: 'Reject forged checked claims even when predicate resolver returns true.',
+    facts: [
+      {
+        fact_id: 'chk-forged',
+        tier: 'checked',
+        scope: 'current',
+        check: { predicate: 'file_exists', repo: 'foundry', path: 'src/ok.ts' },
+        claim: 'Totally forged claim unrelated to predicate',
+        tags: ['predbind'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
+      },
+      ...predicates.map((check, i) => ({
+        fact_id: `chk-canon-${i}`,
+        tier: 'checked',
+        scope: 'current',
+        check,
+        claim: formatCheckedPredicateClaim(check),
+        tags: ['predbind'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
+      })),
+    ],
+  });
+
+  const res = await queryFacts({
+    logPath,
+    tag: 'predbind',
+    nowMs,
+    freshnessResolver: () => ({ status: 'supported', predicateHolds: true }),
+  });
+  const forged = res.results.find((r) => r.fact.fact_id === 'chk-forged');
+  assert.equal(forged?.badge, 'UNVERIFIABLE');
+  assert.equal(forged?.freshness, 'unverifiable');
+  assert.equal(forged?.predicateHolds, null);
+  assert.equal(forged?.citable, false);
+
+  for (let i = 0; i < predicates.length; i++) {
+    const item = res.results.find((r) => r.fact.fact_id === `chk-canon-${i}`);
+    assert.equal(item?.badge, 'VERIFIED');
+    assert.equal(item?.freshness, 'supported');
+    assert.equal(item?.predicateHolds, true);
+    assert.equal(item?.citable, true);
+  }
+
+  // Also check related partial match on forged checked claim keeps degraded freshness/unverifiable.
+  const partialForged = await queryFacts({
+    logPath,
+    text: 'forged unrelated extramissingword',
+    nowMs,
+    freshnessResolver: () => ({ status: 'supported', predicateHolds: true }),
+  });
+  assert.equal(partialForged.results[0]?.fact.fact_id, 'chk-forged');
+  assert.equal(partialForged.results[0]?.badge, 'UNVERIFIABLE');
+  assert.equal(partialForged.results[0]?.freshness, 'unverifiable');
+  assert.equal(partialForged.results[0]?.predicateHolds, null);
+  assert.equal(partialForged.results[0]?.citable, false);
+
+  // When predicateHolds is false, freshness degrades to stale consistently with STALE badge.
+  const failedPred = await queryFacts({
+    logPath,
+    id: 'chk-canon-0',
+    nowMs,
+    freshnessResolver: () => ({ status: 'supported', predicateHolds: false }),
+  });
+  assert.equal(failedPred.results[0]?.badge, 'STALE');
+  assert.equal(failedPred.results[0]?.freshness, 'stale');
+  assert.equal(failedPred.results[0]?.citable, false);
+});
+
+test('count-preserving tamper on fact_evidence and facts_fts triggers clean rebuild', async (t) => {
+  const dir = makeTempDir(t);
+  const logPath = join(dir, 'ledger.jsonl');
+  const indexPath = defaultIndexPath(logPath);
+  const nowMs = Date.UTC(2026, 10, 20, 0, 1, 0);
+  const freshAt = new Date(nowMs - 10_000).toISOString();
+
+  appendBlock(logPath, {
+    agent: 'z3-test',
+    project: 'foundry',
+    intent: 'Count-preserving tamper test',
+    reasoning: 'Verify full index digest detects in-place UPDATEs on evidence and FTS5.',
+    facts: [
+      {
+        fact_id: 'ev-fts-target',
+        tier: 'asserted',
+        scope: 'at-commit',
+        claim: 'Original cryptographic token check',
+        tags: ['tamper2'],
+        sensitivity: 'public',
+        evidence: [
+          {
+            type: 'file',
+            repo: 'foundry',
+            path: 'packages/orig.ts',
+            commit: 'a'.repeat(40),
+            blob: 'b'.repeat(40),
+          },
+        ],
+      },
+    ],
+  });
+
+  syncIndex(logPath, indexPath);
+
+  // 1) Count-preserving UPDATE on fact_evidence.
+  {
+    const db = new DatabaseSync(indexPath);
+    try {
+      db.exec("UPDATE fact_evidence SET path = 'packages/tampered.ts' WHERE fact_id = 'ev-fts-target'");
+    } finally {
+      db.close();
+    }
+  }
+  const afterEvTamper = await queryFacts({ logPath, indexPath, path: 'packages/tampered.ts', nowMs });
+  assert.equal(afterEvTamper.rebuilt, true);
+  assert.equal(afterEvTamper.status, 'not_found');
+  const cleanEv = await queryFacts({ logPath, indexPath, path: 'packages/orig.ts', nowMs });
+  assert.equal(cleanEv.rebuilt, false);
+  assert.equal(cleanEv.results[0]?.fact.fact_id, 'ev-fts-target');
+
+  // 2) Count-preserving FTS5 corruption (self-consistent wrong inverted index + claim_fts).
+  {
+    const db = new DatabaseSync(indexPath);
+    try {
+      db.exec("UPDATE facts SET claim_fts = 'completely rewritten token' WHERE fact_id = 'ev-fts-target'");
+      db.exec("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')");
+    } finally {
+      db.close();
+    }
+  }
+  const afterFtsTamper = await queryFacts({ logPath, indexPath, text: 'cryptographic', nowMs });
+  assert.equal(afterFtsTamper.rebuilt, true);
+  assert.equal(afterFtsTamper.status, 'match');
+  assert.equal(afterFtsTamper.results[0]?.fact.fact_id, 'ev-fts-target');
+
+  // 3) FTS5 postings tamper alone (delete original 4-word entry, insert 4 different words -> docsize & facts untouched).
+  {
+    const db = new DatabaseSync(indexPath);
+    try {
+      const row = db.prepare("SELECT rowid, claim_fts, note_fts FROM facts WHERE fact_id = 'ev-fts-target'").get();
+      db.prepare("INSERT INTO facts_fts(facts_fts, rowid, claim_fts, note_fts) VALUES('delete', ?, ?, ?)").run(
+        row.rowid,
+        row.claim_fts,
+        row.note_fts,
+      );
+      db.prepare('INSERT INTO facts_fts(rowid, claim_fts, note_fts) VALUES(?, ?, ?)').run(
+        row.rowid,
+        'wrong alpha beta gamma',
+        '',
+      );
+    } finally {
+      db.close();
+    }
+  }
+  const afterShadowTamper = await queryFacts({ logPath, indexPath, text: 'cryptographic', nowMs });
+  assert.equal(afterShadowTamper.rebuilt, true);
+  assert.equal(afterShadowTamper.status, 'match');
+  assert.equal(afterShadowTamper.results[0]?.fact.fact_id, 'ev-fts-target');
+});
+
+test('HTTP and command embedders reject malformed vectors, >4 MiB payloads, and exit non-zero via CLI', async (t) => {
+  const dir = makeTempDir(t);
+  const logPath = join(dir, 'ledger.jsonl');
+  const nowMs = Date.UTC(2026, 10, 20, 0, 1, 0);
+  const freshAt = new Date(nowMs - 10_000).toISOString();
+
+  appendBlock(logPath, {
+    agent: 'z3-test',
+    project: 'foundry',
+    intent: 'Embedder validation coverage',
+    reasoning: 'Verify strict vector validation and 4 MiB cap across HTTP and command adapters.',
+    facts: [
+      {
+        fact_id: 'emb-val-1',
+        tier: 'asserted',
+        scope: 'at-commit',
+        claim: 'Semantic validation fixture entry.',
+        tags: ['embval'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
+      },
+    ],
+  });
+
+  // Command embedder: [null] and [["bad"]] must reject cleanly without turning null into 0.
+  const nullCmd = join(dir, 'null-embed.mjs');
+  writeFileSync(nullCmd, "process.stdout.write('[null]');", 'utf8');
+  await assert.rejects(
+    () => createCommandEmbedder(process.execPath, [nullCmd]).embed(['probe']),
+    /invalid embedding vector/,
+  );
+
+  const strVecCmd = join(dir, 'str-embed.mjs');
+  writeFileSync(strVecCmd, "process.stdout.write('[[\"bad\"]]');", 'utf8');
+  await assert.rejects(
+    () => createCommandEmbedder(process.execPath, [strVecCmd]).embed(['probe']),
+    /non-numeric embedding/,
+  );
+
+  // CLI exit non-zero on invalid command embedder vector output.
+  await assert.rejects(
+    () =>
+      exec(
+        process.execPath,
+        [cliPath, 'query', 'unmatchedsemanticquery', '--log', logPath, '--embed-cmd', process.execPath, '--embed-arg', nullCmd],
+        { timeout: 15_000 },
+      ),
+    (err) => typeof err?.code === 'number' && err.code !== 0,
+  );
+
+  // HTTP embedder: reject [null] vectors and >4 MiB streaming payloads.
+  let serverMode = 'null';
+  const server = createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.on('error', () => {});
+      if (serverMode === 'null') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"embeddings":[[null]]}');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      const chunk = ' '.repeat(65_536);
+      for (let i = 0; i < 70 && !res.destroyed; i++) {
+        res.write(chunk);
+      }
+      res.end();
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+  const url = `http://127.0.0.1:${server.address().port}/embed`;
+
+  await assert.rejects(() => createHttpEmbedder(url).embed(['probe']), /non-numeric embedding/);
+  serverMode = 'oversize';
+  await assert.rejects(() => createHttpEmbedder(url).embed(['probe']), /exceeded 4194304 bytes/);
+});
+
+test('non-Latin (Devanagari/Arabic) and underscore tokenization align Stage 2 and Stage 2b', async (t) => {
+  const dir = makeTempDir(t);
+  const logPath = join(dir, 'ledger.jsonl');
+  const nowMs = Date.UTC(2026, 10, 20, 0, 1, 0);
+  const freshAt = new Date(nowMs - 10_000).toISOString();
+
+  appendBlock(logPath, {
+    agent: 'z3-test',
+    project: 'foundry',
+    intent: 'Unicode and underscore FTS5 parity',
+    reasoning: 'Verify unicode61 remove_diacritics 0 preserves non-Latin marks and underscore splits.',
+    facts: [
+      {
+        fact_id: 'tok-under',
+        tier: 'asserted',
+        scope: 'at-commit',
+        claim: 'Identifier foo_bar handles serialization cleanly.',
+        tags: ['tok'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
+      },
+      {
+        fact_id: 'tok-hi',
+        tier: 'asserted',
+        scope: 'at-commit',
+        claim: 'नमस्ते दुनिया सेवा उपलब्ध है',
+        tags: ['tok'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
+      },
+      {
+        fact_id: 'tok-ar',
+        tier: 'asserted',
+        scope: 'at-commit',
+        claim: 'مرحبا بالعالم خدمة الفهرس',
+        tags: ['tok'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'seed', output_sha256: VALID_SHA256, ran_at: freshAt, ttl_s: 3600 }],
+      },
+    ],
+  });
+
+  for (const [text, expectedId] of [
+    ['foo_bar', 'tok-under'],
+    ['foo', 'tok-under'],
+    ['bar', 'tok-under'],
+    ['नमस्ते', 'tok-hi'],
+    ['مرحبا', 'tok-ar'],
+  ]) {
+    const res = await queryFacts({ logPath, text, nowMs });
+    assert.equal(res.status, 'match');
+    assert.equal(res.results[0]?.stage, 'lexical');
+    assert.equal(res.results[0]?.fact.fact_id, expectedId);
+
+    const partial = await queryFacts({ logPath, text: `${text} unmatchedextraterm`, nowMs });
+    assert.equal(partial.status, 'related');
+    assert.equal(partial.results[0]?.stage, 'partial');
+    assert.equal(partial.results[0]?.fact.fact_id, expectedId);
+  }
 });

@@ -35,6 +35,15 @@ declare function fetch(
 ): Promise<{
   readonly ok: boolean;
   readonly status: number;
+  readonly headers: {
+    get(name: string): string | null;
+  };
+  readonly body: {
+    getReader(): {
+      read(): Promise<{ readonly done: boolean; readonly value?: Uint8Array }>;
+      cancel(reason?: unknown): Promise<void>;
+    };
+  } | null;
   json(): Promise<unknown>;
   text(): Promise<string>;
 }>;

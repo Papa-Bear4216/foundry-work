@@ -55,8 +55,10 @@ export {
 
 export {
   SHA256_HEX_RE,
+  formatCheckedPredicateClaim,
   isValidCheckedPredicate,
   normalizeTextForFts,
+  tokenizeForFts,
 } from './normalize.js';
 
 export {

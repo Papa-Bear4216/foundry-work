@@ -19,7 +19,7 @@ import {
 } from './log.js';
 import {
   normalizeBlockFactsAndRetractions,
-  normalizeTextForFts,
+  tokenizeForFts,
 } from './normalize.js';
 import {
   type Block,
@@ -28,7 +28,8 @@ import {
   type ScanReport,
 } from './types.js';
 
-export const INDEX_SCHEMA_VERSION = 5;
+export const INDEX_SCHEMA_VERSION = 6;
+const EMPTY_SHA256 = createHash('sha256').update('').digest('hex');
 
 const REQUIRED_INDEX_TABLES = [
   'blocks',
@@ -127,28 +128,99 @@ function withIndexLock<T>(indexPath: string, fn: () => T): T {
   }
 }
 
-function computeVisibilityDigest(db: DatabaseSync): string {
-  const h = createHash('sha256');
-  for (const r of db
-    .prepare('SELECT fact_id, block_id, reason FROM fact_retractions ORDER BY fact_id COLLATE BINARY ASC')
-    .iterate()) {
-    h.update(`R\0${String(r['fact_id'])}\0${String(r['block_id'])}\0${String(r['reason'])}\n`);
+function hashDigestValue(h: ReturnType<typeof createHash>, val: unknown): void {
+  if (val === null || val === undefined) {
+    h.update('N;');
+    return;
   }
-  for (const s of db
-    .prepare('SELECT superseded_fact_id, block_id FROM fact_supersessions ORDER BY superseded_fact_id COLLATE BINARY ASC')
+  if (val instanceof Uint8Array) {
+    h.update(`B${val.byteLength}:`);
+    h.update(val);
+    h.update(';');
+    return;
+  }
+  if (typeof val === 'number' || typeof val === 'bigint') {
+    h.update(`I${String(val)};`);
+    return;
+  }
+  const s = String(val);
+  h.update(`S${s.length}:${s};`);
+}
+
+function hashDigestRow(h: ReturnType<typeof createHash>, prefix: string, cols: readonly unknown[]): void {
+  h.update(prefix);
+  for (const col of cols) {
+    hashDigestValue(h, col);
+  }
+  h.update('\n');
+}
+
+function computeIndexContentDigest(db: DatabaseSync): string {
+  const h = createHash('sha256');
+  for (const b of db
+    .prepare(
+      'SELECT id, ts, agent, project, parent, trace_id, status, intent, reasoning, supersedes, schema, line_number FROM blocks ORDER BY line_number ASC, id COLLATE BINARY ASC',
+    )
     .iterate()) {
-    h.update(`S\0${String(s['superseded_fact_id'])}\0${String(s['block_id'])}\n`);
+    hashDigestRow(h, 'B:', [
+      b['id'], b['ts'], b['agent'], b['project'], b['parent'], b['trace_id'],
+      b['status'], b['intent'], b['reasoning'], b['supersedes'], b['schema'], b['line_number'],
+    ]);
+  }
+  for (const f of db
+    .prepare(
+      'SELECT rowid, fact_id, block_id, project, tier, scope, check_json, claim, note, claim_fts, note_fts, sensitivity, verified_at, supersedes FROM facts ORDER BY rowid ASC',
+    )
+    .iterate()) {
+    hashDigestRow(h, 'F:', [
+      f['rowid'], f['fact_id'], f['block_id'], f['project'], f['tier'], f['scope'],
+      f['check_json'], f['claim'], f['note'], f['claim_fts'], f['note_fts'],
+      f['sensitivity'], f['verified_at'], f['supersedes'],
+    ]);
   }
   for (const t of db
     .prepare('SELECT fact_id, tag FROM fact_tags ORDER BY tag COLLATE BINARY ASC, fact_id COLLATE BINARY ASC')
     .iterate()) {
-    h.update(`T\0${String(t['fact_id'])}\0${String(t['tag'])}\n`);
+    hashDigestRow(h, 'T:', [t['fact_id'], t['tag']]);
   }
-  for (const f of db
-    .prepare('SELECT fact_id, sensitivity, supersedes FROM facts ORDER BY fact_id COLLATE BINARY ASC')
+  for (const e of db
+    .prepare(
+      'SELECT fact_id, evidence_idx, type, repo, path, commit_id, blob, body FROM fact_evidence ORDER BY fact_id COLLATE BINARY ASC, evidence_idx ASC',
+    )
     .iterate()) {
-    const sup = typeof f['supersedes'] === 'string' ? f['supersedes'] : '';
-    h.update(`F\0${String(f['fact_id'])}\0${String(f['sensitivity'])}\0${sup}\n`);
+    hashDigestRow(h, 'E:', [
+      e['fact_id'], e['evidence_idx'], e['type'], e['repo'], e['path'],
+      e['commit_id'], e['blob'], e['body'],
+    ]);
+  }
+  for (const r of db
+    .prepare('SELECT fact_id, block_id, reason FROM fact_retractions ORDER BY fact_id COLLATE BINARY ASC')
+    .iterate()) {
+    hashDigestRow(h, 'R:', [r['fact_id'], r['block_id'], r['reason']]);
+  }
+  for (const s of db
+    .prepare('SELECT superseded_fact_id, block_id FROM fact_supersessions ORDER BY superseded_fact_id COLLATE BINARY ASC')
+    .iterate()) {
+    hashDigestRow(h, 'S:', [s['superseded_fact_id'], s['block_id']]);
+  }
+  for (const z of db.prepare('SELECT id, sz FROM facts_fts_docsize ORDER BY id ASC').iterate()) {
+    hashDigestRow(h, 'Z:', [z['id'], z['sz']]);
+  }
+  return h.digest('hex');
+}
+
+function computeFtsShadowDigest(db: DatabaseSync): string {
+  const h = createHash('sha256');
+  for (const c of db.prepare('SELECT k, v FROM facts_fts_config ORDER BY k COLLATE BINARY ASC').iterate()) {
+    hashDigestRow(h, 'C:', [c['k'], c['v']]);
+  }
+  for (const d of db.prepare('SELECT id, block FROM facts_fts_data ORDER BY id ASC').iterate()) {
+    hashDigestRow(h, 'D:', [d['id'], d['block']]);
+  }
+  for (const x of db
+    .prepare('SELECT segid, term, pgno FROM facts_fts_idx ORDER BY segid COLLATE BINARY ASC, term COLLATE BINARY ASC, pgno COLLATE BINARY ASC')
+    .iterate()) {
+    hashDigestRow(h, 'X:', [x['segid'], x['term'], x['pgno']]);
   }
   return h.digest('hex');
 }
@@ -184,7 +256,10 @@ function verifyReadOnlyIntegrity(db: DatabaseSync, saved: IndexState): boolean {
     if (Number(ftsDocRow?.['c'] ?? -1) !== saved.factsCount) {
       return false;
     }
-    return computeVisibilityDigest(db) === saved.visibilitySha256;
+    return (
+      computeIndexContentDigest(db) === saved.contentSha256 &&
+      computeFtsShadowDigest(db) === saved.ftsShadowSha256
+    );
   } catch {
     return false;
   }
@@ -239,7 +314,10 @@ function verifyIndexIntegrity(db: DatabaseSync, saved: IndexState): boolean {
       }
     }
 
-    if (computeVisibilityDigest(db) !== saved.visibilitySha256) {
+    if (
+      computeIndexContentDigest(db) !== saved.contentSha256 ||
+      computeFtsShadowDigest(db) !== saved.ftsShadowSha256
+    ) {
       return false;
     }
 
@@ -332,7 +410,8 @@ function createSchema(db: DatabaseSync): void {
       claim_fts,
       note_fts,
       content='facts',
-      content_rowid='rowid'
+      content_rowid='rowid',
+      tokenize='unicode61 remove_diacritics 0'
     );
 
     CREATE TABLE state (
@@ -354,7 +433,8 @@ function createSchema(db: DatabaseSync): void {
       fact_evidence_count INTEGER NOT NULL,
       fact_retractions_count INTEGER NOT NULL,
       fact_supersessions_count INTEGER NOT NULL,
-      visibility_sha256 TEXT NOT NULL COLLATE BINARY
+      content_sha256 TEXT NOT NULL COLLATE BINARY,
+      fts_shadow_sha256 TEXT NOT NULL COLLATE BINARY
     );
   `);
 }
@@ -422,8 +502,8 @@ function ingestBlock(stmts: PreparedIngest, block: Block, lineNumber: number): n
     stmts.insertSupersession.run(sup.superseded_fact_id, block.id);
   }
   for (const fact of facts) {
-    const claimFts = normalizeTextForFts(fact.claim);
-    const noteFts = normalizeTextForFts(fact.note);
+    const claimFts = tokenizeForFts(fact.claim).join(' ');
+    const noteFts = tokenizeForFts(fact.note).join(' ');
     const factRes = stmts.insertFact.run(
       fact.fact_id,
       block.id,
@@ -482,6 +562,26 @@ function openReadOnlyIfExists(logPath: string): number | null {
   }
 }
 
+function emptyLogHeaderState(): {
+  readonly exists: boolean;
+  readonly size: number;
+  readonly headSha256: string;
+  readonly tailSha256: string;
+  readonly mtimeNs: string;
+  readonly ctimeNs: string;
+  readonly ino: string;
+} {
+  return {
+    exists: false,
+    size: 0,
+    headSha256: EMPTY_SHA256,
+    tailSha256: EMPTY_SHA256,
+    mtimeNs: '0',
+    ctimeNs: '0',
+    ino: '0',
+  };
+}
+
 function isNonNegativeSafeInt(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
@@ -493,7 +593,7 @@ function readStateRow(db: DatabaseSync): IndexState | null {
         `SELECT schema_version, log_bytes, head_sha256, tail_sha256, log_mtime_ns, log_ctime_ns, log_ino,
                 indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete,
                 blocks_count, facts_count, fact_tags_count, fact_evidence_count, fact_retractions_count, fact_supersessions_count,
-                visibility_sha256
+                content_sha256, fts_shadow_sha256
          FROM state WHERE id = 1`,
       )
       .get();
@@ -519,7 +619,8 @@ function readStateRow(db: DatabaseSync): IndexState | null {
       !isNonNegativeSafeInt(row['fact_evidence_count']) ||
       !isNonNegativeSafeInt(row['fact_retractions_count']) ||
       !isNonNegativeSafeInt(row['fact_supersessions_count']) ||
-      typeof row['visibility_sha256'] !== 'string'
+      typeof row['content_sha256'] !== 'string' ||
+      typeof row['fts_shadow_sha256'] !== 'string'
     ) {
       return null;
     }
@@ -545,7 +646,8 @@ function readStateRow(db: DatabaseSync): IndexState | null {
       factEvidenceCount: row['fact_evidence_count'],
       factRetractionsCount: row['fact_retractions_count'],
       factSupersessionsCount: row['fact_supersessions_count'],
-      visibilitySha256: row['visibility_sha256'],
+      contentSha256: row['content_sha256'],
+      ftsShadowSha256: row['fts_shadow_sha256'],
     };
   } catch {
     return null;
@@ -570,7 +672,8 @@ function saveState(
     readonly ino: string;
   },
   counts: DerivedTableCounts,
-  visibilitySha256: string,
+  contentSha256: string,
+  ftsShadowSha256: string,
   indexedOffset: number,
   nextLineNumber: number,
   completeBadLines: readonly number[],
@@ -582,8 +685,8 @@ function saveState(
       (id, schema_version, log_bytes, head_sha256, tail_sha256, log_mtime_ns, log_ctime_ns, log_ino,
        indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete,
        blocks_count, facts_count, fact_tags_count, fact_evidence_count, fact_retractions_count, fact_supersessions_count,
-       visibility_sha256)
-     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       content_sha256, fts_shadow_sha256)
+     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     INDEX_SCHEMA_VERSION,
     header.size,
@@ -602,16 +705,16 @@ function saveState(
     counts.factEvidenceCount,
     counts.factRetractionsCount,
     counts.factSupersessionsCount,
-    visibilitySha256,
+    contentSha256,
+    ftsShadowSha256,
   );
 }
 
 function rebuildIndexUnlocked(logPath: string, indexPath: string): IndexSyncResult {
   assertDistinctIndexPath(logPath, indexPath);
   mkdirSync(dirname(indexPath), { recursive: true });
-  const header = readLogHeaderState(logPath);
   const tempPath = `${indexPath}.tmp.${process.pid}.${randomUUID().replaceAll('-', '').slice(0, 8)}`;
-  const db = new DatabaseSync(tempPath);
+  let db: DatabaseSync | null = null;
   let dbClosed = false;
   let logFd: number | null = null;
   let scanState = {
@@ -623,12 +726,14 @@ function rebuildIndexUnlocked(logPath: string, indexPath: string): IndexSyncResu
   };
 
   try {
+    logFd = openReadOnlyIfExists(logPath);
+    const header = logFd !== null ? readLogHeaderFromFd(logFd) : emptyLogHeaderState();
+    db = new DatabaseSync(tempPath);
     db.exec('PRAGMA journal_mode = DELETE;');
     createSchema(db);
     const stmts = prepareIngest(db);
 
     db.exec('BEGIN');
-    logFd = openReadOnlyIfExists(logPath);
     if (logFd !== null && header.size > 0) {
       scanState = scanFdRange(
         logFd,
@@ -645,14 +750,18 @@ function rebuildIndexUnlocked(logPath: string, indexPath: string): IndexSyncResu
       closeSync(logFd);
       logFd = null;
     }
+    db.exec('COMMIT');
 
     const counts = readDerivedTableCounts(db);
-    const visibilitySha256 = computeVisibilityDigest(db);
+    const contentSha256 = computeIndexContentDigest(db);
+    const ftsShadowSha256 = computeFtsShadowDigest(db);
+    db.exec('BEGIN');
     saveState(
       db,
       header,
       counts,
-      visibilitySha256,
+      contentSha256,
+      ftsShadowSha256,
       scanState.lastCompleteOffset,
       scanState.nextLineNumber,
       scanState.completeBadLineNumbers,
@@ -683,7 +792,7 @@ function rebuildIndexUnlocked(logPath: string, indexPath: string): IndexSyncResu
         // Ignore cleanup errors on log fd.
       }
     }
-    if (!dbClosed) {
+    if (db && !dbClosed) {
       try {
         db.close();
       } catch {
@@ -856,7 +965,7 @@ function syncIndexUnlocked(
 
     logFd = openReadOnlyIfExists(logPath);
     const header =
-      logFd !== null ? readLogHeaderFromFd(logFd, onReadRange) : readLogHeaderState(logPath);
+      logFd !== null ? readLogHeaderFromFd(logFd, onReadRange) : emptyLogHeaderState();
 
     if (isWarmStateMatch(saved, header)) {
       const badLines = makeScanReport(
@@ -893,6 +1002,7 @@ function syncIndexUnlocked(
       return rebuildIndexUnlocked(logPath, indexPath);
     }
 
+    db.prepare('DELETE FROM state').run();
     const stmts = prepareIngest(db);
     const scanState = scanFdRange(
       logFd,
@@ -906,18 +1016,24 @@ function syncIndexUnlocked(
       onReadRange,
     );
     closeLogFd();
+    db.exec('COMMIT');
+    inTxn = false;
 
     const combinedBadLines = [
       ...saved.completeBadLines,
       ...scanState.completeBadLineNumbers,
     ];
     const counts = readDerivedTableCounts(db);
-    const visibilitySha256 = computeVisibilityDigest(db);
+    const contentSha256 = computeIndexContentDigest(db);
+    const ftsShadowSha256 = computeFtsShadowDigest(db);
+    db.exec('BEGIN IMMEDIATE');
+    inTxn = true;
     saveState(
       db,
       header,
       counts,
-      visibilitySha256,
+      contentSha256,
+      ftsShadowSha256,
       scanState.lastCompleteOffset,
       scanState.nextLineNumber,
       combinedBadLines,

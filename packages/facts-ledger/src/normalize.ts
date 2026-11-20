@@ -16,6 +16,37 @@ export function normalizeTextForFts(text: string): string {
     .toLowerCase();
 }
 
+/** Tokenize text identically for FTS5 indexing (`unicode61 remove_diacritics 0`) and query matching. */
+export function tokenizeForFts(text: string): readonly string[] {
+  return normalizeTextForFts(text)
+    .split(/[^\p{L}\p{N}\p{M}]+/u)
+    .filter((token) => token.length > 0);
+}
+
+/** Format the canonical single-line claim string for a Step Zero section 3.4 checked predicate. */
+export function formatCheckedPredicateClaim(check: CheckedPredicate): string {
+  if (!isValidCheckedPredicate(check)) {
+    throw new Error('Invalid checked predicate');
+  }
+  const obj = check as Record<string, unknown>;
+  switch (check.predicate) {
+    case 'file_exists':
+      return `repo ${JSON.stringify(obj['repo'])}: file ${JSON.stringify(obj['path'])} exists`;
+    case 'file_absent':
+      return `repo ${JSON.stringify(obj['repo'])}: file ${JSON.stringify(obj['path'])} is absent`;
+    case 'file_blob_is':
+      return `repo ${JSON.stringify(obj['repo'])}: file ${JSON.stringify(obj['path'])} has blob ${JSON.stringify(obj['blob'])}`;
+    case 'file_contains':
+      return `repo ${JSON.stringify(obj['repo'])}: file ${JSON.stringify(obj['path'])} contains ${JSON.stringify(obj['text'])}`;
+    case 'file_lacks':
+      return `repo ${JSON.stringify(obj['repo'])}: file ${JSON.stringify(obj['path'])} lacks ${JSON.stringify(obj['text'])}`;
+    case 'command_output_is':
+      return `command ${JSON.stringify(obj['template'])} ${JSON.stringify(obj['args'])} outputs sha256 ${String(obj['output_sha256'])}`;
+    default:
+      throw new Error(`Unsupported checked predicate: ${String(check.predicate)}`);
+  }
+}
+
 function isNonEmptyTrimmed(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }

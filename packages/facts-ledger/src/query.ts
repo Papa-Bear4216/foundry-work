@@ -4,9 +4,10 @@ import { TextDecoder, TextEncoder } from 'node:util';
 import { defaultIndexPath, openSyncedIndexForQuery } from './index-db.js';
 import { compareBytewise } from './log.js';
 import {
+  formatCheckedPredicateClaim,
   isValidCheckedPredicate,
-  normalizeTextForFts,
   SHA256_HEX_RE,
+  tokenizeForFts,
 } from './normalize.js';
 import {
   type CheckedPredicate,
@@ -61,9 +62,7 @@ function allowedSensitivities(maxSensitivity: Exclude<Sensitivity, 'secret'>): r
 
 /** Extract search content words aligned with FTS5 unicode61 diacritic folding. */
 export function extractSearchTokens(text: string): readonly string[] {
-  const rawTokens = normalizeTextForFts(text)
-    .split(/[^\p{L}\p{N}\p{M}]+/u)
-    .filter((token) => token.length > 0);
+  const rawTokens = tokenizeForFts(text);
   if (rawTokens.length === 0) return [];
   const filtered = rawTokens.filter((token) => !STOP_WORDS.has(token));
   const chosen = filtered.length > 0 ? filtered : rawTokens;
@@ -163,6 +162,7 @@ function classifyPresentation(
   assessment: FreshnessAssessment,
 ): {
   readonly badge: DisplayBadge;
+  readonly effectiveFreshness: FreshnessStatus;
   readonly predicateHolds: boolean | null;
   readonly citable: boolean;
   readonly citationRule: string;
@@ -174,6 +174,7 @@ function classifyPresentation(
   if (fact.retracted) {
     return {
       badge: 'RETRACTED',
+      effectiveFreshness: 'stale',
       predicateHolds,
       citable: false,
       citationRule: 'Must not be cited. Historical fact was retracted.',
@@ -182,15 +183,90 @@ function classifyPresentation(
   if (fact.superseded) {
     return {
       badge: 'SUPERSEDED',
+      effectiveFreshness: 'stale',
       predicateHolds,
       citable: false,
       citationRule: 'Must not be cited. Historical fact was superseded.',
     };
   }
 
+  if (fact.tier === 'checked') {
+    if (!isValidCheckedPredicate(fact.check) || fact.claim !== formatCheckedPredicateClaim(fact.check)) {
+      return {
+        badge: 'UNVERIFIABLE',
+        effectiveFreshness: 'unverifiable',
+        predicateHolds: null,
+        citable: false,
+        citationRule: 'Must not be cited. Checked fact claim does not match a valid predicate.',
+      };
+    }
+    if (freshness === 'stale') {
+      return {
+        badge: 'STALE',
+        effectiveFreshness: 'stale',
+        predicateHolds,
+        citable: false,
+        citationRule: 'Must not be cited. Re-verify or abstain.',
+      };
+    }
+    if (freshness === 'expired') {
+      return {
+        badge: 'EXPIRED',
+        effectiveFreshness: 'expired',
+        predicateHolds,
+        citable: false,
+        citationRule: 'Must not be cited. Re-verify or abstain.',
+      };
+    }
+    if (freshness === 'unverifiable') {
+      return {
+        badge: 'UNVERIFIABLE',
+        effectiveFreshness: 'unverifiable',
+        predicateHolds,
+        citable: false,
+        citationRule: 'Must not be cited. Re-verify or abstain.',
+      };
+    }
+    if (predicateHolds === false) {
+      return {
+        badge: 'STALE',
+        effectiveFreshness: 'stale',
+        predicateHolds: false,
+        citable: false,
+        citationRule: 'Must not be cited. Predicate did not hold; re-verify or abstain.',
+      };
+    }
+    if (predicateHolds !== true) {
+      return {
+        badge: 'UNVERIFIABLE',
+        effectiveFreshness: 'unverifiable',
+        predicateHolds: null,
+        citable: false,
+        citationRule: 'Must not be cited. Predicate verifier did not run; re-verify or abstain.',
+      };
+    }
+    if (label === 'related') {
+      return {
+        badge: 'RELATED',
+        effectiveFreshness: freshness,
+        predicateHolds: true,
+        citable: false,
+        citationRule: 'Context only. It is not evidence for the question asked.',
+      };
+    }
+    return {
+      badge: 'VERIFIED',
+      effectiveFreshness: freshness,
+      predicateHolds: true,
+      citable: true,
+      citationRule: 'May be cited as fact.',
+    };
+  }
+
   if (freshness === 'stale') {
     return {
       badge: 'STALE',
+      effectiveFreshness: 'stale',
       predicateHolds,
       citable: false,
       citationRule: 'Must not be cited. Re-verify or abstain.',
@@ -199,6 +275,7 @@ function classifyPresentation(
   if (freshness === 'expired') {
     return {
       badge: 'EXPIRED',
+      effectiveFreshness: 'expired',
       predicateHolds,
       citable: false,
       citationRule: 'Must not be cited. Re-verify or abstain.',
@@ -207,6 +284,7 @@ function classifyPresentation(
   if (freshness === 'unverifiable') {
     return {
       badge: 'UNVERIFIABLE',
+      effectiveFreshness: 'unverifiable',
       predicateHolds,
       citable: false,
       citationRule: 'Must not be cited. Re-verify or abstain.',
@@ -216,47 +294,16 @@ function classifyPresentation(
   if (label === 'related') {
     return {
       badge: 'RELATED',
+      effectiveFreshness: freshness,
       predicateHolds,
       citable: false,
       citationRule: 'Context only. It is not evidence for the question asked.',
     };
   }
 
-  if (fact.tier === 'checked') {
-    if (!isValidCheckedPredicate(fact.check)) {
-      return {
-        badge: 'UNVERIFIABLE',
-        predicateHolds: null,
-        citable: false,
-        citationRule: 'Must not be cited. Checked fact lacks a valid predicate.',
-      };
-    }
-    if ((freshness === 'supported' || freshness === 'moved') && predicateHolds === true) {
-      return {
-        badge: 'VERIFIED',
-        predicateHolds: true,
-        citable: true,
-        citationRule: 'May be cited as fact.',
-      };
-    }
-    if (predicateHolds === false) {
-      return {
-        badge: 'STALE',
-        predicateHolds: false,
-        citable: false,
-        citationRule: 'Must not be cited. Predicate did not hold; re-verify or abstain.',
-      };
-    }
-    return {
-      badge: 'UNVERIFIABLE',
-      predicateHolds: null,
-      citable: false,
-      citationRule: 'Must not be cited. Predicate verifier did not run; re-verify or abstain.',
-    };
-  }
-
   return {
     badge: 'ASSERTED',
+    effectiveFreshness: freshness,
     predicateHolds,
     citable: true,
     citationRule:
@@ -551,7 +598,7 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
         const where = buildFactFilterClause(options, params);
         const matchExpr = tokens.map(quoteFtsToken).join(' OR ');
         const stmt = db.prepare(
-          `SELECT f.fact_id, f.block_id, f.project, f.tier, f.scope, f.check_json, f.claim, f.note, f.sensitivity, f.verified_at, f.supersedes,
+          `SELECT f.fact_id, f.block_id, f.project, f.tier, f.scope, f.check_json, f.claim, f.note, f.claim_fts, f.note_fts, f.sensitivity, f.verified_at, f.supersedes,
                   bm25(facts_fts) AS rank_score
            FROM facts_fts
            JOIN facts f ON f.rowid = facts_fts.rowid
@@ -577,9 +624,15 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
         for (const row of stmt.iterate(matchExpr, ...params)) {
           const factId = String(row['fact_id']);
           if (seenIds.has(factId)) continue;
-          const claim = String(row['claim'] ?? '');
-          const note = String(row['note'] ?? '');
-          const haystackTokens = new Set(extractSearchTokens(`${claim} ${note}`));
+          const claimFts = String(row['claim_fts'] ?? '');
+          const noteFts = String(row['note_fts'] ?? '');
+          const haystackTokens = new Set<string>();
+          for (const tok of claimFts.split(' ')) {
+            if (tok.length > 0) haystackTokens.add(tok);
+          }
+          for (const tok of noteFts.split(' ')) {
+            if (tok.length > 0) haystackTokens.add(tok);
+          }
           let tokenHits = 0;
           for (const t of tokens) {
             if (haystackTokens.has(t)) tokenHits++;
@@ -731,7 +784,7 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
       fact,
       stage,
       label,
-      freshness: assessment.status,
+      freshness: presentation.effectiveFreshness,
       predicateHolds: presentation.predicateHolds,
       badge: presentation.badge,
       citable: presentation.citable,
@@ -796,6 +849,111 @@ export function formatQueryText(result: QueryResult): string {
   return lines.join('\n');
 }
 
+const MAX_EMBED_RESPONSE_BYTES = 4 * 1024 * 1024;
+const MAX_EMBED_VECTOR_DIMS = 16_384;
+const embedDecoder = new TextDecoder('utf-8', { fatal: true });
+const embedEncoder = new TextEncoder();
+
+function concatAndDecode(chunks: readonly Uint8Array[]): string {
+  if (chunks.length === 0) return '';
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.length;
+  }
+  return embedDecoder.decode(merged);
+}
+
+function parseAndValidateVectors(
+  rawVectors: unknown,
+  expectedCount: number,
+  sourceLabel: string,
+): readonly Float32Array[] {
+  if (!Array.isArray(rawVectors) || rawVectors.length !== expectedCount) {
+    throw new Error(`${sourceLabel} returned mismatched embedding count`);
+  }
+  const out: Float32Array[] = [];
+  let expectedDims: number | null = null;
+  for (let i = 0; i < rawVectors.length; i++) {
+    const rawVec = rawVectors[i];
+    if (!Array.isArray(rawVec) || rawVec.length === 0 || rawVec.length > MAX_EMBED_VECTOR_DIMS) {
+      throw new Error(`${sourceLabel} returned an invalid embedding vector at index ${i}`);
+    }
+    if (expectedDims === null) {
+      expectedDims = rawVec.length;
+    } else if (rawVec.length !== expectedDims) {
+      throw new Error(`${sourceLabel} returned inconsistent embedding dimensions`);
+    }
+    for (let j = 0; j < rawVec.length; j++) {
+      const value = rawVec[j];
+      if (typeof value !== 'number' || !Number.isFinite(value)) {
+        throw new Error(`${sourceLabel} returned non-numeric embedding value`);
+      }
+    }
+    out.push(Float32Array.from(rawVec as readonly number[]));
+  }
+  return out;
+}
+
+async function readBoundedResponseText(
+  response: Awaited<ReturnType<typeof fetch>>,
+  maxBytes: number,
+): Promise<string> {
+  const contentLengthHeader = response.headers.get('content-length');
+  if (contentLengthHeader !== null && /^\d+$/.test(contentLengthHeader.trim())) {
+    const declaredBytes = Number(contentLengthHeader.trim());
+    if (declaredBytes > maxBytes) {
+      if (response.body) {
+        try {
+          await response.body.getReader().cancel();
+        } catch {
+          // Ignore cancel failure on oversized response.
+        }
+      }
+      throw new Error(`HTTP embedder response exceeded ${maxBytes} bytes`);
+    }
+  }
+  if (!response.body) {
+    const text = await response.text();
+    if (embedEncoder.encode(text).length > maxBytes) {
+      throw new Error(`HTTP embedder response exceeded ${maxBytes} bytes`);
+    }
+    return text;
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  let completed = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        completed = true;
+        break;
+      }
+      if (value) {
+        totalBytes += value.length;
+        if (totalBytes > maxBytes) {
+          throw new Error(`HTTP embedder response exceeded ${maxBytes} bytes`);
+        }
+        chunks.push(value);
+      }
+    }
+    return concatAndDecode(chunks);
+  } finally {
+    if (!completed) {
+      try {
+        await reader.cancel();
+      } catch {
+        // Ignore stream cancel errors during cleanup.
+      }
+    }
+  }
+}
+
 /** Optional local loopback HTTP embedder adapter (`Embedder` port using built-in `fetch`). */
 export function createHttpEmbedder(
   endpointUrl: string,
@@ -830,38 +988,45 @@ export function createHttpEmbedder(
         signal: AbortSignal.timeout(effectiveTimeoutMs),
       });
       if (!response.ok) {
+        if (response.body) {
+          try {
+            await response.body.getReader().cancel();
+          } catch {
+            // Ignore cancel failure on error response.
+          }
+        }
         throw new Error(`Embedder HTTP ${response.status}`);
       }
-      const payload = (await response.json()) as {
-        data?: readonly { embedding?: readonly number[] }[];
-        embeddings?: readonly (readonly number[])[];
+      const rawText = await readBoundedResponseText(response, MAX_EMBED_RESPONSE_BYTES);
+      let parsedPayload: unknown;
+      try {
+        parsedPayload = JSON.parse(rawText);
+      } catch {
+        throw new Error('Embedder returned invalid JSON');
+      }
+      if (!parsedPayload || typeof parsedPayload !== 'object' || Array.isArray(parsedPayload)) {
+        throw new Error('Unexpected embedder response payload');
+      }
+      const payload = parsedPayload as {
+        readonly data?: unknown;
+        readonly embeddings?: unknown;
       };
-      if (Array.isArray(payload.embeddings)) {
-        return payload.embeddings.map((vec) => Float32Array.from(vec));
+      let rawVectors: unknown;
+      if (payload.embeddings !== undefined) {
+        rawVectors = payload.embeddings;
+      } else if (Array.isArray(payload.data)) {
+        rawVectors = payload.data.map((entry) => {
+          if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+            return null;
+          }
+          return (entry as { readonly embedding?: unknown }).embedding;
+        });
+      } else {
+        throw new Error('Unexpected embedder response payload');
       }
-      if (Array.isArray(payload.data)) {
-        return payload.data.map((entry) => Float32Array.from(entry.embedding ?? []));
-      }
-      throw new Error('Unexpected embedder response payload');
+      return parseAndValidateVectors(rawVectors, texts.length, 'HTTP embedder');
     },
   };
-}
-
-const MAX_COMMAND_STDOUT_BYTES = 8 * 1024 * 1024;
-const embedDecoder = new TextDecoder('utf-8', { fatal: true });
-const embedEncoder = new TextEncoder();
-
-function concatAndDecode(chunks: readonly Uint8Array[]): string {
-  if (chunks.length === 0) return '';
-  let total = 0;
-  for (const c of chunks) total += c.length;
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const c of chunks) {
-    merged.set(c, offset);
-    offset += c.length;
-  }
-  return embedDecoder.decode(merged);
 }
 
 /** Optional command embedder adapter (`Embedder` port passing JSON input over `stdin`, never argv/shell). */
@@ -918,13 +1083,13 @@ export function createCommandEmbedder(
         child.stdout?.on('data', (chunk) => {
           const bytes = typeof chunk === 'string' ? embedEncoder.encode(chunk) : chunk;
           stdoutBytes += bytes.length;
-          if (stdoutBytes > MAX_COMMAND_STDOUT_BYTES) {
+          if (stdoutBytes > MAX_EMBED_RESPONSE_BYTES) {
             try {
               child.kill();
             } catch {
               // Best-effort kill on stdout cap.
             }
-            fail(`Command embedder stdout exceeded ${MAX_COMMAND_STDOUT_BYTES} bytes`);
+            fail(`Command embedder stdout exceeded ${MAX_EMBED_RESPONSE_BYTES} bytes`);
             return;
           }
           stdoutChunks.push(bytes);
@@ -938,30 +1103,28 @@ export function createCommandEmbedder(
           clearTimeout(timer);
           if (settled) return;
           if (code !== 0) {
-            settled = true;
-            rejectPromise(
-              new Error(
-                `Command embedder failed (${signal ? `signal ${signal}` : `exit code ${code ?? 'unknown'}`})`,
-              ),
+            fail(
+              `Command embedder failed (${signal ? `signal ${signal}` : `exit code ${code ?? 'unknown'}`})`,
             );
             return;
           }
-          let parsed: unknown;
+          let vectors: readonly Float32Array[];
           try {
             const stdout = concatAndDecode(stdoutChunks);
-            parsed = JSON.parse(stdout);
-          } catch {
-            settled = true;
-            rejectPromise(new Error('Command embedder returned invalid JSON'));
-            return;
-          }
-          if (!Array.isArray(parsed)) {
-            settled = true;
-            rejectPromise(new Error('Command embedder did not return a JSON array of vectors'));
+            let parsed: unknown;
+            try {
+              parsed = JSON.parse(stdout);
+            } catch {
+              fail('Command embedder returned invalid JSON');
+              return;
+            }
+            vectors = parseAndValidateVectors(parsed, texts.length, 'Command embedder');
+          } catch (err) {
+            fail(err instanceof Error ? err.message : 'Command embedder returned invalid output');
             return;
           }
           settled = true;
-          resolvePromise((parsed as readonly (readonly number[])[]).map((vec) => Float32Array.from(vec)));
+          resolvePromise(vectors);
         });
 
         if (!child.stdin) {
