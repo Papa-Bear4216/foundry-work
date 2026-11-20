@@ -11,11 +11,13 @@ import { promisify } from 'node:util';
 import {
   appendBlock,
   compareBytewise,
+  createCommandEmbedder,
   createHttpEmbedder,
   defaultIndexPath,
   formatQueryText,
   queryFacts,
   rebuildIndex,
+  replaceFileWithRetry,
   scanLog,
   syncIndex,
 } from '../dist/index.js';
@@ -42,7 +44,7 @@ function dumpAllTables(indexPath) {
       fact_supersessions: db.prepare('SELECT * FROM fact_supersessions ORDER BY superseded_fact_id COLLATE BINARY ASC').all(),
       fts_updated: db.prepare("SELECT f.rowid, f.fact_id, bm25(facts_fts) AS rank FROM facts_fts JOIN facts f ON f.rowid = facts_fts.rowid WHERE facts_fts MATCH 'Updated' ORDER BY f.fact_id COLLATE BINARY ASC").all(),
       fts_schema: db.prepare("SELECT f.rowid, f.fact_id, bm25(facts_fts) AS rank FROM facts_fts JOIN facts f ON f.rowid = facts_fts.rowid WHERE facts_fts MATCH 'schema' ORDER BY f.fact_id COLLATE BINARY ASC").all(),
-      state: db.prepare('SELECT schema_version, log_bytes, head_sha256, tail_sha256, log_sha256, log_mtime_ns, log_ctime_ns, log_ino, indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete FROM state').all(),
+      state: db.prepare('SELECT schema_version, log_bytes, head_sha256, tail_sha256, log_mtime_ns, log_ctime_ns, log_ino, indexed_offset, next_line_number, complete_bad_lines_json, tail_incomplete, blocks_count, facts_count, fact_tags_count, fact_evidence_count, fact_retractions_count, fact_supersessions_count FROM state').all(),
     };
   } finally {
     db.close();
@@ -140,12 +142,21 @@ test('incremental update equals full rebuild across >4KiB head boundary, bad lin
   assert.equal(afterDelete.rebuilt, true);
   assert.deepEqual(dumpAllTables(incIndex), dumpAllTables(fullIndex));
 
-  // Mutate first byte -> head hash mismatch forces rebuild.
-  const copyBytes = Buffer.from(readFileSync(logPath));
-  copyBytes[0] = 32; // leading space keeps JSON valid on line 1 while altering 4 KiB hash
-  writeFileSync(logPath, copyBytes);
+  // Valid same-length JSON edit inside the first 4 KiB head window -> head hash mismatch forces clean rebuild.
+  const originalText = readFileSync(logPath, 'utf8');
+  const editedText = originalText.replace('Seed schema block 0', 'Edit schema block 0');
+  assert.equal(Buffer.byteLength(editedText, 'utf8'), Buffer.byteLength(originalText, 'utf8'));
+  writeFileSync(logPath, editedText, 'utf8');
   const afterHeadEdit = syncIndex(logPath, incIndex);
   assert.equal(afterHeadEdit.rebuilt, true);
+  assert.deepEqual(afterHeadEdit.badLines, tailSync.badLines);
+  const headDb = new DatabaseSync(incIndex, { readOnly: true });
+  try {
+    const editedRow = headDb.prepare('SELECT intent FROM blocks WHERE line_number = 1').get();
+    assert.match(String(editedRow?.intent ?? ''), /^Edit schema block 0/);
+  } finally {
+    headDb.close();
+  }
 });
 
 test('lookup stages, bytewise ordering, sensitivity/history filters, freshness badges, and injection fence', async (t) => {
@@ -369,19 +380,32 @@ test('lookup stages, bytewise ordering, sensitivity/history filters, freshness b
   assert.equal(expiredRes.results[0].badge, 'EXPIRED');
   assert.equal(expiredRes.results[0].citable, false);
 
-  // History flag reveals superseded & retracted facts.
+  // History flag reveals superseded & retracted facts, always non-citable.
   const noHistory = await queryFacts({ logPath, tag: 'archive', nowMs });
   assert.deepEqual(noHistory.results.map((r) => r.fact.fact_id), ['c-superseded-new']);
-  const withHistory = await queryFacts({ logPath, tag: 'archive', history: true, nowMs });
+  const withHistory = await queryFacts({
+    logPath,
+    tag: 'archive',
+    history: true,
+    nowMs,
+    freshnessResolver: () => ({ status: 'supported', predicateHolds: true }),
+  });
   assert.deepEqual(
-    withHistory.results.map((r) => r.fact.fact_id),
-    ['c-superseded-new', 'c-superseded-old', 'd-retracted'],
+    withHistory.results.map((r) => [r.fact.fact_id, r.badge, r.citable]),
+    [
+      ['c-superseded-new', 'ASSERTED', true],
+      ['c-superseded-old', 'SUPERSEDED', false],
+      ['d-retracted', 'RETRACTED', false],
+    ],
   );
 
   // not_found returns exact `facts add` guidance.
   const emptyRes = await queryFacts({ logPath, text: 'nonexistenttopic', nowMs });
   assert.equal(emptyRes.status, 'not_found');
-  assert.match(emptyRes.addCommand ?? '', /^facts add /);
+  assert.equal(
+    emptyRes.addCommand,
+    'facts add --intent "<what was verified>" --reasoning "<why>" --claim "<verified claim>" --evidence-file "<path>:<lines>"',
+  );
 });
 
 test('CLI rebuild/query --json/--stats and 10,000-block performance/memory check', async (t) => {
@@ -685,22 +709,23 @@ test('createHttpEmbedder rejects non-loopback hosts synchronously and blocks red
   await assert.rejects(() => embedder.embed(['hello']));
 });
 
-test('edit past 4 KiB followed by append triggers rebuild and restores full parity', async (t) => {
+test('syncIndex reads only head/tail/new-tail ranges on large logs and rebuild handles manual repair', async (t) => {
   const dir = makeTempDir(t);
   const logPath = join(dir, 'ledger.jsonl');
   const incIndex = join(dir, 'facts.index.sqlite');
   const fullIndex = join(dir, 'rebuild.index.sqlite');
 
-  for (let i = 0; i < 14; i++) {
+  // Seed > 128 KiB so there is a wide un-read interior between 4 KiB head and tail windows.
+  for (let i = 0; i < 360; i++) {
     const marker = i === 12 ? 'OLDKEY_ALPHA' : `pad-${i}`;
     appendBlock(logPath, {
       agent: 'z3-test',
       project: 'foundry',
       intent: `Prefix block ${i} ${'p'.repeat(300)}`,
-      reasoning: 'Push editable line past 4 KiB head window.',
+      reasoning: 'Push editable line past 4 KiB head window across a >128 KiB log.',
       facts: [
         {
-          fact_id: `editapp-${String(i).padStart(2, '0')}`,
+          fact_id: `editapp-${String(i).padStart(3, '0')}`,
           tier: 'asserted',
           scope: 'current',
           claim: `Prefix claim ${marker}`,
@@ -714,34 +739,57 @@ test('edit past 4 KiB followed by append triggers rebuild and restores full pari
 
   const warm = syncIndex(logPath, incIndex);
   assert.equal(warm.rebuilt, true);
+  const beforeSize = readFileSync(logPath).length;
+  assert.equal(beforeSize > 128 * 1024, true);
 
-  // Repair a line past the 4 KiB head window AND immediately append another block before the next sync.
-  const repaired = readFileSync(logPath, 'utf8').replace('OLDKEY_ALPHA', 'NEWKEY_OMEGA');
-  writeFileSync(logPath, repaired, 'utf8');
   appendBlock(logPath, {
     agent: 'z3-test',
     project: 'foundry',
-    intent: 'Tail append after mid-file repair',
-    reasoning: 'Verify growth past 4 KiB head match still rebuilds when prefix changed.',
+    intent: 'Tail append on large log',
+    reasoning: 'Verify incremental sync reads only head/tail digests and new tail bytes.',
     facts: [
       {
         fact_id: 'editapp-tail',
         tier: 'asserted',
         scope: 'current',
-        claim: 'Tail claim after repair',
+        claim: 'Tail claim after append',
         tags: ['repair'],
         sensitivity: 'public',
         evidence: [{ type: 'manual', description: 'tail', ran_at: '2026-11-20T00:00:00.000Z', ttl_s: 3600 }],
       },
     ],
   });
+  const afterSize = readFileSync(logPath).length;
 
-  const synced = syncIndex(logPath, incIndex);
-  assert.equal(synced.rebuilt, true);
+  const readRanges = [];
+  const incSync = syncIndex(logPath, incIndex, {
+    onReadRange: (offset, length) => readRanges.push({ offset, end: offset + length }),
+  });
+  assert.equal(incSync.rebuilt, false);
+  // Every read must lie in first 4 KiB head, last 4 KiB tail, or [beforeSize, afterSize) new tail.
+  const headLimit = 4096;
+  const tailStart = Math.max(0, afterSize - 4096);
+  for (const r of readRanges) {
+    const inHead = r.end <= headLimit;
+    const inTail = r.offset >= tailStart;
+    const inNewAppend = r.offset >= beforeSize;
+    assert.equal(
+      inHead || inTail || inNewAppend,
+      true,
+      `Unexpected interior read range [${r.offset}, ${r.end}) with beforeSize=${beforeSize}, afterSize=${afterSize}`,
+    );
+  }
+
+  rebuildIndex(logPath, fullIndex);
+  assert.deepEqual(dumpAllTables(incIndex), dumpAllTables(fullIndex));
+
+  // Manual out-of-band historical repair requires explicit rebuild per append-only contract.
+  const repaired = readFileSync(logPath, 'utf8').replace('OLDKEY_ALPHA', 'NEWKEY_OMEGA');
+  writeFileSync(logPath, repaired, 'utf8');
+  const explicitRebuild = rebuildIndex(logPath, incIndex);
+  assert.equal(explicitRebuild.rebuilt, true);
   assert.equal((await queryFacts({ logPath, indexPath: incIndex, text: 'OLDKEY_ALPHA' })).status, 'not_found');
   assert.equal((await queryFacts({ logPath, indexPath: incIndex, text: 'NEWKEY_OMEGA' })).status, 'match');
-  assert.equal((await queryFacts({ logPath, indexPath: incIndex, id: 'editapp-tail' })).status, 'match');
-
   rebuildIndex(logPath, fullIndex);
   assert.deepEqual(dumpAllTables(incIndex), dumpAllTables(fullIndex));
 });
@@ -906,7 +954,8 @@ test('CLI facts query wires HTTP and command embedders and rejects invalid embed
   writeFileSync(
     cmdScriptPath,
     [
-      'const input = JSON.parse(process.argv[2]);',
+      "import { readFileSync } from 'node:fs';",
+      "const input = JSON.parse(readFileSync(0, 'utf8'));",
       "process.stdout.write(JSON.stringify(input.map((t) => (t.includes('stretching') || t.includes('PBKDF2') ? [1, 0] : [0, 1]))));",
     ].join('\n'),
     'utf8',
@@ -1051,4 +1100,323 @@ test('rebuildIndex and syncIndex report identical deduplicated counts on duplica
   assert.equal(incRes.indexedFacts, 13);
   assert.equal(fullRes.indexedBlocks, incRes.indexedBlocks);
   assert.equal(fullRes.indexedFacts, incRes.indexedFacts);
+});
+
+test('historical superseded/retracted checked and asserted facts are non-citable and labeled cleanly', async (t) => {
+  const dir = makeTempDir(t);
+  const logPath = join(dir, 'ledger.jsonl');
+  const nowMs = Date.UTC(2026, 10, 20, 0, 1, 0);
+  const freshAt = new Date(nowMs - 10_000).toISOString();
+
+  appendBlock(logPath, {
+    agent: 'z3-test',
+    project: 'foundry',
+    intent: 'Seed checked and asserted facts for history test',
+    reasoning: 'Verify --history never promotes superseded or retracted facts to citable.',
+    facts: [
+      {
+        fact_id: 'hist-chk-old',
+        tier: 'checked',
+        scope: 'current',
+        check: { predicate: 'file_exists', repo: 'foundry', path: 'src/a.ts' },
+        claim: 'Historical checked claim before replacement',
+        tags: ['hist'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'seed', ran_at: freshAt, ttl_s: 3600 }],
+      },
+      {
+        fact_id: 'hist-chk-new',
+        tier: 'checked',
+        scope: 'current',
+        check: { predicate: 'file_exists', repo: 'foundry', path: 'src/b.ts' },
+        claim: 'Current checked claim replacing historical one',
+        tags: ['hist'],
+        sensitivity: 'public',
+        supersedes: 'hist-chk-old',
+        evidence: [{ type: 'manual', description: 'seed', ran_at: freshAt, ttl_s: 3600 }],
+      },
+      {
+        fact_id: 'hist-ret-chk',
+        tier: 'checked',
+        scope: 'current',
+        check: { predicate: 'file_exists', repo: 'foundry', path: 'src/c.ts' },
+        claim: 'Historical checked claim later retracted',
+        tags: ['hist'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'seed', ran_at: freshAt, ttl_s: 3600 }],
+      },
+    ],
+    retracted_facts: [{ fact_id: 'hist-ret-chk', reason: 'Removed feature flag' }],
+  });
+
+  const histRes = await queryFacts({
+    logPath,
+    tag: 'hist',
+    history: true,
+    nowMs,
+    freshnessResolver: () => ({ status: 'supported', predicateHolds: true }),
+  });
+  assert.deepEqual(
+    histRes.results.map((r) => [r.fact.fact_id, r.badge, r.citable]),
+    [
+      ['hist-chk-new', 'VERIFIED', true],
+      ['hist-chk-old', 'SUPERSEDED', false],
+      ['hist-ret-chk', 'RETRACTED', false],
+    ],
+  );
+  const rendered = formatQueryText(histRes);
+  assert.ok(rendered.includes('[SUPERSEDED]'));
+  assert.ok(rendered.includes('[RETRACTED]'));
+  assert.ok(rendered.includes('retracted: Removed feature flag'));
+});
+
+test('Unicode normalization and diacritic folding align lexical and partial FTS5 stages', async (t) => {
+  const dir = makeTempDir(t);
+  const logPath = join(dir, 'ledger.jsonl');
+  const nowMs = Date.UTC(2026, 10, 20, 0, 1, 0);
+  const freshAt = new Date(nowMs - 10_000).toISOString();
+
+  appendBlock(logPath, {
+    agent: 'z3-test',
+    project: 'foundry',
+    intent: 'Unicode tokenization parity test',
+    reasoning: 'Match precomposed, decomposed, and folded diacritics across stages.',
+    facts: [
+      {
+        fact_id: 'uni-pre',
+        tier: 'asserted',
+        scope: 'at-commit',
+        claim: 'Precomposed résumé handling across endpoints.',
+        tags: ['unicode'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'seed', ran_at: freshAt, ttl_s: 3600 }],
+      },
+      {
+        fact_id: 'uni-nfd',
+        tier: 'asserted',
+        scope: 'at-commit',
+        claim: 'Decomposed re\u0301sume\u0301 parser entry.',
+        tags: ['unicode'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'seed', ran_at: freshAt, ttl_s: 3600 }],
+      },
+      {
+        fact_id: 'uni-nonlatin',
+        tier: 'asserted',
+        scope: 'at-commit',
+        claim: 'Greek Αθήνα and Japanese がくせい tokens preserved.',
+        tags: ['unicode'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'seed', ran_at: freshAt, ttl_s: 3600 }],
+      },
+    ],
+  });
+
+  for (const q of ['re\u0301sume\u0301', 'résumé', 'resume']) {
+    const res = await queryFacts({ logPath, text: q, nowMs });
+    assert.equal(res.status, 'match');
+    assert.equal(res.results[0]?.stage, 'lexical');
+    assert.deepEqual(
+      res.results.map((r) => r.fact.fact_id).sort(compareBytewise),
+      ['uni-nfd', 'uni-pre'],
+    );
+  }
+
+  // Partial stage counts folded diacritics identically to FTS5 hits.
+  const partialNfd = await queryFacts({ logPath, text: 're\u0301sume\u0301 unmatchedterm', nowMs });
+  assert.equal(partialNfd.status, 'related');
+  assert.equal(partialNfd.results[0]?.stage, 'partial');
+  assert.deepEqual(
+    partialNfd.results.map((r) => r.fact.fact_id).sort(compareBytewise),
+    ['uni-nfd', 'uni-pre'],
+  );
+
+  const nonLatin = await queryFacts({ logPath, text: 'Αθήνα がくせい', nowMs });
+  assert.equal(nonLatin.status, 'match');
+  assert.deepEqual(nonLatin.results.map((r) => r.fact.fact_id), ['uni-nonlatin']);
+});
+
+test('verifyIndexIntegrity detects deleted rows in derived tables even with intact schema and FTS', async (t) => {
+  const dir = makeTempDir(t);
+  const logPath = join(dir, 'ledger.jsonl');
+  const indexPath = defaultIndexPath(logPath);
+  const nowMs = Date.UTC(2026, 10, 20, 0, 1, 0);
+  const freshAt = new Date(nowMs - 10_000).toISOString();
+
+  appendBlock(logPath, {
+    agent: 'z3-test',
+    project: 'foundry',
+    intent: 'Derived table consistency check',
+    reasoning: 'Verify deletions in fact_tags or fact_retractions force rebuild.',
+    facts: [
+      {
+        fact_id: 'deriv-active',
+        tier: 'asserted',
+        scope: 'at-commit',
+        claim: 'Active tagged fact stays discoverable.',
+        tags: ['tagkeep'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'seed', ran_at: freshAt, ttl_s: 3600 }],
+      },
+      {
+        fact_id: 'deriv-retracted',
+        tier: 'asserted',
+        scope: 'at-commit',
+        claim: 'Retracted fact stays suppressed.',
+        tags: ['tagret'],
+        sensitivity: 'public',
+        evidence: [{ type: 'manual', description: 'seed', ran_at: freshAt, ttl_s: 3600 }],
+      },
+    ],
+    retracted_facts: [{ fact_id: 'deriv-retracted', reason: 'Obsolete' }],
+  });
+
+  syncIndex(logPath, indexPath);
+
+  const tamperTags = () => {
+    const db = new DatabaseSync(indexPath);
+    try {
+      db.exec('DELETE FROM fact_tags;');
+    } finally {
+      db.close();
+    }
+  };
+  tamperTags();
+  const rebuiltTags = syncIndex(logPath, indexPath);
+  assert.equal(rebuiltTags.rebuilt, true);
+  assert.equal((await queryFacts({ logPath, indexPath, tag: 'tagkeep', nowMs })).results[0]?.fact.fact_id, 'deriv-active');
+
+  const tamperRetractions = () => {
+    const db = new DatabaseSync(indexPath);
+    try {
+      db.exec('DELETE FROM fact_retractions;');
+    } finally {
+      db.close();
+    }
+  };
+  tamperRetractions();
+  const recoveredQuery = await queryFacts({ logPath, indexPath, tag: 'tagret', nowMs });
+  assert.equal(recoveredQuery.rebuilt, true);
+  assert.equal(recoveredQuery.status, 'not_found');
+});
+
+test('createCommandEmbedder streams large batches over stdin without argv length overflow', async (t) => {
+  const dir = makeTempDir(t);
+  const scriptPath = join(dir, 'large-stdin-embedder.mjs');
+  writeFileSync(
+    scriptPath,
+    [
+      "import { readFileSync } from 'node:fs';",
+      "const items = JSON.parse(readFileSync(0, 'utf8'));",
+      'process.stdout.write(JSON.stringify(items.map((_s, i) => [i === 0 || i === 1 ? 1 : 0, i % 2])));',
+    ].join('\n'),
+    'utf8',
+  );
+
+  const embedder = createCommandEmbedder(process.execPath, [scriptPath], 'stdin-test', 15_000);
+  // Construct 75 items totaling > 64 KiB JSON payload (would exceed Windows CreateProcess argv limit).
+  const payload = Array.from({ length: 75 }, (_, i) => `item-${i}-${'x'.repeat(900)}`);
+  assert.equal(JSON.stringify(payload).length > 64 * 1024, true);
+  const vecs = await embedder.embed(payload);
+  assert.equal(vecs.length, 75);
+  assert.deepEqual(Array.from(vecs[0]), [1, 0]);
+});
+
+test('malformed and unknown evidence entries never allow supported/citable status', async (t) => {
+  const dir = makeTempDir(t);
+  const logPath = join(dir, 'ledger.jsonl');
+  const nowMs = Date.UTC(2026, 10, 20, 0, 1, 0);
+  const freshAt = new Date(nowMs - 10_000).toISOString();
+
+  appendBlock(logPath, {
+    agent: 'z3-test',
+    project: 'foundry',
+    intent: 'Validate strict evidence requirements',
+    reasoning: 'Malformed or unknown evidence entries must yield UNVERIFIABLE and citable: false.',
+    facts: [
+      {
+        fact_id: 'ev-bad-cmd',
+        tier: 'asserted',
+        scope: 'at-commit',
+        claim: 'Malformed command record without template or hash.',
+        tags: ['evcheck'],
+        sensitivity: 'public',
+        evidence: [{ type: 'command', ran_at: freshAt, ttl_s: 3600 }],
+      },
+      {
+        fact_id: 'ev-mixed-bad-cmd',
+        tier: 'asserted',
+        scope: 'at-commit',
+        claim: 'Mixed valid manual and malformed command evidence.',
+        tags: ['evcheck'],
+        sensitivity: 'public',
+        evidence: [
+          { type: 'manual', description: 'valid entry', ran_at: freshAt, ttl_s: 3600 },
+          { type: 'command', template: 'git-rev-parse', ran_at: freshAt, ttl_s: 3600 },
+        ],
+      },
+      {
+        fact_id: 'ev-mixed-unknown',
+        tier: 'asserted',
+        scope: 'at-commit',
+        claim: 'Mixed valid manual and unknown evidence type.',
+        tags: ['evcheck'],
+        sensitivity: 'public',
+        evidence: [
+          { type: 'manual', description: 'valid entry', ran_at: freshAt, ttl_s: 3600 },
+          { type: 'future_type', ran_at: freshAt, ttl_s: 3600 },
+        ],
+      },
+    ],
+  });
+
+  const res = await queryFacts({ logPath, tag: 'evcheck', nowMs });
+  assert.equal(res.results.length, 3);
+  for (const item of res.results) {
+    assert.equal(item.freshness, 'unverifiable', `Expected unverifiable for ${item.fact.fact_id}`);
+    assert.equal(item.badge, 'UNVERIFIABLE', `Expected UNVERIFIABLE badge for ${item.fact.fact_id}`);
+    assert.equal(item.citable, false, `Expected citable: false for ${item.fact.fact_id}`);
+  }
+});
+
+test('replaceFileWithRetry retries transient EBUSY/EPERM errors and cleans temp on fatal failure', (t) => {
+  const dir = makeTempDir(t);
+  const tempOk = join(dir, 'temp-ok.sqlite');
+  const targetOk = join(dir, 'target-ok.sqlite');
+  writeFileSync(tempOk, 'ok', 'utf8');
+
+  let attempts = 0;
+  replaceFileWithRetry(tempOk, targetOk, {
+    maxAttempts: 4,
+    baseDelayMs: 5,
+    renameFn: (src, dst) => {
+      attempts++;
+      if (attempts === 1) throw Object.assign(new Error('busy'), { code: 'EBUSY' });
+      if (attempts === 2) throw Object.assign(new Error('perm'), { code: 'EPERM' });
+      writeFileSync(dst, readFileSync(src));
+      unlinkSync(src);
+    },
+  });
+  assert.equal(attempts, 3);
+  assert.equal(readFileSync(targetOk, 'utf8'), 'ok');
+  assert.equal(existsSync(tempOk), false);
+
+  const tempFail = join(dir, 'temp-fail.sqlite');
+  const targetFail = join(dir, 'target-fail.sqlite');
+  writeFileSync(tempFail, 'cleanup-me', 'utf8');
+  let failAttempts = 0;
+  assert.throws(
+    () =>
+      replaceFileWithRetry(tempFail, targetFail, {
+        maxAttempts: 4,
+        baseDelayMs: 5,
+        renameFn: () => {
+          failAttempts++;
+          throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+        },
+      }),
+    /missing/,
+  );
+  assert.equal(failAttempts, 1);
+  assert.equal(existsSync(tempFail), false);
 });

@@ -235,6 +235,8 @@ function usageText(): string {
     'Usage:',
     '  facts rebuild [--log <file>] [--index <file>] [--json] [--stats]',
     '  facts query [text] [--id <id>] [--tag <tag>] [--path <path>] [--commit <sha>] [--repo <name>] [--history] [--limit <n>] [--max-sensitivity <tier>] [--embed-url <url> | --embed-cmd <exe> [--embed-arg <arg>]] [--embed-model <name>] [--min-semantic-score <float>] [--log <file>] [--index <file>] [--json] [--stats]',
+    '',
+    'Note: Ledger files are append-only; run `facts rebuild` after any manual edit or repair of historical lines.',
   ].join('\n');
 }
 

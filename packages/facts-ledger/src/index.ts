@@ -42,7 +42,6 @@ export {
   replaceFileWithRetry,
   scanFdRange,
   scanLog,
-  updateSha256FromFdRange,
   type StreamScanState,
 } from './log.js';
 

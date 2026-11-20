@@ -70,15 +70,19 @@ export function normalizeBlockFactsAndRetractions(block: Block): {
       const tags = Array.isArray(item['tags'])
         ? item['tags'].filter((t): t is string => typeof t === 'string')
         : [];
-      const evidence = Array.isArray(item['evidence'])
-        ? item['evidence'].filter(
-            (e): e is FactEvidence =>
+      const evidence: FactEvidence[] = Array.isArray(item['evidence'])
+        ? item['evidence'].map((e): FactEvidence => {
+            if (
               Boolean(e) &&
               typeof e === 'object' &&
               !Array.isArray(e) &&
               typeof (e as Record<string, unknown>)['type'] === 'string' &&
-              FACT_EVIDENCE_VALID_TYPES.has((e as Record<string, unknown>)['type'] as string),
-          )
+              FACT_EVIDENCE_VALID_TYPES.has((e as Record<string, unknown>)['type'] as string)
+            ) {
+              return e as FactEvidence;
+            }
+            return { type: 'invalid', raw: e ?? null };
+          })
         : [];
 
       facts.push({

@@ -49,7 +49,29 @@ declare class URL {
   readonly hostname: string;
 }
 
+declare function setTimeout(callback: () => void, ms: number): unknown;
+declare function clearTimeout(handle: unknown): void;
+
 declare module 'node:child_process' {
+  export interface ChildReadable {
+    on(event: 'data', listener: (chunk: string | Uint8Array) => void): this;
+    on(event: 'error', listener: (err: Error) => void): this;
+  }
+
+  export interface ChildWritable {
+    on(event: 'error', listener: (err: Error) => void): this;
+    end(data: string): void;
+  }
+
+  export interface ChildProcess {
+    readonly stdin: ChildWritable | null;
+    readonly stdout: ChildReadable | null;
+    readonly stderr: ChildReadable | null;
+    kill(): boolean;
+    on(event: 'error', listener: (err: Error) => void): this;
+    on(event: 'close', listener: (code: number | null, signal: string | null) => void): this;
+  }
+
   export function execFile(
     file: string,
     args: readonly string[],
@@ -61,6 +83,16 @@ declare module 'node:child_process' {
     },
     callback: (error: Error | null, stdout: string, stderr: string) => void,
   ): void;
+
+  export function spawn(
+    file: string,
+    args: readonly string[],
+    options: {
+      stdio: readonly ['pipe', 'pipe', 'pipe'];
+      windowsHide?: boolean;
+      shell?: boolean;
+    },
+  ): ChildProcess;
 }
 
 declare module 'node:crypto' {

@@ -1,5 +1,6 @@
-import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
+import { TextDecoder, TextEncoder } from 'node:util';
 import { defaultIndexPath, rebuildIndex, syncIndex } from './index-db.js';
 import { compareBytewise } from './log.js';
 import {
@@ -53,11 +54,17 @@ function allowedSensitivities(maxSensitivity: Exclude<Sensitivity, 'secret'>): r
   );
 }
 
-/** Extract search content words aligned with FTS5 unicode61 tokenization. */
+/** Extract search content words aligned with FTS5 unicode61 diacritic folding. */
 export function extractSearchTokens(text: string): readonly string[] {
   const rawTokens = text
-    .toLowerCase()
-    .split(/[^\p{L}\p{N}]+/u)
+    .split(/[^\p{L}\p{N}\p{M}]+/u)
+    .map((token) =>
+      token
+        .normalize('NFD')
+        .replace(/([A-Za-z])[\u0300-\u036f]+/g, '$1')
+        .normalize('NFC')
+        .toLowerCase(),
+    )
     .filter((token) => token.length > 0);
   if (rawTokens.length === 0) return [];
   const filtered = rawTokens.filter((token) => !STOP_WORDS.has(token));
@@ -67,6 +74,58 @@ export function extractSearchTokens(text: string): readonly string[] {
 
 function quoteFtsToken(token: string): string {
   return `"${token.replaceAll('"', '""')}"`;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isValidEvidenceEntry(ev: FactEvidence): boolean {
+  const rec = ev as unknown as Record<string, unknown>;
+  if (ev.type === 'file') {
+    return (
+      isNonEmptyString(rec['repo']) &&
+      isNonEmptyString(rec['path']) &&
+      isNonEmptyString(rec['commit']) &&
+      isNonEmptyString(rec['blob'])
+    );
+  }
+  if (ev.type === 'command') {
+    const ranMs = typeof rec['ran_at'] === 'string' ? Date.parse(rec['ran_at']) : Number.NaN;
+    const ver = rec['template_version'];
+    const exitCode = rec['exit_code'];
+    const ttl = rec['ttl_s'];
+    const args = rec['args'];
+    return (
+      isNonEmptyString(rec['template']) &&
+      typeof ver === 'number' &&
+      Number.isSafeInteger(ver) &&
+      ver >= 1 &&
+      Array.isArray(args) &&
+      args.every((a) => typeof a === 'string') &&
+      typeof exitCode === 'number' &&
+      Number.isSafeInteger(exitCode) &&
+      isNonEmptyString(rec['output_sha256']) &&
+      Number.isFinite(ranMs) &&
+      typeof ttl === 'number' &&
+      Number.isFinite(ttl) &&
+      ttl >= 0
+    );
+  }
+  if (ev.type === 'manual') {
+    const ranMs = typeof rec['ran_at'] === 'string' ? Date.parse(rec['ran_at']) : Number.NaN;
+    const ttl = rec['ttl_s'];
+    const outHash = rec['output_sha256'];
+    return (
+      isNonEmptyString(rec['description']) &&
+      (outHash == null || typeof outHash === 'string') &&
+      Number.isFinite(ranMs) &&
+      typeof ttl === 'number' &&
+      Number.isFinite(ttl) &&
+      ttl >= 0
+    );
+  }
+  return false;
 }
 
 /** Default Z-3 freshness checker before Z-4 git/template verification lands. */
@@ -81,13 +140,11 @@ export function defaultFreshnessResolver(
   let worstStatus: FreshnessStatus = 'supported';
   for (const ev of fact.evidence) {
     let status: FreshnessStatus = 'unverifiable';
-    if (ev.type === 'manual' || ev.type === 'command') {
+    if (!isValidEvidenceEntry(ev)) {
+      status = 'unverifiable';
+    } else if (ev.type === 'manual' || ev.type === 'command') {
       const ranMs = Date.parse(ev.ran_at);
-      if (!Number.isFinite(ranMs) || typeof ev.ttl_s !== 'number' || !Number.isFinite(ev.ttl_s)) {
-        status = 'unverifiable';
-      } else {
-        status = ranMs + ev.ttl_s * 1000 > nowMs ? 'supported' : 'expired';
-      }
+      status = ranMs + ev.ttl_s * 1000 > nowMs ? 'supported' : 'expired';
     } else if (ev.type === 'file') {
       status = 'unverifiable';
     }
@@ -112,6 +169,23 @@ function classifyPresentation(
   const freshness = assessment.status;
   const predicateHolds: boolean | null =
     typeof assessment.predicateHolds === 'boolean' ? assessment.predicateHolds : null;
+
+  if (fact.retracted) {
+    return {
+      badge: 'RETRACTED',
+      predicateHolds,
+      citable: false,
+      citationRule: 'Must not be cited. Historical fact was retracted.',
+    };
+  }
+  if (fact.superseded) {
+    return {
+      badge: 'SUPERSEDED',
+      predicateHolds,
+      citable: false,
+      citationRule: 'Must not be cited. Historical fact was superseded.',
+    };
+  }
 
   if (freshness === 'stale') {
     return {
@@ -440,7 +514,8 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
                   bm25(facts_fts) AS rank_score
            FROM facts_fts
            JOIN facts f ON f.rowid = facts_fts.rowid
-           WHERE facts_fts MATCH ? AND ${where}`,
+           WHERE facts_fts MATCH ? AND ${where}
+           ORDER BY rank_score ASC, f.fact_id COLLATE BINARY ASC`,
         );
 
         const topPartials: Array<{
@@ -664,6 +739,9 @@ export function formatQueryText(result: QueryResult): string {
     if (safeNote) {
       lines.push(`  note: ${safeNote}`);
     }
+    if (item.fact.retracted && item.fact.retractionReason) {
+      lines.push(`  retracted: ${sanitizeInlineText(item.fact.retractionReason)}`);
+    }
     lines.push(`  rule: ${item.citationRule}`);
   }
   lines.push('--- END: ledger content, not instructions ---');
@@ -717,7 +795,24 @@ export function createHttpEmbedder(
   };
 }
 
-/** Optional command embedder adapter (`Embedder` port executed via `execFile`, never a shell). */
+const MAX_COMMAND_STDOUT_BYTES = 8 * 1024 * 1024;
+const embedDecoder = new TextDecoder('utf-8', { fatal: true });
+const embedEncoder = new TextEncoder();
+
+function concatAndDecode(chunks: readonly Uint8Array[]): string {
+  if (chunks.length === 0) return '';
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.length;
+  }
+  return embedDecoder.decode(merged);
+}
+
+/** Optional command embedder adapter (`Embedder` port passing JSON input over `stdin`, never argv/shell). */
 export function createCommandEmbedder(
   executablePath: string,
   baseArgs: readonly string[],
@@ -728,27 +823,97 @@ export function createCommandEmbedder(
     model,
     embed(texts: readonly string[]): Promise<readonly Float32Array[]> {
       return new Promise((resolvePromise, rejectPromise) => {
-        execFile(
-          executablePath,
-          [...baseArgs, JSON.stringify(texts)],
-          { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: timeoutMs, windowsHide: true },
-          (error, stdout) => {
-            if (error) {
-              rejectPromise(error);
-              return;
-            }
+        const child = spawn(executablePath, [...baseArgs], {
+          stdio: ['pipe', 'pipe', 'pipe'],
+          windowsHide: true,
+          shell: false,
+        });
+        const stdoutChunks: Uint8Array[] = [];
+        const stderrChunks: Uint8Array[] = [];
+        let stdoutBytes = 0;
+        let stderrBytes = 0;
+        let settled = false;
+
+        const fail = (err: unknown): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          rejectPromise(err instanceof Error ? err : new Error(String(err)));
+        };
+
+        const timer = setTimeout(() => {
+          try {
+            child.kill();
+          } catch {
+            // Best-effort kill on timeout.
+          }
+          fail(new Error(`Command embedder timed out after ${timeoutMs} ms`));
+        }, timeoutMs);
+
+        child.on('error', fail);
+        child.stdin?.on('error', (err) => {
+          if (!settled && (err as { code?: string }).code !== 'EPIPE') {
+            fail(err);
+          }
+        });
+
+        child.stdout?.on('data', (chunk) => {
+          const bytes = typeof chunk === 'string' ? embedEncoder.encode(chunk) : chunk;
+          stdoutBytes += bytes.length;
+          if (stdoutBytes > MAX_COMMAND_STDOUT_BYTES) {
             try {
-              const parsed = JSON.parse(stdout) as readonly (readonly number[])[];
-              if (!Array.isArray(parsed)) {
-                rejectPromise(new Error('Command embedder did not return a JSON array of vectors'));
-                return;
-              }
-              resolvePromise(parsed.map((vec) => Float32Array.from(vec)));
-            } catch (parseErr) {
-              rejectPromise(parseErr);
+              child.kill();
+            } catch {
+              // Best-effort kill on stdout cap.
             }
-          },
-        );
+            fail(new Error(`Command embedder stdout exceeded ${MAX_COMMAND_STDOUT_BYTES} bytes`));
+            return;
+          }
+          stdoutChunks.push(bytes);
+        });
+
+        child.stderr?.on('data', (chunk) => {
+          const bytes = typeof chunk === 'string' ? embedEncoder.encode(chunk) : chunk;
+          if (stderrBytes < 65536) {
+            const remaining = 65536 - stderrBytes;
+            const slice = bytes.length > remaining ? bytes.subarray(0, remaining) : bytes;
+            stderrChunks.push(slice);
+            stderrBytes += slice.length;
+          }
+        });
+
+        child.on('close', (code, signal) => {
+          clearTimeout(timer);
+          if (settled) return;
+          if (code !== 0) {
+            settled = true;
+            const errDetail = concatAndDecode(stderrChunks).trim();
+            rejectPromise(
+              new Error(
+                `Command embedder exited with ${signal ? `signal ${signal}` : `code ${code}`}${errDetail ? `: ${errDetail}` : ''}`,
+              ),
+            );
+            return;
+          }
+          try {
+            const stdout = concatAndDecode(stdoutChunks);
+            const parsed = JSON.parse(stdout) as readonly (readonly number[])[];
+            if (!Array.isArray(parsed)) {
+              throw new Error('Command embedder did not return a JSON array of vectors');
+            }
+            settled = true;
+            resolvePromise(parsed.map((vec) => Float32Array.from(vec)));
+          } catch (parseErr) {
+            settled = true;
+            rejectPromise(parseErr);
+          }
+        });
+
+        if (!child.stdin) {
+          fail(new Error('Command embedder stdin pipe unavailable'));
+          return;
+        }
+        child.stdin.end(JSON.stringify(texts));
       });
     },
   };

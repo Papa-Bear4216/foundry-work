@@ -43,7 +43,16 @@ export interface ManualEvidence {
   readonly ttl_s: number;
 }
 
-export type FactEvidence = FileEvidence | CommandEvidence | ManualEvidence;
+export interface InvalidEvidence {
+  readonly type: 'invalid';
+  readonly [key: string]: unknown;
+}
+
+export type FactEvidence =
+  | FileEvidence
+  | CommandEvidence
+  | ManualEvidence
+  | InvalidEvidence;
 
 export interface CheckedPredicate {
   readonly predicate: string;
@@ -111,7 +120,6 @@ export interface IndexState {
   readonly logBytes: number;
   readonly headSha256: string;
   readonly tailSha256: string;
-  readonly logSha256: string;
   readonly logMtimeNs: string;
   readonly logCtimeNs: string;
   readonly logIno: string;
@@ -119,6 +127,12 @@ export interface IndexState {
   readonly nextLineNumber: number;
   readonly completeBadLines: readonly number[];
   readonly tailIncomplete: boolean;
+  readonly blocksCount: number;
+  readonly factsCount: number;
+  readonly factTagsCount: number;
+  readonly factEvidenceCount: number;
+  readonly factRetractionsCount: number;
+  readonly factSupersessionsCount: number;
 }
 
 export interface IndexSyncResult {
@@ -176,7 +190,9 @@ export type DisplayBadge =
   | 'RELATED'
   | 'STALE'
   | 'EXPIRED'
-  | 'UNVERIFIABLE';
+  | 'UNVERIFIABLE'
+  | 'SUPERSEDED'
+  | 'RETRACTED';
 
 export interface QueryOptions {
   readonly logPath: string;

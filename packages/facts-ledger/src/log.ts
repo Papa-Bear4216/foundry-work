@@ -88,6 +88,7 @@ export function scanFdRange(
   maxPosition: number,
   onBlock: (block: Block, lineNumber: number, endOffset: number) => void,
   recoverTail: boolean,
+  onReadRange?: (offset: number, length: number) => void,
 ): StreamScanState {
   const chunk = new Uint8Array(MAX_LINE_BYTES);
   const line = new Uint8Array(MAX_LINE_BYTES - 1);
@@ -120,6 +121,9 @@ export function scanFdRange(
   while (position < maxPosition) {
     const count = readSync(fd, chunk, 0, Math.min(chunk.length, maxPosition - position), position);
     if (count === 0) break;
+    if (onReadRange) {
+      onReadRange(position, count);
+    }
     const chunkBase = position;
     position += count;
     let start = 0;
@@ -176,27 +180,11 @@ export function scanLog(logPath: string, onBlock: (block: Block) => void): ScanR
   }
 }
 
-/** Stream `[startOffset, endOffset)` from an open fd into a SHA-256 hasher using a fixed buffer. */
-export function updateSha256FromFdRange(
-  fd: number,
-  hasher: { update(data: Uint8Array): unknown },
-  startOffset: number,
-  endOffset: number,
-): void {
-  if (endOffset <= startOffset) return;
-  const chunk = new Uint8Array(MAX_LINE_BYTES);
-  let pos = startOffset;
-  while (pos < endOffset) {
-    const toRead = Math.min(chunk.length, endOffset - pos);
-    const n = readSync(fd, chunk, 0, toRead, pos);
-    if (n === 0) break;
-    hasher.update(n === chunk.length ? chunk : chunk.subarray(0, n));
-    pos += n;
-  }
-}
-
 /** Read size, stat metadata, and head/tail 4 KiB SHA-256 digests from an already-open log fd. */
-export function readLogHeaderFromFd(fd: number): {
+export function readLogHeaderFromFd(
+  fd: number,
+  onReadRange?: (offset: number, length: number) => void,
+): {
   exists: true;
   size: number;
   headSha256: string;
@@ -213,6 +201,9 @@ export function readLogHeaderFromFd(fd: number): {
   while (totalHead < headLen) {
     const n = readSync(fd, headBuf, totalHead, headLen - totalHead, totalHead);
     if (n === 0) break;
+    if (onReadRange) {
+      onReadRange(totalHead, n);
+    }
     totalHead += n;
   }
   const headSha256 = createHash('sha256').update(headBuf.subarray(0, totalHead)).digest('hex');
@@ -224,6 +215,9 @@ export function readLogHeaderFromFd(fd: number): {
   while (totalTail < tailLen) {
     const n = readSync(fd, tailBuf, totalTail, tailLen - totalTail, tailOffset + totalTail);
     if (n === 0) break;
+    if (onReadRange) {
+      onReadRange(tailOffset + totalTail, n);
+    }
     totalTail += n;
   }
   const tailSha256 = createHash('sha256').update(tailBuf.subarray(0, totalTail)).digest('hex');
@@ -278,13 +272,18 @@ export function readLogHeaderState(logPath: string): {
 export function replaceFileWithRetry(
   tempPath: string,
   targetPath: string,
-  options?: { maxAttempts?: number; baseDelayMs?: number },
+  options?: {
+    maxAttempts?: number;
+    baseDelayMs?: number;
+    renameFn?: (oldPath: string, newPath: string) => void;
+  },
 ): void {
   const maxAttempts = options?.maxAttempts ?? 8;
   const baseDelayMs = options?.baseDelayMs ?? 15;
+  const rename = options?.renameFn ?? renameSync;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      renameSync(tempPath, targetPath);
+      rename(tempPath, targetPath);
       return;
     } catch (error) {
       const code = (error as { code?: string }).code;
