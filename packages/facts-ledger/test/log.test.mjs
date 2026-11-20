@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,12 +7,22 @@ import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { appendBlock, MAX_LINE_BYTES, scanLog } from '../dist/index.js';
+import { appendBlock, compareBytewise, MAX_LINE_BYTES, scanLog } from '../dist/index.js';
 
 const exec = promisify(execFile);
 const writer = fileURLToPath(new URL('./writer.py', import.meta.url));
 const moduleUrl = new URL('../dist/index.js', import.meta.url).href;
-const python = process.env.FACTS_LEDGER_PYTHON || 'python';
+
+function resolvePythonBinary() {
+  if (process.env.FACTS_LEDGER_PYTHON) return process.env.FACTS_LEDGER_PYTHON;
+  for (const candidate of ['python', 'python3']) {
+    const probe = spawnSync(candidate, ['--version'], { stdio: 'ignore' });
+    if (!probe.error && probe.status === 0) return candidate;
+  }
+  return 'python3';
+}
+
+const python = resolvePythonBinary();
 const fixture = { agent: 'ts-fixture', project: 'fixture', intent: 'append café', reasoning: 'verify format' };
 
 function logPath(t) {
@@ -152,4 +162,28 @@ print(json.dumps([before, tool["format_block"](before), after]))
   assert.deepEqual(read(path), {
     blocks: [first, after], report: { badLineCount: 0, badLineNumbers: [] },
   });
+});
+
+test('treats UTF-8 BOM lines as bad lines and normalizes explicit undefined/empty supersedes', (t) => {
+  const path = logPath(t);
+  const first = appendBlock(path, {
+    ...fixture,
+    actions: undefined,
+    verification: undefined,
+    touches: undefined,
+    supersedes: undefined,
+  });
+  assert.deepEqual(first.actions, []);
+  assert.deepEqual(first.touches, []);
+  assert.equal(first.verification, null);
+  assert.equal(first.supersedes, null);
+  assert.throws(() => appendBlock(path, { ...fixture, supersedes: '' }), /Unknown block/);
+
+  const bomLine = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(JSON.stringify(first) + '\n')]);
+  writeFileSync(path, bomLine);
+  assert.deepEqual(read(path), { blocks: [], report: { badLineCount: 1, badLineNumbers: [1] } });
+
+  // Lone surrogates encode identically as U+FFFD in UTF-8 and must compare equal (total order).
+  assert.equal(compareBytewise('\uD800', '\uD801'), 0);
+  assert.equal(compareBytewise('\uD801', '\uD800'), 0);
 });
