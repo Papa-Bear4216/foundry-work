@@ -1,14 +1,17 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 
 const approved = new Set([
   'MIT', 'ISC', 'Apache-2.0', 'BSD-2-Clause', 'BSD-3-Clause', 'BSD-4-Clause',
 ]);
-const lock = JSON.parse(readFileSync(new URL('../package-lock.json', import.meta.url), 'utf8'));
+const locks = [new URL('../package-lock.json', import.meta.url)];
+const vaultLock = new URL('../packages/vault/codec/package-lock.json', import.meta.url);
+if (existsSync(vaultLock)) locks.push(vaultLock);
+const packages = locks.flatMap(path => Object.entries(JSON.parse(readFileSync(path, 'utf8')).packages));
 const inventory = readFileSync(new URL('../docs/DEPENDENCIES.md', import.meta.url), 'utf8');
 const rows = inventory.split(/\r?\n/).map(line => line.split('|').map(cell => cell.trim()));
 
 let checked = 0;
-for (const [path, entry] of Object.entries(lock.packages)) {
+for (const [path, entry] of packages) {
   const installedName = /(?:^|\/)node_modules\/(?!.*\/node_modules\/)([^/]+(?:\/[^/]+)?)$/.exec(path)?.[1];
   if (!installedName || entry.link) continue;
 

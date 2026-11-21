@@ -1,11 +1,12 @@
 """Run the shared vector catalog with: python -B packages/vault/reference/test_vectors.py."""
 import base64
 import hashlib
+import hmac
 import json
 from pathlib import Path
 import unittest
 
-from reader import FRAME, InvalidVault, document, plaintext, records, unlock, verify_segment
+from reader import FRAME, InvalidVault, plaintext, records, unlock, vault_metadata, verify_segment
 
 VECTORS = Path(__file__).resolve().parents[1] / "codec" / "test" / "vectors"
 CASES = json.loads((VECTORS / "cases.json").read_bytes())
@@ -20,7 +21,8 @@ def record_bytes(case):
     raw = asset(case["asset"])
     if "prefix" in case:
         start, end = case["slice"]
-        return asset(case["prefix"]) + raw[start:end]
+        frame = raw[start:end] + (asset(case["tag"]) if "tag" in case else b"")
+        return asset(case["prefix"]) + frame * case.get("repeat", 1)
     if case.get("swap_frames"):
         split = 69 + FRAME + 20
         return raw[:69] + raw[split:] + raw[69:split]
@@ -30,8 +32,7 @@ def record_bytes(case):
 class Vectors(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.metadata = document(asset("VAULT.json"), "foundry-vault/1", "vault_id created_at signing_public_key")
-        cls.vault_id = cls.metadata["vault_id"]
+        cls.vault_id, cls.public_key = vault_metadata(asset("VAULT.json"))
         cls.key_for_id = staticmethod(unlock(asset(CASES["keyring"]), cls.vault_id, passphrase=CASES["passphrase"]))
 
     def expect(self, case, operation):
@@ -48,21 +49,33 @@ class Vectors(unittest.TestCase):
                     parsed = list(records(record_bytes(case)))
                     if len(parsed) != 1:
                         raise InvalidVault("LENGTH")
+                    if case.get("scan_only"):
+                        return None
                     key = (lambda _: bytes(32)) if case.get("wrong_key") else self.key_for_id
                     return parsed[0], plaintext(parsed[0], case.get("vault_id", self.vault_id), key)
 
                 result = self.expect(case, decode)
                 if result is not None:
-                    (kind, seq, *_), raw = result
+                    (kind, seq, key_id, *_), raw = result
                     self.assertEqual((kind, seq, len(raw)), (case["type"], case["sequence"], case["length"]))
                     self.assertEqual(hashlib.sha256(raw).hexdigest(), case["sha256"])
+                    if "blob_id" in case:
+                        key = self.key_for_id(key_id, identity=True)
+                        self.assertEqual(hmac.digest(key, raw, "sha256").hex(), case["blob_id"])
+
+    def test_metadata_vectors(self):
+        for case in CASES["metadata_cases"]:
+            with self.subTest(case=case["name"]):
+                result = self.expect(case, lambda: vault_metadata(asset(case["asset"])))
+                if result is not None:
+                    self.assertEqual(result, (CASES["metadata"]["vault_id"],
+                                              base64.b64decode(CASES["metadata"]["signing_public_key"])))
 
     def test_manifest_vectors(self):
-        public_key = base64.b64decode(self.metadata["signing_public_key"])
         positions = {}
         for case in CASES["manifest_cases"]:
             with self.subTest(case=case["name"]):
-                args = (asset(case["asset"]), asset(case["signature"]), public_key, self.vault_id,
+                args = (asset(case["asset"]), asset(case["signature"]), self.public_key, self.vault_id,
                         {name: asset(path) for name, path in case["files"].items()})
                 prior = {"previous": positions[case["prior"]]} if "prior" in case else {}
                 result = self.expect(case, lambda: verify_segment(*args, **prior))

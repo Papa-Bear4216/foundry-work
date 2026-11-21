@@ -88,7 +88,8 @@ A parser improvement never touches the vault: bump the deriver version and re-de
 ```
 
 - Use the exact literal names shown above. Record stream names use lowercase ASCII.
-  Segment directories use the decimal segment number padded to at least six digits.
+  Segment directories use the decimal segment number, zero-padded to six digits for
+  1 through 999,999 and written without leading zeros from 1,000,000 onward.
 - A record stream file rolls over at 64 MiB. A blob never spans two files; a blob larger
   than 64 MiB gets a file to itself. (**Decided:** segment soft cap 512 MiB.)
 - The cap is soft. A blob larger than the cap gets a segment to itself, and that segment is
@@ -109,7 +110,7 @@ offset  size  field
 4       1     type: 0x01 = event, 0x02 = blob
 5       16    key_id: raw bytes, matching a collection keyring entry
 21      32    salt: fresh cryptographically random bytes for every record
-53      8     ctx: u64 big-endian, positive event sequence or zero for a blob
+53      8     ctx: u64 big-endian, 1 through 9,007,199,254,740,991 for an event, zero for a blob
 61      8     total_len: u64 big-endian, bytes after the header in this record
 69      ...   one or more frames: u32 big-endian ciphertext_len | ciphertext | 16-byte tag
 ```
@@ -182,7 +183,7 @@ The blob id is stored inside the encrypted event, not in the clear record header
 
 ### 4.5 Manifest and chain
 
-The manifest and keyring use UTF-8 without a BOM, trailing newline or other extra
+`VAULT.json`, the manifest and the keyring use UTF-8 without a BOM, trailing newline or other extra
 whitespace, as specified by [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785). Sort object
 members recursively by ascending UTF-16 code units and preserve array order. Use RFC 8785
 string escaping and well-formed Unicode without normalization. Numbers are interoperable
@@ -190,7 +191,8 @@ integers with absolute value at most 9,007,199,254,740,991. Readers require exac
 bytes, unique member names and the exact named fields for each versioned object. Hex
 strings are lowercase without a prefix. Base64 uses the RFC 4648 standard alphabet with
 canonical padding and no whitespace. Format timestamps are Gregorian UTC with exactly
-the form `YYYY-MM-DDTHH:MM:SSZ`, year 0001 through 9999 and seconds 00 through 59.
+the form `YYYY-MM-DDTHH:MM:SSZ`, with years 0001 through 9999, hours 00 through 23,
+and minutes and seconds 00 through 59.
 
 ```json
 {
@@ -219,19 +221,23 @@ the form `YYYY-MM-DDTHH:MM:SSZ`, year 0001 through 9999 and seconds 00 through 5
   without events uses JSON `null` for both range endpoints and preserves the last
   event sequence for the next link.
 - `files` is a nonempty array of unique stream names sorted by ascending ASCII name.
-  A name is `events-` or `pack-`, the positive decimal stream ordinal padded to at
-  least four digits, and `.fvr`. Ordinals are at most 9,007,199,254,740,991. Each file
+  A name is `events-` or `pack-`, the positive decimal stream ordinal, and `.fvr`.
+  Zero-pad ordinals 1 through 9,999 to four digits. Write ordinals from 10,000
+  onward without leading zeros. The maximum ordinal is 9,007,199,254,740,991. Each file
   has at least one record and carries its exact byte count and lowercase hex SHA-256.
   An `events` stream contains events and a `pack` stream contains blobs. Check the
   event contexts in ascending event-stream ordinal and in byte order in each stream.
-  `key_ids` is the complete set of record key IDs in the segment, including erased
+  `key_ids` is the nonempty set of all record key IDs in the segment, including erased
   IDs, rendered as 32 hex digits each, unique and sorted in ascending ASCII order.
 - `MANIFEST.sig` is exactly the 64 raw bytes of a pure Ed25519 signature over the
-  canonical `MANIFEST.json` bytes. Store the 32 raw public-key bytes as base64 in
-  `VAULT.json` under `signing_public_key`. The other metadata fields are `format`
-  (`foundry-vault/1`), `vault_id` and `created_at`. The anchor's public-key
+  canonical `MANIFEST.json` bytes. `VAULT.json` has four fields. `format` is
+  `foundry-vault/1`, `vault_id` is 16 bytes encoded as 32 lowercase hex digits,
+  `created_at` is a canonical timestamp, and `signing_public_key` is the 32 raw
+  public-key bytes encoded as canonical base64. The anchor's public-key
   fingerprint is lowercase hex SHA-256 of the 32 raw public-key bytes. The keyring
-  wraps the 32-byte Ed25519 private seed (section 5.4).
+  wraps the 32-byte Ed25519 private seed (section 5.4). The signing key and its
+  printed anchor are fixed for the life of a v1 vault. A later format version may
+  add signing-key rotation. Version 1 readers need only support the fixed key.
 - **Verification needs no secret.** Starting at segment 1, check the signatures, vault
   ID, chain links and event context ranges. Check the exact set of record stream names,
   file lengths, hashes, record structures and key ID inventory. Renaming a stream or
@@ -327,6 +333,10 @@ keyring MAC. The rewrite can use the current passphrase to unlock MK and needs n
 - Changing the passphrase does not revoke an old one. Anyone who copied an earlier keyring
   and knows the earlier passphrase can still unwrap the keys that keyring held. After a
   suspected passphrase leak the remedy is `foundry vault rekey --all`, not a passphrase change.
+- `foundry vault rekey --all` rotates MK and the profile, collection and index keys
+  for confidentiality. It preserves the vault signing key and printed anchor. If
+  the signing key may be compromised, create a new vault and import the old vault's
+  contents. The new vault has its own vault ID, signing key and printed anchor.
 
 ### 5.4 Keyring file
 

@@ -110,6 +110,16 @@ function vaultKey(key: Buffer, vaultId: string, label: string): Buffer {
   return derive(key, label, Buffer.from(vaultId, 'hex'));
 }
 
+export function collectionIdKey(collectionKey: Buffer, vaultId: string): Buffer {
+  hex(vaultId, 16);
+  return vaultKey(collectionKey, vaultId, 'collection-id');
+}
+
+export function blobId(idKey: Buffer, plaintext: Buffer): string {
+  check(idKey.length === 32, 'KEY');
+  return createHmac('sha256', idKey).update(plaintext).digest('hex');
+}
+
 function aad(vaultId: string, keyId: string, kind: string, parent: string, kdf?: Kdf): Buffer {
   return Buffer.from(canonical([FORMAT, vaultId, keyId, kind, parent, (kdf as unknown as Json) ?? null]));
 }

@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer';
 import { createPrivateKey, createPublicKey, sign, verify } from 'node:crypto';
 import {
-  canonical, check, hex, integer, object, parseCanonical, sha256, timestamp,
+  base64, canonical, check, hex, integer, object, parseCanonical, sha256, timestamp,
 } from './bytes.ts';
 import type { Json } from './bytes.ts';
 import { scanRecords } from './record.ts';
@@ -9,6 +9,18 @@ import { scanRecords } from './record.ts';
 export const GENESIS_HASH = '0'.repeat(64);
 const SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 const PKCS8_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
+
+export function decodeVaultMetadata(raw: Buffer) {
+  const data = parseCanonical(raw);
+  check(data !== null && typeof data === 'object' && Object.hasOwn(data, 'format'));
+  check((data as { format: unknown }).format === 'foundry-vault/1', 'VERSION');
+  object(data, 'format vault_id created_at signing_public_key');
+  const { vault_id, created_at, signing_public_key } = data;
+  hex(vault_id, 16);
+  timestamp(created_at);
+  base64(signing_public_key, 32);
+  return { format: 'foundry-vault/1' as const, vault_id, created_at, signing_public_key };
+}
 
 export interface ManifestFile {
   name: string;
@@ -55,7 +67,8 @@ function validateManifest(value: unknown): asserts value is Manifest {
   }
   timestamp(value.closed_at);
   check(typeof value.writer === 'string' && value.writer.length > 0);
-  check(Array.isArray(value.files) && value.files.length > 0 && Array.isArray(value.key_ids));
+  check(Array.isArray(value.files) && value.files.length > 0
+    && Array.isArray(value.key_ids) && value.key_ids.length > 0);
   let previous = '';
   for (const file of value.files) {
     object(file, 'name bytes sha256');

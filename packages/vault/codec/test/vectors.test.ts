@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import {
-  FRAME_BYTES, decodeKeyring, decodeRecord, decryptRecord, scanRecords,
+  FRAME_BYTES, blobId, collectionIdKey, decodeKeyring, decodeRecord, decodeVaultMetadata, decryptRecord, scanRecords,
   sha256, signingPublicKey, VaultFormatError, verifySegment,
 } from '../src/index.ts';
 import type { ChainPosition } from '../src/index.ts';
@@ -12,21 +12,33 @@ function asset(name: string): Buffer {
   return name.endsWith('.b64') ? Buffer.from(stored.toString('ascii'), 'base64') : stored;
 }
 const suite = JSON.parse(asset('cases.json').toString());
-const metadata = JSON.parse(asset('VAULT.json').toString());
+const metadata = decodeVaultMetadata(asset('VAULT.json'));
 assert.deepEqual(metadata, suite.metadata);
 const vaultId = metadata.vault_id;
 const publicKey = Buffer.from(metadata.signing_public_key, 'base64');
 const unlocked = decodeKeyring(asset(suite.keyring), { passphrase: suite.passphrase }, vaultId);
 const initialKey = unlocked.collectionEncryptionKey(suite.ids.collection);
+const identityKey = collectionIdKey(unlocked.keys.get(suite.ids.collection)!, vaultId);
 const expect = <T>(operation: () => T, error?: string): T | undefined => {
   if (error === undefined) return operation();
   assert.throws(operation, (value: unknown) => value instanceof VaultFormatError && value.code === error);
 };
 
+for (const vector of suite.metadata_cases) {
+  test('metadata: ' + vector.name, () => {
+    const result = expect(() => decodeVaultMetadata(asset(vector.asset)), vector.error);
+    if (result) assert.deepEqual(result, suite.metadata);
+  });
+}
+
 for (const vector of suite.record_cases) {
   test('record: ' + vector.name, () => {
     let bytes = asset(vector.asset);
-    if (vector.prefix) bytes = Buffer.concat([asset(vector.prefix), bytes.subarray(...vector.slice)]);
+    if (vector.prefix) {
+      let frame = bytes.subarray(...vector.slice);
+      if (vector.tag) frame = Buffer.concat([frame, asset(vector.tag)]);
+      bytes = Buffer.concat([asset(vector.prefix), ...Array(vector.repeat ?? 1).fill(frame)]);
+    }
     if (vector.swap_frames) {
       const split = 69 + FRAME_BYTES + 20;
       bytes = Buffer.concat([bytes.subarray(0, 69), bytes.subarray(split), bytes.subarray(69, split)]);
@@ -34,6 +46,7 @@ for (const vector of suite.record_cases) {
     const result = expect(() => {
       const records = [...scanRecords(bytes)];
       if (records.length !== 1) throw new VaultFormatError('LENGTH');
+      if (vector.scan_only) return;
       const key = vector.wrong_key ? Buffer.alloc(32) : unlocked.collectionEncryptionKey(records[0].keyId);
       return decodeRecord(bytes, vector.vault_id ?? vaultId, key);
     }, vector.error);
@@ -42,6 +55,7 @@ for (const vector of suite.record_cases) {
       assert.equal(result.context, BigInt(vector.sequence));
       assert.equal(result.plaintext.length, vector.length);
       assert.equal(sha256(result.plaintext), vector.sha256);
+      if (vector.blob_id) assert.equal(blobId(identityKey, result.plaintext), vector.blob_id);
     }
   });
 }

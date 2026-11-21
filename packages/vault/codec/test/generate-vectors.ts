@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { createHmac, scryptSync } from 'node:crypto';
+import { createHmac, createPrivateKey, scryptSync, sign } from 'node:crypto';
 import {
-  FRAME_BYTES, GENESIS_HASH, encodeKeyring, encodeManifest, encodeRecord, sha256, signingPublicKey,
+  FRAME_BYTES, GENESIS_HASH, blobId, collectionIdKey, encodeKeyring, encodeManifest, encodeRecord, sha256, signingPublicKey,
 } from '../src/index.ts';
 import { canonical, derive, seal } from '../src/bytes.ts';
 import type { Json } from '../src/bytes.ts';
@@ -23,6 +23,7 @@ const recoveryKey = Buffer.alloc(32, 0x34);
 const indexKey = Buffer.alloc(32, 0x35);
 const salt = Buffer.from(vaultId, 'hex');
 const encryption = derive(collection, 'collection-encryption', salt);
+const identity = collectionIdKey(collection, vaultId);
 const date = '2026-01-02T03:04:05Z';
 let nonceByte = 0x40;
 const live = { state: 'active', created_at: date } as const;
@@ -65,6 +66,14 @@ const changedRing = withKeyringMac({
 });
 const metadata = { format: 'foundry-vault/1', vault_id: vaultId, created_at: date,
   signing_public_key: signingPublicKey(signing).toString('base64') };
+const testSigningKey = createPrivateKey({
+  format: 'jwk',
+  key: {
+    kty: 'OKP', crv: 'Ed25519',
+    x: Buffer.from(metadata.signing_public_key, 'base64').toString('base64url'),
+    d: signing.toString('base64url'),
+  },
+});
 const dir = new URL('./vectors/', import.meta.url);
 const checkOnly = process.argv.includes('--check');
 if (!checkOnly) mkdirSync(dir, { recursive: true });
@@ -93,12 +102,13 @@ function record(name: string, type: 1 | 2, sequence: number, plaintext: Buffer, 
   const asset = save(name + '.fvr', bytes);
   const digest = sha256(plaintext);
   plaintextDigests.set(asset, digest);
-  recordCases.push({ name, asset, type, sequence, length: plaintext.length, sha256: digest });
+  recordCases.push({ name, asset, type, sequence, length: plaintext.length, sha256: digest,
+    ...(type === 2 ? { blob_id: blobId(identity, plaintext) } : {}) });
   return asset;
 }
 const event = record('event', 1, 1, Buffer.from('{"seq":1,"kind":"vault.created"}'), 0x50);
 const event2 = record('event-next', 1, 2, Buffer.from('{"seq":2,"kind":"profile.created"}'), 0x51);
-record('event-max-seq', 1, Number.MAX_SAFE_INTEGER, Buffer.from('{"seq":9007199254740991}'), 0x52);
+const maxEvent = record('event-max-seq', 1, Number.MAX_SAFE_INTEGER, Buffer.from('{"seq":9007199254740991}'), 0x52);
 const empty = record('empty', 2, 0, Buffer.alloc(0), 0x53);
 const tiny = record('one-byte', 2, 0, Buffer.from([0xa5]), 0x54);
 record('full-frame', 2, 0, Buffer.alloc(FRAME_BYTES, 0x5a), 0x57);
@@ -110,6 +120,7 @@ const recordError = (name: string, asset: string, error: string, options = {}) =
   recordCases.push({ name, asset, error, ...options });
 recordError('wrong-key', event, 'AUTH', { wrong_key: true });
 recordError('wrong-vault', event, 'AUTH', { vault_id: wrongVault });
+recordError('invalid-vault-id', event, 'SCHEMA', { vault_id: vaultId + ' ' });
 recordError('tag-bit', save('tag-bit.fvr', flip(read(tiny), read(tiny).length - 1)), 'AUTH');
 recordError('record-version', save('record-version.fvr', flip(read(event), 3)), 'VERSION');
 recordError('record-type', save('record-type.fvr', flip(read(event), 4)), 'SCHEMA');
@@ -124,22 +135,58 @@ const offsets = { magic: 4, type: 5, key_id: 21, salt: 53, context: 61,
 for (const [field, end] of Object.entries(offsets)) {
   recordError('cut-' + field, save('cut-' + field + '.fvr', read(tiny).subarray(0, end - 1)), 'LENGTH');
 }
-const oversized = Buffer.from(read(tiny));
-oversized.writeUInt32BE(FRAME_BYTES + 1, 69);
-recordError('oversized-frame', save('oversized-frame.fvr', oversized), 'LENGTH');
+const unsafeContext = Buffer.from(read(maxEvent));
+unsafeContext.writeBigUInt64BE(BigInt(Number.MAX_SAFE_INTEGER) + 1n, 53);
+recordError('event-context-above-max', save('event-context-above-max.fvr', unsafeContext), 'SCHEMA', { scan_only: true });
+for (const [name, json, saltByte, error] of [
+  ['event-seq-mismatch', '{"seq":2}', 0x58, 'SEQUENCE'],
+  ['event-seq-fraction', '{"seq":1.0}', 0x59, 'SEQUENCE'],
+  ['empty-event', '', 0x5a, 'LENGTH'],
+] as const) {
+  // Seal deliberately invalid plaintexts that the production encoder refuses.
+  const payload = Buffer.from(json);
+  const eventHeader = Buffer.from(read(event).subarray(0, 69));
+  eventHeader.fill(saltByte, 21, 53);
+  eventHeader.writeBigUInt64BE(BigInt(payload.length + 20), 61);
+  const aad = Buffer.concat([eventHeader, salt, Buffer.alloc(8), Buffer.from([1])]);
+  const key = derive(encryption, 'record-key', eventHeader.subarray(21, 53));
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(payload.length);
+  const bytes = Buffer.concat([eventHeader, length, seal(key, Buffer.alloc(12), aad, payload)]);
+  recordError(name, save(name + '.fvr', bytes), error, name === 'empty-event' ? { scan_only: true } : {});
+}
 const unsafeLength = Buffer.from(read(tiny));
 unsafeLength.writeBigUInt64BE((1n << 64n) - 1n, 61);
 recordError('u64-length', save('u64-length.fvr', unsafeLength), 'LENGTH');
 recordError('extra-byte', save('extra-byte.fvr', Buffer.concat([read(tiny), Buffer.alloc(1)])), 'LENGTH');
 const header = read(multi).subarray(0, 69);
 const firstFrame = read(multi).subarray(69, 69 + FRAME_BYTES + 20);
+const oversizedPrefix = Buffer.from(read(multi).subarray(0, 73));
+oversizedPrefix.writeBigUInt64BE(BigInt(firstFrame.length + 1), 61);
+oversizedPrefix.writeUInt32BE(FRAME_BYTES + 1, 69);
+// With an exact final-frame boundary, only the size limit can reject this during scanning.
+recordError('oversized-frame', multi, 'LENGTH', {
+  prefix: save('oversized-frame-prefix.bin', oversizedPrefix), slice: [73, 70 + firstFrame.length], scan_only: true,
+});
 const shortenedHeader = Buffer.from(header);
 shortenedHeader.writeBigUInt64BE(BigInt(firstFrame.length), 61);
 // The recipe stores small bytes separately and references the shared large frame.
 recordError('missing-final-frame', multi, 'AUTH', {
   prefix: save('missing-final-header.bin', shortenedHeader), slice: [69, 69 + firstFrame.length],
 });
-recordError('frame-swap', multi, 'LENGTH', { swap_frames: true });
+recordError('short-nonfinal-frame', multi, 'LENGTH', { swap_frames: true, scan_only: true });
+const double = encodeRecord({ type: 2, keyId: ids.collection, context: 0n },
+  Buffer.alloc(2 * FRAME_BYTES, 0x5a), vaultId, encryption, header.subarray(21, 53));
+const tagOffset = 73 + FRAME_BYTES;
+// With the same synthetic salt and plaintext, the first ciphertext is reusable. Its new
+// tag authenticates the new header at index 0. Replaying that complete frame at index 1 fails.
+assert.deepEqual(double.subarray(69, tagOffset), read(multi).subarray(69, tagOffset));
+recordError('frame-replay', multi, 'AUTH', {
+  prefix: save('frame-replay-header.bin', double.subarray(0, 69)),
+  slice: [69, tagOffset],
+  tag: save('frame-replay-tag.bin', double.subarray(tagOffset, tagOffset + 16)),
+  repeat: 2,
+});
 
 const eventStream = save('events.fvr', Buffer.concat([read(event), read(event2)]));
 const swapped = save('events-swapped.fvr', Buffer.concat([read(event2), read(event)]));
@@ -166,11 +213,14 @@ const next = segment('next', 2, { 'pack-0001.fvr': multi }, 'genesis');
 const end = segment('end', 3, { 'events-0001.fvr': save('event-third.fvr', encodeRecord(
   { type: 1, context: 3n, keyId: ids.collection }, Buffer.from('{"seq":3}'), vaultId, encryption, Buffer.alloc(32, 0x56))) },
 'next', [3, 3]);
+const boundary = segment('stream-ordinal-boundary', 1,
+  { 'events-9999.fvr': event, 'events-10000.fvr': event2 }, undefined, [1, 2]);
 const digestFor = (asset: string) => plaintextDigests.get(asset)!;
 manifestCases.push(
   { name: 'genesis', ...genesis, plaintext_sha256: [event, event2, empty, tiny].map(digestFor) },
   { name: 'next', ...next, plaintext_sha256: [digestFor(multi)] },
   { name: 'end', ...end, plaintext_sha256: [sha256(Buffer.from('{"seq":3}'))] },
+  { name: 'stream-ordinal-boundary', ...boundary, plaintext_sha256: [event, event2].map(digestFor) },
 );
 manifestCases.push(
   { name: 'reordered-records', ...genesis, error: 'FILE', files: { ...genesis.files, 'events-0001.fvr': swapped } },
@@ -190,6 +240,18 @@ manifestCases.push(
   { name: 'manifest-newline', ...genesis, asset: save('manifest-newline.json',
     Buffer.concat([read(genesis.asset), Buffer.from('\n')])), error: 'CANONICAL' },
 );
+for (const [name, edit] of [
+  ['timestamp-hour-24', (data: Manifest) => { data.closed_at = '2026-01-01T24:00:00Z'; }],
+  ['timestamp-leap-second', (data: Manifest) => { data.closed_at = '2026-01-01T23:59:60Z'; }],
+  ['stream-leading-zero', (data: Manifest) => { data.files[0].name = 'events-00001.fvr'; }],
+  ['empty-key-ids', (data: Manifest) => { data.key_ids = []; }],
+] as const) {
+  const data = JSON.parse(read(genesis.asset).toString());
+  edit(data);
+  const bytes = Buffer.from(canonical(data));
+  manifestCases.push({ name, ...genesis, asset: save(name + '.json', bytes),
+    signature: save(name + '.sig', sign(null, bytes, testSigningKey)), error: 'SCHEMA' });
+}
 const ring = save('ring.json', keyring);
 const changed = save('ring-passphrase-changed.json', changedRing);
 const keyringCases: object[] = [{ name: 'passphrase', asset: ring }, { name: 'recovery', asset: ring, recovery: true },
@@ -200,11 +262,11 @@ const keyringCases: object[] = [{ name: 'passphrase', asset: ring }, { name: 're
   { name: 'wrong-passphrase', asset: ring, wrong_passphrase: true, error: 'AUTH' },
   { name: 'keyring-vault', asset: ring, vault_id: wrongVault, error: 'KEY' }];
 for (const [name, error, edit, remac] of [
-  ['keyring-version', 'VERSION', data => { data.format = 'foundry-keyring/2'; }, false],
+  ['ring-version', 'VERSION', data => { data.format = 'foundry-keyring/2'; }, false],
   ['scrypt-below-floor', 'KDF', data => { data.kdf.N = 65536; }, false],
   ['scrypt-above-ceiling', 'KDF', data => { data.kdf.p = 3; }, false],
-  ['live-kdf-aad', 'AUTH', data => { data.kdf.p = 2; }, false],
-  ['keyring-mac', 'MAC', data => { data.version--; }, false],
+  ['kdf-parallelism-tamper', 'AUTH', data => { data.kdf.p = 2; }, false],
+  ['ring-mac', 'MAC', data => { data.version--; }, false],
   ['master-slot-swap', 'AUTH', data => {
     [data.master.by_passphrase, data.master.by_recovery] = [data.master.by_recovery, data.master.by_passphrase];
   }, false],
@@ -227,11 +289,25 @@ keyringCases.push(
   { name: 'recovery-kdf-tamper-after-change', recovery: true, error: 'MAC',
     asset: save('changed-kdf-tamper.json', Buffer.from(canonical(tamperedRing))) },
 );
-save('VAULT.json', Buffer.from(canonical(metadata)));
+const metadataBytes = Buffer.from(canonical(metadata));
+const metadataCases: object[] = [{ name: 'vault-metadata', asset: save('VAULT.json', metadataBytes) }];
+for (const [name, bytes, error] of [
+  ['vault-newline', Buffer.concat([metadataBytes, Buffer.from('\n')]), 'CANONICAL'],
+  ['vault-short-signing-key', Buffer.from(canonical({ ...metadata, signing_public_key: Buffer.alloc(31).toString('base64') })), 'SCHEMA'],
+  ['vault-noncanonical-signing-key', Buffer.from(canonical({ ...metadata, signing_public_key: metadata.signing_public_key.slice(0, -1) })), 'SCHEMA'],
+  ['vault-invalid-id', Buffer.from(canonical({ ...metadata, vault_id: 'AA'.repeat(16) })), 'SCHEMA'],
+  ['vault-invalid-date', Buffer.from(canonical({ ...metadata, created_at: '2026-02-29T00:00:00Z' })), 'SCHEMA'],
+  ['json-fraction', Buffer.from('{"a":1.0}'), 'CANONICAL'],
+  ['json-nan', Buffer.from('{"a":NaN}'), 'CANONICAL'],
+  ['json-surrogate', Buffer.from('{"a":"\\ud800"}'), 'CANONICAL'],
+  ['json-unsafe-integer', Buffer.from('{"a":9007199254740992}'), 'CANONICAL'],
+] as const) {
+  metadataCases.push({ name, asset: save(name + '.json', bytes), error });
+}
 save('cases.json', Buffer.from(JSON.stringify({
   warning: 'TEST ONLY: all credentials, keys, salts, nonces and content are synthetic.',
   passphrase, changed_passphrase: changedPassphrase, recovery_key: recoveryKey.toString('hex'), metadata, ids,
   keyring: ring, changed_keyring: changed,
-  record_cases: recordCases, manifest_cases: manifestCases, keyring_cases: keyringCases,
+  metadata_cases: metadataCases, record_cases: recordCases, manifest_cases: manifestCases, keyring_cases: keyringCases,
 }, null, 2) + '\n'));
 if (checkOnly) assert.deepEqual(readdirSync(dir).filter(name => name !== '.gitattributes').sort(), [...assets.keys()].sort());

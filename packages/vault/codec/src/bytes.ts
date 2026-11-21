@@ -33,10 +33,10 @@ export function parseCanonical(raw: Buffer): Json {
   let value: Json;
   try {
     value = JSON.parse(raw.toString());
+    check(Buffer.from(canonical(value)).equals(raw), 'CANONICAL');
   } catch {
     throw new VaultFormatError('CANONICAL');
   }
-  check(Buffer.from(canonical(value)).equals(raw), 'CANONICAL');
   return value;
 }
 

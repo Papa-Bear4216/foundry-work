@@ -18,6 +18,57 @@
   },
   "keyring": "ring.json",
   "changed_keyring": "ring-passphrase-changed.json",
+  "metadata_cases": [
+    {
+      "name": "vault-metadata",
+      "asset": "VAULT.json"
+    },
+    {
+      "name": "vault-newline",
+      "asset": "vault-newline.json",
+      "error": "CANONICAL"
+    },
+    {
+      "name": "vault-short-signing-key",
+      "asset": "vault-short-signing-key.json",
+      "error": "SCHEMA"
+    },
+    {
+      "name": "vault-noncanonical-signing-key",
+      "asset": "vault-noncanonical-signing-key.json",
+      "error": "SCHEMA"
+    },
+    {
+      "name": "vault-invalid-id",
+      "asset": "vault-invalid-id.json",
+      "error": "SCHEMA"
+    },
+    {
+      "name": "vault-invalid-date",
+      "asset": "vault-invalid-date.json",
+      "error": "SCHEMA"
+    },
+    {
+      "name": "json-fraction",
+      "asset": "json-fraction.json",
+      "error": "CANONICAL"
+    },
+    {
+      "name": "json-nan",
+      "asset": "json-nan.json",
+      "error": "CANONICAL"
+    },
+    {
+      "name": "json-surrogate",
+      "asset": "json-surrogate.json",
+      "error": "CANONICAL"
+    },
+    {
+      "name": "json-unsafe-integer",
+      "asset": "json-unsafe-integer.json",
+      "error": "CANONICAL"
+    }
+  ],
   "record_cases": [
     {
       "name": "event",
@@ -49,7 +100,8 @@
       "type": 2,
       "sequence": 0,
       "length": 0,
-      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "blob_id": "e6f742155f301304448013ec12389a14fc46a1b59d8b60f9fa511629e4bb4ce4"
     },
     {
       "name": "one-byte",
@@ -57,7 +109,8 @@
       "type": 2,
       "sequence": 0,
       "length": 1,
-      "sha256": "6922e93e3827642ce4b883c756b31abf80036649d3614bf5fcb3adda43b8ea32"
+      "sha256": "6922e93e3827642ce4b883c756b31abf80036649d3614bf5fcb3adda43b8ea32",
+      "blob_id": "233b90176cfcb9c9e83180c716daae449f619fa24abe3a1d55fe4ad73033c0b0"
     },
     {
       "name": "full-frame",
@@ -65,7 +118,8 @@
       "type": 2,
       "sequence": 0,
       "length": 1048576,
-      "sha256": "bf63d8a95fcc2e64619813aae35fdcbe871fdd9264caa3f365eb3aed0f679129"
+      "sha256": "bf63d8a95fcc2e64619813aae35fdcbe871fdd9264caa3f365eb3aed0f679129",
+      "blob_id": "a4de76a5190dca2ea3631ea5cec5ee19c56a701aca0874ddca57482668b2922a"
     },
     {
       "name": "multiple-frames",
@@ -73,7 +127,8 @@
       "type": 2,
       "sequence": 0,
       "length": 1048577,
-      "sha256": "54ee86addafa96efebf6ea851e26f523c2e6dab06c80b1e69375b75cbc11ad28"
+      "sha256": "54ee86addafa96efebf6ea851e26f523c2e6dab06c80b1e69375b75cbc11ad28",
+      "blob_id": "ec35262719eded5b397a63cd78c9fbf0582c20e54365d44d30a879dafa52e209"
     },
     {
       "name": "wrong-key",
@@ -86,6 +141,12 @@
       "asset": "event.fvr",
       "error": "AUTH",
       "vault_id": "11111111111111111111111111111111"
+    },
+    {
+      "name": "invalid-vault-id",
+      "asset": "event.fvr",
+      "error": "SCHEMA",
+      "vault_id": "10101010101010101010101010101010 "
     },
     {
       "name": "tag-bit",
@@ -168,9 +229,26 @@
       "error": "LENGTH"
     },
     {
-      "name": "oversized-frame",
-      "asset": "oversized-frame.fvr",
-      "error": "LENGTH"
+      "name": "event-context-above-max",
+      "asset": "event-context-above-max.fvr",
+      "error": "SCHEMA",
+      "scan_only": true
+    },
+    {
+      "name": "event-seq-mismatch",
+      "asset": "event-seq-mismatch.fvr",
+      "error": "SEQUENCE"
+    },
+    {
+      "name": "event-seq-fraction",
+      "asset": "event-seq-fraction.fvr",
+      "error": "SEQUENCE"
+    },
+    {
+      "name": "empty-event",
+      "asset": "empty-event.fvr",
+      "error": "LENGTH",
+      "scan_only": true
     },
     {
       "name": "u64-length",
@@ -183,6 +261,17 @@
       "error": "LENGTH"
     },
     {
+      "name": "oversized-frame",
+      "asset": "multiple-frames.fvr.b64",
+      "error": "LENGTH",
+      "prefix": "oversized-frame-prefix.bin",
+      "slice": [
+        73,
+        1048666
+      ],
+      "scan_only": true
+    },
+    {
       "name": "missing-final-frame",
       "asset": "multiple-frames.fvr.b64",
       "error": "AUTH",
@@ -193,10 +282,23 @@
       ]
     },
     {
-      "name": "frame-swap",
+      "name": "short-nonfinal-frame",
       "asset": "multiple-frames.fvr.b64",
       "error": "LENGTH",
-      "swap_frames": true
+      "swap_frames": true,
+      "scan_only": true
+    },
+    {
+      "name": "frame-replay",
+      "asset": "multiple-frames.fvr.b64",
+      "error": "AUTH",
+      "prefix": "frame-replay-header.bin",
+      "slice": [
+        69,
+        1048649
+      ],
+      "tag": "frame-replay-tag.bin",
+      "repeat": 2
     }
   ],
   "manifest_cases": [
@@ -237,6 +339,19 @@
       "prior": "next",
       "plaintext_sha256": [
         "e1f447ad2c2071e1f4f0a269e338e37c2949ec93962633710281e031a7015741"
+      ]
+    },
+    {
+      "name": "stream-ordinal-boundary",
+      "asset": "stream-ordinal-boundary.json",
+      "signature": "stream-ordinal-boundary.sig",
+      "files": {
+        "events-9999.fvr": "event.fvr",
+        "events-10000.fvr": "event-next.fvr"
+      },
+      "plaintext_sha256": [
+        "f0e9e142d1eb94a8ee9707aaaa978f828a039af3b218ddb98cb5306e6d35d4f3",
+        "2f139d46de0fcd63641fd22db5cc285cb306f37e38cdf128649cda9629dc6544"
       ]
     },
     {
@@ -337,6 +452,46 @@
         "pack-0001.fvr": "pack.fvr"
       },
       "error": "CANONICAL"
+    },
+    {
+      "name": "timestamp-hour-24",
+      "asset": "timestamp-hour-24.json",
+      "signature": "timestamp-hour-24.sig",
+      "files": {
+        "events-0001.fvr": "events.fvr",
+        "pack-0001.fvr": "pack.fvr"
+      },
+      "error": "SCHEMA"
+    },
+    {
+      "name": "timestamp-leap-second",
+      "asset": "timestamp-leap-second.json",
+      "signature": "timestamp-leap-second.sig",
+      "files": {
+        "events-0001.fvr": "events.fvr",
+        "pack-0001.fvr": "pack.fvr"
+      },
+      "error": "SCHEMA"
+    },
+    {
+      "name": "stream-leading-zero",
+      "asset": "stream-leading-zero.json",
+      "signature": "stream-leading-zero.sig",
+      "files": {
+        "events-0001.fvr": "events.fvr",
+        "pack-0001.fvr": "pack.fvr"
+      },
+      "error": "SCHEMA"
+    },
+    {
+      "name": "empty-key-ids",
+      "asset": "empty-key-ids.json",
+      "signature": "empty-key-ids.sig",
+      "files": {
+        "events-0001.fvr": "events.fvr",
+        "pack-0001.fvr": "pack.fvr"
+      },
+      "error": "SCHEMA"
     }
   ],
   "keyring_cases": [
@@ -381,8 +536,8 @@
       "error": "KEY"
     },
     {
-      "name": "keyring-version",
-      "asset": "keyring-version.json",
+      "name": "ring-version",
+      "asset": "ring-version.json",
       "error": "VERSION"
     },
     {
@@ -396,13 +551,13 @@
       "error": "KDF"
     },
     {
-      "name": "live-kdf-aad",
-      "asset": "live-kdf-aad.json",
+      "name": "kdf-parallelism-tamper",
+      "asset": "kdf-parallelism-tamper.json",
       "error": "AUTH"
     },
     {
-      "name": "keyring-mac",
-      "asset": "keyring-mac.json",
+      "name": "ring-mac",
+      "asset": "ring-mac.json",
       "error": "MAC"
     },
     {

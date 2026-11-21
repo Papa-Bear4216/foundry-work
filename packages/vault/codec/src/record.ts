@@ -5,7 +5,7 @@ import { check, derive, hex, open, seal, VaultFormatError } from './bytes.ts';
 export const FRAME_BYTES = 1024 * 1024;
 const HEADER_BYTES = 69;
 const OVERHEAD = 20;
-const MAX_U64 = (1n << 64n) - 1n;
+const MAX_EVENT_CONTEXT = BigInt(Number.MAX_SAFE_INTEGER);
 
 export interface RecordFields {
   type: 1 | 2;
@@ -14,7 +14,7 @@ export interface RecordFields {
 }
 
 function checkFields(type: number, context: bigint): asserts type is 1 | 2 {
-  check(type === 1 ? context > 0n && context <= MAX_U64 : type === 2 && context === 0n);
+  check(type === 1 ? context > 0n && context <= MAX_EVENT_CONTEXT : type === 2 && context === 0n);
 }
 
 function frameParameters(header: Buffer, vaultId: string, index: bigint, final: boolean) {
