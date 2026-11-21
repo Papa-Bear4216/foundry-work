@@ -71,6 +71,40 @@ jobs:
         if: ${{ !cancelled() }}
         run: npm run budgets --workspace facts-ledger
 
+  vault-format:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          package-manager-cache: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Verify the vault format vectors
+        shell: pwsh
+        run: |
+          python -m pip install --only-binary=:all: -r packages/vault/reference/requirements.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm ci --ignore-scripts --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm --prefix packages/vault/codec run typecheck
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm --prefix packages/vault/codec run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm --prefix packages/vault/codec run vectors -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm --prefix packages/vault/codec test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B packages/vault/reference/test_vectors.py
+
   v0-measure:
     concurrency:
       group: v0-measure-${{ github.ref }}-${{ matrix.os }}

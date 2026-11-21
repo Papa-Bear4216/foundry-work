@@ -13,3 +13,7 @@ also requires a recorded decision in [DECISIONS.md](DECISIONS.md).
 
 TypeScript (Apache-2.0) is a build dependency. Gitleaks (MIT) is a standalone CI
 tool. Neither ships with the facts ledger.
+
+| Reference reader dependency | License | Purpose |
+| --- | --- | --- |
+| `cryptography` 50.0.2 | Apache-2.0 OR BSD-3-Clause | Provides AES-256-GCM and Ed25519 for the independent Python reader and CI. |

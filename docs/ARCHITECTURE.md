@@ -1,8 +1,7 @@
 # Foundry architecture
 
-Status: draft for build, 2026-11-19. Byte-level formats in this document are **draft v0**:
-work package V-1 in [ROADMAP.md](ROADMAP.md) freezes them with test vectors. Until then a
-builder may change a layout detail if the change is recorded in [DECISIONS.md](DECISIONS.md).
+Status: architecture for build. V-1 freezes the record, manifest and keyring byte formats
+with committed test vectors. See [A-31 in DECISIONS.md](DECISIONS.md).
 
 Terms used throughout:
 
@@ -75,7 +74,7 @@ A parser improvement never touches the vault: bump the deriver version and re-de
 
 ```
 <vault>/
-  VAULT.json                 clear text, written once: format, vault_id, created_at
+  VAULT.json                 clear text, written once: format, vault_id, created_at, signing_public_key
   HEAD.json                  convenience copy of the chain head. Never trusted on its own.
   keyring/keyring.json       the only mutable file that holds key material (section 5.4)
   segments/
@@ -88,7 +87,8 @@ A parser improvement never touches the vault: bump the deriver version and re-de
   open/                      the segment being written. Same files, no manifest yet.
 ```
 
-- File names are lowercase ASCII so the vault copies cleanly to exFAT, NTFS and ext4.
+- Use the exact literal names shown above. Record stream names use lowercase ASCII.
+  Segment directories use the decimal segment number padded to at least six digits.
 - A record stream file rolls over at 64 MiB. A blob never spans two files; a blob larger
   than 64 MiB gets a file to itself. (**Decided:** segment soft cap 512 MiB.)
 - The cap is soft. A blob larger than the cap gets a segment to itself, and that segment is
@@ -100,30 +100,38 @@ A parser improvement never touches the vault: bump the deriver version and re-de
 
 ### 4.2 Record
 
-Events and blobs use one record layout. An event is a record whose plaintext is one JSON document.
+A stream concatenates complete version 1 records without delimiters or padding. Offsets
+and lengths count bytes.
 
 ```
 offset  size  field
-0       4     magic "FVR1"
-4       1     type: 1 = event, 2 = blob
-5       16    key_id (which collection key encrypts this record)
-21      32    salt (random per record)
-53      8     ctx: u64 big-endian. Event sequence number for events, 0 for blobs.
-61      8     total_len: u64 big-endian, bytes from offset 69 to the end of the record
-69      ...   frames: u32 big-endian ciphertext_len | ciphertext | 16-byte tag
+0       4     ASCII magic "FVR1"
+4       1     type: 0x01 = event, 0x02 = blob
+5       16    key_id: raw bytes, matching a collection keyring entry
+21      32    salt: fresh cryptographically random bytes for every record
+53      8     ctx: u64 big-endian, positive event sequence or zero for a blob
+61      8     total_len: u64 big-endian, bytes after the header in this record
+69      ...   one or more frames: u32 big-endian ciphertext_len | ciphertext | 16-byte tag
 ```
 
-- Cipher: AES-256-GCM. Plaintext is cut into 1 MiB frames.
-- Record key: `HKDF-SHA256(ikm = collection encryption key, salt = salt, info = "foundry/record-key/v1")`.
-  Every record has its own key, so the frame nonce is `4 zero bytes || u64 frame index`.
-- Additional authenticated data for each frame: `header (bytes 0..68) || vault_id (16 bytes) ||
-  frame index (u64) || final flag (1 byte)`. The last frame has the final flag set.
-  Truncation, reordering, a swapped header and replay into another vault all fail authentication.
-- This is the construction already proven in the private predecessor (per-record salted key,
-  header bound into every frame, final-frame flag), extended with `key_id`, `ctx`,
-  `total_len` and the vault binding. It is a new format with new HKDF labels, not a
-  compatible continuation; see section 14.
-- `total_len` lets a reader walk a file and check structure without any key.
+- Use AES-256-GCM. Ciphertext length equals frame plaintext length. Every nonfinal frame
+  has 1,048,576 bytes of plaintext. The final frame has 1 through 1,048,576 bytes.
+  A zero-byte blob uses a single zero-length frame and its tag. An exact multiple of
+  1,048,576 bytes ends with a full frame.
+- Derive the 32-byte record key with HKDF-SHA256 using the collection encryption key
+  (section 5.1), the header salt and ASCII info `foundry/record-key/v1`. Never reuse
+  a salt with the same collection encryption key. The nonce is four zero bytes
+  followed by the zero-based frame index as a big-endian u64, restarting at zero for
+  each record.
+- Frame AAD is the complete 69-byte header, the 16 raw vault ID bytes, the big-endian
+  u64 frame index and one byte, `0x01` for the final frame or `0x00` otherwise,
+  in that order. A frame is final exactly when its tag ends at offset
+  `69 + total_len` relative to the record start.
+- Check that the declared record fits in the stream and all frames fit exactly inside
+  `total_len`. The minimum record size is 89 bytes. A reader without a key can verify
+  structure and advance by `69 + total_len`. The signed manifest authenticates file
+  placement and the order of complete records in a closed segment.
+- FVR1 has its own HKDF labels and vault binding. See section 14.
 
 ### 4.3 Event plaintext
 
@@ -141,7 +149,11 @@ offset  size  field
 }
 ```
 
-`seq` is a vault-wide counter with no gaps. Event kinds in v1:
+Each event plaintext is a UTF-8 JSON object. Its top-level `seq` is a positive decimal
+integer token without a fraction or exponent, at most 9,007,199,254,740,991, and equals
+the header's `ctx`. Writers emit one `seq` member. JSON parsers that accept duplicate
+members use the last occurrence. The vault-wide counter starts at 1 and has no gaps.
+Event kinds in v1:
 
 | Kind | Purpose |
 |---|---|
@@ -161,7 +173,7 @@ Structural and history events use a `system` collection key.
 
 ### 4.4 Blob identity
 
-`blob id = HMAC-SHA256(collection id key, plaintext)`, 64 hex characters. Identical content
+`blob id = HMAC-SHA256(collection id key, plaintext)`, 64 lowercase hex characters. Identical content
 inside one collection is stored once. The id key is per collection so that destroying a
 collection's keys also destroys the ability to confirm what a given blob contained.
 Content is not deduplicated across collections; that is the price.
@@ -170,8 +182,15 @@ The blob id is stored inside the encrypted event, not in the clear record header
 
 ### 4.5 Manifest and chain
 
-`MANIFEST.json` is canonical JSON (RFC 8785): UTF-8, sorted keys, no extra whitespace,
-integers only.
+The manifest and keyring use UTF-8 without a BOM, trailing newline or other extra
+whitespace, as specified by [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785). Sort object
+members recursively by ascending UTF-16 code units and preserve array order. Use RFC 8785
+string escaping and well-formed Unicode without normalization. Numbers are interoperable
+integers with absolute value at most 9,007,199,254,740,991. Readers require exact canonical
+bytes, unique member names and the exact named fields for each versioned object. Hex
+strings are lowercase without a prefix. Base64 uses the RFC 4648 standard alphabet with
+canonical padding and no whitespace. Format timestamps are Gregorian UTC with exactly
+the form `YYYY-MM-DDTHH:MM:SSZ`, year 0001 through 9999 and seconds 00 through 59.
 
 ```json
 {
@@ -179,7 +198,7 @@ integers only.
   "vault_id": "<32 hex>",
   "epoch": 1,
   "segment": 12,
-  "prev_manifest_sha256": "<64 hex; 64 zeros for segment 1>",
+  "prev_manifest_sha256": "<64 hex>",
   "first_event_seq": 48211,
   "last_event_seq": 50977,
   "files": [
@@ -192,23 +211,37 @@ integers only.
 }
 ```
 
-- Manifest hash = SHA-256 of the file's bytes. Each manifest names the previous one's hash.
-  Segment numbers and event sequence ranges are contiguous from one manifest to the next.
-- `MANIFEST.sig` is an Ed25519 signature over the manifest bytes. The vault's public key
-  is in `VAULT.json` and its fingerprint is part of the printed anchor (section 8.1). The
-  private key is wrapped in the keyring like any other key. Without the signature, someone
-  holding a drive could drop records and recompute a consistent chain, and a check that
-  runs without keys would not notice.
-- **Verification needs no secret.** `foundry vault verify` hashes every file, compares to
-  the manifests, checks each signature against the public key, walks the chain from
-  segment 1, and checks record structure. This is what scheduled jobs run.
-- `foundry vault verify --deep` additionally needs the passphrase: it authenticates every
-  frame of every record and checks that event sequence numbers have no gaps.
-- `epoch` is 1 in v1. It is reserved so that a later "compact" command can write a new
-  chain that leaves out erased ciphertext and names the head of the chain it replaces.
-- What the clear manifest reveals to someone holding the drive: number and size of files,
-  when segments were closed, how many distinct keys were used. It does not reveal names,
-  content, sources or blob ids. Stated in the threat model.
+- `vault_id` encodes 16 bytes. `epoch` is the integer 1 in v1 and reserves space for
+  later compaction. `writer` is a nonempty string identifying the writer version.
+- Segment numbers start at 1 and increase by 1. The genesis link is 64 ASCII zeros.
+  Each later link is lowercase hex SHA-256 of the preceding `MANIFEST.json` bytes.
+  Event ranges are inclusive and contiguous across the chain, starting at 1. A segment
+  without events uses JSON `null` for both range endpoints and preserves the last
+  event sequence for the next link.
+- `files` is a nonempty array of unique stream names sorted by ascending ASCII name.
+  A name is `events-` or `pack-`, the positive decimal stream ordinal padded to at
+  least four digits, and `.fvr`. Ordinals are at most 9,007,199,254,740,991. Each file
+  has at least one record and carries its exact byte count and lowercase hex SHA-256.
+  An `events` stream contains events and a `pack` stream contains blobs. Check the
+  event contexts in ascending event-stream ordinal and in byte order in each stream.
+  `key_ids` is the complete set of record key IDs in the segment, including erased
+  IDs, rendered as 32 hex digits each, unique and sorted in ascending ASCII order.
+- `MANIFEST.sig` is exactly the 64 raw bytes of a pure Ed25519 signature over the
+  canonical `MANIFEST.json` bytes. Store the 32 raw public-key bytes as base64 in
+  `VAULT.json` under `signing_public_key`. The other metadata fields are `format`
+  (`foundry-vault/1`), `vault_id` and `created_at`. The anchor's public-key
+  fingerprint is lowercase hex SHA-256 of the 32 raw public-key bytes. The keyring
+  wraps the 32-byte Ed25519 private seed (section 5.4).
+- **Verification needs no secret.** Starting at segment 1, check the signatures, vault
+  ID, chain links and event context ranges. Check the exact set of record stream names,
+  file lengths, hashes, record structures and key ID inventory. Renaming a stream or
+  changing the order of complete records changes this authenticated inventory or its
+  hashes. Compare the verified head to an independent anchor to detect rollback or
+  replacement (sections 8.1 and 8.2).
+- Deep verification also unlocks the keyring, authenticates each frame and checks that
+  each recovered event's plaintext sequence equals its context.
+- Clear manifests reveal file counts and sizes, close times, event ranges and key IDs.
+  They omit profile names, content, sources and blob IDs.
 
 ### 4.6 Closing and crash safety
 
@@ -223,10 +256,13 @@ integers only.
 
 ### 4.7 Reading the vault without Foundry
 
-Work package V-1 ships a reference reader in Python, standard library plus one widely
-packaged crypto module, under 200 lines, that decrypts a vault given the keyring and
-passphrase. It runs in CI against the same test vectors. An archive meant to last decades
-must not depend on one implementation.
+The [Python reference reader](../packages/vault/reference/reader.py) uses the standard
+library and `cryptography` in fewer than 200 lines. It validates signed segments and
+decrypts records with a keyring and passphrase. Run the shared vectors with
+`python -B packages/vault/reference/test_vectors.py`. The TypeScript codec and generator
+live in [packages/vault/codec](../packages/vault/codec). Run the TypeScript tests
+with `npm --prefix packages/vault/codec test` and check fixture reproducibility with
+`npm --prefix packages/vault/codec run vectors -- --check`.
 
 ## 5. Keys, encryption and erasure
 
@@ -247,35 +283,39 @@ recovery key ──HKDF──► RK ──┘                 │ wraps
                      encryption key      id key (HMAC)    (reserved)
 ```
 
-- "Wraps" means AES-256-GCM encryption of the child key under the parent, with the child's
-  key id and kind as additional authenticated data.
+- "Wraps" means AES-256-GCM encryption of the child key under the parent, with the
+  additional authenticated data in section 5.4. MK, PK, CK and index keys are 32 bytes.
 - Collection keys are random, not derived from MK. That is what makes erasure possible:
   a derived key can always be re-derived.
 - The index key is also random and wrapped by MK, one per index generation. Rebuilding the
   index after an erasure creates a new generation under a new key and destroys the old one,
   so leftover pages of the old index file are unreadable.
 - The manifest signing key (Ed25519) is random and wrapped by MK.
-- Every use of a key has its own derivation label. No key is used for two purposes.
+- The collection encryption key and collection ID key are 32-byte HKDF-SHA256 outputs.
+  Use raw CK as input key material, the 16 raw vault ID bytes as salt, and ASCII info
+  `foundry/collection-encryption/v1` or `foundry/collection-id/v1`, respectively.
+  Use each derived key only for its named purpose.
 - Secrets are read from a terminal prompt or the wizard form. They are never accepted on
   the command line or from environment variables, and never written to logs.
 
 ### 5.2 Passphrase
 
-scrypt with N = 2^17, r = 8, p = 1 and a 32-byte random salt. Parameters and salt are
-stored in the keyring header so they can be raised later. Unlocking needs about 128 MiB
-for under two seconds on a Tier 0 machine; see the budgets in section 9. The keyring has a
-`kdf` field so a later version can move to Argon2id once the runtime's implementation is stable.
-
-- The call passes an explicit memory limit. A reader rejects a keyring whose parameters
-  are below the shipped floor or above a fixed ceiling **before** running the KDF, so a
-  tampered keyring can neither weaken the passphrase nor exhaust memory.
-- Parameters are never lowered silently. A change of KDF is a keyring rewrite the user confirms.
+Use scrypt to derive a 32-byte KEK from the passphrase's exact UTF-8 bytes and a fresh
+32-byte cryptographically random salt. The prompt adds no normalization or newline.
+Use the production defaults `N = 131072` (2^17), `r = 8`, `p = 1`. Version 1 readers
+accept `N = 131072`, `r = 8`, and `p = 1` or `p = 2`. Readers reject other values
+before calling scrypt and set an explicit memory limit of 268,435,456 bytes (256 MiB).
+Parameters and salt are in the keyring header. A confirmed rewrite can raise p within
+this range. Other KDFs or parameter ranges require a format revision and budget
+verification. See section 9 and the V-0 measurements.
 
 ### 5.3 Recovery key
 
 256 random bits, shown once as grouped base32 text and as a QR code for printing. It
 unwraps MK independently of the passphrase. The wizard asks the user to type back four
-groups before it continues. Changing the passphrase re-wraps MK and leaves the recovery key valid.
+groups before it continues. Changing the passphrase re-wraps MK and leaves the same recovery key valid. Both master
+wraps authenticate the current KDF header, including the salt. A V-2 command that changes
+that header needs the existing recovery key to refresh its wrap in the same rewrite.
 
 - The text form carries a version character and a checksum, so a typing mistake is
   reported as a mistake and not as a wrong key.
@@ -300,19 +340,48 @@ must be kept in step across copies.
   "kdf": { "name": "scrypt", "N": 131072, "r": 8, "p": 1, "salt": "<base64>" },
   "master": { "by_passphrase": "<base64>", "by_recovery": "<base64>" },
   "keys": [
-    { "key_id": "<32 hex>", "kind": "profile", "parent": "master", "label_enc": "<base64>", "wrapped": "<base64>", "state": "active", "created_at": "…" },
-    { "key_id": "<32 hex>", "kind": "collection", "parent": "<profile key id>", "wrapped": "<base64>", "state": "active", "created_at": "…" },
-    { "key_id": "<32 hex>", "kind": "collection", "parent": "<profile key id>", "wrapped": null, "state": "destroyed", "destroyed_at": "…" }
+    { "key_id": "<32 hex>", "kind": "profile", "parent": "master", "label_enc": "<base64>", "wrapped": "<base64>", "state": "active", "created_at": "2026-11-19T00:00:00Z" },
+    { "key_id": "<32 hex>", "kind": "collection", "parent": "<profile key id>", "wrapped": "<base64>", "state": "active", "created_at": "2026-11-19T00:00:00Z" },
+    { "key_id": "<32 hex>", "kind": "collection", "parent": "<profile key id>", "wrapped": null, "state": "destroyed", "destroyed_at": "2026-11-20T00:00:00Z" }
   ],
-  "mac": "<HMAC over the canonical file without this field, keyed from MK>"
+  "mac": "<base64>"
 }
 ```
 
-- Writes are atomic (temp file, fsync, rename) and bump `version`.
-- Every wrap authenticates, as additional data: format, vault id, key id, kind, parent and,
-  for the two master wraps, the KDF parameters. A wrap moved to another slot or another
-  vault fails to open.
-- Entries of kind `index` (one per index generation) and `signing` follow the same shape.
+- Use the canonical JSON and field encodings in section 4.5. The positive `version`
+  starts at 1. Each rewrite increments it and uses a temp file, fsync and rename.
+  `vault_id` must match the vault being opened.
+- `keys` is sorted by ascending ASCII `key_id`. IDs are unique 16-byte identifiers.
+  The kinds are `profile`, `collection`, `index` and `signing`. Profile, index and
+  signing entries have parent `master`. A collection's parent is a profile entry ID,
+  and that profile must be active if the collection is active. A destroyed entry keeps
+  its identity and `destroyed_at` with `wrapped: null`. An active entry carries
+  `created_at` and `wrapped`. Only an active profile has `label_enc`.
+- Each encrypted field is base64 of `nonce[12] || ciphertext || GCM tag[16]` using
+  AES-256-GCM. Use a fresh cryptographically random 12-byte nonce for each encryption.
+  Never reuse a nonce under the same key, including across rewrites. A key wrap
+  encrypts exactly 32 raw bytes (the Ed25519 seed for signing), giving 60 bytes before
+  base64. A profile label encrypts nonempty UTF-8 text.
+- AAD is the canonical JSON array
+  `["foundry-keyring/1", vault_id, key_id, kind, parent, kdf_or_null]`. IDs in the
+  array use their JSON string representation. Use these exact values.
+
+  | Field | `key_id` | `kind` | `parent` | `kdf_or_null` | Encryption key |
+  |---|---|---|---|---|---|
+  | `master.by_passphrase` | `master` | `master` | `passphrase` | complete `kdf` object | scrypt KEK |
+  | `master.by_recovery` | `master` | `master` | `recovery` | complete `kdf` object | recovery wrapping key |
+  | `keys[].wrapped` | entry key ID | entry kind | entry parent | JSON null | MK or raw parent PK |
+  | `keys[].label_enc` | profile key ID | `profile-label` | `master` | JSON null | profile label key |
+
+- Derive the 32-byte recovery wrapping, profile label and keyring MAC keys using
+  HKDF-SHA256 with the 16 raw vault ID bytes as salt. For recovery, use the 32 raw
+  recovery bytes and ASCII info `foundry/recovery-wrap/v1`. For the other two, use
+  MK and ASCII info `foundry/profile-label/v1` and `foundry/keyring-mac/v1`,
+  respectively.
+- `mac` is base64 of raw HMAC-SHA256 over the canonical keyring object with its
+  `mac` member removed, using the keyring MAC key. Check the format, KDF bounds and
+  vault ID, unwrap MK using either credential, and verify the MAC with a constant-time
+  comparison before using entry keys or accepting erasure states. Unwrap parents first.
 - Size: keys exist per profile and per collection, never per item, so the file stays in
   the tens of kilobytes. A design with a random key per item was rejected for v1: it needs
   a transactional key store and makes every keyring backup a larger erasure liability.
@@ -645,7 +714,7 @@ that exits after an idle timeout.
 
 | Threat | Covered? | How |
 |---|---|---|
-| Lost or stolen second-copy drive | Yes | All content encrypted; manifest reveals sizes and dates only |
+| Lost or stolen second-copy drive | Yes | Encrypted content and labels. Clear metadata includes sizes, dates, event ranges and key IDs (sections 4.5 and 5.4) |
 | Stolen working device, powered off | Yes, if no `os-protected` key cache | Vault and index encrypted at rest |
 | Malware running as the user while unlocked | No | It can read what the user can read. Stated plainly. |
 | Ransomware or a bug rewriting the working copy | Detected and recoverable | Hash chain plus an offline sealed copy it could not reach |
@@ -760,7 +829,7 @@ as a consumer, with a one-time migration that is planned separately and is not p
 
 | Gate | Fails the build when |
 |---|---|
-| Format vectors | TypeScript writer and Python reader disagree on any vector |
+| Format vectors | Regenerated bytes differ from the committed vectors, or either reader differs from an expected plaintext or rejection |
 | Tamper suite | A flipped bit, removed file, reordered record, swapped manifest or replayed record passes verification |
 | Crash suite | A write killed at any point leaves a vault that cannot be opened or repaired automatically |
 | Offline run | Import and search produce any network packet |

@@ -1,0 +1,7 @@
+# Preserve exact cryptographic inputs across checkouts.
+* -text
+*.fvr binary
+*.sig binary
+*.bin binary
+*.b64 -diff
+.gitattributes text eol=lf

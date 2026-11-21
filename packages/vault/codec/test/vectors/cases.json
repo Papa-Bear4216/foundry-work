@@ -1,0 +1,418 @@
+{
+  "warning": "TEST ONLY: all credentials, keys, salts, nonces and content are synthetic.",
+  "passphrase": "TEST ONLY café 🔒",
+  "recovery_key": "3434343434343434343434343434343434343434343434343434343434343434",
+  "metadata": {
+    "format": "foundry-vault/1",
+    "vault_id": "10101010101010101010101010101010",
+    "created_at": "2026-01-02T03:04:05Z",
+    "signing_public_key": "F8t5+ytBIPKx7GXkGY1uCLKOgT/rAeSkAIObheGAgM4="
+  },
+  "ids": {
+    "collection": "01010101010101010101010101010101",
+    "profile": "02020202020202020202020202020202",
+    "index": "03030303030303030303030303030303",
+    "signing": "04040404040404040404040404040404",
+    "erased": "05050505050505050505050505050505"
+  },
+  "keyring": "ring.json",
+  "record_cases": [
+    {
+      "name": "event",
+      "asset": "event.fvr",
+      "type": 1,
+      "sequence": 1,
+      "length": 32,
+      "sha256": "f0e9e142d1eb94a8ee9707aaaa978f828a039af3b218ddb98cb5306e6d35d4f3"
+    },
+    {
+      "name": "event-next",
+      "asset": "event-next.fvr",
+      "type": 1,
+      "sequence": 2,
+      "length": 34,
+      "sha256": "2f139d46de0fcd63641fd22db5cc285cb306f37e38cdf128649cda9629dc6544"
+    },
+    {
+      "name": "event-max-seq",
+      "asset": "event-max-seq.fvr",
+      "type": 1,
+      "sequence": 9007199254740991,
+      "length": 24,
+      "sha256": "fc8e0a823739b1e64ddb3bd6f51cb8b59db2c930a7d41b8731ef4ebca2494f76"
+    },
+    {
+      "name": "empty",
+      "asset": "empty.fvr",
+      "type": 2,
+      "sequence": 0,
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "one-byte",
+      "asset": "one-byte.fvr",
+      "type": 2,
+      "sequence": 0,
+      "length": 1,
+      "sha256": "6922e93e3827642ce4b883c756b31abf80036649d3614bf5fcb3adda43b8ea32"
+    },
+    {
+      "name": "full-frame",
+      "asset": "full-frame.fvr.b64",
+      "type": 2,
+      "sequence": 0,
+      "length": 1048576,
+      "sha256": "bf63d8a95fcc2e64619813aae35fdcbe871fdd9264caa3f365eb3aed0f679129"
+    },
+    {
+      "name": "multiple-frames",
+      "asset": "multiple-frames.fvr.b64",
+      "type": 2,
+      "sequence": 0,
+      "length": 1048577,
+      "sha256": "54ee86addafa96efebf6ea851e26f523c2e6dab06c80b1e69375b75cbc11ad28"
+    },
+    {
+      "name": "wrong-key",
+      "asset": "event.fvr",
+      "error": "AUTH",
+      "wrong_key": true
+    },
+    {
+      "name": "wrong-vault",
+      "asset": "event.fvr",
+      "error": "AUTH",
+      "vault_id": "11111111111111111111111111111111"
+    },
+    {
+      "name": "tag-bit",
+      "asset": "tag-bit.fvr",
+      "error": "AUTH"
+    },
+    {
+      "name": "record-version",
+      "asset": "record-version.fvr",
+      "error": "VERSION"
+    },
+    {
+      "name": "record-type",
+      "asset": "record-type.fvr",
+      "error": "SCHEMA"
+    },
+    {
+      "name": "changed-context",
+      "asset": "changed-context.fvr",
+      "error": "AUTH"
+    },
+    {
+      "name": "changed-salt",
+      "asset": "changed-salt.fvr",
+      "error": "AUTH"
+    },
+    {
+      "name": "unknown-key",
+      "asset": "unknown-key.fvr",
+      "error": "KEY"
+    },
+    {
+      "name": "erased-key",
+      "asset": "erased-key.fvr",
+      "error": "ERASED"
+    },
+    {
+      "name": "cut-magic",
+      "asset": "cut-magic.fvr",
+      "error": "LENGTH"
+    },
+    {
+      "name": "cut-type",
+      "asset": "cut-type.fvr",
+      "error": "LENGTH"
+    },
+    {
+      "name": "cut-key_id",
+      "asset": "cut-key_id.fvr",
+      "error": "LENGTH"
+    },
+    {
+      "name": "cut-salt",
+      "asset": "cut-salt.fvr",
+      "error": "LENGTH"
+    },
+    {
+      "name": "cut-context",
+      "asset": "cut-context.fvr",
+      "error": "LENGTH"
+    },
+    {
+      "name": "cut-body_length",
+      "asset": "cut-body_length.fvr",
+      "error": "LENGTH"
+    },
+    {
+      "name": "cut-frame_length",
+      "asset": "cut-frame_length.fvr",
+      "error": "LENGTH"
+    },
+    {
+      "name": "cut-ciphertext",
+      "asset": "cut-ciphertext.fvr",
+      "error": "LENGTH"
+    },
+    {
+      "name": "cut-tag",
+      "asset": "cut-tag.fvr",
+      "error": "LENGTH"
+    },
+    {
+      "name": "oversized-frame",
+      "asset": "oversized-frame.fvr",
+      "error": "LENGTH"
+    },
+    {
+      "name": "u64-length",
+      "asset": "u64-length.fvr",
+      "error": "LENGTH"
+    },
+    {
+      "name": "extra-byte",
+      "asset": "extra-byte.fvr",
+      "error": "LENGTH"
+    },
+    {
+      "name": "missing-final-frame",
+      "asset": "multiple-frames.fvr.b64",
+      "error": "AUTH",
+      "prefix": "missing-final-header.bin",
+      "slice": [
+        69,
+        1048665
+      ]
+    },
+    {
+      "name": "frame-swap",
+      "asset": "multiple-frames.fvr.b64",
+      "error": "LENGTH",
+      "swap_frames": true
+    }
+  ],
+  "manifest_cases": [
+    {
+      "name": "genesis",
+      "asset": "genesis.json",
+      "signature": "genesis.sig",
+      "files": {
+        "events-0001.fvr": "events.fvr",
+        "pack-0001.fvr": "pack.fvr"
+      },
+      "plaintext_sha256": [
+        "f0e9e142d1eb94a8ee9707aaaa978f828a039af3b218ddb98cb5306e6d35d4f3",
+        "2f139d46de0fcd63641fd22db5cc285cb306f37e38cdf128649cda9629dc6544",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "6922e93e3827642ce4b883c756b31abf80036649d3614bf5fcb3adda43b8ea32"
+      ]
+    },
+    {
+      "name": "next",
+      "asset": "next.json",
+      "signature": "next.sig",
+      "files": {
+        "pack-0001.fvr": "multiple-frames.fvr.b64"
+      },
+      "prior": "genesis",
+      "plaintext_sha256": [
+        "54ee86addafa96efebf6ea851e26f523c2e6dab06c80b1e69375b75cbc11ad28"
+      ]
+    },
+    {
+      "name": "end",
+      "asset": "end.json",
+      "signature": "end.sig",
+      "files": {
+        "events-0001.fvr": "event-third.fvr"
+      },
+      "prior": "next",
+      "plaintext_sha256": [
+        "e1f447ad2c2071e1f4f0a269e338e37c2949ec93962633710281e031a7015741"
+      ]
+    },
+    {
+      "name": "reordered-records",
+      "asset": "genesis.json",
+      "signature": "genesis.sig",
+      "files": {
+        "events-0001.fvr": "events-swapped.fvr",
+        "pack-0001.fvr": "pack.fvr"
+      },
+      "error": "FILE"
+    },
+    {
+      "name": "signed-reordered-events",
+      "asset": "signed-reorder.json",
+      "signature": "signed-reorder.sig",
+      "files": {
+        "events-0001.fvr": "events-swapped.fvr"
+      },
+      "error": "SEQUENCE"
+    },
+    {
+      "name": "renamed-record-file",
+      "asset": "genesis.json",
+      "signature": "genesis.sig",
+      "files": {
+        "events-0002.fvr": "events.fvr",
+        "pack-0001.fvr": "pack.fvr"
+      },
+      "error": "FILE"
+    },
+    {
+      "name": "missing-file",
+      "asset": "genesis.json",
+      "signature": "genesis.sig",
+      "files": {
+        "events-0001.fvr": "events.fvr"
+      },
+      "error": "FILE"
+    },
+    {
+      "name": "extra-file",
+      "asset": "genesis.json",
+      "signature": "genesis.sig",
+      "files": {
+        "events-0001.fvr": "events.fvr",
+        "pack-0001.fvr": "pack.fvr",
+        "pack-0002.fvr": "pack.fvr"
+      },
+      "error": "FILE"
+    },
+    {
+      "name": "broken-chain",
+      "asset": "broken-chain.json",
+      "signature": "broken-chain.sig",
+      "files": {
+        "pack-0001.fvr": "multiple-frames.fvr.b64"
+      },
+      "prior": "genesis",
+      "error": "CHAIN"
+    },
+    {
+      "name": "swapped-manifest",
+      "asset": "next.json",
+      "signature": "next.sig",
+      "files": {
+        "pack-0001.fvr": "multiple-frames.fvr.b64"
+      },
+      "prior": "next",
+      "error": "CHAIN"
+    },
+    {
+      "name": "bad-signature",
+      "asset": "genesis.json",
+      "signature": "bad-signature.sig",
+      "files": {
+        "events-0001.fvr": "events.fvr",
+        "pack-0001.fvr": "pack.fvr"
+      },
+      "error": "SIGNATURE"
+    },
+    {
+      "name": "manifest-version",
+      "asset": "manifest-version.json",
+      "signature": "genesis.sig",
+      "files": {
+        "events-0001.fvr": "events.fvr",
+        "pack-0001.fvr": "pack.fvr"
+      },
+      "error": "VERSION"
+    },
+    {
+      "name": "manifest-newline",
+      "asset": "manifest-newline.json",
+      "signature": "genesis.sig",
+      "files": {
+        "events-0001.fvr": "events.fvr",
+        "pack-0001.fvr": "pack.fvr"
+      },
+      "error": "CANONICAL"
+    }
+  ],
+  "keyring_cases": [
+    {
+      "name": "passphrase",
+      "asset": "ring.json"
+    },
+    {
+      "name": "recovery",
+      "asset": "ring.json",
+      "recovery": true
+    },
+    {
+      "name": "scrypt-at-ceiling",
+      "asset": "ring-p2.json"
+    },
+    {
+      "name": "wrong-passphrase",
+      "asset": "ring.json",
+      "wrong_passphrase": true,
+      "error": "AUTH"
+    },
+    {
+      "name": "keyring-vault",
+      "asset": "ring.json",
+      "vault_id": "11111111111111111111111111111111",
+      "error": "KEY"
+    },
+    {
+      "name": "keyring-version",
+      "asset": "keyring-version.json",
+      "error": "VERSION"
+    },
+    {
+      "name": "scrypt-below-floor",
+      "asset": "scrypt-below-floor.json",
+      "error": "KDF"
+    },
+    {
+      "name": "scrypt-above-ceiling",
+      "asset": "scrypt-above-ceiling.json",
+      "error": "KDF"
+    },
+    {
+      "name": "live-kdf-aad",
+      "asset": "live-kdf-aad.json",
+      "error": "AUTH"
+    },
+    {
+      "name": "keyring-mac",
+      "asset": "keyring-mac.json",
+      "error": "MAC"
+    },
+    {
+      "name": "master-slot-swap",
+      "asset": "master-slot-swap.json",
+      "error": "AUTH"
+    },
+    {
+      "name": "entry-slot-swap",
+      "asset": "entry-slot-swap.json",
+      "error": "AUTH"
+    },
+    {
+      "name": "wrong-parent-kind",
+      "asset": "wrong-parent-kind.json",
+      "error": "KEY"
+    },
+    {
+      "name": "noncanonical-base64",
+      "asset": "noncanonical-base64.json",
+      "error": "SCHEMA"
+    },
+    {
+      "name": "recovery-kdf-aad",
+      "asset": "live-kdf-aad.json",
+      "recovery": true,
+      "error": "AUTH"
+    }
+  ]
+}
