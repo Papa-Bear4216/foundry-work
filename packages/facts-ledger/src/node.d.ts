@@ -159,6 +159,7 @@ declare module 'node:fs' {
     path: string,
     options: { bigint: true },
   ): { ino: bigint; dev: bigint };
+  export function statSync(path: string): { size: number; isFile(): boolean };
   export function realpathSync(path: string): string;
   export function fsyncSync(fd: number): void;
   export function mkdirSync(path: string, options: { recursive: true }): string | undefined;
@@ -198,6 +199,7 @@ declare module 'node:sqlite' {
     get(...params: unknown[]): Record<string, unknown> | undefined;
     all(...params: unknown[]): Record<string, unknown>[];
     iterate(...params: unknown[]): IterableIterator<Record<string, unknown>>;
+    setReturnArrays(enabled: boolean): void;
   }
 
   export class DatabaseSync {
@@ -217,4 +219,12 @@ declare module 'node:util' {
   export class TextEncoder {
     encode(text: string): Uint8Array;
   }
+}
+
+declare module 'node:v8' {
+  export function setFlagsFromString(flags: string): void;
+}
+
+declare module 'node:vm' {
+  export function runInNewContext(code: string): unknown;
 }

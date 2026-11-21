@@ -47,8 +47,16 @@ export function formatCheckedPredicateClaim(check: CheckedPredicate): string {
   }
 }
 
+/** Lone UTF-16 surrogate: not a Unicode scalar value, and SQLite and JavaScript compare it differently. */
+const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+/** A predicate string must be well-formed Unicode, so every comparison (JavaScript or SQL) agrees (A-28). */
+function isWellFormedString(value: unknown): value is string {
+  return typeof value === 'string' && !LONE_SURROGATE_RE.test(value);
+}
+
 function isNonEmptyTrimmed(value: unknown): value is string {
-  return typeof value === 'string' && value.trim().length > 0;
+  return isWellFormedString(value) && value.trim().length > 0;
 }
 
 /** Validate a checked fact predicate per specification section 3.4. */
@@ -70,7 +78,7 @@ export function isValidCheckedPredicate(value: unknown): value is CheckedPredica
       return (
         isNonEmptyTrimmed(obj['repo']) &&
         isNonEmptyTrimmed(obj['path']) &&
-        typeof obj['text'] === 'string' &&
+        isWellFormedString(obj['text']) &&
         obj['text'].length > 0
       );
     case 'command_output_is': {
@@ -79,7 +87,7 @@ export function isValidCheckedPredicate(value: unknown): value is CheckedPredica
       return (
         isNonEmptyTrimmed(obj['template']) &&
         Array.isArray(args) &&
-        args.every((a) => typeof a === 'string') &&
+        args.every((a) => isWellFormedString(a)) &&
         typeof outHash === 'string' &&
         SHA256_HEX_RE.test(outHash)
       );

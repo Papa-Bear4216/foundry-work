@@ -26,6 +26,7 @@ import {
   type FileEvidence,
   type ManualEvidence,
   type Sensitivity,
+  type TokenUsage,
 } from './types.js';
 
 export const MAX_CLAIM_BYTES = 300;
@@ -64,6 +65,9 @@ export interface AddFactOptions {
   readonly evidenceCommands?: readonly EvidenceCommandRequest[];
   readonly manual?: { readonly description: string; readonly outputSha256?: string; readonly ttlS?: number };
   readonly nowMs?: number;
+  /** Required when the block is written for an agent (`--from-agent`, Step Zero 10.4). */
+  readonly tokenUsage?: TokenUsage;
+  readonly fromAgent?: boolean;
 }
 
 function isoSeconds(ms: number): string {
@@ -297,6 +301,10 @@ export function addFact(options: AddFactOptions): Block {
     if (typeof value !== 'string' || value.trim().length === 0) throw new Error(`--${field} is required`);
   }
   assertNoSecrets({ intent: options.intent, reasoning: options.reasoning });
+  if (options.fromAgent && options.tokenUsage === undefined) {
+    throw new Error('--from-agent requires token usage: --model, --task, --input-tokens and --output-tokens');
+  }
+  const tokenUsage = options.tokenUsage === undefined ? undefined : validateTokenUsage(options.tokenUsage);
   const fact = buildFact(options);
   const touches = [...new Set(fact.evidence?.flatMap((ev) => (ev.type === 'file' ? [ev.path] : [])) ?? [])];
   return appendBlock(options.logPath, {
@@ -310,5 +318,27 @@ export function addFact(options: AddFactOptions): Block {
     schema: 2,
     facts: [fact],
     retracted_facts: [],
+    ...(tokenUsage ? { token_usage: tokenUsage } : {}),
   });
+}
+
+const TOKEN_LABEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,99}$/;
+
+/** `token_usage` (Step Zero 3.1): model and task are short labels, counts are non-negative integers. */
+export function validateTokenUsage(usage: TokenUsage): TokenUsage {
+  for (const field of ['model', 'task'] as const) {
+    const value = usage[field];
+    if (typeof value !== 'string' || !TOKEN_LABEL_RE.test(value)) {
+      throw new Error(`Token usage ${field} must be 1-100 characters of letters, digits and . _ : / + -`);
+    }
+  }
+  for (const field of ['input', 'output'] as const) {
+    const value = usage[field];
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`Token usage ${field} must be a non-negative integer`);
+    }
+  }
+  if (typeof usage.measured !== 'boolean') throw new Error('Token usage measured must be true or false');
+  assertNoSecrets({ model: usage.model, task: usage.task });
+  return { model: usage.model, task: usage.task, input: usage.input, output: usage.output, measured: usage.measured };
 }

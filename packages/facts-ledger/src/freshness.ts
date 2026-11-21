@@ -24,6 +24,9 @@ import type {
   IndexedFact,
 } from './types.js';
 
+/** Upper bound on cached blob text (UTF-16 code units, ~4 MiB for ASCII) kept across pages of a scan. */
+const CONTENT_CACHE_MAX_CHARS = 4 * 1024 * 1024;
+
 export const FRESHNESS_ORDER: Record<FreshnessStatus, number> = {
   supported: 0,
   moved: 1,
@@ -62,7 +65,9 @@ export class FreshnessChecker {
   private readonly heads = new Map<string, string | null>();
   /** Tree entry at `rev:path` (blob, tree or gitlink), or null when the path is not in the tree. */
   private readonly entries = new Map<string, { id: string; type: string } | null>();
+  /** Decoded blob text keyed by blob id (content-addressed, so never stale); bounded by `CONTENT_CACHE_MAX_CHARS`. */
   private readonly contents = new Map<string, string>();
+  private contentsChars = 0;
   private readonly commits = new Map<string, boolean>();
   private readonly partial = new Map<string, boolean>();
   private readonly templateRuns = new Map<string, { exitCode: number; outputSha256: string } | null>();
@@ -78,7 +83,7 @@ export class FreshnessChecker {
   reset(): void {
     this.heads.clear();
     this.entries.clear();
-    this.contents.clear();
+    this.clearContents();
     this.commits.clear();
     this.partial.clear();
     this.templateRuns.clear();
@@ -149,9 +154,16 @@ export class FreshnessChecker {
     let text = this.contents.get(key);
     if (text === undefined) {
       text = decodeUtf8(readBlob(dir, blob));
+      if (this.contentsChars + text.length > CONTENT_CACHE_MAX_CHARS) this.clearContents();
       this.contents.set(key, text);
+      this.contentsChars += text.length;
     }
     return text;
+  }
+
+  private clearContents(): void {
+    this.contents.clear();
+    this.contentsChars = 0;
   }
 
   /**
@@ -355,9 +367,14 @@ export class FreshnessChecker {
     run(blobGroups, (dir, key, hit) => this.entries.set(`${dir}\u0000${key}`, hit));
   }
 
-  /** Drop cached file contents (bounded memory between pages). */
+  /**
+   * Called between pages of a long scan. Blob text is keyed by blob id, so it cannot go
+   * stale inside a snapshot; it is kept across pages while the cache stays under
+   * `CONTENT_CACHE_MAX_CHARS`, so a file cited by many facts is read once per scan rather
+   * than once per page (each read is a `git cat-file` process).
+   */
   releaseContents(): void {
-    this.contents.clear();
+    if (this.contentsChars > CONTENT_CACHE_MAX_CHARS) this.clearContents();
   }
 
   assess(fact: IndexedFact, nowMs: number): FreshnessAssessment & { readonly evidence: readonly EvidenceCheck[] } {
@@ -373,6 +390,14 @@ export class FreshnessChecker {
     const holds = this.evaluatePredicate(fact.check, fact.scope, pinned);
     if (holds === false) status = 'stale';
     return holds === undefined ? { status, evidence: checks } : { status, predicateHolds: holds, evidence: checks };
+  }
+
+  /** `prefetch` bound to one operation's snapshot, for `QueryOptions.freshnessPrefetch`. */
+  prefetcher(): (facts: readonly IndexedFact[], nowMs: number) => void {
+    return (facts, nowMs) => {
+      this.enterSnapshot(nowMs);
+      this.prefetch(facts);
+    };
   }
 
   resolver(): FreshnessResolver {

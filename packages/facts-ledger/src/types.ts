@@ -185,7 +185,7 @@ export interface Embedder {
   ): Promise<readonly Float32Array[]>;
 }
 
-export type QueryStage = 'exact' | 'lexical' | 'partial' | 'semantic';
+export type QueryStage = 'exact' | 'lexical' | 'partial' | 'semantic' | 'conflict';
 export type QueryLabel = 'match' | 'related';
 export type QueryOutcomeStatus = 'match' | 'related' | 'not_found';
 export type DisplayBadge =
@@ -214,6 +214,8 @@ export interface QueryOptions {
   readonly minSemanticScore?: number;
   readonly semanticTimeoutMs?: number;
   readonly freshnessResolver?: FreshnessResolver;
+  /** Optional batch lookup run once over all results before they are assessed (A-28). */
+  readonly freshnessPrefetch?: (facts: readonly IndexedFact[], nowMs: number) => void;
   readonly nowMs?: number;
 }
 
@@ -227,6 +229,8 @@ export interface QueryResultItem {
   readonly citable: boolean;
   readonly citationRule: string;
   readonly score?: number;
+  /** Ids of live facts that cannot hold together with this one (A-28). */
+  readonly conflictsWith?: readonly string[];
 }
 
 export interface QueryResult {

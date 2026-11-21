@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { TextDecoder, TextEncoder } from 'node:util';
 import { defaultIndexPath, openSyncedIndexForQuery } from './index-db.js';
+import { complementClause, conflictSubject, factsConflict } from './conflicts.js';
 import { compareBytewise } from './log.js';
 import {
   formatCheckedPredicateClaim,
@@ -400,6 +401,71 @@ function buildFactFilterClause(
   }
 
   return clauses.join(' AND ');
+}
+
+/**
+ * Facts by id from an open index, including superseded and retracted ones (their flags are
+ * set), limited to the sensitivity cap. Used by `facts check-answer` to resolve every cited
+ * id through one index open.
+ */
+export function lookupFactsByIds(
+  db: DatabaseSync,
+  ids: readonly string[],
+  maxSensitivity?: Exclude<Sensitivity, 'secret'>,
+): IndexedFact[] {
+  const out: IndexedFact[] = [];
+  const allowed = allowedSensitivities(maxSensitivity ?? 'child');
+  for (let i = 0; i < ids.length; i += 200) {
+    const chunk = ids.slice(i, i + 200);
+    const rows = db
+      .prepare(
+        `SELECT f.fact_id, f.block_id, f.project, f.tier, f.scope, f.check_json, f.claim, f.note, f.sensitivity, f.verified_at, f.supersedes
+         FROM facts f
+         WHERE f.fact_id IN (${chunk.map(() => '?').join(', ')})
+           AND f.sensitivity IN (${allowed.map(() => '?').join(', ')})
+         ORDER BY f.fact_id COLLATE BINARY ASC`,
+      )
+      .all(...chunk, ...allowed);
+    out.push(...hydrateFacts(db, rows));
+  }
+  return out;
+}
+
+/** Most conflict partners pulled in for one query, so a crowded subject cannot flood the output. */
+const MAX_CONFLICT_PARTNERS = 20;
+
+function addConflictPartners(
+  db: DatabaseSync,
+  options: QueryOptions,
+  collected: Array<{ fact: IndexedFact; stage: QueryStage; label: QueryLabel; score?: number }>,
+  seenIds: Set<string>,
+): void {
+  // Partners are live facts within the same sensitivity cap; superseded and retracted facts never conflict.
+  const live: QueryOptions = { logPath: options.logPath, history: false, ...(options.maxSensitivity ? { maxSensitivity: options.maxSensitivity } : {}) };
+  const originals = collected.map((c) => c.fact).filter((f) => conflictSubject(f) !== null);
+  let added = 0;
+  for (const original of originals) {
+    const params: unknown[] = [];
+    const complement = complementClause(original, params);
+    if (!complement) continue;
+    const where = buildFactFilterClause(live, params);
+    const stmt = db.prepare(
+      `SELECT f.fact_id, f.block_id, f.project, f.tier, f.scope, f.check_json, f.claim, f.note, f.sensitivity, f.verified_at, f.supersedes
+       FROM facts f
+       WHERE f.tier = 'checked' AND f.check_json IS NOT NULL AND json_valid(f.check_json) AND ${complement} AND ${where}
+       ORDER BY f.fact_id COLLATE BINARY ASC`,
+    );
+    // Streamed and hydrated one row at a time: memory stays flat however many facts share the path.
+    for (const row of stmt.iterate(...params)) {
+      if (added >= MAX_CONFLICT_PARTNERS) return;
+      if (seenIds.has(String(row['fact_id']))) continue;
+      const [candidate] = hydrateFacts(db, [row]);
+      if (!candidate || !factsConflict(original, candidate)) continue;
+      seenIds.add(candidate.fact_id);
+      collected.push({ fact: candidate, stage: 'conflict', label: 'related' });
+      added++;
+    }
+  }
 }
 
 function hydrateFacts(db: DatabaseSync, rows: readonly Record<string, unknown>[]): IndexedFact[] {
@@ -837,6 +903,8 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
           });
         }
       }
+      // Conflicts (A-28): pull in live checked facts that contradict a returned one.
+      addConflictPartners(db, options, collected, seenIds);
       break;
     } catch (error) {
       if (db) {
@@ -871,9 +939,24 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
     }
   }
 
+  const conflictMap = new Map<string, string[]>();
+  for (const a of collected) {
+    for (const b of collected) {
+      if (factsConflict(a.fact, b.fact)) {
+        const list = conflictMap.get(a.fact.fact_id) ?? [];
+        list.push(b.fact.fact_id);
+        conflictMap.set(a.fact.fact_id, list);
+      }
+    }
+  }
+  if (options.freshnessPrefetch && collected.length > 0) {
+    // One batched git lookup per repository instead of one per result (A-27 item 2, A-28).
+    options.freshnessPrefetch(collected.map((c) => c.fact), nowMs);
+  }
   const results: QueryResultItem[] = collected.map(({ fact, stage, label, score }) => {
     const assessment = resolver(fact, nowMs);
     const presentation = classifyPresentation(label, fact, assessment);
+    const conflictsWith = conflictMap.get(fact.fact_id);
     return {
       fact,
       stage,
@@ -884,6 +967,7 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
       citable: presentation.citable,
       citationRule: presentation.citationRule,
       ...(score !== undefined ? { score } : {}),
+      ...(conflictsWith ? { conflictsWith: [...conflictsWith].sort(compareBytewise) } : {}),
     };
   });
 
@@ -936,6 +1020,9 @@ export function formatQueryText(result: QueryResult): string {
     }
     if (item.fact.retracted && item.fact.retractionReason) {
       lines.push(`  retracted: ${sanitizeInlineText(item.fact.retractionReason)}`);
+    }
+    if (item.conflictsWith && item.conflictsWith.length > 0) {
+      lines.push(`  conflict: cannot hold together with ${item.conflictsWith.map(sanitizeInlineText).join(', ')}`);
     }
     lines.push(`  rule: ${item.citationRule}`);
   }

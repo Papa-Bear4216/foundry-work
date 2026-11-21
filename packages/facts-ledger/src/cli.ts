@@ -1,11 +1,13 @@
 #!/usr/bin/env node
+import { readFileSync, statSync } from 'node:fs';
 import { addFact } from './add.js';
+import { MAX_ANSWER_BYTES, checkAnswer, formatCheckAnswerText } from './check-answer.js';
 import { assertDigestProject, generateDigest } from './digest.js';
 import { FreshnessChecker } from './freshness.js';
 import { templateNames } from './git.js';
 import { defaultIndexPath, rebuildIndex } from './index-db.js';
 import { loadRepoMap } from './repos.js';
-import { formatVerifyText, verifyFacts } from './verify.js';
+import { verifyFacts, verifyOutputChunks } from './verify.js';
 import {
   createCommandEmbedder,
   createHttpEmbedder,
@@ -13,7 +15,7 @@ import {
   queryFacts,
   sanitizeInlineText,
 } from './query.js';
-import { type CheckedPredicate, type Embedder, type FactScope, type Sensitivity } from './types.js';
+import { type CheckedPredicate, type Embedder, type FactScope, type Sensitivity, type TokenUsage } from './types.js';
 
 interface ParsedArgs {
   readonly command: string | undefined;
@@ -139,7 +141,15 @@ function parseCliArgs(argv: readonly string[]): ParsedArgs {
       case '--reasoning':
       case '--trace-id':
       case '--evidence-cmd':
+      case '--model':
+      case '--task':
+      case '--input-tokens':
+      case '--output-tokens':
         add[arg.slice(2)] = next();
+        break;
+      case '--from-agent':
+      case '--tokens-measured':
+        add[arg.slice(2)] = 'true';
         break;
       case '--evidence-file':
         evidenceFiles.push(next());
@@ -293,6 +303,34 @@ function warnBadLines(report: { readonly badLineCount: number; readonly badLineN
 }
 
 /** Storage flags the user chose, repeated in the digest's closing query command. */
+const TOKEN_FLAGS = ['model', 'task', 'input-tokens', 'output-tokens'] as const;
+
+/** `token_usage` from `--model --task --input-tokens --output-tokens [--tokens-measured]`: all four or none. */
+function tokenUsageFromArgs(a: Record<string, string>): { tokenUsage?: TokenUsage } {
+  const given = TOKEN_FLAGS.filter((f) => a[f] !== undefined);
+  if (given.length === 0) {
+    if (a['tokens-measured'] !== undefined) throw new Error('--tokens-measured needs --model, --task, --input-tokens and --output-tokens');
+    return {};
+  }
+  if (given.length !== TOKEN_FLAGS.length) {
+    throw new Error('Token usage needs all of --model, --task, --input-tokens and --output-tokens');
+  }
+  const count = (flag: string): number => {
+    const raw = a[flag] as string;
+    if (!/^\d{1,15}$/.test(raw)) throw new Error(`--${flag} must be a non-negative integer`);
+    return Number(raw);
+  };
+  return {
+    tokenUsage: {
+      model: a['model'] as string,
+      task: a['task'] as string,
+      input: count('input-tokens'),
+      output: count('output-tokens'),
+      measured: a['tokens-measured'] === 'true',
+    },
+  };
+}
+
 function digestQueryFlags(args: ParsedArgs): string[] {
   const flags: string[] = [];
   if (args.logPath !== (process.env['FACTS_LEDGER_LOG'] || 'ledger.jsonl')) flags.push('--log', args.logPath);
@@ -321,6 +359,8 @@ function usageText(): string {
     '            [--note <text>] [--tag <tag>]... [--sensitivity <tier>] [--scope current|at-commit] [--supersedes-fact <id>]',
     '  facts verify (--fact <id> | --tag <tag> | --all) [--rerun] [--write [--agent <name>]] [--json]',
     '  facts digest --project <p> [--max-sensitivity <tier>] [--json]   (writes digest.<project>.md beside the index; at most 6,000 bytes)',
+    '  facts check-answer <file> [--max-sensitivity <tier>] [--json]   (every non-blank line: a statement with [fact:<id>] or [asserted:<id>], or ABSTAIN: <text>)',
+    '  facts add ... --from-agent --model <id> --task <label> --input-tokens <n> --output-tokens <n> [--tokens-measured]',
     '',
     `Command templates: ${templateNames().join(', ')}. Git templates take the repo name first.`,
     'Repo names map to local checkouts in a per-machine file outside any repository (FACTS_LEDGER_REPOS).',
@@ -393,6 +433,7 @@ async function run(): Promise<void> {
     } else if (args.command === 'query') {
       const queryText = args.positionals.join(' ').trim();
       const embedder = buildEmbedderFromArgs(args);
+      const checker = new FreshnessChecker({ repos: loadRepoMap() });
       const result = await queryFacts({
         logPath: args.logPath,
         indexPath,
@@ -407,7 +448,8 @@ async function run(): Promise<void> {
         maxSensitivity: args.maxSensitivity,
         embedder,
         minSemanticScore: args.minSemanticScore,
-        freshnessResolver: new FreshnessChecker({ repos: loadRepoMap() }).resolver(),
+        freshnessResolver: checker.resolver(),
+        freshnessPrefetch: checker.prefetcher(),
       });
       if (args.json) {
         process.stdout.write(`${JSON.stringify(result)}\n`);
@@ -443,6 +485,8 @@ async function run(): Promise<void> {
         evidenceFiles: args.evidenceFiles.map((raw) => parseEvidenceFile(raw, args.repo)),
         evidenceCommands: a['evidence-cmd'] ? [{ template: a['evidence-cmd'], args: args.evidenceArgs }] : [],
         ...(a['manual'] !== undefined ? { manual: { description: a['manual'] } } : {}),
+        ...(a['from-agent'] === 'true' ? { fromAgent: true } : {}),
+        ...tokenUsageFromArgs(a),
       });
       const fact = block.facts?.[0];
       if (args.json) {
@@ -484,11 +528,30 @@ async function run(): Promise<void> {
         rerun: args.rerun,
         ...(args.write ? { writeAs: agentName(args) } : {}),
       });
-      if (args.json) {
-        process.stdout.write(`${JSON.stringify(result)}\n`);
-      } else {
-        process.stdout.write(`${formatVerifyText(result)}\n`);
+      // Written in pieces: a 10,000-fact report as one string costs several MiB (Step Zero 10.4).
+      let pending = '';
+      for (const chunk of verifyOutputChunks(result, args.json)) {
+        pending += chunk;
+        if (pending.length >= 65536) {
+          process.stdout.write(pending);
+          pending = '';
+        }
       }
+      process.stdout.write(`${pending}\n`);
+    } else if (args.command === 'check-answer') {
+      const file = args.positionals[0];
+      if (!file || args.positionals.length > 1) throw new Error('check-answer takes exactly one answer file');
+      const st = statSync(file);
+      if (!st.isFile()) throw new Error('check-answer needs a regular file');
+      if (st.size > MAX_ANSWER_BYTES) throw new Error(`Answer exceeds ${MAX_ANSWER_BYTES} bytes`);
+      const result = await checkAnswer(readFileSync(file, 'utf8'), {
+        logPath: args.logPath,
+        indexPath,
+        repos: loadRepoMap(),
+        ...(args.maxSensitivity ? { maxSensitivity: args.maxSensitivity } : {}),
+      });
+      process.stdout.write(args.json ? `${JSON.stringify(result)}\n` : `${formatCheckAnswerText(result)}\n`);
+      if (!result.ok) process.exitCode = 1;
     } else {
       process.stderr.write(`Unknown command: ${args.command}\n${usageText()}\n`);
       process.exitCode = 2;
