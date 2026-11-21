@@ -14,4 +14,4 @@
 
 Run these commands from the repository root. Build once with `npm run build --workspace facts-ledger`, then invoke the tool with `node packages/facts-ledger/dist/cli.js <command> --log ledger/foundry.jsonl`. Use `--project foundry` when adding facts or generating the digest.
 
-Read `ledger/digest.foundry.md` at session start. The append-only ledger is `ledger/foundry.jsonl`. Set `FACTS_LEDGER_REPOS` to a per-machine JSON map outside the repository with a `foundry` entry pointing to this checkout.
+Read `ledger/digest.foundry.md` at session start. The append-only ledger is `ledger/foundry.jsonl`. Set `FACTS_LEDGER_REPOS` to the path of a per-machine JSON map file outside the repository with a `foundry` entry pointing to this checkout.
