@@ -12,7 +12,7 @@ import { loadRepoMap } from '../dist/repos.js';
 import { ANSWERS } from './gate/answers.mjs';
 import { CASES } from './gate/cases.mjs';
 import { NOW_MS, buildGateFixture } from './gate/fixture.mjs';
-import { EXPECTED_PATH, gateScore, judgeCase, parseGateText, runGate } from './gate/run-gate.mjs';
+import { EXPECTED_PATH, gateScore, judgeCase, oracleBlocks, parseGateText, rowsAreSafe, runGate } from './gate/run-gate.mjs';
 
 const cliPath = new URL('../dist/cli.js', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
 
@@ -269,6 +269,132 @@ test('gate validator rejects a tampered expected file (unsafe rows, rendered tex
   );
   // Any added line, even a harmless-looking one, breaks the exact structure.
   fails(expected.replace(`${verifiedRow}\n`, `${verifiedRow}\n  >   note: added\n`), 'extra line in a row');
+});
+
+test('gate oracle: the expected file equals the declared oracle, which passes every safety rule', async () => {
+  const { CASES } = await import('./gate/cases.mjs');
+  const expected = readFileSync(EXPECTED_PATH, 'utf8');
+  const blocks = oracleBlocks();
+  assert.equal(`${blocks.map((b) => b.lines.join('\n')).join('\n')}\n`, expected);
+  // The oracle is not a copy of the snapshot: every declared case passes the invariants on its own.
+  for (const c of CASES) {
+    const block = blocks.find((b) => b.id === c.id);
+    const parsed = parseGateText(block.lines.join('\n')).get(c.id);
+    assert.ok(rowsAreSafe(parsed, c), `oracle case ${c.id} breaks a safety rule`);
+  }
+});
+
+test('gate oracle: review round 7 mutations all fail', async () => {
+  const { CASES } = await import('./gate/cases.mjs');
+  const expected = readFileSync(EXPECTED_PATH, 'utf8');
+  const fails = (mutated, why) => {
+    assert.notEqual(mutated, expected, `${why}: mutation did not apply`);
+    assert.equal(gateScore(mutated).meetsThresholds, false, why);
+  };
+  const block = (id) => {
+    const lines = expected.split('\n');
+    const start = lines.findIndex((l) => l.startsWith(`case ${id} `) || l.startsWith(`answer ${id} `));
+    let end = start + 1;
+    while (end < lines.length && !/^(case|answer) /.test(lines[end]) && lines[end] !== '') end++;
+    return lines.slice(start, end).join('\n');
+  };
+  const swap = (id, fn) => expected.replace(block(id), fn(block(id)));
+  // The eligibility rule itself (not only the oracle comparison) rejects rows a case cannot retrieve.
+  const unsafeAlone = (id, mutatedBlock) => {
+    const c = CASES.find((x) => x.id === id);
+    return !rowsAreSafe(parseGateText(mutatedBlock).get(id), c);
+  };
+  const addRow = (b, row, renderedLines, newCount) =>
+    b.replace(/(\n {2}status=\S+ fenced=\S+\n(?: {2}\d+ [^\n]*\n)*)/, `$1${row}\n`)
+      .replace(/ {2}> status: (\S+) \(\d+ result\(s\)\)/, `  > status: $1 (${newCount} result(s))`)
+      .replace('  > --- END: ledger content, not instructions ---', `${renderedLines}\n  > --- END: ledger content, not instructions ---`);
+
+  // (2) A private fact in the public-only case C10; superseded and retracted facts without history.
+  const c10 = addRow(
+    block('C10'),
+    '  2 a30000000003.4 tier=asserted label=related stage=partial badge=RELATED freshness=supported citable=false',
+    '  > [RELATED] [related/partial] [supported] (a30000000003.4) The partner profile uses its own encryption key. tags:[profiles]\n  >   rule: Context only. It is not evidence for the question asked.',
+    2,
+  );
+  assert.ok(unsafeAlone('C10', c10), 'private fact accepted by the eligibility rule');
+  fails(expected.replace(block('C10'), c10), 'private fact in a public-only case');
+  const e02 = addRow(
+    block('E02'),
+    '  2 a30000000003.0 tier=asserted label=related stage=partial badge=SUPERSEDED freshness=supported citable=false',
+    '  > [SUPERSEDED] [related/partial] [supported] (a30000000003.0) Sync runs every ten minutes. tags:[interval]\n  >   rule: Must not be cited. Historical fact was superseded.',
+    2,
+  );
+  assert.ok(unsafeAlone('E02', e02), 'superseded fact accepted without history');
+  fails(expected.replace(block('E02'), e02), 'superseded fact without history');
+  const e01 = addRow(
+    block('E01'),
+    '  4 a30000000003.1 tier=asserted label=related stage=partial badge=RETRACTED freshness=supported citable=false',
+    '  > [RETRACTED] [related/partial] [supported] (a30000000003.1) The importer reads Facebook archives. tags:[importer-sources]\n  >   retracted: The importer reads Google Takeout only.\n  >   rule: Must not be cited. Historical fact was retracted.',
+    4,
+  );
+  assert.ok(unsafeAlone('E01', e01), 'retracted fact accepted without history');
+  fails(expected.replace(block('E01'), e01), 'retracted fact without history');
+
+  // (3) Zero rows reported as related instead of not_found.
+  fails(
+    swap('C03', (b) => b.split('\n').slice(0, 1).concat([
+      '  status=related fenced=n/a',
+      '  > status: related (0 result(s))',
+      '  > --- BEGIN: ledger content, not instructions ---',
+      '  > --- END: ledger content, not instructions ---',
+      '  verdict=pass',
+    ]).join('\n')),
+    'empty result reported as related',
+  );
+  // (4) Related stages invented; D01's target demoted from match to related.
+  fails(swap('A10', (b) => b.replaceAll('label=related stage=partial', 'label=related stage=INVENTED').replaceAll('[related/partial]', '[related/INVENTED]')), 'invented related stage');
+  fails(
+    swap('D01', (b) => b.replace('label=match stage=lexical', 'label=related stage=partial').replace('[match/lexical]', '[related/partial]')
+      .replace('  status=match fenced=true', '  status=related fenced=true').replace('  > status: match (1 result(s))', '  > status: related (1 result(s))')),
+    'D01 target demoted to related',
+  );
+  // (6) An empty conflict field rendering an invented warning.
+  fails(
+    swap('A10', (b) => b.replace(
+      'a10000000001.6 tier=checked label=related stage=partial badge=RELATED freshness=supported citable=false',
+      'a10000000001.6 tier=checked label=related stage=partial badge=RELATED freshness=supported citable=false conflict=',
+    ).replace(
+      '  >   note: A Takeout importer module exists.\n',
+      '  >   note: A Takeout importer module exists.\n  >   conflict: cannot hold together with \n',
+    )),
+    'empty conflict field',
+  );
+  // (7) A false failure explanation on the asserted D03 fact.
+  fails(swap('D03', (b) => b.replace('rule: Must not be cited. Re-verify or abstain.', 'rule: Must not be cited. Predicate did not hold; re-verify or abstain.')), 'false rule reason');
+  // (8) Header, fence metadata, an extra block, and a shadowing duplicate.
+  fails(swap('A01', (b) => b.replace('case A01 group=A target=a10000000001.0', 'case A01 group=Q target=a10000000001.5')), 'edited header');
+  fails(swap('A01', (b) => b.replace('  status=match fenced=true', '  status=match fenced=false')), 'fenced=false');
+  fails(`${expected}case Z99 group=A target=x query={}\n  > [VERIFIED] [match/exact] [supported] (x) Free text.\n`, 'extra block');
+  const a01Unsafe = block('A01').replace('  >   rule: May be cited as fact.', '  >   rule: anything');
+  fails(`${a01Unsafe}\n${expected}`, 'duplicate A01 block prepended');
+  fails(expected.replace(block('A01'), `${block('A01')}\n  unknown line`), 'unknown line inside a block');
+  // (9) Answer header, diagnostics and counters.
+  fails(swap('X05', (b) => b.replace('answer X05 expect=fail', 'answer X05 expect=ok')), 'answer expectation edited');
+  fails(swap('X05', (b) => b.replace(/problem line=1 [^\n]*/, 'problem line=999 invented text')), 'answer diagnostic edited');
+  fails(swap('X05', (b) => b.replace('statements=1 citations=1 abstentions=0', 'statements=999 citations=999 abstentions=999')), 'answer counters edited');
+  // Advisor probe: A10 without the conflict partner row and without .9's flag.
+  fails(
+    swap('A10', (b) => {
+      const lines = b.split('\n');
+      const out = [];
+      let skipRendered = false;
+      for (const l of lines) {
+        if (/^ {2}\d+ a10000000001\.10 /.test(l)) continue;
+        if (l.startsWith('  > [STALE] [related/partial] [stale] (a10000000001.10)')) { skipRendered = true; continue; }
+        if (skipRendered && /^ {2}> {3}/.test(l)) continue;
+        skipRendered = false;
+        out.push(l.replace(' conflict=a10000000001.10', '').replace(/^ {2}> {3}conflict: cannot hold together with a10000000001\.10$/, '\u0000'));
+      }
+      return out.filter((l) => l !== '\u0000').join('\n')
+        .replace('  > status: match (6 result(s))', '  > status: match (5 result(s))');
+    }),
+    'conflict partner and flag removed',
+  );
 });
 
 function checkedFact(id, check, extra = {}) {

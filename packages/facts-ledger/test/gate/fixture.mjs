@@ -294,6 +294,7 @@ export function gateFactCatalog() {
     for (const f of b.facts) {
       catalog.set(f.fact_id, {
         tier: f.tier,
+        sensitivity: f.sensitivity,
         check: f.check ?? null,
         claim: f.claim,
         note: f.note,
