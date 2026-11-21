@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { blockCount, project } from '../../bench/fixture.mjs';
+import { CASES } from '../../dist/eval/cases.js';
 import { formatCheckedPredicateClaim } from '../../dist/normalize.js';
 import { DIGEST_MAX_BYTES, digestFormatProblems } from '../../dist/digest.js';
 
@@ -177,6 +178,21 @@ function answerOutcome(result) {
   return null;
 }
 
+function usageOutcome(result) {
+  if (result.blocksWithUsage < blockCount) return `only ${result.blocksWithUsage} usage blocks`;
+  if (result.totals.estimated.blocks < blockCount) return `only ${result.totals.estimated.blocks} estimated blocks`;
+  return null;
+}
+
+function evalOutcome(result) {
+  if (result.cases_run !== 50) return `expected 50 cases, got ${result.cases_run}`;
+  if (!result.passes_bar || result.unsupported_claims !== 0) {
+    return `eval failed bar: unsupported=${result.unsupported_claims} counts=${JSON.stringify(result.counts)}`;
+  }
+  if (!result.block_id) return 'eval did not append a result block';
+  return null;
+}
+
 const root = mkdtempSync(join(tmpdir(), 'facts-budgets-'));
 try {
   // 10,000 blocks whose evidence resolves in a real repository, so the success paths run:
@@ -209,6 +225,27 @@ try {
     cited.push(`[fact:${blockId(3 * (i * 61 + 1))}.0]`);
   }
   writeFileSync(answerPath, `Probe statement. ${cited.join(' ')}\nABSTAIN: nothing else.\n`);
+  const evalAnswersPath = join(root, 'eval-answers.json');
+  const evalAnswers = Object.fromEntries(
+    CASES.map((c) => [
+      c.id,
+      'cite' in c.expect
+        ? `Synthetic answer for ${c.id}. [${c.expect.as}:${c.expect.cite}]\n`
+        : `ABSTAIN: not supported for ${c.id}.\n`,
+    ]),
+  );
+  writeFileSync(evalAnswersPath, JSON.stringify(evalAnswers));
+  const fakeModelPath = join(root, 'fake-model.mjs');
+  writeFileSync(
+    fakeModelPath,
+    [
+      "import { readFileSync } from 'node:fs';",
+      'const answers = JSON.parse(readFileSync(process.argv[2], "utf8"));',
+      'const prompt = readFileSync(0, "utf8");',
+      'const m = /^Case: ([A-E]\\d{2})$/m.exec(prompt);',
+      'process.stdout.write(m && answers[m[1]] ? answers[m[1]] : "ABSTAIN: unknown case.\\n");',
+    ].join('\n'),
+  );
 
   const steps = [
     { name: 'rebuild', args: ['rebuild', ...store] },
@@ -224,6 +261,15 @@ try {
         '--from-agent', '--model', 'probe-model', '--task', 'budgets', '--input-tokens', '10', '--output-tokens', '2',
         ...store, '--json',
       ],
+    },
+    { name: 'usage', args: ['usage', '--log', logPath, '--json'], outcome: usageOutcome },
+    {
+      name: 'eval',
+      args: [
+        'eval', '--model-cmd', process.execPath, '--model-arg', fakeModelPath, '--model-arg', evalAnswersPath,
+        '--model-name', 'budget-fake', '--project', project, '--log', logPath, '--json',
+      ],
+      outcome: evalOutcome,
     },
     { name: 'query (cold)', args: ['query', 'calibration sample', ...store, '--json'], maxMs: COLD_QUERY_MS, cold: true },
   ];

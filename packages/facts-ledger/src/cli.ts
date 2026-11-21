@@ -3,10 +3,17 @@ import { readFileSync, statSync } from 'node:fs';
 import { addFact } from './add.js';
 import { MAX_ANSWER_BYTES, checkAnswer, formatCheckAnswerText } from './check-answer.js';
 import { assertDigestProject, generateDigest } from './digest.js';
+import {
+  formatDryRunPrompts,
+  formatEvalText,
+  runEval,
+  runEvalDryRun,
+} from './eval/runner.js';
 import { FreshnessChecker } from './freshness.js';
 import { templateNames } from './git.js';
 import { defaultIndexPath, rebuildIndex } from './index-db.js';
 import { loadRepoMap } from './repos.js';
+import { computeUsage, formatUsageText } from './usage.js';
 import { verifyFacts, verifyOutputChunks } from './verify.js';
 import {
   createCommandEmbedder,
@@ -45,6 +52,13 @@ interface ParsedArgs {
   readonly all: boolean;
   readonly rerun: boolean;
   readonly write: boolean;
+  readonly modelCmd: string | undefined;
+  readonly modelArgs: readonly string[];
+  readonly modelName: string | undefined;
+  readonly caseTimeoutMs: number | undefined;
+  readonly cases: readonly string[] | undefined;
+  readonly dryRun: boolean;
+  readonly since: string | undefined;
 }
 
 const VALID_MAX_SENSITIVITY = new Set(['public', 'personal', 'private', 'clinical', 'child']);
@@ -105,6 +119,13 @@ function parseCliArgs(argv: readonly string[]): ParsedArgs {
   let all = false;
   let rerun = false;
   let write = false;
+  let modelCmd: string | undefined;
+  const modelArgs: string[] = [];
+  let modelName: string | undefined;
+  let caseTimeoutMs: number | undefined;
+  let cases: string[] | undefined;
+  let dryRun = false;
+  let since: string | undefined;
 
   for (let i = 1; i < argv.length; i++) {
     const arg = argv[i];
@@ -212,6 +233,37 @@ function parseCliArgs(argv: readonly string[]): ParsedArgs {
       case '--min-semantic-score':
         minSemanticScore = parseMinSemanticScore(next());
         break;
+      case '--model-cmd':
+        modelCmd = next();
+        break;
+      case '--model-arg':
+        modelArgs.push(next());
+        break;
+      case '--model-name':
+        modelName = next();
+        break;
+      case '--case-timeout-ms': {
+        const raw = next();
+        if (!/^\d{1,9}$/.test(raw)) {
+          throw new Error('--case-timeout-ms must be a positive integer');
+        }
+        const parsed = Number.parseInt(raw, 10);
+        if (!Number.isFinite(parsed) || parsed < 1) {
+          throw new Error('--case-timeout-ms must be a positive integer');
+        }
+        caseTimeoutMs = parsed;
+        break;
+      }
+      case '--cases':
+        cases = next().split(',');
+        break;
+      case '--dry-run':
+      case '--print-prompts':
+        dryRun = true;
+        break;
+      case '--since':
+        since = next();
+        break;
       case '--json':
         json = true;
         break;
@@ -250,6 +302,9 @@ function parseCliArgs(argv: readonly string[]): ParsedArgs {
 
   if (cliEmbedArgs.length > 0 && !embedCmd) {
     throw new Error('--embed-arg requires --embed-cmd or FACTS_LEDGER_EMBED_CMD');
+  }
+  if (modelArgs.length > 0 && !modelCmd) {
+    throw new Error('--model-arg requires --model-cmd');
   }
 
   let embedArgs: string[] = [];
@@ -292,6 +347,13 @@ function parseCliArgs(argv: readonly string[]): ParsedArgs {
     all,
     rerun,
     write,
+    modelCmd,
+    modelArgs,
+    modelName,
+    caseTimeoutMs,
+    cases,
+    dryRun,
+    since,
   };
 }
 
@@ -360,6 +422,9 @@ function usageText(): string {
     '  facts verify (--fact <id> | --tag <tag> | --all) [--rerun] [--write [--agent <name>]] [--json]',
     '  facts digest --project <p> [--max-sensitivity <tier>] [--json]   (writes digest.<project>.md beside the index; at most 6,000 bytes)',
     '  facts check-answer <file> [--max-sensitivity <tier>] [--json]   (every non-blank line: a statement with [fact:<id>] or [asserted:<id>], or ABSTAIN: <text>)',
+    '  facts eval --model-cmd <exe> [--model-arg <arg>]... [--model-name <label>] [--case-timeout-ms <n>] [--cases <id,...>] [--project <p>] [--agent <name>] [--log <file>] [--json] [--stats]',
+    '  facts eval --dry-run [--cases <id,...>] [--json] [--stats]   (print deterministic prompts without running a model)',
+    '  facts usage [--since <iso>] [--project <p>] [--log <file>] [--json] [--stats]   (measured and estimated totals kept separate)',
     '  facts add ... --from-agent --model <id> --task <label> --input-tokens <n> --output-tokens <n> [--tokens-measured]',
     '',
     `Command templates: ${templateNames().join(', ')}. Git templates take the repo name first.`,
@@ -552,6 +617,35 @@ async function run(): Promise<void> {
       });
       process.stdout.write(args.json ? `${JSON.stringify(result)}\n` : `${formatCheckAnswerText(result)}\n`);
       if (!result.ok) process.exitCode = 1;
+    } else if (args.command === 'eval') {
+      if (args.dryRun) {
+        const dry = await runEvalDryRun(args.cases);
+        process.stdout.write(args.json ? `${JSON.stringify(dry)}\n` : `${formatDryRunPrompts(dry)}\n`);
+      } else {
+        if (!args.modelCmd) {
+          throw new Error('--model-cmd is required (or pass --dry-run to inspect prompts)');
+        }
+        const project = args.add['project'] || process.env['FACTS_LEDGER_PROJECT'] || 'facts-eval';
+        const result = await runEval({
+          modelCmd: args.modelCmd,
+          modelArgs: args.modelArgs,
+          ...(args.modelName !== undefined ? { modelName: args.modelName } : {}),
+          ...(args.caseTimeoutMs !== undefined ? { caseTimeoutMs: args.caseTimeoutMs } : {}),
+          ...(args.cases !== undefined ? { caseIds: args.cases } : {}),
+          logPath: args.logPath,
+          project,
+          agent: agentName(args),
+        });
+        process.stdout.write(args.json ? `${JSON.stringify(result)}\n` : `${formatEvalText(result)}\n`);
+      }
+    } else if (args.command === 'usage') {
+      const result = computeUsage({
+        logPath: args.logPath,
+        ...(args.since !== undefined ? { since: args.since } : {}),
+        ...(args.add['project'] !== undefined ? { project: args.add['project'] } : {}),
+      });
+      warnBadLines(result.badLines);
+      process.stdout.write(args.json ? `${JSON.stringify(result)}\n` : `${formatUsageText(result)}\n`);
     } else {
       process.stderr.write(`Unknown command: ${args.command}\n${usageText()}\n`);
       process.exitCode = 2;

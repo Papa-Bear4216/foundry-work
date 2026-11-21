@@ -139,12 +139,12 @@ declare module 'node:child_process' {
 
 declare module 'node:crypto' {
   export function randomUUID(): string;
-  export interface Sha256Hash {
-    update(data: Uint8Array | string): Sha256Hash;
-    copy(): Sha256Hash;
+  export interface HashDigest {
+    update(data: Uint8Array | string): HashDigest;
+    copy(): HashDigest;
     digest(encoding: 'hex'): string;
   }
-  export function createHash(algorithm: 'sha256'): Sha256Hash;
+  export function createHash(algorithm: 'sha256' | 'sha1'): HashDigest;
 }
 
 declare module 'node:fs' {
@@ -163,6 +163,11 @@ declare module 'node:fs' {
   export function realpathSync(path: string): string;
   export function fsyncSync(fd: number): void;
   export function mkdirSync(path: string, options: { recursive: true }): string | undefined;
+  export function mkdtempSync(prefix: string): string;
+  export function rmSync(
+    path: string,
+    options?: { recursive?: boolean; force?: boolean; maxRetries?: number },
+  ): void;
   export function readSync(
     fd: number,
     buffer: Uint8Array,
@@ -171,6 +176,7 @@ declare module 'node:fs' {
     position: number | null,
   ): number;
   export function writeSync(fd: number, buffer: Uint8Array): number;
+  export function writeFileSync(path: string, data: Uint8Array | string): void;
   export function renameSync(oldPath: string, newPath: string): void;
   export function unlinkSync(path: string): void;
   export function existsSync(path: string): boolean;
@@ -180,6 +186,7 @@ declare module 'node:fs' {
 
 declare module 'node:os' {
   export function homedir(): string;
+  export function tmpdir(): string;
 }
 
 declare module 'node:path' {
