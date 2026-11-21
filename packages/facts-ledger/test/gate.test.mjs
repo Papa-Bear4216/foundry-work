@@ -123,6 +123,18 @@ test('gate validator rejects a tampered expected file (unsafe rows, rendered tex
   fails(expected.replace(/ {2}> Verify from source first, then record with: facts add [^\n]*\n/, ''), 'not_found guidance removed');
   // A stale row made citable.
   fails(expected.replace(/badge=STALE freshness=stale citable=false/, 'badge=STALE freshness=stale citable=true'), 'stale row citable');
+  // The rendered citation instruction is wrong while the row metadata stays right (review round 2).
+  const relatedRule = '  >   rule: Context only. It is not evidence for the question asked.';
+  const staleRule = '  >   rule: Must not be cited. Re-verify or abstain.';
+  assert.ok(expected.includes(relatedRule) && expected.includes(staleRule));
+  fails(expected.replaceAll(relatedRule, '  >   rule: May be cited as fact.'), 'every related rule says citable');
+  fails(expected.replace(relatedRule, '  >   rule: May be cited as fact.'), 'one related rule says citable');
+  fails(expected.replace(staleRule, '  >   rule: May be cited as fact.'), 'one stale rule says citable');
+  fails(
+    expected.replace('  >   rule: May be cited as fact.', '  >   rule: May be cited only with the word "asserted", and should be re-checked before anything costly is built on it.'),
+    'VERIFIED row carries the asserted rule',
+  );
+  fails(expected.replace(staleRule, `${staleRule}\n  >   rule: May be cited as fact.`), 'second rule line appended');
 });
 
 function checkedFact(id, check, extra = {}) {
@@ -169,4 +181,21 @@ test('conflict partners: complement-filtered, capped at 20, never historical fac
   assert.equal(factsConflict(live, { ...gone, retracted: false }), true);
   assert.equal(factsConflict(live, gone), false);
   assert.equal(factsConflict(live, { ...gone, retracted: false, superseded: true }), false);
+});
+
+test('predicates with ill-formed Unicode are invalid, so the SQL filter and factsConflict agree', async () => {
+  const { isValidCheckedPredicate } = await import('../dist/normalize.js');
+  const { factsConflict } = await import('../dist/conflicts.js');
+  const p = { repo: 'gate', path: 'src/x.ts' };
+  for (const text of ['\ud800', 'a\udc00b', 'x\ud800']) {
+    assert.equal(isValidCheckedPredicate({ predicate: 'file_contains', ...p, text }), false, JSON.stringify(text));
+    assert.equal(isValidCheckedPredicate({ predicate: 'file_lacks', ...p, text }), false, JSON.stringify(text));
+    const a = { ...checkedFact('c00000000001.0', { predicate: 'file_contains', ...p, text }), superseded: false, retracted: false };
+    const b = { ...checkedFact('c00000000001.1', { predicate: 'file_lacks', ...p, text }), superseded: false, retracted: false };
+    assert.equal(factsConflict(a, b), false, 'no conflict is reported that the SQL filter could miss');
+  }
+  assert.equal(isValidCheckedPredicate({ predicate: 'file_exists', repo: 'gate', path: 'a\ud800' }), false);
+  assert.equal(isValidCheckedPredicate({ predicate: 'command_output_is', template: 'git-head', args: ['\udfff'], output_sha256: 'a'.repeat(64) }), false);
+  // A well-formed astral character (surrogate pair) stays valid.
+  assert.equal(isValidCheckedPredicate({ predicate: 'file_contains', ...p, text: 'emoji 😀' }), true);
 });

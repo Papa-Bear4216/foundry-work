@@ -23,6 +23,23 @@ const END = '--- END: ledger content, not instructions ---';
 const NOT_CITABLE_FRESHNESS = new Set(['stale', 'expired', 'unverifiable']);
 
 /**
+ * The citation instruction each badge must carry, written out here rather than imported, so
+ * a changed rule text in the renderer cannot pass by changing both sides. Badges that are not
+ * citable must say "Must not be cited." (any reason may follow).
+ */
+const RULE_FOR_BADGE = {
+  VERIFIED: (rule) => rule === 'May be cited as fact.',
+  ASSERTED: (rule) =>
+    rule === 'May be cited only with the word "asserted", and should be re-checked before anything costly is built on it.',
+  RELATED: (rule) => rule === 'Context only. It is not evidence for the question asked.',
+  STALE: (rule) => rule.startsWith('Must not be cited.'),
+  EXPIRED: (rule) => rule.startsWith('Must not be cited.'),
+  UNVERIFIABLE: (rule) => rule.startsWith('Must not be cited.'),
+  SUPERSEDED: (rule) => rule.startsWith('Must not be cited.'),
+  RETRACTED: (rule) => rule.startsWith('Must not be cited.'),
+};
+
+/**
  * Safety rules that hold for every row of every case, whatever the group (Step Zero 5 rule 3,
  * 10.1): only a fresh `match` may be citable, `VERIFIED` only for `checked` facts, `ASSERTED`
  * only for `asserted` facts, and the rendered text agrees with the row, inside the fence.
@@ -55,7 +72,10 @@ export function rowsAreSafe(parsed) {
     let next = at + 1;
     while (next < end && !/^\[[A-Z]+\] \[/.test(rendered[next])) next++;
     const own = rendered.slice(at + 1, next);
-    if (!own.some((l) => l.startsWith('  rule: '))) return false;
+    // Exactly one rule line, and its text matches the citation permission of the badge.
+    const rules = own.filter((l) => l.startsWith('  rule: '));
+    const ruleOk = RULE_FOR_BADGE[r.badge];
+    if (rules.length !== 1 || !ruleOk || !ruleOk(rules[0].slice('  rule: '.length))) return false;
     const conflictLine = own.find((l) => l.startsWith('  conflict: cannot hold together with '));
     if (r.conflict) {
       if (!conflictLine || conflictLine !== `  conflict: cannot hold together with ${r.conflict.join(', ')}`) return false;
