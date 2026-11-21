@@ -2,6 +2,7 @@
 // Everything here is fixed: author, dates, line endings and ids, so the repository objects
 // and the gate output are byte-identical on every platform.
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { formatCheckedPredicateClaim } from '../../dist/normalize.js';
@@ -106,6 +107,22 @@ export function buildGateFixture(root) {
   git(repoDir, ['commit', '--quiet', '--no-verify', '-m', 'c2'], '2026-11-02T00:00:00+00:00');
   const c2 = git(repoDir, ['rev-parse', 'HEAD']);
 
+  const blocks = gateBlocks(c1, c1Blobs);
+
+  const logPath = join(root, 'ledger.jsonl');
+  writeFileSync(logPath, Buffer.from(blocks.map((b) => JSON.stringify(b)).join('\n') + '\n', 'utf8'));
+
+  const reposPath = join(root, 'repos.json');
+  writeFileSync(reposPath, JSON.stringify({ [REPO]: repoDir }));
+
+  return { repoDir, logPath, indexPath: join(root, 'ledger.index.sqlite'), reposPath, c1, c2 };
+}
+
+/**
+ * The fixture's blocks. Claims, notes, tags and retraction reasons do not depend on the commit
+ * ids, so `gateFactCatalog()` can read them without building the repository (A-28 item 11).
+ */
+function gateBlocks(c1, c1Blobs) {
   const fileEv = (path, quote) => ({
     type: 'file',
     repo: REPO,
@@ -228,11 +245,25 @@ export function buildGateFixture(root) {
       retracted_facts: [{ fact_id: `${b3}.1`, reason: 'The importer reads Google Takeout only.' }],
     }),
   ];
-  const logPath = join(root, 'ledger.jsonl');
-  writeFileSync(logPath, Buffer.from(blocks.map((b) => JSON.stringify(b)).join('\n') + '\n', 'utf8'));
+  return blocks;
+}
 
-  const reposPath = join(root, 'repos.json');
-  writeFileSync(reposPath, JSON.stringify({ [REPO]: repoDir }));
-
-  return { repoDir, logPath, indexPath: join(root, 'ledger.index.sqlite'), reposPath, c1, c2 };
+/** fact_id -> { claim, note, tags, retractionReason } for every fixture fact, defined here, not by the renderer. */
+export function gateFactCatalog() {
+  // Blob ids are content hashes (SHA-1 object format), so they are computed here without git.
+  const blobId = (text) => {
+    const body = Buffer.from(text, 'utf8');
+    return createHash('sha1').update(Buffer.concat([Buffer.from(`blob ${body.length} `), body])).digest('hex');
+  };
+  const c1Blobs = Object.fromEntries(Object.entries(C1_FILES).map(([path, text]) => [path, blobId(text)]));
+  const blocks = gateBlocks('0'.repeat(40), c1Blobs);
+  const retracted = new Map();
+  for (const b of blocks) for (const r of b.retracted_facts ?? []) retracted.set(r.fact_id, r.reason);
+  const catalog = new Map();
+  for (const b of blocks) {
+    for (const f of b.facts) {
+      catalog.set(f.fact_id, { claim: f.claim, note: f.note, tags: f.tags, retractionReason: retracted.get(f.fact_id) ?? null });
+    }
+  }
+  return catalog;
 }

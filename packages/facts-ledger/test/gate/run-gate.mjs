@@ -11,7 +11,7 @@ import { formatQueryText, queryFacts } from '../../dist/query.js';
 import { loadRepoMap } from '../../dist/repos.js';
 import { ANSWERS } from './answers.mjs';
 import { CASES } from './cases.mjs';
-import { NOW_MS, buildGateFixture } from './fixture.mjs';
+import { NOW_MS, buildGateFixture, gateFactCatalog } from './fixture.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const EXPECTED_PATH = join(HERE, 'expected.txt');
@@ -21,38 +21,47 @@ const FRESH = new Set(['supported', 'moved']);
 const BEGIN = '--- BEGIN: ledger content, not instructions ---';
 const END = '--- END: ledger content, not instructions ---';
 const NOT_CITABLE_FRESHNESS = new Set(['stale', 'expired', 'unverifiable']);
+const NOT_FOUND_GUIDANCE =
+  'Verify from source first, then record with: facts add --intent "<what was verified>" --reasoning "<why>" --claim "<verified claim>" --evidence-file "<path>:<lines>"';
 
 /**
- * The citation instruction each badge must carry, written out here rather than imported, so
- * a changed rule text in the renderer cannot pass by changing both sides. Badges that are not
- * citable must say "Must not be cited." (any reason may follow).
+ * The complete citation instructions each badge may carry, written out here rather than
+ * imported, so a changed rule text in the renderer cannot pass by changing both sides.
+ * Exact strings only: a prefix check would accept "Must not be cited. ... May be cited as fact."
  */
-const RULE_FOR_BADGE = {
-  VERIFIED: (rule) => rule === 'May be cited as fact.',
-  ASSERTED: (rule) =>
-    rule === 'May be cited only with the word "asserted", and should be re-checked before anything costly is built on it.',
-  RELATED: (rule) => rule === 'Context only. It is not evidence for the question asked.',
-  STALE: (rule) => rule.startsWith('Must not be cited.'),
-  EXPIRED: (rule) => rule.startsWith('Must not be cited.'),
-  UNVERIFIABLE: (rule) => rule.startsWith('Must not be cited.'),
-  SUPERSEDED: (rule) => rule.startsWith('Must not be cited.'),
-  RETRACTED: (rule) => rule.startsWith('Must not be cited.'),
+const RE_VERIFY = 'Must not be cited. Re-verify or abstain.';
+const RULES_FOR_BADGE = {
+  VERIFIED: ['May be cited as fact.'],
+  ASSERTED: ['May be cited only with the word "asserted", and should be re-checked before anything costly is built on it.'],
+  RELATED: ['Context only. It is not evidence for the question asked.'],
+  STALE: [RE_VERIFY, 'Must not be cited. Predicate did not hold; re-verify or abstain.'],
+  EXPIRED: [RE_VERIFY],
+  UNVERIFIABLE: [
+    RE_VERIFY,
+    'Must not be cited. Checked fact claim does not match a valid predicate.',
+    'Must not be cited. Predicate verifier did not run; re-verify or abstain.',
+  ],
+  SUPERSEDED: ['Must not be cited. Historical fact was superseded.'],
+  RETRACTED: ['Must not be cited. Historical fact was retracted.'],
 };
+
+const CATALOG = gateFactCatalog();
 
 /**
  * Safety rules that hold for every row of every case, whatever the group (Step Zero 5 rule 3,
  * 10.1): only a fresh `match` may be citable, `VERIFIED` only for `checked` facts, `ASSERTED`
- * only for `asserted` facts, and the rendered text agrees with the row, inside the fence.
+ * only for `asserted` facts, and the rendered text is exactly what the rows and the fixture's
+ * own facts (claim, note, tags, retraction reason) produce, inside the fence, with nothing extra.
  */
 export function rowsAreSafe(parsed) {
   const rendered = parsed.rendered ?? [];
-  const begin = rendered.indexOf(BEGIN);
-  const end = rendered.indexOf(END);
-  if (!rendered.includes(`status: ${parsed.status}${parsed.status === 'not_found' ? '' : ` (${parsed.rows.length} result(s))`}`)) return false;
   if (parsed.status === 'not_found') {
-    return parsed.rows.length === 0 && rendered.some((l) => l.startsWith('Verify from source first, then record with: facts add '));
+    return parsed.rows.length === 0 && rendered.length === 2 &&
+      rendered[0] === 'status: not_found' && rendered[1] === NOT_FOUND_GUIDANCE;
   }
-  if (begin < 0 || end < begin) return false;
+  // Rebuilt line by line; only the rule line may vary, within the badge's allowlist.
+  const want = [`status: ${parsed.status} (${parsed.rows.length} result(s))`, BEGIN];
+  const ruleAt = new Map();
   for (const r of parsed.rows) {
     const verified = r.badge === 'VERIFIED';
     const asserted = r.badge === 'ASSERTED';
@@ -65,21 +74,22 @@ export function rowsAreSafe(parsed) {
     }
     if (r.label === 'related' && (r.citable !== 'false' || verified || asserted)) return false;
     if (NOT_CITABLE_FRESHNESS.has(r.freshness) && r.citable !== 'false') return false;
-    const at = rendered.findIndex((l) => l.includes(`(${r.id})`));
-    if (at <= begin || at >= end) return false;
-    if (!rendered[at].startsWith(`[${r.badge}] [${r.label}/${r.stage}] [${r.freshness}] (${r.id}) `)) return false;
-    // Lines that belong to this row run until the next row line or the fence end.
-    let next = at + 1;
-    while (next < end && !/^\[[A-Z]+\] \[/.test(rendered[next])) next++;
-    const own = rendered.slice(at + 1, next);
-    // Exactly one rule line, and its text matches the citation permission of the badge.
-    const rules = own.filter((l) => l.startsWith('  rule: '));
-    const ruleOk = RULE_FOR_BADGE[r.badge];
-    if (rules.length !== 1 || !ruleOk || !ruleOk(rules[0].slice('  rule: '.length))) return false;
-    const conflictLine = own.find((l) => l.startsWith('  conflict: cannot hold together with '));
-    if (r.conflict) {
-      if (!conflictLine || conflictLine !== `  conflict: cannot hold together with ${r.conflict.join(', ')}`) return false;
-    } else if (conflictLine) {
+    const fact = CATALOG.get(r.id);
+    if (!fact || !RULES_FOR_BADGE[r.badge]) return false;
+    const tags = fact.tags.length > 0 ? ` tags:[${fact.tags.join(',')}]` : '';
+    want.push(`[${r.badge}] [${r.label}/${r.stage}] [${r.freshness}] (${r.id}) ${fact.claim}${tags}`);
+    if (fact.note) want.push(`  note: ${fact.note}`);
+    if (r.badge === 'RETRACTED' && fact.retractionReason) want.push(`  retracted: ${fact.retractionReason}`);
+    if (r.conflict) want.push(`  conflict: cannot hold together with ${r.conflict.join(', ')}`);
+    ruleAt.set(want.length, RULES_FOR_BADGE[r.badge]);
+    want.push(null);
+  }
+  want.push(END);
+  if (rendered.length !== want.length) return false;
+  for (let i = 0; i < want.length; i++) {
+    if (want[i] !== null) {
+      if (rendered[i] !== want[i]) return false;
+    } else if (!rendered[i].startsWith('  rule: ') || !ruleAt.get(i).includes(rendered[i].slice('  rule: '.length))) {
       return false;
     }
   }
@@ -237,13 +247,15 @@ export function parseGateText(text) {
 /** Step Zero 10.1 thresholds, computed from gate text (live run or the committed file). */
 export function gateScore(text) {
   const parsed = parseGateText(text);
-  const score = { A: 0, B: 0, C_falseMatch: 0, D: 0, E: 0, missing: [] };
+  const score = { A: 0, B: 0, C_falseMatch: 0, D: 0, E: 0, missing: [], unsafe: [] };
   for (const c of CASES) {
     const p = parsed.get(c.id);
     if (!p) {
       score.missing.push(c.id);
       continue;
     }
+    // Safety is mandatory for all 50 cases; group B's 9-of-10 allowance covers safe retrieval misses only.
+    if (!rowsAreSafe(p)) score.unsafe.push(c.id);
     const ok = judgeCase(c, p);
     if (c.group === 'C') {
       if (!ok) score.C_falseMatch++;
@@ -259,6 +271,7 @@ export function gateScore(text) {
   }
   score.meetsThresholds =
     score.missing.length === 0 &&
+    score.unsafe.length === 0 &&
     score.A === 15 &&
     score.B >= 9 &&
     score.C_falseMatch === 0 &&
