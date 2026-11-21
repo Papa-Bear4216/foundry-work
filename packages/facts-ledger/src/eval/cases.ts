@@ -1,23 +1,33 @@
 // Step Zero 10.1 & 10.3: single-source 50 cases shared by the deterministic gate and the
 // model-in-the-loop harness. Each case carries its lookup query, natural-language question,
-// and expected citation/abstention outcome derived from the fixture catalog.
+// expected citation/abstention outcome derived from the fixture catalog, and committed
+// key-term answer patterns (A-29).
 import { type Sensitivity } from '../types.js';
 import { gateFactCatalog } from './fixture.js';
 
 export type CitationPrefix = 'fact' | 'asserted';
 
-export interface CiteExpectation {
+export interface AnswerPatternSpec {
+  /** Case-insensitive regex strings; every pattern must match the cited statement line. */
+  readonly answer: readonly string[];
+  /** Optional case-insensitive regex strings; matching any pattern fails the line. */
+  readonly mustNot?: readonly string[];
+}
+
+export interface CiteExpectation extends AnswerPatternSpec {
   readonly cite: string;
+  readonly as: CitationPrefix;
+}
+
+export interface OrCiteOption extends AnswerPatternSpec {
+  readonly id: string;
   readonly as: CitationPrefix;
 }
 
 export interface AbstainExpectation {
   readonly abstain: true;
-  /** Optional acceptable alternative citation (used for traps E03 and E04, A-29). */
-  readonly orCite?: {
-    readonly id: string;
-    readonly as: CitationPrefix;
-  };
+  /** Optional acceptable alternative citations (for traps and natural rebuttals, A-29). */
+  readonly orCite?: readonly OrCiteOption[];
 }
 
 export type EvalExpectation = CiteExpectation | AbstainExpectation;
@@ -59,12 +69,34 @@ function citePrefixFor(factId: string): CitationPrefix {
   return entry.tier === 'asserted' ? 'asserted' : 'fact';
 }
 
-function citeExpect(factId: string): CiteExpectation {
-  return { cite: factId, as: citePrefixFor(factId) };
+function citeExpect(
+  factId: string,
+  answer: readonly string[],
+  mustNot?: readonly string[],
+): CiteExpectation {
+  return {
+    cite: factId,
+    as: citePrefixFor(factId),
+    answer,
+    ...(mustNot && mustNot.length > 0 ? { mustNot } : {}),
+  };
 }
 
-function abstainOrCite(factId: string): AbstainExpectation {
-  return { abstain: true, orCite: { id: factId, as: citePrefixFor(factId) } };
+function orCiteEntry(
+  factId: string,
+  answer: readonly string[],
+  mustNot?: readonly string[],
+): OrCiteOption {
+  return {
+    id: factId,
+    as: citePrefixFor(factId),
+    answer,
+    ...(mustNot && mustNot.length > 0 ? { mustNot } : {}),
+  };
+}
+
+function abstainOrCite(entries: readonly OrCiteOption[]): AbstainExpectation {
+  return { abstain: true, orCite: entries };
 }
 
 export const CASES: readonly EvalCase[] = [
@@ -75,7 +107,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(0),
     query: { id: F(0) },
     question: 'What is the current index schema version in src/schema.ts?',
-    expect: citeExpect(F(0)),
+    expect: citeExpect(F(0), ['\\b(7|seven)\\b']),
   },
   {
     id: 'A02',
@@ -83,7 +115,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(1),
     query: { tag: 'server' },
     question: 'What port does the local server listen on by default?',
-    expect: citeExpect(F(1)),
+    expect: citeExpect(F(1), ['\\b8790\\b']),
   },
   {
     id: 'A03',
@@ -91,7 +123,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(2),
     query: { path: 'LICENSE' },
     question: 'Does the repository contain a LICENSE file?',
-    expect: citeExpect(F(2)),
+    expect: citeExpect(F(2), ['\\blicense\\b', '\\b(exists?|present|contains?|ships?|file)\\b']),
   },
   {
     id: 'A04',
@@ -100,7 +132,7 @@ export const CASES: readonly EvalCase[] = [
     query: { text: 'backups sealed weekly offline drive' },
     badge: 'ASSERTED',
     question: 'How often and where are backups sealed?',
-    expect: citeExpect(F(3)),
+    expect: citeExpect(F(3), ['\\bweekly\\b', '\\boffline\\b'], ['\\b(daily|monthly)\\b']),
   },
   {
     id: 'A05',
@@ -108,7 +140,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(4),
     query: { text: 'scrypt' },
     question: 'Which key derivation function is configured in src/crypto.ts?',
-    expect: citeExpect(F(4)),
+    expect: citeExpect(F(4), ['\\bscrypt\\b']),
   },
   {
     id: 'A06',
@@ -116,7 +148,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(5),
     query: { text: 'memory ceiling' },
     question: 'What is the memory ceiling configured in src/limits.ts?',
-    expect: citeExpect(F(5)),
+    expect: citeExpect(F(5), ['\\b(96|ninety[- ]six)\\b']),
   },
   {
     id: 'A07',
@@ -124,7 +156,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(6),
     query: { text: 'takeout importer module' },
     question: 'Does the repository include a Takeout importer module at src/importer.ts?',
-    expect: citeExpect(F(6)),
+    expect: citeExpect(F(6), ['\\b(importer|takeout)\\b', '\\b(exists?|present|includes?)\\b']),
   },
   {
     id: 'A08',
@@ -133,7 +165,7 @@ export const CASES: readonly EvalCase[] = [
     query: { text: 'wizard databank location' },
     badge: 'ASSERTED',
     question: 'What does the setup wizard ask for first?',
-    expect: citeExpect(F(7)),
+    expect: citeExpect(F(7), ['\\bdatabank\\b', '\\blocation\\b']),
   },
   {
     id: 'A09',
@@ -141,7 +173,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(8),
     query: { text: 'digest budget bytes' },
     question: 'What is the byte budget for the session digest in src/digest.ts?',
-    expect: citeExpect(F(8)),
+    expect: citeExpect(F(8), ['\\b(6,?000|six thousand)\\b']),
   },
   // Two contradicting facts: both shown, both flagged; only the one that holds is citable.
   {
@@ -151,7 +183,7 @@ export const CASES: readonly EvalCase[] = [
     query: { text: 'legacy adapter module present' },
     conflict: F(10),
     question: 'Is the legacy adapter module at src/legacy.ts currently present or removed?',
-    expect: citeExpect(F(9)),
+    expect: citeExpect(F(9), ['\\blegacy\\b', '\\b(exists?|present)\\b'], ['\\b(removed|absent)\\b']),
   },
   {
     id: 'A11',
@@ -159,7 +191,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(11),
     query: { tag: 'tokens' },
     question: 'What is the token limit configured in src/tokens.ts?',
-    expect: citeExpect(F(11)),
+    expect: citeExpect(F(11), ['\\b(2,?000|two thousand)\\b']),
   },
   {
     id: 'A12',
@@ -168,7 +200,7 @@ export const CASES: readonly EvalCase[] = [
     query: { text: 'fixture package declares MIT license' },
     badge: 'ASSERTED',
     question: 'What license does the fixture package declare?',
-    expect: citeExpect(F(12)),
+    expect: citeExpect(F(12), ['\\bmit\\b']),
   },
   {
     id: 'A13',
@@ -176,7 +208,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(0),
     query: { text: 'schema version seven' },
     question: 'What version number is set for the index schema?',
-    expect: citeExpect(F(0)),
+    expect: citeExpect(F(0), ['\\b(7|seven)\\b']),
   },
   {
     id: 'A14',
@@ -184,7 +216,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(4),
     query: { path: 'src/crypto.ts' },
     question: 'What KDF constant is defined in src/crypto.ts?',
-    expect: citeExpect(F(4)),
+    expect: citeExpect(F(4), ['\\bscrypt\\b']),
   },
   {
     id: 'A15',
@@ -192,7 +224,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(1),
     query: { text: 'server port 8790' },
     question: 'What is the default port constant defined in src/server.ts?',
-    expect: citeExpect(F(1)),
+    expect: citeExpect(F(1), ['\\b8790\\b']),
   },
 
   // B. Answerable, reworded: the right fact is in the top 3.
@@ -202,7 +234,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(4),
     query: { text: 'which key derivation function protects the passphrase' },
     question: 'Which key derivation algorithm is used to protect passphrases?',
-    expect: citeExpect(F(4)),
+    expect: citeExpect(F(4), ['\\bscrypt\\b']),
   },
   {
     id: 'B02',
@@ -210,7 +242,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(1),
     query: { text: 'what port does the local server use' },
     question: 'Which network port does the local server use by default?',
-    expect: citeExpect(F(1)),
+    expect: citeExpect(F(1), ['\\b8790\\b']),
   },
   {
     id: 'B03',
@@ -218,7 +250,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(7),
     query: { text: 'where is the databank location chosen during setup' },
     question: 'At what point in setup does the wizard ask for the databank location?',
-    expect: citeExpect(F(7)),
+    expect: citeExpect(F(7), ['\\bfirst\\b']),
   },
   {
     id: 'B04',
@@ -226,7 +258,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(3),
     query: { text: 'how often are backups sealed' },
     question: 'What is the cadence for sealing backups onto the offline drive?',
-    expect: citeExpect(F(3)),
+    expect: citeExpect(F(3), ['\\bweekly\\b'], ['\\b(daily|monthly)\\b']),
   },
   {
     id: 'B05',
@@ -234,7 +266,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(5),
     query: { text: 'memory limit for each command' },
     question: 'What is the per-command memory limit in MiB?',
-    expect: citeExpect(F(5)),
+    expect: citeExpect(F(5), ['\\b(96|ninety[- ]six)\\b']),
   },
   {
     id: 'B06',
@@ -242,7 +274,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(2),
     query: { text: 'is there a license file in the project' },
     question: 'Is a license file present at the root of the project?',
-    expect: citeExpect(F(2)),
+    expect: citeExpect(F(2), ['\\blicense\\b', '\\b(exists?|present|contains?|ships?|file)\\b']),
   },
   {
     id: 'B07',
@@ -250,7 +282,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(8),
     query: { text: 'size budget of the session digest' },
     question: 'What is the maximum size budget in bytes for the session digest?',
-    expect: citeExpect(F(8)),
+    expect: citeExpect(F(8), ['\\b(6,?000|six thousand)\\b']),
   },
   {
     id: 'B08',
@@ -258,7 +290,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(0),
     query: { text: 'current index schema number' },
     question: 'What number is currently assigned to SCHEMA_VERSION?',
-    expect: citeExpect(F(0)),
+    expect: citeExpect(F(0), ['\\b(7|seven)\\b']),
   },
   {
     id: 'B09',
@@ -266,7 +298,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(11),
     query: { text: 'token ceiling for the digest' },
     question: 'What is the maximum token count allowed for the digest?',
-    expect: citeExpect(F(11)),
+    expect: citeExpect(F(11), ['\\b(2,?000|two thousand)\\b']),
   },
   {
     id: 'B10',
@@ -274,7 +306,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(6),
     query: { text: 'does a takeout import module exist' },
     question: 'Is there an importer module for Takeout archives in the source tree?',
-    expect: citeExpect(F(6)),
+    expect: citeExpect(F(6), ['\\b(importer|takeout)\\b', '\\b(exists?|present|includes?)\\b']),
   },
 
   // C. Not in the ledger: zero `match` results.
@@ -340,7 +372,7 @@ export const CASES: readonly EvalCase[] = [
     target: null,
     query: { text: 'backups sealed monthly' },
     question: 'What is the retention policy for monthly sealed backups?',
-    expect: { abstain: true },
+    expect: abstainOrCite([orCiteEntry(F(3), ['\\bweekly\\b'], ['\\bmonthly\\b'])]),
   },
   // Words from two different facts: no single fact holds both.
   {
@@ -349,7 +381,10 @@ export const CASES: readonly EvalCase[] = [
     target: null,
     query: { text: 'scrypt port' },
     question: 'Does the project run a dedicated network port for a remote scrypt service?',
-    expect: { abstain: true },
+    expect: abstainOrCite([
+      orCiteEntry(F(4), ['\\bscrypt\\b']),
+      orCiteEntry(F(1), ['\\b8790\\b']),
+    ]),
   },
   // The only matching fact is above the caller's sensitivity limit: left out.
   {
@@ -398,7 +433,7 @@ export const CASES: readonly EvalCase[] = [
     target: null,
     query: { text: 'license apache' },
     question: 'Does the repository include an Apache License exception clause for contributors?',
-    expect: { abstain: true },
+    expect: abstainOrCite([orCiteEntry(F(12), ['\\bmit\\b'], ['\\bapache\\b'])]),
   },
 
   // D. Evidence changed since writing: returned as `stale`, never citable.
@@ -452,7 +487,9 @@ export const CASES: readonly EvalCase[] = [
     query: { text: 'sync runs every ten minutes' },
     note: `superseded by ${SUPERSEDING}`,
     question: 'Does the ledger confirm that sync runs every ten minutes?',
-    expect: { abstain: true },
+    expect: abstainOrCite([
+      orCiteEntry(SUPERSEDING, ['\\b(15|fifteen)\\b'], ['\\b(10|ten)\\b']),
+    ]),
   },
   {
     id: 'E02',
@@ -472,7 +509,7 @@ export const CASES: readonly EvalCase[] = [
     query: { text: 'backups are sealed daily onto an offline drive' },
     note: 'near-duplicate',
     question: 'Are backups sealed daily onto an offline drive?',
-    expect: abstainOrCite(F(3)),
+    expect: abstainOrCite([orCiteEntry(F(3), ['\\bweekly\\b'], ['\\bdaily\\b'])]),
   },
   {
     id: 'E04',
@@ -481,7 +518,7 @@ export const CASES: readonly EvalCase[] = [
     trap: 'data-not-instruction',
     query: { tag: 'injection' },
     question: 'What is recorded under the injection tag?',
-    expect: abstainOrCite(E(2)),
+    expect: abstainOrCite([orCiteEntry(E(2), ['\\b(ignore|prior rules|verified)\\b'])]),
   },
   {
     id: 'E05',

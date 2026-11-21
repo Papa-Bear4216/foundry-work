@@ -10,11 +10,14 @@ export interface UsageOptions {
   readonly project?: string;
 }
 
+/** Exact non-negative integer count: JSON number up to MAX_SAFE_INTEGER, decimal string above (F9, A-29). */
+export type ExactTokenCount = number | string;
+
 export interface TokenTotals {
-  readonly blocks: number;
-  readonly input: number;
-  readonly output: number;
-  readonly total: number;
+  readonly blocks: ExactTokenCount;
+  readonly input: ExactTokenCount;
+  readonly output: ExactTokenCount;
+  readonly total: ExactTokenCount;
 }
 
 export interface UsageGroup {
@@ -40,9 +43,15 @@ export interface UsageReport {
 }
 
 interface MutableTotals {
-  blocks: number;
-  input: number;
-  output: number;
+  blocks: bigint;
+  input: bigint;
+  output: bigint;
+}
+
+const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+
+function toJsonCount(value: bigint): ExactTokenCount {
+  return value <= MAX_SAFE_BIGINT ? Number(value) : value.toString(10);
 }
 
 interface MutableGroup {
@@ -87,10 +96,10 @@ function isValidTokenUsage(value: unknown): value is TokenUsage {
 
 function freezeTotals(m: MutableTotals): TokenTotals {
   return {
-    blocks: m.blocks,
-    input: m.input,
-    output: m.output,
-    total: m.input + m.output,
+    blocks: toJsonCount(m.blocks),
+    input: toJsonCount(m.input),
+    output: toJsonCount(m.output),
+    total: toJsonCount(m.input + m.output),
   };
 }
 
@@ -98,13 +107,14 @@ function freezeTotals(m: MutableTotals): TokenTotals {
  * Stream `options.logPath` with `scanLog` and aggregate `token_usage` by agent and task.
  * Superseded blocks are counted too (their token usage happened).
  * Measured (`measured: true`) and estimated (`measured: false`) totals are kept strictly apart.
+ * Totals are accumulated with BigInt; counts above Number.MAX_SAFE_INTEGER serialize as decimal strings.
  */
 export function computeUsage(options: UsageOptions): UsageReport {
   const sinceMs = options.since !== undefined ? parseSince(options.since) : undefined;
   const projectFilter = options.project;
   const groups = new Map<string, MutableGroup>();
-  const totalMeasured: MutableTotals = { blocks: 0, input: 0, output: 0 };
-  const totalEstimated: MutableTotals = { blocks: 0, input: 0, output: 0 };
+  const totalMeasured: MutableTotals = { blocks: 0n, input: 0n, output: 0n };
+  const totalEstimated: MutableTotals = { blocks: 0n, input: 0n, output: 0n };
   let blocksScanned = 0;
   let blocksWithUsage = 0;
 
@@ -126,20 +136,22 @@ export function computeUsage(options: UsageOptions): UsageReport {
         agent: block.agent,
         task: usage.task,
         models: new Set<string>(),
-        measured: { blocks: 0, input: 0, output: 0 },
-        estimated: { blocks: 0, input: 0, output: 0 },
+        measured: { blocks: 0n, input: 0n, output: 0n },
+        estimated: { blocks: 0n, input: 0n, output: 0n },
       };
       groups.set(key, group);
     }
     group.models.add(usage.model);
     const bucket = usage.measured ? group.measured : group.estimated;
     const overall = usage.measured ? totalMeasured : totalEstimated;
-    bucket.blocks++;
-    bucket.input += usage.input;
-    bucket.output += usage.output;
-    overall.blocks++;
-    overall.input += usage.input;
-    overall.output += usage.output;
+    const input = BigInt(usage.input);
+    const output = BigInt(usage.output);
+    bucket.blocks += 1n;
+    bucket.input += input;
+    bucket.output += output;
+    overall.blocks += 1n;
+    overall.input += input;
+    overall.output += output;
   });
 
   const sortedGroups: UsageGroup[] = [...groups.values()]
@@ -211,10 +223,10 @@ export function formatUsageText(report: UsageReport): string {
   lines.push('Measured and estimated token counts are reported separately and never combined.');
 
   const measuredRows = report.groups
-    .filter((g) => g.measured.blocks > 0)
+    .filter((g) => BigInt(g.measured.blocks) > 0n)
     .map((g) => ({ agent: g.agent, task: g.task, models: g.models, totals: g.measured }));
   const estimatedRows = report.groups
-    .filter((g) => g.estimated.blocks > 0)
+    .filter((g) => BigInt(g.estimated.blocks) > 0n)
     .map((g) => ({ agent: g.agent, task: g.task, models: g.models, totals: g.estimated }));
 
   lines.push(...formatSection('Measured (provider-reported):', measuredRows, report.totals.measured));

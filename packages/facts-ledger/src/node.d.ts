@@ -14,6 +14,7 @@ declare const process: {
   readonly env: Record<string, string | undefined>;
   exitCode: number | undefined;
   kill(pid: number, signal?: string | number): boolean;
+  nextTick(callback: () => void): void;
   resourceUsage(): { maxRSS: number };
   readonly hrtime: {
     bigint(): bigint;
@@ -72,8 +73,11 @@ declare module 'node:child_process' {
   }
 
   export interface ChildWritable {
+    readonly errored?: Error | null;
+    readonly writableFinished?: boolean;
     on(event: 'error', listener: (err: Error) => void): this;
-    end(data: string): void;
+    on(event: 'finish', listener: () => void): this;
+    end(data: string, callback?: () => void): void;
     destroy(): void;
   }
 
@@ -130,6 +134,8 @@ declare module 'node:child_process' {
     args: readonly string[],
     options: {
       stdio: readonly ['pipe', 'pipe', 'pipe'];
+      cwd?: string;
+      env?: Record<string, string | undefined>;
       windowsHide?: boolean;
       shell?: boolean;
       detached?: boolean;

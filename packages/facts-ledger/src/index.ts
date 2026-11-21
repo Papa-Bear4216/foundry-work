@@ -81,6 +81,7 @@ export { DIGEST_MAX_BYTES, digestFormatProblems, digestLine, generateDigest, typ
 export {
   MAX_ANSWER_BYTES,
   MAX_DISTINCT_CITATIONS,
+  MAX_STORED_PROBLEMS,
   checkAnswer,
   formatCheckAnswerText,
   type AnswerProblem,
@@ -90,6 +91,7 @@ export {
 export {
   computeUsage,
   formatUsageText,
+  type ExactTokenCount,
   type TokenTotals,
   type UsageGroup,
   type UsageOptions,
@@ -108,25 +110,32 @@ export {
 export {
   CASES as EVAL_CASES,
   type AbstainExpectation,
+  type AnswerPatternSpec,
   type CaseQuery,
   type CitationPrefix,
   type CiteExpectation,
   type EvalCase,
   type EvalExpectation,
+  type OrCiteOption,
 } from './eval/cases.js';
 export { AGENT_RULES_TEXT, buildEvalPrompt } from './eval/prompt.js';
 export {
   DEFAULT_CASE_TIMEOUT_MS,
+  MAX_ABSTAIN_PAYLOAD_BYTES,
+  MAX_EVAL_CASE_PROBLEMS,
+  buildModelChildEnv,
   deriveModelName,
   estimateTokens,
   estimateTokensFromBytes,
   formatDryRunPrompts,
   formatEvalText,
+  matchesAnswerSpec,
   runEval,
   runEvalDryRun,
   runModelCommand,
   scoreEvalAnswer,
   selectEvalCases,
+  stripFixturePaths,
   type EvalCaseResult,
   type EvalDryRunCase,
   type EvalDryRunResult,
@@ -134,5 +143,7 @@ export {
   type EvalOutcome,
   type EvalOutcomeCounts,
   type EvalResult,
+  type EvalScoreResult,
+  type ModelCommandOptions,
   type ModelCommandResult,
 } from './eval/runner.js';

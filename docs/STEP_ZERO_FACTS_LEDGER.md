@@ -452,6 +452,7 @@ number is changed by a recorded decision before code is written against it.
 - Hash-chaining blocks for tamper evidence.
 - Marking facts stale automatically from a git post-commit hook.
 - Regular-expression predicates.
+- Held-out or independently varied question sets for `facts eval` qualification runs.
 - A hosted or shared ledger. Out of scope; the file is local.
 
 ## 13. Open points for the builder

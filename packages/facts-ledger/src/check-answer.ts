@@ -14,7 +14,9 @@ import { type Sensitivity } from './types.js';
 
 export const MAX_ANSWER_BYTES = 256 * 1024;
 export const MAX_DISTINCT_CITATIONS = 500;
+export const MAX_STORED_PROBLEMS = 20;
 
+const encoder = new TextEncoder();
 const CITATION_RE = /\[(fact|asserted):([^\]\s]*)\]/g;
 const FACT_ID_RE = /^[0-9a-f]{12}\.\d{1,4}$/;
 const ABSTAIN_RE = /^ABSTAIN:\s*\S/;
@@ -29,7 +31,9 @@ export interface CheckAnswerResult {
   readonly statements: number;
   readonly abstentions: number;
   readonly citations: number;
+  readonly problemCount: number;
   readonly problems: readonly AnswerProblem[];
+  readonly invalidCitations: readonly string[];
 }
 
 export interface CheckAnswerOptions {
@@ -38,6 +42,7 @@ export interface CheckAnswerOptions {
   readonly repos: RepoMap;
   readonly maxSensitivity?: Exclude<Sensitivity, 'secret'>;
   readonly nowMs?: number;
+  readonly maxProblems?: number;
 }
 
 interface CitationVerdict {
@@ -45,45 +50,96 @@ interface CitationVerdict {
   readonly asAsserted: string | null;
 }
 
+function compareProblems(a: AnswerProblem, b: AnswerProblem): number {
+  return a.line - b.line || (a.problem < b.problem ? -1 : a.problem > b.problem ? 1 : 0);
+}
+
 export async function checkAnswer(text: string, options: CheckAnswerOptions): Promise<CheckAnswerResult> {
-  if (new TextEncoder().encode(text).length > MAX_ANSWER_BYTES) {
+  if (encoder.encode(text).length > MAX_ANSWER_BYTES) {
     throw new Error(`Answer exceeds ${MAX_ANSWER_BYTES} bytes`);
   }
-  const lines = text.replace(/^﻿/, '').split(/\r?\n/);
+  const maxProblems = Math.max(0, Math.floor(options.maxProblems ?? MAX_STORED_PROBLEMS));
   const problems: AnswerProblem[] = [];
+  let problemCount = 0;
+  const recordProblem = (line: number, problem: string): void => {
+    problemCount++;
+    if (maxProblems === 0) return;
+    if (problems.length < maxProblems) {
+      problems.push({ line, problem });
+      if (problems.length === maxProblems) problems.sort(compareProblems);
+      return;
+    }
+    const worst = problems[problems.length - 1] as AnswerProblem;
+    if (line > worst.line || (line === worst.line && problem >= worst.problem)) return;
+    problems[problems.length - 1] = { line, problem };
+    problems.sort(compareProblems);
+  };
+
   const pending: Array<{ line: number; kind: 'fact' | 'asserted'; id: string }> = [];
   let statements = 0;
   let abstentions = 0;
 
-  lines.forEach((raw, i) => {
-    const lineNo = i + 1;
-    const line = raw.trim();
-    if (line.length === 0) return;
+  // Iterate line by line without allocating substrings for ordinary uncited lines.
+  const startOffset = text.startsWith('\ufeff') ? 1 : 0;
+  let pos = startOffset;
+  let lineNo = 0;
+  let nextBracket = text.indexOf('[', startOffset);
+  while (pos <= text.length) {
+    lineNo++;
+    const nl = text.indexOf('\n', pos);
+    const end = nl === -1 ? text.length : nl;
+    let s = pos;
+    let e = end > pos && text.charCodeAt(end - 1) === 13 ? end - 1 : end;
+    pos = nl === -1 ? text.length + 1 : nl + 1;
+
+    while (s < e && text.charCodeAt(s) <= 32) s++;
+    while (e > s && text.charCodeAt(e - 1) <= 32) e--;
+    if (s === e) continue;
+
+    // Fast path for non-ABSTAIN lines without '[' (O(1) amortized, avoids slicing up to 131k short lines).
+    const hasNonAsciiEdge = text.charCodeAt(s) > 127 || text.charCodeAt(e - 1) > 127;
+    if (!hasNonAsciiEdge && !text.startsWith('ABSTAIN:', s)) {
+      if (nextBracket !== -1 && nextBracket < s) {
+        nextBracket = text.indexOf('[', s);
+      }
+      if (nextBracket === -1 || nextBracket >= e) {
+        statements++;
+        recordProblem(lineNo, 'statement without a citation');
+        continue;
+      }
+    }
+
+    const line = hasNonAsciiEdge ? text.slice(s, e).trim() : text.slice(s, e);
+    if (line.length === 0) continue;
     if (line.startsWith('ABSTAIN:')) {
-      if (!ABSTAIN_RE.test(line)) problems.push({ line: lineNo, problem: 'ABSTAIN without a description of what is not known' });
+      if (!ABSTAIN_RE.test(line)) recordProblem(lineNo, 'ABSTAIN without a description of what is not known');
       else abstentions++;
-      if (/\[(fact|asserted):/.test(line)) problems.push({ line: lineNo, problem: 'ABSTAIN line must not cite facts' });
-      return;
+      if (/\[(fact|asserted):/.test(line)) recordProblem(lineNo, 'ABSTAIN line must not cite facts');
+      continue;
     }
     statements++;
+    if (!line.includes('[fact') && !line.includes('[asserted')) {
+      recordProblem(lineNo, 'statement without a citation');
+      continue;
+    }
     const found = [...line.matchAll(CITATION_RE)];
     // Any other bracket that starts like a citation is malformed.
     const loose = (line.match(/\[(fact|asserted)\b/g) ?? []).length;
-    if (loose !== found.length) problems.push({ line: lineNo, problem: 'malformed citation' });
+    if (loose !== found.length) recordProblem(lineNo, 'malformed citation');
     if (found.length === 0) {
-      problems.push({ line: lineNo, problem: 'statement without a citation' });
-      return;
+      recordProblem(lineNo, 'statement without a citation');
+      continue;
     }
     for (const m of found) {
       const kind = m[1] as 'fact' | 'asserted';
       const id = m[2] ?? '';
       if (!FACT_ID_RE.test(id)) {
-        problems.push({ line: lineNo, problem: `invalid fact id in ${kind}: citation` });
+        recordProblem(lineNo, `invalid fact id in ${kind}: citation`);
         continue;
       }
       pending.push({ line: lineNo, kind, id });
     }
-  });
+  }
 
   const distinct = [...new Set(pending.map((p) => p.id))].sort();
   if (distinct.length > MAX_DISTINCT_CITATIONS) {
@@ -117,20 +173,35 @@ export async function checkAnswer(text: string, options: CheckAnswerOptions): Pr
     const asFact = reason ?? (view.badge === 'VERIFIED' ? null : `cited fact is ${view.badge}, not VERIFIED; cite it as asserted:`);
     verdicts.set(id, { asFact, asAsserted: reason });
   }
+  const invalidCitationsSet = new Set<string>();
   for (const p of pending) {
     const v = verdicts.get(p.id) as CitationVerdict;
     const problem = p.kind === 'fact' ? v.asFact : v.asAsserted;
-    if (problem) problems.push({ line: p.line, problem: `${p.kind}:${p.id}: ${problem}` });
+    if (problem) {
+      invalidCitationsSet.add(`${p.kind}:${p.id}`);
+      recordProblem(p.line, `${p.kind}:${p.id}: ${problem}`);
+    }
   }
-  problems.sort((a, b) => a.line - b.line || (a.problem < b.problem ? -1 : a.problem > b.problem ? 1 : 0));
-  if (statements === 0 && abstentions === 0) problems.push({ line: 0, problem: 'answer is empty' });
-  return { ok: problems.length === 0, statements, abstentions, citations: pending.length, problems };
+  if (statements === 0 && abstentions === 0) recordProblem(0, 'answer is empty');
+  problems.sort(compareProblems);
+  return {
+    ok: problemCount === 0,
+    statements,
+    abstentions,
+    citations: pending.length,
+    problemCount,
+    problems,
+    invalidCitations: [...invalidCitationsSet].sort(),
+  };
 }
 
 export function formatCheckAnswerText(result: CheckAnswerResult): string {
   const lines = result.problems.map((p) => `line ${p.line}: ${p.problem}`);
+  if (result.problemCount > result.problems.length) {
+    lines.push(`... and ${result.problemCount - result.problems.length} more problem(s) omitted`);
+  }
   lines.push(
-    `${result.ok ? 'check-answer: ok' : `check-answer: FAILED (${result.problems.length} problem(s))`}: ${result.statements} statement(s), ${result.citations} citation(s), ${result.abstentions} abstention(s)`,
+    `${result.ok ? 'check-answer: ok' : `check-answer: FAILED (${result.problemCount} problem(s))`}: ${result.statements} statement(s), ${result.citations} citation(s), ${result.abstentions} abstention(s)`,
   );
   return lines.join('\n');
 }

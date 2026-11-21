@@ -423,6 +423,7 @@ function usageText(): string {
     '  facts digest --project <p> [--max-sensitivity <tier>] [--json]   (writes digest.<project>.md beside the index; at most 6,000 bytes)',
     '  facts check-answer <file> [--max-sensitivity <tier>] [--json]   (every non-blank line: a statement with [fact:<id>] or [asserted:<id>], or ABSTAIN: <text>)',
     '  facts eval --model-cmd <exe> [--model-arg <arg>]... [--model-name <label>] [--case-timeout-ms <n>] [--cases <id,...>] [--project <p>] [--agent <name>] [--log <file>] [--json] [--stats]',
+    '             (--model-cmd must be a real executable, shell: false; on Windows .cmd/.bat shims are rejected — pass interpreter and script, e.g. --model-cmd node --model-arg path/to/cli.js)',
     '  facts eval --dry-run [--cases <id,...>] [--json] [--stats]   (print deterministic prompts without running a model)',
     '  facts usage [--since <iso>] [--project <p>] [--log <file>] [--json] [--stats]   (measured and estimated totals kept separate)',
     '  facts add ... --from-agent --model <id> --task <label> --input-tokens <n> --output-tokens <n> [--tokens-measured]',

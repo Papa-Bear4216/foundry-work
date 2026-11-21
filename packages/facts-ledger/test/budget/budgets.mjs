@@ -10,12 +10,16 @@
 //   block carries token_usage.
 // The runtime dependency check is the workspace script check:runtime-dependencies.
 import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { blockCount, project } from '../../bench/fixture.mjs';
 import { CASES } from '../../dist/eval/cases.js';
+import { gateFactCatalog } from '../../dist/eval/fixture.js';
+import { MAX_ANSWER_BYTES, MAX_STORED_PROBLEMS } from '../../dist/check-answer.js';
+import { MAX_LINE_BYTES } from '../../dist/log.js';
 import { formatCheckedPredicateClaim } from '../../dist/normalize.js';
 import { DIGEST_MAX_BYTES, digestFormatProblems } from '../../dist/digest.js';
 
@@ -193,6 +197,32 @@ function evalOutcome(result) {
   return null;
 }
 
+const INVALID_FLOOD_LINES_PER_CASE = Math.floor(MAX_ANSWER_BYTES / 2);
+
+function evalInvalidFloodOutcome(logPath) {
+  return (result) => {
+    if (result.cases_run !== 50) return `expected 50 cases, got ${result.cases_run}`;
+    if (result.passes_bar) return 'invalid-flood eval unexpectedly passed bar';
+    const wantProblems = 50 * INVALID_FLOOD_LINES_PER_CASE;
+    if (result.checker_problems !== wantProblems || result.unsupported_claims !== wantProblems) {
+      return `expected ${wantProblems} checker problems, got checker=${result.checker_problems} unsupported=${result.unsupported_claims}`;
+    }
+    for (const c of result.cases) {
+      if ((c.problems?.length ?? 0) > MAX_STORED_PROBLEMS) {
+        return `case ${c.id} retained ${c.problems.length} > ${MAX_STORED_PROBLEMS} problems`;
+      }
+    }
+    if (!result.block_id) return 'invalid-flood eval did not append a result block';
+    const raw = readFileSync(logPath, 'utf8').trimEnd().split('\n');
+    const lastLine = raw[raw.length - 1] ?? '';
+    const lastBytes = Buffer.byteLength(lastLine, 'utf8') + 1;
+    if (lastBytes > MAX_LINE_BYTES) return `appended block line ${lastBytes} bytes > ${MAX_LINE_BYTES}`;
+    const parsed = JSON.parse(lastLine);
+    if (parsed.id !== result.block_id) return `last block id ${parsed.id} != ${result.block_id}`;
+    return null;
+  };
+}
+
 const root = mkdtempSync(join(tmpdir(), 'facts-budgets-'));
 try {
   // 10,000 blocks whose evidence resolves in a real repository, so the success paths run:
@@ -225,25 +255,41 @@ try {
     cited.push(`[fact:${blockId(3 * (i * 61 + 1))}.0]`);
   }
   writeFileSync(answerPath, `Probe statement. ${cited.join(' ')}\nABSTAIN: nothing else.\n`);
+  const catalog = gateFactCatalog();
+  const questionHash = (q) => createHash('sha256').update(q.trim()).digest('hex');
   const evalAnswersPath = join(root, 'eval-answers.json');
   const evalAnswers = Object.fromEntries(
-    CASES.map((c) => [
-      c.id,
-      'cite' in c.expect
-        ? `Synthetic answer for ${c.id}. [${c.expect.as}:${c.expect.cite}]\n`
-        : `ABSTAIN: not supported for ${c.id}.\n`,
-    ]),
+    CASES.map((c) => {
+      const key = questionHash(c.question);
+      if ('cite' in c.expect) {
+        const entry = catalog.get(c.expect.cite);
+        const text = entry?.note ? `${entry.claim} ${entry.note}` : (entry?.claim ?? '');
+        return [key, `${text} [${c.expect.as}:${c.expect.cite}]\n`];
+      }
+      return [key, 'ABSTAIN: no current citable fact answers this question.\n'];
+    }),
   );
   writeFileSync(evalAnswersPath, JSON.stringify(evalAnswers));
   const fakeModelPath = join(root, 'fake-model.mjs');
   writeFileSync(
     fakeModelPath,
     [
+      "import { createHash } from 'node:crypto';",
       "import { readFileSync } from 'node:fs';",
       'const answers = JSON.parse(readFileSync(process.argv[2], "utf8"));',
       'const prompt = readFileSync(0, "utf8");',
-      'const m = /^Case: ([A-E]\\d{2})$/m.exec(prompt);',
-      'process.stdout.write(m && answers[m[1]] ? answers[m[1]] : "ABSTAIN: unknown case.\\n");',
+      'const m = /=== Question ===\\r?\\n([\\s\\S]+)$/.exec(prompt);',
+      'const key = m ? createHash("sha256").update(m[1].trim()).digest("hex") : "";',
+      'process.stdout.write(answers[key] ?? "ABSTAIN: unknown question.\\n");',
+    ].join('\n'),
+  );
+  const invalidFloodModelPath = join(root, 'invalid-flood-model.mjs');
+  writeFileSync(
+    invalidFloodModelPath,
+    [
+      "import { readFileSync } from 'node:fs';",
+      'readFileSync(0, "utf8");',
+      `process.stdout.write("x\\n".repeat(${INVALID_FLOOD_LINES_PER_CASE}));`,
     ].join('\n'),
   );
 
@@ -270,6 +316,14 @@ try {
         '--model-name', 'budget-fake', '--project', project, '--log', logPath, '--json',
       ],
       outcome: evalOutcome,
+    },
+    {
+      name: 'eval (invalid-flood)',
+      args: [
+        'eval', '--model-cmd', process.execPath, '--model-arg', invalidFloodModelPath,
+        '--model-name', 'budget-invalid-flood', '--project', project, '--log', logPath, '--json',
+      ],
+      outcome: evalInvalidFloodOutcome(logPath),
     },
     { name: 'query (cold)', args: ['query', 'calibration sample', ...store, '--json'], maxMs: COLD_QUERY_MS, cold: true },
   ];
