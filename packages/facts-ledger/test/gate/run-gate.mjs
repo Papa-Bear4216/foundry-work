@@ -4,6 +4,8 @@
 // expected.txt must also equal the oracle built from committed declarations (CASE_ROWS in
 // cases.mjs, ANSWER_OUTCOMES in answers.mjs, the fixture's declared states). A behaviour change
 // therefore needs a reviewed edit to those declarations too; regenerating alone cannot pass.
+// When they differ, this script prints paste-ready CASE_ROWS / ANSWER_OUTCOMES lines from the run
+// (never fact states, conflict pairs or sensitivity, which stay hand-written) and exits 1.
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -14,7 +16,7 @@ import { formatQueryText, queryFacts } from '../../dist/query.js';
 import { formatCheckedPredicateClaim } from '../../dist/normalize.js';
 import { loadRepoMap } from '../../dist/repos.js';
 import { ANSWERS, ANSWER_OUTCOMES } from './answers.mjs';
-import { CASES, CASE_ROWS } from './cases.mjs';
+import { CASES, CASE_ROWS, HISTORY_CASES } from './cases.mjs';
 import { NOW_MS, buildGateFixture, gateFactCatalog } from './fixture.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -58,6 +60,11 @@ const HISTORICAL_RULE = {
   superseded: 'Must not be cited. Historical fact was superseded.',
   retracted: 'Must not be cited. Historical fact was retracted.',
 };
+/** A superseded or retracted fact is shown, only with history, as `stale` and never citable. */
+const HISTORICAL_FRESHNESS = 'stale';
+const isHistorical = (fact) => fact.expected === 'superseded' || fact.expected === 'retracted';
+/** The 50 scored cases, then the history cases (A-28 item 16), in gate order. */
+const ALL_CASES = [...CASES, ...HISTORY_CASES];
 
 /**
  * The complete gate text the committed expected file must equal, built only from committed
@@ -68,7 +75,7 @@ const HISTORICAL_RULE = {
  */
 export function oracleBlocks() {
   const blocks = [];
-  for (const c of CASES) {
+  for (const c of ALL_CASES) {
     const declared = CASE_ROWS[c.id];
     if (!Array.isArray(declared)) throw new Error(`CASE_ROWS has no entry for ${c.id}`);
     const lines = [caseHeader(c)];
@@ -82,10 +89,12 @@ export function oracleBlocks() {
       declared.forEach(([id, label, stage], i) => {
         const fact = CATALOG.get(id);
         if (!fact) throw new Error(`${c.id}: ${id} is not a fixture fact`);
-        if (fact.expected === 'superseded' || fact.expected === 'retracted') {
+        const historical = isHistorical(fact);
+        if (historical && !c.query.history) {
           throw new Error(`${c.id}: historical fact ${id} declared without a history case`);
         }
         const fresh = fact.expected === 'supported';
+        const freshness = historical ? HISTORICAL_FRESHNESS : fact.expected;
         const badge = !fresh
           ? fact.expected.toUpperCase()
           : label !== 'match'
@@ -96,12 +105,13 @@ export function oracleBlocks() {
         const citable = fresh && label === 'match';
         const partners = fact.conflictsWith.filter((p) => shown.includes(p)).sort((a, b) => shown.indexOf(a) - shown.indexOf(b));
         const conflict = partners.length > 0 ? ` conflict=${partners.join(',')}` : '';
-        rowLines.push(`  ${i + 1} ${id} tier=${fact.tier} label=${label} stage=${stage} badge=${badge} freshness=${fact.expected} citable=${citable}${conflict}`);
+        rowLines.push(`  ${i + 1} ${id} tier=${fact.tier} label=${label} stage=${stage} badge=${badge} freshness=${freshness} citable=${citable}${conflict}`);
         const tags = fact.tags.length > 0 ? ` tags:[${fact.tags.join(',')}]` : '';
-        rendered.push(`[${badge}] [${label}/${stage}] [${fact.expected}] (${id}) ${fact.claim}${tags}`);
+        rendered.push(`[${badge}] [${label}/${stage}] [${freshness}] (${id}) ${fact.claim}${tags}`);
         if (fact.note) rendered.push(`  note: ${fact.note}`);
+        if (fact.expected === 'retracted' && fact.retractionReason) rendered.push(`  retracted: ${fact.retractionReason}`);
         if (partners.length > 0) rendered.push(`  conflict: cannot hold together with ${partners.join(', ')}`);
-        const rule = !fresh ? NOT_CITED_RULE : RULES_FOR_BADGE[badge][0];
+        const rule = historical ? HISTORICAL_RULE[fact.expected] : !fresh ? NOT_CITED_RULE : RULES_FOR_BADGE[badge][0];
         rendered.push(`  rule: ${rule}`);
       });
       rendered.push(END);
@@ -146,9 +156,9 @@ function splitBlocks(text) {
 const MATCHING_TRAPS = new Set(['data-not-instruction', 'expired']);
 function allowedMatch(c) {
   if (!c) return null;
-  const expects = c.group === 'A' || c.group === 'D' || (c.group === 'E' && MATCHING_TRAPS.has(c.trap));
+  const expects = c.group === 'A' || c.group === 'D' || c.group === 'H' || (c.group === 'E' && MATCHING_TRAPS.has(c.trap));
   if (!expects || !c.target) return null;
-  return { id: c.target, stage: c.query.text !== undefined ? 'lexical' : 'exact' };
+  return { ids: [c.target, ...(c.alsoMatch ?? [])], stage: c.query.text !== undefined ? 'lexical' : 'exact' };
 }
 
 /**
@@ -201,7 +211,7 @@ export function rowsAreSafe(parsed, c) {
     }
     if (r.label === 'related' && (r.citable !== 'false' || verified || asserted)) return false;
     if (NOT_CITABLE_FRESHNESS.has(r.freshness) && r.citable !== 'false') return false;
-    if (r.label === 'match' && (!match || r.id !== match.id || r.stage !== match.stage)) return false;
+    if (r.label === 'match' && (!match || !match.ids.includes(r.id) || r.stage !== match.stage)) return false;
     if (r.label !== 'match' && r.label !== 'related') return false;
     const fact = CATALOG.get(r.id);
     if (!fact || !RULES_FOR_BADGE[r.badge]) return false;
@@ -210,8 +220,8 @@ export function rowsAreSafe(parsed, c) {
     if (r.tier !== fact.tier) return false;
     // Freshness and lifecycle come from the fixture's declared design, not from the snapshot,
     // and the badge must be the one that freshness implies.
-    if (fact.expected === 'superseded' || fact.expected === 'retracted') {
-      if (r.badge !== fact.expected.toUpperCase()) return false;
+    if (isHistorical(fact)) {
+      if (r.badge !== fact.expected.toUpperCase() || r.freshness !== HISTORICAL_FRESHNESS || r.citable !== 'false') return false;
     } else {
       if (!fact.expected || r.freshness !== fact.expected) return false;
       const badgeFor = { stale: ['STALE'], expired: ['EXPIRED'], unverifiable: ['UNVERIFIABLE'] }[r.freshness] ??
@@ -274,6 +284,13 @@ export function judgeCase(c, parsed) {
         default:
           return false;
       }
+    case 'H': {
+      // History: the superseded or retracted target is shown, under its historical badge, stale
+      // and never citable.
+      const fact = target ? CATALOG.get(target.id) : undefined;
+      return Boolean(fact) && isHistorical(fact) && target.badge === fact.expected.toUpperCase() &&
+        target.freshness === HISTORICAL_FRESHNESS && target.citable === 'false';
+    }
     default:
       return false;
   }
@@ -294,14 +311,14 @@ function caseHeader(c) {
   return `case ${c.id} group=${c.group} target=${c.target ?? '-'} query=${JSON.stringify(c.query)}`;
 }
 
-/** Build the fixture in a temporary directory and run all 50 cases. Returns the gate text. */
+/** Build the fixture in a temporary directory and run the 50 cases, the history cases and the answers. Returns the gate text. */
 export async function runGate() {
   const root = mkdtempSync(join(tmpdir(), 'facts-gate-'));
   try {
     const fx = buildGateFixture(root);
     const repos = loadRepoMap(fx.reposPath);
     const out = [];
-    for (const c of CASES) {
+    for (const c of ALL_CASES) {
       const { text, ...rest } = c.query;
       const result = await queryFacts({
         logPath: fx.logPath,
@@ -394,7 +411,7 @@ export function gateScore(text) {
   const unsafe = (id) => {
     if (!score.unsafe.includes(id)) score.unsafe.push(id);
   };
-  // The text must equal the oracle block for block: exactly 50 case blocks then 20 answer blocks,
+  // The text must equal the oracle block for block: the 50 case blocks, the history case blocks, then the 20 answer blocks,
   // in order, each line as declared. Extra, missing, duplicated or reordered blocks all fail.
   const oracle = oracleBlocks();
   const got = splitBlocks(text);
@@ -417,6 +434,17 @@ export function gateScore(text) {
       score[c.group]++;
     }
   }
+  // History cases (A-28 item 16): outside the 10.1 thresholds, but each must be safe and pass.
+  score.H = 0;
+  for (const c of HISTORY_CASES) {
+    const p = parsed.get(c.id);
+    if (!p) {
+      score.missing.push(c.id);
+      continue;
+    }
+    if (!rowsAreSafe(p, c)) unsafe(c.id);
+    if (judgeCase(c, p)) score.H++;
+  }
   score.answers = 0;
   for (const a of ANSWERS) {
     const p = parsed.get(`answer:${a.id}`);
@@ -426,6 +454,7 @@ export function gateScore(text) {
   score.meetsThresholds =
     score.missing.length === 0 &&
     score.unsafe.length === 0 &&
+    score.H === HISTORY_CASES.length &&
     score.A === 15 &&
     score.B >= 9 &&
     score.C_falseMatch === 0 &&
@@ -435,11 +464,59 @@ export function gateScore(text) {
   return score;
 }
 
+const quote = (s) => `'${s.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+
+/**
+ * Compare a gate run with the committed declarations and return paste-ready replacement lines,
+ * in the exact format of cases.mjs and answers.mjs, for every entry that differs (A-28 item 16).
+ * Only rows (id, label, stage) and answer outcomes are proposed. Fact states, conflict pairs and
+ * sensitivity are never proposed: they stay hand-written so citability stays independent of the
+ * code under test. Returns { caseRows: string[], answerOutcomes: string[] }.
+ */
+export function proposedDeclarations(text) {
+  const parsed = parseGateText(text);
+  const caseRows = [];
+  for (const c of ALL_CASES) {
+    const p = parsed.get(c.id);
+    if (!p) continue;
+    const rows = p.rows.map((r) => [r.id, r.label, r.stage]);
+    if (JSON.stringify(rows) !== JSON.stringify(CASE_ROWS[c.id])) {
+      caseRows.push(`  ${c.id}: [${rows.map((r) => `[${r.map(quote).join(', ')}]`).join(', ')}],`);
+    }
+  }
+  const answerOutcomes = [];
+  const blocks = splitBlocks(text);
+  for (const a of ANSWERS) {
+    const block = blocks.find((b) => b.lines[0].startsWith(`answer ${a.id} `));
+    if (!block) continue;
+    const problems = block.lines.filter((l) => l.startsWith('  problem ')).map((l) => l.slice('  problem '.length));
+    const stats = (block.lines.find((l) => l.startsWith('  result=')) ?? '').replace(/^ {2}result=\S+ /, '');
+    const want = ANSWER_OUTCOMES[a.id];
+    if (!want || JSON.stringify(problems) !== JSON.stringify(want.problems) || stats !== want.stats) {
+      answerOutcomes.push(`  ${a.id}: { problems: [${problems.map(quote).join(', ')}], stats: ${quote(stats)} },`);
+    }
+  }
+  return { caseRows, answerOutcomes };
+}
+
+/** Print the declaration lines a reviewer would paste after accepting a behaviour change. */
+function reportDeclarations(text) {
+  const { caseRows, answerOutcomes } = proposedDeclarations(text);
+  if (caseRows.length === 0 && answerOutcomes.length === 0) return false;
+  let out = '\nThis run differs from the committed declarations. If the change is intended, review and\n' +
+    'paste these lines over the matching entries (fact states and conflict pairs are never proposed):\n';
+  if (caseRows.length > 0) out += `\nCASE_ROWS in test/gate/cases.mjs:\n${caseRows.join('\n')}\n`;
+  if (answerOutcomes.length > 0) out += `\nANSWER_OUTCOMES in test/gate/answers.mjs:\n${answerOutcomes.join('\n')}\n`;
+  process.stderr.write(out);
+  return true;
+}
+
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const text = await runGate();
   if (process.argv.includes('--write')) {
     writeFileSync(EXPECTED_PATH, text);
     process.stdout.write(`Wrote ${EXPECTED_PATH}\n${JSON.stringify(gateScore(text))}\n`);
+    if (reportDeclarations(text)) process.exitCode = 1;
   } else {
     const expected = readFileSync(EXPECTED_PATH, 'utf8');
     if (expected !== text) {
@@ -447,8 +524,10 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
       const b = text.split('\n');
       const at = a.findIndex((l, i) => l !== b[i]);
       process.stderr.write(`Gate output differs from expected.txt at line ${at + 1}:\n- ${a[at]}\n+ ${b[at]}\n`);
+      reportDeclarations(text);
       process.exit(1);
     }
     process.stdout.write(`Gate matches expected.txt exactly. ${JSON.stringify(gateScore(text))}\n`);
+    if (reportDeclarations(text)) process.exitCode = 1;
   }
 }

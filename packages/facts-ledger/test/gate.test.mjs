@@ -12,7 +12,7 @@ import { loadRepoMap } from '../dist/repos.js';
 import { ANSWERS } from './gate/answers.mjs';
 import { CASES } from './gate/cases.mjs';
 import { NOW_MS, buildGateFixture } from './gate/fixture.mjs';
-import { EXPECTED_PATH, gateScore, judgeCase, oracleBlocks, parseGateText, rowsAreSafe, runGate } from './gate/run-gate.mjs';
+import { EXPECTED_PATH, gateScore, judgeCase, oracleBlocks, parseGateText, proposedDeclarations, rowsAreSafe, runGate } from './gate/run-gate.mjs';
 
 const cliPath = new URL('../dist/cli.js', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
 
@@ -272,16 +272,79 @@ test('gate validator rejects a tampered expected file (unsafe rows, rendered tex
 });
 
 test('gate oracle: the expected file equals the declared oracle, which passes every safety rule', async () => {
-  const { CASES } = await import('./gate/cases.mjs');
+  const { CASES, HISTORY_CASES } = await import('./gate/cases.mjs');
   const expected = readFileSync(EXPECTED_PATH, 'utf8');
   const blocks = oracleBlocks();
   assert.equal(`${blocks.map((b) => b.lines.join('\n')).join('\n')}\n`, expected);
-  // The oracle is not a copy of the snapshot: every declared case passes the invariants on its own.
-  for (const c of CASES) {
+  // The oracle is not a copy of the snapshot: every declared case passes the invariants on its own,
+  // and every history case passes its group rule.
+  for (const c of [...CASES, ...HISTORY_CASES]) {
     const block = blocks.find((b) => b.id === c.id);
     const parsed = parseGateText(block.lines.join('\n')).get(c.id);
     assert.ok(rowsAreSafe(parsed, c), `oracle case ${c.id} breaks a safety rule`);
+    if (c.group === 'H') assert.ok(judgeCase(c, parsed), `oracle history case ${c.id} fails its rule`);
   }
+  assert.equal(HISTORY_CASES.length, 3);
+  assert.equal(gateScore(expected).H, 3);
+});
+
+test('gate history cases: tampered historical rows fail', () => {
+  const expected = readFileSync(EXPECTED_PATH, 'utf8');
+  const fails = (mutated, why) => {
+    assert.notEqual(mutated, expected, `${why}: mutation did not apply`);
+    assert.equal(gateScore(mutated).meetsThresholds, false, why);
+  };
+  const block = (id) => {
+    const lines = expected.split('\n');
+    const start = lines.findIndex((l) => l.startsWith(`case ${id} `));
+    let end = start + 1;
+    while (end < lines.length && !/^(case|answer) /.test(lines[end])) end++;
+    return lines.slice(start, end).join('\n');
+  };
+  const swap = (id, fn) => expected.replace(block(id), fn(block(id)));
+  // The safety rule on its own (not only block equality) pins historical freshness and citability.
+  const unsafeAlone = async (id, mutatedBlock) => {
+    const { HISTORY_CASES } = await import('./gate/cases.mjs');
+    return !rowsAreSafe(parseGateText(mutatedBlock).get(id), HISTORY_CASES.find((c) => c.id === id));
+  };
+  const invented = (b) => b.replace('badge=SUPERSEDED freshness=stale', 'badge=SUPERSEDED freshness=invented')
+    .replace('[SUPERSEDED] [match/lexical] [stale]', '[SUPERSEDED] [match/lexical] [invented]');
+  fails(swap('H01', invented), 'invented historical freshness');
+  const supportedHistorical = (b) => b.replace('badge=SUPERSEDED freshness=stale', 'badge=SUPERSEDED freshness=supported')
+    .replace('[SUPERSEDED] [match/lexical] [stale]', '[SUPERSEDED] [match/lexical] [supported]');
+  return Promise.all([
+    unsafeAlone('H01', swap('H01', invented)).then((u) => assert.ok(u, 'invented historical freshness accepted by the rule')),
+    unsafeAlone('H01', swap('H01', supportedHistorical)).then((u) => assert.ok(u, 'historical fact shown as supported accepted by the rule')),
+  ]).then(() => {
+    fails(swap('H01', supportedHistorical), 'historical fact shown as supported');
+    fails(swap('H01', (b) => b.replace('rule: Must not be cited. Historical fact was superseded.', 'rule: Must not be cited. Historical fact was retracted.')), 'swapped historical rule');
+    fails(swap('H02', (b) => b.replace('  >   retracted: The importer reads Google Takeout only.\n', '')), 'retraction reason dropped');
+    fails(swap('H02', (b) => b.replace('badge=RETRACTED freshness=stale citable=false', 'badge=RETRACTED freshness=stale citable=true')), 'historical row citable');
+    fails(swap('H03', (b) => b.replace('badge=SUPERSEDED', 'badge=ASSERTED').replace('[SUPERSEDED] [match/exact]', '[ASSERTED] [match/exact]')), 'superseded fact relabelled ASSERTED');
+    fails(expected.replace(block('H03'), ''), 'history case removed');
+  });
+});
+
+test('gate declarations: a changed run yields paste-ready CASE_ROWS and ANSWER_OUTCOMES lines', () => {
+  const expected = readFileSync(EXPECTED_PATH, 'utf8');
+  // The committed file needs no declaration change.
+  assert.deepEqual(proposedDeclarations(expected), { caseRows: [], answerOutcomes: [] });
+  // A behaviour change (H03's two rows swapped; X05's counters changed) yields exactly the
+  // replacement lines, in the committed format, and nothing for unchanged entries.
+  const lines = expected.split('\n');
+  const h03 = lines.findIndex((l) => l.startsWith('case H03 '));
+  [lines[h03 + 2], lines[h03 + 3]] = [lines[h03 + 3].replace(/^ {2}2 /, '  1 '), lines[h03 + 2].replace(/^ {2}1 /, '  2 ')];
+  const changed = lines.join('\n').replace(
+    /(answer X05 expect=fail\n {2}problem [^\n]*\n {2}result=fail )statements=1 citations=1 abstentions=0/,
+    '$1statements=2 citations=1 abstentions=0',
+  );
+  assert.deepEqual(proposedDeclarations(changed), {
+    caseRows: ["  H03: [['a40000000004.0', 'match', 'exact'], ['a30000000003.0', 'match', 'exact']],"],
+    answerOutcomes: ["  X05: { problems: ['line=1 fact:a20000000002.0: cited fact is not currently fresh (stale)'], stats: 'statements=2 citations=1 abstentions=0' },"],
+  });
+  // The proposed format is the committed format: today's H03 entry appears verbatim in cases.mjs.
+  const casesSource = readFileSync(new URL('./gate/cases.mjs', import.meta.url), 'utf8');
+  assert.ok(casesSource.includes("  H03: [['a30000000003.0', 'match', 'exact'], ['a40000000004.0', 'match', 'exact']],"));
 });
 
 test('gate oracle: review round 7 mutations all fail', async () => {
