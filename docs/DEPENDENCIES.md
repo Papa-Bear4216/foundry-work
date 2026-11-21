@@ -9,6 +9,7 @@ also requires a recorded decision in [DECISIONS.md](DECISIONS.md).
 
 | Package | License | Why it cannot be avoided |
 | --- | --- | --- |
+| better-sqlite3-multiple-ciphers | MIT | SQLCipher encrypted working index adapter (decided in D-10); transitive dependency: `node-addon-api` (MIT). |
 
 TypeScript (Apache-2.0) is a build dependency. Gitleaks (MIT) is a standalone CI
 tool. Neither ships with the facts ledger.
