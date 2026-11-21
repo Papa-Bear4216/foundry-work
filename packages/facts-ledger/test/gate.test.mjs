@@ -164,6 +164,25 @@ test('gate validator rejects a tampered expected file (unsafe rows, rendered tex
     .join('\n');
   assert.notEqual(substituted, expected);
   fails(substituted, 'VERIFIED claims substituted with free text');
+  // Review round 4 probe: B03's asserted (free-text) fact promoted to a citable VERIFIED match, with
+  // its metadata, status, rendered badge and rule all changed together.
+  const b03 = expected.indexOf('case B03 ');
+  const b04 = expected.indexOf('case B04 ');
+  assert.ok(b03 > 0 && b04 > b03);
+  const promoted = expected.slice(b03, b04)
+    .replace('status=related fenced=true', 'status=match fenced=true')
+    .replace(
+      'a10000000001.7 tier=asserted label=related stage=partial badge=RELATED freshness=supported citable=false',
+      'a10000000001.7 tier=checked label=match stage=partial badge=VERIFIED freshness=supported citable=true',
+    )
+    .replace('  > status: related (1 result(s))', '  > status: match (1 result(s))')
+    .replace('  > [RELATED] [related/partial] [supported] (a10000000001.7)', '  > [VERIFIED] [match/partial] [supported] (a10000000001.7)')
+    .replace(relatedRule, '  >   rule: May be cited as fact.');
+  assert.notEqual(promoted, expected.slice(b03, b04));
+  const promotedText = expected.slice(0, b03) + promoted + expected.slice(b04);
+  assert.deepEqual(gateScore(promotedText).unsafe, ['B03']);
+  fails(promotedText, 'asserted free text promoted to VERIFIED with coordinated metadata');
+  // The same promotion keeping tier=asserted is caught by the badge/tier rule; with tier=checked by the catalog.
   // Any added line, even a harmless-looking one, breaks the exact structure.
   fails(expected.replace(`${verifiedRow}\n`, `${verifiedRow}\n  >   note: added\n`), 'extra line in a row');
 });

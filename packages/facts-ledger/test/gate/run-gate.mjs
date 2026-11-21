@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { checkAnswer } from '../../dist/check-answer.js';
 import { FreshnessChecker } from '../../dist/freshness.js';
 import { formatQueryText, queryFacts } from '../../dist/query.js';
+import { formatCheckedPredicateClaim } from '../../dist/normalize.js';
 import { loadRepoMap } from '../../dist/repos.js';
 import { ANSWERS } from './answers.mjs';
 import { CASES } from './cases.mjs';
@@ -76,6 +77,10 @@ export function rowsAreSafe(parsed) {
     if (NOT_CITABLE_FRESHNESS.has(r.freshness) && r.citable !== 'false') return false;
     const fact = CATALOG.get(r.id);
     if (!fact || !RULES_FOR_BADGE[r.badge]) return false;
+    // The row's tier must be the fixture's own tier, and VERIFIED needs a checked fact whose
+    // claim is the canonical form of its predicate (never free text).
+    if (r.tier !== fact.tier) return false;
+    if (verified && (fact.tier !== 'checked' || !fact.check || fact.claim !== formatCheckedPredicateClaim(fact.check))) return false;
     const tags = fact.tags.length > 0 ? ` tags:[${fact.tags.join(',')}]` : '';
     want.push(`[${r.badge}] [${r.label}/${r.stage}] [${r.freshness}] (${r.id}) ${fact.claim}${tags}`);
     if (fact.note) want.push(`  note: ${fact.note}`);

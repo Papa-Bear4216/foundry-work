@@ -248,12 +248,16 @@ function gateBlocks(c1, c1Blobs) {
   return blocks;
 }
 
-/** fact_id -> { claim, note, tags, retractionReason } for every fixture fact, defined here, not by the renderer. */
+/**
+ * fact_id -> { tier, check, claim, note, tags, retractionReason } for every fixture fact, defined
+ * here, not by the renderer. The gate checks every row's tier against this, so a snapshot cannot
+ * promote an asserted (free-text) fact to a checked one.
+ */
 export function gateFactCatalog() {
   // Blob ids are content hashes (SHA-1 object format), so they are computed here without git.
   const blobId = (text) => {
     const body = Buffer.from(text, 'utf8');
-    return createHash('sha1').update(Buffer.concat([Buffer.from(`blob ${body.length} `), body])).digest('hex');
+    return createHash('sha1').update(Buffer.concat([Buffer.from(`blob ${body.length}\0`), body])).digest('hex');
   };
   const c1Blobs = Object.fromEntries(Object.entries(C1_FILES).map(([path, text]) => [path, blobId(text)]));
   const blocks = gateBlocks('0'.repeat(40), c1Blobs);
@@ -262,7 +266,14 @@ export function gateFactCatalog() {
   const catalog = new Map();
   for (const b of blocks) {
     for (const f of b.facts) {
-      catalog.set(f.fact_id, { claim: f.claim, note: f.note, tags: f.tags, retractionReason: retracted.get(f.fact_id) ?? null });
+      catalog.set(f.fact_id, {
+        tier: f.tier,
+        check: f.check ?? null,
+        claim: f.claim,
+        note: f.note,
+        tags: f.tags,
+        retractionReason: retracted.get(f.fact_id) ?? null,
+      });
     }
   }
   return catalog;
