@@ -249,7 +249,30 @@ function gateBlocks(c1, c1Blobs) {
 }
 
 /**
- * fact_id -> { tier, check, claim, note, tags, retractionReason } for every fixture fact, defined
+ * What the fixture is built to produce for each fact at NOW_MS, written out by hand from the
+ * fixture's design rather than read from any run, so the gate can check every row's freshness
+ * and lifecycle independently of the snapshot (A-28 item 13). `live` facts must show exactly
+ * this freshness; historical facts may appear only as SUPERSEDED or RETRACTED.
+ */
+const EXPECTED_STATE = {
+  // Block 1: files unchanged in commit 2, so the predicates hold.
+  'a10000000001.0': 'supported', 'a10000000001.1': 'supported', 'a10000000001.2': 'supported',
+  'a10000000001.3': 'supported', 'a10000000001.4': 'supported', 'a10000000001.5': 'supported',
+  'a10000000001.6': 'supported', 'a10000000001.7': 'supported', 'a10000000001.8': 'supported',
+  'a10000000001.9': 'supported', 'a10000000001.11': 'supported', 'a10000000001.12': 'supported',
+  // src/legacy.ts still exists, so "is absent" does not hold.
+  'a10000000001.10': 'stale',
+  // Block 2: commit 2 changes retry.ts, deletes old-sync.ts, rewrites cache.ts and flags.ts.
+  'a20000000002.0': 'stale', 'a20000000002.1': 'stale', 'a20000000002.2': 'stale',
+  'a20000000002.3': 'stale', 'a20000000002.4': 'stale',
+  // Block 3: superseded and retracted by block 4; the command evidence of .3 is past its TTL.
+  'a30000000003.0': 'superseded', 'a30000000003.1': 'retracted',
+  'a30000000003.2': 'supported', 'a30000000003.3': 'expired', 'a30000000003.4': 'supported',
+  'a40000000004.0': 'supported',
+};
+
+/**
+ * fact_id -> { tier, check, claim, note, tags, retractionReason, expected } for every fixture fact, defined
  * here, not by the renderer. The gate checks every row's tier against this, so a snapshot cannot
  * promote an asserted (free-text) fact to a checked one.
  */
@@ -273,6 +296,7 @@ export function gateFactCatalog() {
         note: f.note,
         tags: f.tags,
         retractionReason: retracted.get(f.fact_id) ?? null,
+        expected: EXPECTED_STATE[f.fact_id],
       });
     }
   }

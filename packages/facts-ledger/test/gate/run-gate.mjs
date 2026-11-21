@@ -80,6 +80,16 @@ export function rowsAreSafe(parsed) {
     // The row's tier must be the fixture's own tier, and VERIFIED needs a checked fact whose
     // claim is the canonical form of its predicate (never free text).
     if (r.tier !== fact.tier) return false;
+    // Freshness and lifecycle come from the fixture's declared design, not from the snapshot,
+    // and the badge must be the one that freshness implies.
+    if (fact.expected === 'superseded' || fact.expected === 'retracted') {
+      if (r.badge !== fact.expected.toUpperCase()) return false;
+    } else {
+      if (!fact.expected || r.freshness !== fact.expected) return false;
+      const badgeFor = { stale: ['STALE'], expired: ['EXPIRED'], unverifiable: ['UNVERIFIABLE'] }[r.freshness] ??
+        (fact.tier === 'checked' ? ['VERIFIED', 'RELATED'] : ['ASSERTED', 'RELATED']);
+      if (!badgeFor.includes(r.badge)) return false;
+    }
     if (verified && (fact.tier !== 'checked' || !fact.check || fact.claim !== formatCheckedPredicateClaim(fact.check))) return false;
     const tags = fact.tags.length > 0 ? ` tags:[${fact.tags.join(',')}]` : '';
     want.push(`[${r.badge}] [${r.label}/${r.stage}] [${r.freshness}] (${r.id}) ${fact.claim}${tags}`);

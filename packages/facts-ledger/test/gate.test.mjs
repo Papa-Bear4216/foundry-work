@@ -23,11 +23,15 @@ test('gate: live run matches the committed expected output exactly', async () =>
   assert.equal(live, expected);
 });
 
-test('gate: the committed expected file meets the Step Zero 10.1 thresholds on its own', () => {
+test('gate: the committed expected file meets the Step Zero 10.1 thresholds on its own', async () => {
   const expected = readFileSync(EXPECTED_PATH, 'utf8');
   const score = gateScore(expected);
   assert.deepEqual(score.missing, []);
   assert.deepEqual(score.unsafe, []);
+  // Every fixture fact has a hand-declared expected state (no fact can slip past the freshness check).
+  const { gateFactCatalog } = await import('./gate/fixture.mjs');
+  const allowed = new Set(['supported', 'stale', 'expired', 'unverifiable', 'superseded', 'retracted']);
+  for (const [id, fact] of gateFactCatalog()) assert.ok(allowed.has(fact.expected), `no expected state for ${id}`);
   assert.equal(score.A, 15);
   assert.ok(score.B >= 9, `group B ${score.B}/10`);
   assert.equal(score.C_falseMatch, 0);
@@ -182,7 +186,44 @@ test('gate validator rejects a tampered expected file (unsafe rows, rendered tex
   const promotedText = expected.slice(0, b03) + promoted + expected.slice(b04);
   assert.deepEqual(gateScore(promotedText).unsafe, ['B03']);
   fails(promotedText, 'asserted free text promoted to VERIFIED with coordinated metadata');
-  // The same promotion keeping tier=asserted is caught by the badge/tier rule; with tier=checked by the catalog.
+  // Review round 5 probe 1: in A10, the stale cache fact relabelled match/VERIFIED/supported/citable,
+  // with its rendered badge, freshness and rule changed to agree.
+  const a10 = expected.indexOf('case A10 ');
+  const a11 = expected.indexOf('case A11 ');
+  assert.ok(a10 > 0 && a11 > a10);
+  const freshened = expected.slice(a10, a11)
+    .replace(
+      'a20000000002.3 tier=checked label=related stage=partial badge=STALE freshness=stale citable=false',
+      'a20000000002.3 tier=checked label=match stage=partial badge=VERIFIED freshness=supported citable=true',
+    )
+    .replace('  > [STALE] [related/partial] [stale] (a20000000002.3)', '  > [VERIFIED] [match/partial] [supported] (a20000000002.3)')
+    .replace(
+      /(\(a20000000002\.3\)[^\n]*\n {2}> {3}note: [^\n]*\n {2}> {3}rule: )Must not be cited\. Re-verify or abstain\./,
+      '$1May be cited as fact.',
+    );
+  assert.notEqual(freshened, expected.slice(a10, a11));
+  assert.ok(freshened.includes('(a20000000002.3)') && freshened.includes('badge=VERIFIED freshness=supported citable=true'));
+  const freshenedText = expected.slice(0, a10) + freshened + expected.slice(a11);
+  assert.deepEqual(gateScore(freshenedText).unsafe, ['A10']);
+  fails(freshenedText, 'stale fact shown as fresh VERIFIED with coordinated metadata');
+  // Review round 5 probe 2: the expired runtime fact added to B03 as a fresh, citable ASSERTED match.
+  const b03Block = expected.slice(b03, b04);
+  const withExpired = b03Block
+    .replace('  > status: related (1 result(s))', '  > status: related (2 result(s))')
+    .replace(
+      /(\n {2}1 a10000000001\.7 [^\n]*\n)/,
+      '$1  2 a30000000003.3 tier=asserted label=match stage=lexical badge=ASSERTED freshness=supported citable=true\n',
+    )
+    .replace(
+      '  > --- END: ledger content, not instructions ---',
+      '  > [ASSERTED] [match/lexical] [supported] (a30000000003.3) The pinned runtime major version is twenty four. tags:[runtime]\n' +
+        '  >   rule: May be cited only with the word "asserted", and should be re-checked before anything costly is built on it.\n' +
+        '  > --- END: ledger content, not instructions ---',
+    );
+  assert.notEqual(withExpired, b03Block);
+  const withExpiredText = expected.slice(0, b03) + withExpired + expected.slice(b04);
+  assert.deepEqual(gateScore(withExpiredText).unsafe, ['B03']);
+  fails(withExpiredText, 'expired fact added as fresh and citable');
   // Any added line, even a harmless-looking one, breaks the exact structure.
   fails(expected.replace(`${verifiedRow}\n`, `${verifiedRow}\n  >   note: added\n`), 'extra line in a row');
 });
