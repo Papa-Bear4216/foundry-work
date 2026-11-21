@@ -106,6 +106,8 @@ jobs:
           npm --prefix packages/vault/codec test
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -B packages/vault/reference/test_vectors.py
+      - name: Vault key command peak RSS (pinned runtime)
+        run: npm --prefix packages/vault/codec run budgets
 
   v0-measure:
     concurrency:

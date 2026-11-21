@@ -87,9 +87,16 @@ export function open(key: Buffer, nonce: Buffer, aad: Buffer, sealed: Buffer): B
   const decipher = createDecipheriv('aes-256-gcm', key, nonce, { authTagLength: 16 });
   decipher.setAAD(aad);
   decipher.setAuthTag(sealed.subarray(-16));
+  let plaintext: Buffer | undefined;
+  let tail: Buffer | undefined;
   try {
-    return Buffer.concat([decipher.update(sealed.subarray(0, -16)), decipher.final()]);
+    plaintext = decipher.update(sealed.subarray(0, -16));
+    tail = decipher.final();
+    return Buffer.concat([plaintext, tail]);
   } catch {
     throw new VaultFormatError('AUTH');
+  } finally {
+    plaintext?.fill(0);
+    tail?.fill(0);
   }
 }
