@@ -1,0 +1,3 @@
+# Generated SQLite index, journals, and writer locks
+*.sqlite
+*.sqlite-*
