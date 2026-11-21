@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { addFact } from './add.js';
+import { assertDigestProject, generateDigest } from './digest.js';
 import { FreshnessChecker } from './freshness.js';
 import { templateNames } from './git.js';
 import { defaultIndexPath, rebuildIndex } from './index-db.js';
@@ -284,6 +285,21 @@ function parseCliArgs(argv: readonly string[]): ParsedArgs {
   };
 }
 
+/** Section 3.1: damaged log lines are reported on every run. */
+function warnBadLines(report: { readonly badLineCount: number; readonly badLineNumbers: readonly number[] }): void {
+  if (report.badLineCount > 0) {
+    process.stderr.write(`Warning: skipped ${report.badLineCount} bad log line(s) at line(s): ${report.badLineNumbers.join(', ')}\n`);
+  }
+}
+
+/** Storage flags the user chose, repeated in the digest's closing query command. */
+function digestQueryFlags(args: ParsedArgs): string[] {
+  const flags: string[] = [];
+  if (args.logPath !== (process.env['FACTS_LEDGER_LOG'] || 'ledger.jsonl')) flags.push('--log', args.logPath);
+  if (args.indexPath) flags.push('--index', args.indexPath);
+  return flags;
+}
+
 function buildEmbedderFromArgs(args: ParsedArgs): Embedder | undefined {
   if (args.embedUrl !== undefined) {
     return createHttpEmbedder(args.embedUrl, args.embedModel);
@@ -304,6 +320,7 @@ function usageText(): string {
     '            [--evidence-cmd <template> [--evidence-arg <arg>]...] [--manual <description>]',
     '            [--note <text>] [--tag <tag>]... [--sensitivity <tier>] [--scope current|at-commit] [--supersedes-fact <id>]',
     '  facts verify (--fact <id> | --tag <tag> | --all) [--rerun] [--write [--agent <name>]] [--json]',
+    '  facts digest --project <p> [--max-sensitivity <tier>] [--json]   (writes digest.<project>.md beside the index; at most 6,000 bytes)',
     '',
     `Command templates: ${templateNames().join(', ')}. Git templates take the repo name first.`,
     'Repo names map to local checkouts in a per-machine file outside any repository (FACTS_LEDGER_REPOS).',
@@ -406,6 +423,8 @@ async function run(): Promise<void> {
         throw new Error('--scope must be current or at-commit');
       }
       if (args.evidenceArgs.length > 0 && !a['evidence-cmd']) throw new Error('--evidence-arg requires --evidence-cmd');
+      // Validate before the append: the block cannot be taken back if the digest then fails.
+      assertDigestProject(a['project'] || process.env['FACTS_LEDGER_PROJECT'] || '');
       const block = addFact({
         logPath: args.logPath,
         repos,
@@ -431,6 +450,29 @@ async function run(): Promise<void> {
       } else {
         process.stdout.write(`Appended block ${block.id}: fact ${fact?.fact_id ?? '?'} (${fact?.tier ?? '?'})\n`);
       }
+      // Every facts add regenerates the project's digest (Step Zero 7).
+      const regenerated = generateDigest({
+        logPath: args.logPath,
+        indexPath,
+        project: block.project,
+        repos,
+        ...(args.maxSensitivity ? { maxSensitivity: args.maxSensitivity } : {}),
+        queryFlags: digestQueryFlags(args),
+      });
+      warnBadLines(regenerated.badLines);
+    } else if (args.command === 'digest') {
+      const project = args.add['project'] || process.env['FACTS_LEDGER_PROJECT'];
+      if (!project) throw new Error('--project is required');
+      const result = generateDigest({
+        logPath: args.logPath,
+        indexPath,
+        project,
+        repos: loadRepoMap(),
+        ...(args.maxSensitivity ? { maxSensitivity: args.maxSensitivity } : {}),
+        queryFlags: digestQueryFlags(args),
+      });
+      warnBadLines(result.badLines);
+      process.stdout.write(args.json ? `${JSON.stringify(result)}\n` : result.text);
     } else if (args.command === 'verify') {
       const result = verifyFacts({
         logPath: args.logPath,
