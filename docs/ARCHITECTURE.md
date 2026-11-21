@@ -324,17 +324,24 @@ recovery key valid. Either change uses a fresh salt, re-wraps MK under the new
 passphrase-derived key, keeps `master.by_recovery` byte-identical, and recomputes the
 keyring MAC. The rewrite can use the current passphrase to unlock MK and needs no recovery key.
 
-- The text form carries a version character and a checksum, so a typing mistake is
-  reported as a mistake and not as a wrong key.
+- The printed text starts with the version character `1`. Encode the 32 recovery
+  bytes as 52 uppercase, unpadded RFC 4648 base32 characters. Append the first four
+  base32 characters of SHA-256 over the ASCII version character followed by those 52
+  characters. Print the resulting 56 characters in groups of four, with a hyphen
+  before each group. Check the text and checksum before attempting to unwrap MK.
 - The wizard warns before printing: "print to PDF" saves the key as a file, and network
   or cloud printers keep copies of what they print. Writing it down by hand is offered first.
 - The recovery key is useless without a keyring file. The restore drill proves the pair
   works using only what is on the second copy.
 - Changing the passphrase does not revoke an old one. Anyone who copied an earlier keyring
   and knows the earlier passphrase can still unwrap the keys that keyring held. After a
-  suspected passphrase leak the remedy is `foundry vault rekey --all`, not a passphrase change.
+  suspected passphrase leak, use `foundry vault rekey --all` with a fresh passphrase.
 - `foundry vault rekey --all` rotates MK and the profile, collection and index keys
-  for confidentiality. It preserves the vault signing key and printed anchor. If
+  for future writes. It issues a new recovery key, which is shown once. The new
+  keyring keeps historical collection keys wrapped under the new hierarchy so it
+  can read existing records by their original IDs. New writes use fresh collection
+  IDs, and the index must be rebuilt under the new index key. Sealed segments stay
+  byte-identical. It preserves the vault signing key and printed anchor. If
   the signing key may be compromised, create a new vault and import the old vault's
   contents. The new vault has its own vault ID, signing key and printed anchor.
 
@@ -362,6 +369,10 @@ must be kept in step across copies.
 - Use the canonical JSON and field encodings in section 4.5. The positive `version`
   starts at 1. Each rewrite increments it and uses a temp file, fsync and rename.
   `vault_id` must match the vault being opened.
+- Writers use an exclusive sibling `.pending` file, compare the current keyring to
+  the authenticated input before publishing, and retry transient Windows rename
+  failures. If a writer is interrupted, confirm the writer has exited and inspect
+  the published keyring before removing its abandoned `.pending` file.
 - `keys` is sorted by ascending ASCII `key_id`. IDs are unique 16-byte identifiers.
   The kinds are `profile`, `collection`, `index` and `signing`. Profile, index and
   signing entries have parent `master`. A collection's parent is a profile entry ID,
@@ -491,6 +502,12 @@ tombstone key is derived from MK. The importer checks new items against the tomb
 re-importing the same archive does not restore a redacted item. The trade: the vault's
 owner can later confirm that a given file was once redacted. Erasing a whole profile
 records no per-item tombstones.
+
+The V-2 library rotates keys at the keyring boundary. Before enabling vault-wide
+rekey on a populated vault, the command must carry forward the ability to match
+existing tombstones across the MK change and recover the switch to the new write
+IDs and index generation. A later collection erasure must cover each historical
+ID for that collection as well as its current ID.
 
 **Items about more than one person.** A photo or a conversation is stored once, in the
 collection of the profile that imported it. A per-profile key cannot erase it for one

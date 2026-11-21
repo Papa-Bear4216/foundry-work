@@ -61,3 +61,19 @@ declare module 'node:crypto' {
   export function sign(algorithm: null, data: Uint8Array, key: KeyObject): Buffer;
   export function verify(algorithm: null, data: Uint8Array, key: KeyObject, signature: Uint8Array): boolean;
 }
+
+declare module 'node:fs' {
+  import type { Buffer } from 'node:buffer';
+
+  export function readFileSync(pathOrFd: string | number): Buffer;
+  export function openSync(path: string, flags: 'wx', mode: number): number;
+  export function writeFileSync(fd: number, data: Uint8Array): void;
+  export function fsyncSync(fd: number): void;
+  export function closeSync(fd: number): void;
+  export function renameSync(source: string, target: string): void;
+  export function unlinkSync(path: string): void;
+}
+
+declare module 'node:process' {
+  export const platform: string;
+}

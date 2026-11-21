@@ -5,4 +5,7 @@ export type { RecordFields } from './record.ts';
 export { GENESIS_HASH, decodeManifest, decodeVaultMetadata, encodeManifest, signingPublicKey, verifySegment } from './manifest.ts';
 export type { ChainPosition, Manifest, ManifestFile } from './manifest.ts';
 export { blobId, collectionIdKey, decodeKeyring, encodeKeyring } from './keyring.ts';
-export type { Unlock } from './keyring.ts';
+export type { KdfParallelism, Unlock } from './keyring.ts';
+export { changePassphrase, create, rekeyAll, unlockByPassphrase, unlockByRecovery } from './keys.ts';
+export { decodeRecoveryKey } from './recovery.ts';
+export { guardSecretInput, readSecretFromFd } from './secret-input.ts';
