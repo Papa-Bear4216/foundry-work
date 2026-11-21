@@ -49,7 +49,7 @@ Parameters match `docs/ARCHITECTURE.md` section 5.2: `scryptSync` with `N = 1310
 | External OS peak | `177.56 MiB` (`186187776 B`) | `165.24 MiB` (`173268992 B`) | `165.84 MiB` (`173895680 B`) |
 | `256 MiB` KDF allowance | Pass (`kdfWithinBudget: true`) | Pass (`kdfWithinBudget: true`) | Pass (`kdfWithinBudget: true`) |
 
-**Result:** The isolated `scrypt` primitive stays well below `256 MiB` on both platforms (`177.56 MiB` Linux, `165.24 MiB` Windows; `~345–378 ms` median on 2-core CI runners and `204.42 ms` on 16-core Windows). Full passphrase-command budgets remain to be verified in the packages implementing those commands per `A-24`.
+**Result:** The isolated `scrypt` primitive stays well below `256 MiB` on both platforms (`177.56 MiB` Linux, `165.24 MiB` Windows; `~345–378 ms` median on 2-core CI runners and `204.42 ms` on 16-core Windows). Full passphrase-command budgets remain to be verified in the packages implementing those commands per `A-26`.
 
 ---
 
@@ -58,7 +58,7 @@ Parameters match `docs/ARCHITECTURE.md` section 5.2: `scryptSync` with `N = 1310
 Constructs the `69`-byte `FVR1` header (`headerTotalLen = 134220288`), derives the `32`-byte record key via `hkdfSync('sha256', collectionKey, salt, 'foundry/record-key/v1', 32)`, and encrypts/decrypts `128` x `1 MiB` frames (`128 MiB` plaintext; `134220288` encoded body bytes) using `64 KiB` streaming slices into reusable buffers, followed by SHA-256 round-trip equality and a 1-frame tamper check.
 
 - **Timing & memory scope note:** `encryptMs` and `decryptMs` exclude SHA-256 verification (decrypted plaintext slices copy into a reusable `decryptedFrame` buffer inside `decryptMs`, and `roundtripHash.update(...)` runs afterward). `totalWallMs` covers the `128 MiB` payload loop plus the single-frame tamper check. `internalMaxRssKiB` and `externalPeakBytes` reflect child-process lifetime peak RSS from startup through measurement/exit.
-- **CI gate policy:** `run-all.mjs` checks that this isolated probe stays below the `256 MiB` runaway-memory sanity guard (`streamProbeWithinSanityGuard: true`) and reports the provisional `128 MiB` `vault verify` target (`referenceVaultVerifyCeilingMiB: 128`) for reference only, deferred to V-3/V-5 per `A-24`.
+- **CI gate policy:** `run-all.mjs` checks that this isolated probe stays below the `256 MiB` runaway-memory sanity guard (`streamProbeWithinSanityGuard: true`) and reports the provisional `128 MiB` `vault verify` target (`referenceVaultVerifyCeilingMiB: 128`) for reference only, deferred to V-3/V-5 per `A-26`.
 
 | Metric | Hosted Linux CI (`44638009731`) | Hosted Windows CI (`44638009731`) | Local Windows (16c) |
 |---|---|---|---|
@@ -108,7 +108,7 @@ Tests pinned `better-sqlite3-multiple-ciphers` **`13.2.0`** (with transitive `no
 | Internal `maxRSS` / External OS peak | `58.52 MiB` / `58.89 MiB` | `43.86 MiB` / `44.13 MiB` | `44.33 MiB` / `44.61 MiB` |
 | `256 MiB` probe sanity guard | Pass (`sqlcipherProbeWithinSanityGuard: true`) | Pass (`sqlcipherProbeWithinSanityGuard: true`) | Pass (`sqlcipherProbeWithinSanityGuard: true`) |
 
-- **Leak-scan and CI gate scope note:** Both the live `-wal` scan before checkpoint and the post-close `.db` scan check for both UTF-8 and UTF-16LE encodings of the planted marker string. Rollback-journal (`DELETE`/`TRUNCATE`), SQLite temp/spill files under large transactions, and crash recovery with an uncheckpointed `-wal` remain in scope for `V-4`. In `run-all.mjs`, the SQLCipher probe is gated by the `256 MiB` runaway-memory sanity guard while the provisional `192 MiB` `search` ceiling (`referenceSearchCeilingMiB: 192`) is reported for reference only per `A-24`.
+- **Leak-scan and CI gate scope note:** Both the live `-wal` scan before checkpoint and the post-close `.db` scan check for both UTF-8 and UTF-16LE encodings of the planted marker string. Rollback-journal (`DELETE`/`TRUNCATE`), SQLite temp/spill files under large transactions, and crash recovery with an uncheckpointed `-wal` remain in scope for `V-4`. In `run-all.mjs`, the SQLCipher probe is gated by the `256 MiB` runaway-memory sanity guard while the provisional `192 MiB` `search` ceiling (`referenceSearchCeilingMiB: 192`) is reported for reference only per `A-26`.
 
 ---
 
@@ -116,14 +116,14 @@ Tests pinned `better-sqlite3-multiple-ciphers` **`13.2.0`** (with transitive `no
 
 V-0 loads the unsigned native addon binary `better_sqlite3.node` (`better-sqlite3-multiple-ciphers` `13.2.0`). Under Windows 11 Smart App Control (**SAC**), unsigned native addons loaded at runtime may be blocked unless signed or exempted, whereas hosts with SAC off (`VerifiedAndReputablePolicyState = 0`) cannot confirm SAC behavior.
 
-- **Status:** **OPEN (`O-2` / `K-4`)** — Not yet verified on a clean Windows 11 image with Smart App Control enforced (`VerifiedAndReputablePolicyState = 1`) against the unsigned CI-built `13.2.0` binary.
-- **Implication:** Per `docs/ROADMAP.md` (V-0 "Done when") and `docs/internal/BUILD_ASSIGNMENTS.md` (`K-4`), `pkg/v-0` remains parked on its branch (`proposed`) and cannot be marked `done` or merged to `main` until `O-2` is executed and recorded here (and in `docs/DECISIONS.md` if signing is required beyond `D-19`).
+- **Status:** **MOVED TO `P-6` (`D-22`, 2026-11-21)** — Not yet verified on a clean Windows 11 image with Smart App Control enforced (`VerifiedAndReputablePolicyState = 1`) against the unsigned CI-built `13.2.0` binary.
+- **Implication:** `D-22` (owner, 2026-11-21) moves this test from V-0 to `P-6`. V-0 merges with every other line done; `P-6` (installers) cannot be marked `done` until the test passes on a clean Windows 11 image with Smart App Control on, and is recorded in `docs/DECISIONS.md` if signing is required beyond `D-19`.
 
 ---
 
-## 6. Architecture Section 9 Ceiling Decision (`A-24`)
+## 6. Architecture Section 9 Ceiling Decision (`A-26`)
 
-Per `docs/DECISIONS.md` entry **`A-24`** (amending `A-17` and the V-0 acceptance timing for Architecture section 9 ceilings per Roadmap rule 4):
+Per `docs/DECISIONS.md` entry **`A-26`** (amending `A-17` and the V-0 acceptance timing for Architecture section 9 ceilings per Roadmap rule 4):
 
 1. **Numerical ceilings retained unchanged:** All Architecture section 9 ceilings stay unchanged as target limits: passphrase KDF commands `256 MiB`, `vault verify` `128 MiB`, `import` `256 MiB`, `search` `192 MiB`, first-run `wizard` `192 MiB`, and `Mode A` receiver `96 MiB`.
 2. **Amended V-0 acceptance scope & timing:** V-0 confirms only that the isolated `scrypt` KDF primitive (`177.56 MiB` Linux, `165.24 MiB` Windows) fits within the `256 MiB` allowance, and records isolated baseline probes for `FVR1` streaming AES-256-GCM (`124.90 MiB` Linux, `108.60 MiB` Windows for `128 MiB`) and `SQLite3MultipleCiphers` (`58.89 MiB` Linux, `44.13 MiB` Windows).
@@ -142,7 +142,7 @@ Per `docs/DECISIONS.md` entry **`A-24`** (amending `A-17` and the V-0 acceptance
 |---|---|---|
 | CI `check` (`ubuntu-latest`, `windows-latest`) | Pass | Run `44638009731` |
 | CI `v0-measure` (`ubuntu-latest`, `windows-latest`) | Pass | Run `44638009731` (`better-sqlite3-multiple-ciphers` `13.2.0` built from source) |
-| Isolated KDF primitive within `256 MiB` (`A-24`) | Pass | `177.56 MiB` Linux / `165.24 MiB` Windows |
+| Isolated KDF primitive within `256 MiB` (`A-26`) | Pass | `177.56 MiB` Linux / `165.24 MiB` Windows |
 | Isolated stream & SQLCipher probes + UTF-8/UTF-16LE leak scans | Pass | `124.90 MiB` / `108.60 MiB`; `58.89 MiB` / `44.13 MiB`; `256 MiB` guard pass |
-| Architecture section 9 full-command confirmation (`A-24`) | Amended timing | Deferred to `V-1`/`V-3`/`V-4`/`V-5`/`V-7`/`P-5`/`X-6` |
-| Clean Windows 11 with Smart App Control ON (`O-2`) | **Open** | Parked on `pkg/v-0` pending `O-2` / `K-4` VM verification |
+| Architecture section 9 full-command confirmation (`A-26`) | Amended timing | Deferred to `V-1`/`V-3`/`V-4`/`V-5`/`V-7`/`P-5`/`X-6` |
+| Clean Windows 11 with Smart App Control ON (`O-2`) | **Moved to P-6** | `D-22`: no longer blocks V-0; `P-6` needs it (`O-2` / `K-4`) |

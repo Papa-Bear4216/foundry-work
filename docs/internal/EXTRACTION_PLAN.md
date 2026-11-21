@@ -39,18 +39,20 @@ marked "read". Files marked "not read" must be inspected before anyone relies on
 | `packages/databank/sensitivity.ts` | Read | `packages/profiles` (sensitivity rules) | Port only the generic secret rules (the block of credential and identity-number patterns near the top of the rule list). The household-specific rules that follow it stay behind; in Foundry such rules are user configuration stored in the vault. |
 | `packages/databank/parsers/contacts.ts` | Read | `packages/importers` | Port the parsing logic. Split into `split` (originals) and `derive` (text and structure). |
 | `packages/databank/parsers/takeout-location.ts` | Read | `packages/importers` (Phase 3) | Port for the older export formats. The newer on-device export needs new code. |
-| `packages/databank/parsers/` (other files) | Listing only | None in v1 | Device- and carrier-specific. Not ported until a Phase 3 package asks for one, then inspected first. |
+| `packages/databank/parsers/` (other files) | Listing only | Phase 3 (`X-2`) | Device- and carrier-specific parsers ported one at a time in `X-2`, each inspected first through the scrub gate with synthetic fixtures only. |
 | `packages/databank/archive.ts` | Not read | `packages/importers` (archive reader) | Inspect. Foundry needs zip64 streaming without unpacking; write new if this does not do that. |
 | `packages/databank/ops/restore-drill.ts` | Read | `packages/vault` (restore drill) | Reference for the drill's steps. Foundry's drill adds the anchor check, signature check, withdrawal replay and failure suite. |
-| `packages/core/corrections.ts` | Read | `packages/vault` (event kinds) | Reference for corrections as events that point at records and carry no content inline. |
-| `packages/databank/verify.ts`, `ask.ts`, `ask-prep.ts` | Not read | Phase 3 (ask and verifier) | Inspect when X-4 starts. |
-| `packages/databank/people-resolver.ts`, `relationship-analysis.ts` | Not read | Phase 3 (relationship map) | Inspect when X-5 starts. Expect household-specific logic; assume not portable until shown otherwise. |
-| `apps/mobile/src/pages/LivingBrain.tsx` | Read | None | **Do not port.** Its layout is a force simulation and is not repeatable. Foundry records positions as events. |
-| `packages/databank/server.ts`, `ui.ts`, `cli.ts`, `databank.ts`, helper and type files | Not read | None | Do not port. Foundry has its own command line and wizard and no resident server. |
-| `packages/databank/ops/*.sh`, `*.service`, `deploy.sh`, `windows/` | Listing only | None | **Do not port.** Deployment for one specific machine. |
-| `packages/databank/ops/*.py`, `enrich/`, `intake/`, `phone-feed/`, `tags-*.ts`, `weekly-digests.ts`, `summarize-model.ts` | Listing only | None | **Do not port.** Personal pipelines. |
-| `packages/databank/ops/ask-bench.ts` and its question set | Listing only | None | **Do not port.** The benchmark questions are about real people and real events. Foundry's question sets are synthetic. |
-| `packages/databank/migrate-sensitivity.ts`, `sensitivity-migration.ts`, `tags-ddl.ts`, `ledger-bridge.ts`, `authority.ts` | Not read | None | Do not port. Predecessor-specific migrations and bridges. |
+| `packages/core/*`, `packages/memory/*` | Read overview | Phase 4 (`E-1`, `E-3`) | Scrubbed extraction (D-20): extract event bus, pattern analyzer, speculative dry-run cache, pre-cognitive readiness, write-time recap card synthesis, and token/vector memory through the scrub gate; bind cold storage and archival to `FVR1` + SQLCipher. |
+| `apps/daemon/*` | Read overview | Phase 4 (`E-2`, `E-3`, `E-4`) & Phase 5 (`W-3`) | Scrubbed extraction (D-20, D-21): opt-in `exocortexd` gateway, hash-chained event log, device enrollment/JWT/attestation, encrypted `ChannelVault` adapters (Obsidian/Notion/Gmail), `llama.cpp` role orchestration, shadow recorder, and autonomic archival; strip household configs, home-proxy coupling, and hardcoded service endpoints. |
+| `apps/desktop/*` (Tauri) | Listing | Phase 4 (`E-5`) | Scrubbed extraction (D-20, D-21): opt-in desktop tray shell, local daemon discovery, and Command Center UI with generic branding. |
+| `apps/mobile/*` (Capacitor Android) | Read overview | Phase 4 (`E-6`) | Scrubbed extraction (D-20, D-21): opt-in Android companion (accessibility capture, Recent tab + widget, `AnticipationRing`, QR pairing, Android Keystore `BiometricPrompt` WYSIWYS approval, Ambient Living Graph HUD). Strip hardcoded URLs, real device IDs, FCM credentials, and standalone consumer app links. |
+| `packages/world-model/*` | Read overview | Phase 5 (`W-1`, `W-2`, `W-3`) | Scrubbed extraction (D-20): Living Life Graph (`GraphStore`, replacing Neo4j), Cognitive Mode Gate (`DEEP_FOCUS`, `HIGH_VELOCITY_EXECUTION`, `EXPLORATORY_LEARNING`, `MAINTENANCE_SURFACING`, `REST_RECOVERY`), Pre-Cognitive Dynamic Wake, Active Inference (`A/B/C/D` tables), next-action prediction log, and `Precision@surface` shadow evaluator. |
+| `packages/mesh/*`, `packages/triad/*` | Read overview | Phase 5 (`W-4`, `W-5`) | Scrubbed extraction (D-20): MCP router, playbooks, swarms, two-phase patch promotion, Advisory Triad, and Morphogenetic self-healing ladder (biometric approval -> earned auto-merge excluding safety/tests/CI/engine); remove any private sibling-repo defaults or local user config. |
+| `apps/mobile/src/pages/LivingBrain.tsx` | Read | None | **Do not port.** Unrepeatable force layout; superseded by recorded/seeded `GraphStore` snapshots (A-11). |
+| `packages/databank/ops/*.sh`, `*.service`, `deploy.sh`, `windows/` | Listing only | None | **Do not port.** Machine-specific deployment scripts for personal hosts. |
+| `packages/databank/ops/*.py`, `enrich/`, `intake/`, `phone-feed/`, `tags-*.ts`, `weekly-digests.ts`, `summarize-model.ts` | Listing only | None | **Do not port.** Personal pipelines replaced by generic Phase 4 extractors (`E-3`). |
+| `packages/databank/ops/ask-bench.ts` and its question set | Listing only | None | **Do not port.** Benchmark questions contain real personal events; Foundry uses synthetic fixtures only. |
+| `packages/databank/migrate-sensitivity.ts`, `sensitivity-migration.ts`, `tags-ddl.ts`, `ledger-bridge.ts`, `authority.ts`, `.env*`, standalone consumer apps | Not read | None | **Do not port.** Predecessor-specific migrations, secrets, and external consumer products remain excluded. |
 | The decision-log tool in the separate orchestrator project (`triad/decision_log.py`) | Read | `packages/facts-ledger` reads and writes its file format | Not ported. Foundry's ledger is a compatible superset. A small change to that tool (lock and last-byte check) is proposed in package Z-8. |
 
 ## 3. What must change in anything that is ported
@@ -92,7 +94,9 @@ against the tree **and** against every release archive.
 | 3 | Generic index tables and search ported through the gate | V-4 |
 | 4 | Contacts parser ported; calendar and mail written new | V-5 |
 | 5 | Generic sensitivity rules ported | P-1 |
-| 6 | Location parser ported | X-1 |
+| 6 | Location parser and additional synthetic-fixture importers ported | X-1, X-2 |
+| 7 | Remember Live Stack: event bus, memory, `exocortexd`, recap cards, encrypted channels, `llama.cpp` runner, Tauri desktop, Android companion | Phase 4 (`E-1` to `E-6`) |
+| 8 | Act Stack: Living World Model, Cognitive Mode Gate, Active Inference, Shadow calibration & WYSIWYS actuation, Agent Mesh/Triad, Morphogenetic ladder | Phase 5 (`W-1` to `W-5`) |
 
 ## 6. Later: the predecessor adopts Foundry
 

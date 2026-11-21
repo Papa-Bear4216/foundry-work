@@ -230,7 +230,7 @@ const report = {
     scopeNote:
       'V-0 measures isolated primitives in individual benchmark child processes (startup through measurement/exit), not full end-to-end commands or launcher+helper trees.',
     policyNote:
-      'CI fails if KDF exceeds its 256 MiB allowance, if any isolated probe exceeds the 256 MiB runaway-memory sanity guard, or if any functional/security check fails. Provisional Architecture section 9 full-command ceilings (vault verify 128 MiB, search 192 MiB) are reported for reference only and deferred to implementing packages per A-24.',
+      'CI fails if KDF exceeds its 256 MiB allowance, if any isolated probe exceeds the 256 MiB runaway-memory sanity guard, or if any functional/security check fails. Provisional Architecture section 9 full-command ceilings (vault verify 128 MiB, search 192 MiB) are reported for reference only and deferred to implementing packages per A-26.',
     kdfBudgetMiB: 256,
     kdfMaxMiB: Number((kdfMaxBytes / MIB).toFixed(2)),
     kdfWithinBudget: kdfMaxBytes <= 256 * MIB,

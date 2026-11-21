@@ -75,7 +75,7 @@ A builder cannot complete these. Ask early; each one blocks the packages named.
 | Id | What the owner supplies | Blocks |
 |---|---|---|
 | O-1 | A **private** working repository on the code host, set as this repository's remote, with CI enabled. It is not the public repository: that is created at P-8 from a clean export. Before the first push, check the current free CI allowance for private repositories and how Windows minutes are counted. | Z-0 "done", so everything |
-| O-2 | A clean Windows 11 install with Smart App Control switched on, which a builder can run a test on (a local virtual machine is enough). | V-0, P-6 |
+| O-2 | A clean Windows 11 install with Smart App Control switched on, which a builder can run a test on (a local virtual machine is enough). | P-6 (D-22: no longer blocks V-0) |
 | O-3 | The application for free open-source code signing (D-16). Check the programme's terms first: if it requires a public repository, the application waits for P-8 and that is recorded as a decision. | P-8 |
 | O-4 | The private pattern scan (names, hostnames, account identifiers), run locally with the Markdown allowlist removed, against the tree and every archive. The pattern file stays outside every repository. | V-8 before anyone outside receives a package; P-7 |
 | O-5 | Approval of the change Z-8 proposes to the existing Python log tool. That tool lives in another repository. | Closes R-7; does not block Z-8 |
@@ -100,7 +100,7 @@ files are covered in section 7. Needs, specification sections and "Done when" ar
 | Z-5 | Antigravity | Codex | `packages/facts-ledger` | |
 | Z-6 | Antigravity | Codex | `packages/facts-ledger`, CI workflow | Expected outputs are committed and matched exactly. |
 | Z-7 | Antigravity | Codex | `packages/facts-ledger` | After merge the orchestrator runs rule 7 for both builder models and commits the results. |
-| Z-8 | Antigravity | Codex | Agent instruction files at the root, the first digest; a proposed change in the other repository, **not merged** | Needs a claim in that other project too. O-5 approves the proposal. |
+| Z-8 | Codex (D-23; was Antigravity) | Antigravity, Claude | Agent instruction files at the root, the first digest; a proposed change in the other repository, **not merged** | Needs a claim in that other project too. O-5 approves the proposal. |
 
 ### Phase 1: thin slice
 
@@ -143,7 +143,28 @@ Provisional. Confirm these at the Phase 2 exit: the roster and the order may hav
 | X-6 | Codex | Antigravity, Claude | `packages/vault` (Mode A), pairing | Home network first. |
 | X-7 | Antigravity (packaging: `.deb`, macOS, Linux arm64); Codex (the compact command) | Each reviews the other's half; Claude reviews the compact command | Packaging files; `packages/vault` | Two halves, two branches. X-7 is done when both are merged. |
 
-Phase 4 (the predecessor adopts Foundry) is not assigned. It needs the owner's approval and
+### Phase 4: Remember Live Stack (Opt-in Tier 1+)
+
+| Id | Writer | Review | Writes in | Notes |
+|---|---|---|---|---|
+| E-1 | Codex | Antigravity | `packages/core`, `packages/memory` | Event bus, pattern analyzer, speculative dry-run cache, local token/vector memory. Scrub gate mandatory. |
+| E-2 | Codex | Antigravity, Claude | `apps/daemon` (`exocortexd` core) | Hash-chained event log, device enrollment, JWT auth, attestation, strict local-host default without home-proxy lock-in. |
+| E-3 | Antigravity | Codex | `packages/core`, `apps/daemon` | Write-time session recap cards (anti-trust-breaker tests), encrypted `ChannelVault` adapters (Obsidian/Notion/Gmail), autonomic `FVR1`/SQLCipher archival. |
+| E-4 | Antigravity | Codex | `apps/daemon` (`llama.cpp` role runner) | Bounded optional local `llama.cpp` role launcher (`triage`, `embed`, `vision`) with explicit opt-in toggle and stop-on-disable. |
+| E-5 | Antigravity | Codex | `apps/desktop` | Tauri tray shell, daemon discovery, generic Command Center UI. |
+| E-6 | Antigravity | Codex, Claude | `apps/mobile` | Capacitor Android companion: accessibility capture, Recent tab + widget, `AnticipationRing`, QR pairing, Android Keystore `BiometricPrompt` WYSIWYS approval, Ambient Living Graph HUD. Zero real device IDs or hardcoded URLs. |
+
+### Phase 5: Act — World Model, Shadow Calibration & Earned Autonomy (Opt-in Tier 1–2)
+
+| Id | Writer | Review | Writes in | Notes |
+|---|---|---|---|---|
+| W-1 | Codex | Antigravity | `packages/world-model` | Living Life Graph (`GraphStore`) with spreading/decaying activation and generic replay from event log (no Neo4j). |
+| W-2 | Codex | Antigravity, Claude | `packages/world-model` | Cognitive Mode Gate (5 states), Pre-Cognitive Dynamic Wake (`p20` quantile), Active Inference (`A/B/C/D`), next-action prediction log. |
+| W-3 | Antigravity | Codex, Claude | `packages/core`, `apps/daemon`, `packages/world-model` | Shadow recorder, `wanted`/`not_wanted` + `InferredOutcomeScheduler`, `Precision@surface >= 0.90` / 14-day / 50-label gate, fail-closed `SHADOW=1` default & single-use attested WYSIWYS actuation. |
+| W-4 | Codex | Antigravity, Claude | `packages/mesh`, `packages/triad` | Agent Mesh MCP router, playbooks, swarms, Advisory Triad bridge, capability-scoped `/network/delegate` default-deny allowlist. |
+| W-5 | Codex | Antigravity, Claude | `packages/triad`, `packages/mesh` | Morphogenetic self-healing patch ladder (disabled by default; no-network container tests, diff cap, `morpho/<id>` branch -> biometric approval -> earned auto-merge excluding safety/tests/CI/engine). |
+
+Phase 6 (the predecessor adopts Foundry) is not assigned. It needs the owner's approval and
 its own plan.
 
 ## 6. Dispatch order
@@ -164,7 +185,9 @@ builder waiting on the other queue stays idle; it does not start a package out o
 | 9 | P-3 | V-8, then P-1, then P-6 |
 | 10 | P-2 | P-5 |
 | 11 | P-4, then P-7 | reviews |
-| 12 | Owner: P-8 | |
+| 12 | Owner: P-8 (public release of Tiers 0–3 foundation) | |
+| 13 | Phase 3 (`X-3`, `X-4`, `X-6`) + Phase 4 (`E-1`, `E-2`) | Phase 3 (`X-1`, `X-2`, `X-5`, `X-7`) + Phase 4 (`E-3`, `E-4`, `E-5`, `E-6`) |
+| 14 | Phase 5 (`W-1`, `W-2`, `W-4`, `W-5`) | Phase 5 (`W-3`, reviews & integration gates) |
 
 Phase exits are checked by the orchestrator and reviewed by Claude before the next phase's
 first package is merged:
@@ -172,6 +195,9 @@ first package is merged:
 - Phase 0: both Step Zero deliverables green in CI on both platforms, one harness run committed.
 - Phase 1: the 1 GiB synthetic archive goes from `foundry init` to a search result on a Tier 0 machine.
 - Phase 2: every success measure in Product section 11 is measured and recorded.
+- Phase 3: multi-source importers, local embeddings/ask/verifier, relational map, and Mode A sync verified with synthetic fixtures.
+- Phase 4: opt-in Remember live stack (`exocortexd`, recap cards, encrypted channels, desktop shell, Android companion) builds and passes synthetic end-to-end tests with zero personal identifiers.
+- Phase 5: opt-in Act stack stays fail-closed in `SHADOW=1` by default, passes biometric WYSIWYS + capability deny gates, and verifies Morphogenetic ladder safety exclusions.
 
 Sizes in the roadmap add up to roughly 30 working days per queue. They are estimates for
 planning, not commitments, and they exclude review time.
@@ -237,7 +263,7 @@ Report back: commits, the commands you ran and their output, each "Done when" li
 | K-1 | The repository has no remote, so "CI on Windows and Linux" cannot be true for any package. | O-1. |
 | K-2 | V-8 and P-6 ask for a registry package and build provenance before the public repository and the final name exist (D-14 leaves the name open until P-8). As the planner recalls, the package registry refuses provenance from a private source repository and the code host's build attestations for private repositories need a paid plan; **not verified on this date**. | The V-8 writer verifies both first. If true, the planner recommends: V-8 delivers a CI-built package tarball handed to testers directly, and provenance attaches at the first public release. This changes "Done when" for V-8 and P-6 and touches D-17, so the owner rules (O-6) and the ruling is recorded before V-8 is built. |
 | K-3 | CI cost. The gates generate large fixtures (a 10,000-block log, a 1 GiB mail file) on two platforms, and Windows minutes may count more than once against a free allowance. | Measure minutes used after Z-1 and V-0. If the free allowance would be exceeded, stop and ask the owner. Moving a gate off "every push" needs a recorded decision. |
-| K-4 | The Smart App Control test needs a machine no CI runner provides. | O-2. V-0's other lines can be finished first; the package is not done without this one. |
+| K-4 | The Smart App Control test needs a machine no CI runner provides. | O-2. D-22 moves this test to P-6; V-0 merges without it. |
 | K-5 | Z-8 proposes a change in another repository. | Deliver it as an unmerged branch or patch there, with a claim in that project. O-5. |
 | K-6 | Only two builders exist. Grok and Cursor are absent, so every review that is not from the other builder comes from Claude. | Rule 6. If the owner installs another agent, add it as a reviewer first and as a builder only after it passes rule 7. |
 | K-7 | The mesh policy requires a plan to have an approving review before execution. | If the work runs through the mesh, register this file as the plan and get that review from a provider other than Claude, since Claude wrote it. |
@@ -247,3 +273,4 @@ Report back: commits, the commands you ran and their output, each "Done when" li
 | Date | Entry |
 |---|---|
 | 2026-11-19 | First version. Every roadmap package assigned. Nothing dispatched, nothing built. |
+| 2026-11-19 | Expanded for D-20 and D-21: added Phase 4 (`E-1`..`E-6`) and Phase 5 (`W-1`..`W-5`) full public Sovereign Exocortex assignments and phase exits; renumbered Predecessor Adoption to Phase 6. |
