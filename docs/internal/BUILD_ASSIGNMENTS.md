@@ -78,7 +78,7 @@ A builder cannot complete these. Ask early; each one blocks the packages named.
 | O-2 | A clean Windows 11 install with Smart App Control switched on, which a builder can run a test on (a local virtual machine is enough). | P-6 (D-22: no longer blocks V-0) |
 | O-3 | The application for free open-source code signing (D-16). Check the programme's terms first: if it requires a public repository, the application waits for P-8 and that is recorded as a decision. | P-8 |
 | O-4 | The private pattern scan (names, hostnames, account identifiers), run locally with the Markdown allowlist removed, against the tree and every archive. The pattern file stays outside every repository. | V-8 before anyone outside receives a package; P-7 |
-| O-5 | Approval of the change Z-8 proposes to the existing Python log tool. That tool lives in another repository. | Closes R-7; does not block Z-8 |
+| O-5 | Approval of the change Z-8 proposes to the existing Python log tool. That tool lives in another repository. | Done 2026-11-21 (autonomous-triad #8). R-7 closed. |
 | O-6 | A ruling on conflict K-2 (section 9). | V-8 |
 | O-7 | P-8 in full: name, package scope, hosting organisation, the public repository, the single first commit, the 0.1.0 tag. | Release |
 
