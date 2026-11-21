@@ -1,9 +1,10 @@
+import type { Buffer } from 'node:buffer';
 import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { check } from './bytes.ts';
 import {
   changeKeyringPassphrase, decodeKeyring, encodeKeyring, nextKeyringVersion, readKeyring, replacementParallelism,
-  unlockKeyring, validateParallelism,
+  unlockKeyring, validateParallelism, vaultKey,
 } from './keyring.ts';
 import type { KdfParallelism } from './keyring.ts';
 import { publishKeyring } from './keyring-file.ts';
@@ -67,8 +68,18 @@ export function changePassphrase(
 }
 
 interface RekeyOptions extends PassphraseOptions {
-  /** The writer's complete set of current collection IDs, excluding historical and destroyed IDs. */
+  /** Together these lists must partition all active collection IDs. */
   currentCollectionIds: readonly string[];
+  historicalCollectionIds: readonly string[];
+  /** Called synchronously under the writer lock. The tombstone buffers are borrowed for the call. */
+  beforePublish?: (handoff: RekeyHandoff) => undefined;
+}
+
+export interface RekeyHandoff {
+  oldTombstoneKey: Buffer;
+  newTombstoneKey: Buffer;
+  collectionIds: ReadonlyMap<string, string>;
+  indexKeyId: string;
 }
 
 /** Rotate keys for future writes. The result contains a new, one-time recovery key and the writer's new collection IDs. */
@@ -80,46 +91,76 @@ export function rekeyAll(path: string, vaultId: string, credential: Credential, 
   const parallelism = replacementParallelism(ring.kdf.p, options.parallelism);
   const activeCollections = new Set(ring.keys.filter(entry => entry.kind === 'collection' && entry.state === 'active')
     .map(entry => entry.key_id));
+  check(Array.isArray(options.currentCollectionIds) && Array.isArray(options.historicalCollectionIds), 'KEY');
   const currentIds = new Set(options.currentCollectionIds);
+  const historicalIds = new Set(options.historicalCollectionIds);
   check(currentIds.size === options.currentCollectionIds.length
+    && historicalIds.size === options.historicalCollectionIds.length
+    && currentIds.size + historicalIds.size === activeCollections.size
     && [...currentIds].every(id => activeCollections.has(id))
-    && (activeCollections.size === 0 || currentIds.size > 0), 'KEY');
+    && [...historicalIds].every(id => activeCollections.has(id) && !currentIds.has(id)), 'KEY');
+  check(('passphrase' in credential) !== ('recoveryKey' in credential), 'KEY');
   const oldRecovery = 'recoveryKey' in credential ? decodeRecoveryKey(credential.recoveryKey) : undefined;
   try {
     const unlocked = unlockKeyring(ring, 'passphrase' in credential ? credential : { recoveryKey: oldRecovery! });
-    const masterKey = randomBytes(32);
-    const recovery = randomBytes(32);
-    const generated = [masterKey, recovery];
+    const generated: Buffer[] = [];
     try {
+      const newKey = () => {
+        const key = randomBytes(32);
+        generated.push(key);
+        return key;
+      };
+      const masterKey = newKey();
+      const recovery = newKey();
       const created_at = now();
       const ids = new Set(ring.keys.map(entry => entry.key_id));
+      const newId = () => {
+        let id: string;
+        do id = randomBytes(16).toString('hex'); while (ids.has(id));
+        ids.add(id);
+        return id;
+      };
       const collectionIds = new Map<string, string>();
       const entries = ring.keys.flatMap<Parameters<typeof encodeKeyring>[0]['entries'][number]>(entry => {
         if (entry.state === 'destroyed') return [entry];
         const { key_id, kind, parent, state } = entry;
+        if (kind === 'index') return [{ key_id, kind, parent, state: 'destroyed', destroyed_at: created_at }];
         const identity = { key_id, kind, parent, state };
         const oldKey = unlocked.keys.get(key_id)!;
-        if (kind === 'signing') return [{ ...identity, created_at: entry.created_at, key: oldKey }];
-        if (kind === 'collection' && !currentIds.has(key_id)) {
-          return [{ ...identity, created_at: entry.created_at, key: oldKey }];
-        }
-        const key = randomBytes(32);
-        generated.push(key);
+        const retained = { ...identity, created_at: entry.created_at, key: oldKey };
         if (kind === 'collection') {
-          let nextId: string;
-          do nextId = randomBytes(16).toString('hex'); while (ids.has(nextId));
-          ids.add(nextId);
+          if (!currentIds.has(key_id)) return [retained];
+          const nextId = newId();
           collectionIds.set(key_id, nextId);
-          return [
-            { ...identity, created_at: entry.created_at, key: oldKey },
-            { ...identity, key_id: nextId, created_at, key },
-          ];
+          return [retained, { ...identity, key_id: nextId, created_at, key: newKey() }];
         }
-        return [{ ...identity, created_at, key, label: unlocked.labels.get(key_id) }];
+        if (kind === 'signing') return [retained];
+        return [{ ...identity, created_at, key: newKey(), label: unlocked.labels.get(key_id) }];
       });
+      const indexKeyId = newId();
+      entries.push({ key_id: indexKeyId, kind: 'index', parent: 'master', state: 'active', created_at, key: newKey() });
       const next = encodeKeyring({ vaultId, version, masterKey, entries, parallelism }, options.passphrase, recovery);
-      const result = { recoveryKey: formatRecoveryKey(recovery), collectionIds };
-      publishKeyring(path, next, previous);
+      const verified = decodeKeyring(next, { recoveryKey: recovery }, vaultId);
+      verified.masterKey.fill(0);
+      for (const key of verified.keys.values()) key.fill(0);
+
+      const result = { recoveryKey: formatRecoveryKey(recovery), collectionIds, indexKeyId };
+      const beforePublish = options.beforePublish;
+      publishKeyring(path, next, previous, beforePublish && (() => {
+        const oldTombstoneKey = vaultKey(unlocked.masterKey, vaultId, 'tombstone');
+        try {
+          const newTombstoneKey = vaultKey(masterKey, vaultId, 'tombstone');
+          try {
+            check(beforePublish({
+              oldTombstoneKey, newTombstoneKey, collectionIds: new Map(collectionIds), indexKeyId,
+            }) === undefined, 'KEY');
+          } finally {
+            newTombstoneKey.fill(0);
+          }
+        } finally {
+          oldTombstoneKey.fill(0);
+        }
+      }));
       return result;
     } finally {
       for (const key of generated) key.fill(0);

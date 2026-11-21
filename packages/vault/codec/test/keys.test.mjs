@@ -1,18 +1,20 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { fork, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
+import { once } from 'node:events';
 import fs, { mkdtempDisposableSync, readFileSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { canonical, derive } from '../src/bytes.ts';
+import { parseArgs } from 'node:util';
+import { canonical, derive, seal } from '../src/bytes.ts';
 import { publishKeyring } from '../src/keyring-file.ts';
 import { formatRecoveryKey } from '../src/recovery.ts';
 import {
   changePassphrase, create, decodeKeyring, decodeRecord, decodeRecoveryKey, rekeyAll,
-  signingPublicKey, unlockByPassphrase, unlockByRecovery,
+  guardSecretInput, readSecretFromFd, signingPublicKey, unlockByPassphrase, unlockByRecovery,
 } from '../src/index.ts';
 
 // TEST ONLY: these credentials and all generated keyrings are synthetic.
@@ -93,13 +95,23 @@ test('rekey rotates future write keys, keeps history readable and preserves eras
   const initial = Buffer.from(canonical({ ...body, mac }));
   writeFileSync(path, initial);
   const { collection, profile, index, signing, erased } = cases.ids;
-  const options = { passphrase: third, currentCollectionIds: [collection] };
+  const options = { passphrase: third, currentCollectionIds: [collection], historicalCollectionIds: [] };
   assert.throws(() => rekeyAll(path, vectorId, { recoveryKey: vectorText }, {
     ...options, currentCollectionIds: [erased],
   }), { code: 'KEY' });
   assert.deepEqual(readFileSync(path), initial);
 
-  const { recoveryKey, collectionIds } = rekeyAll(path, vectorId, { recoveryKey: vectorText }, options);
+  let handoff;
+  let newTombstoneKey;
+  const { recoveryKey, collectionIds, indexKeyId } = rekeyAll(path, vectorId, { recoveryKey: vectorText }, {
+    ...options,
+    beforePublish(value) {
+      handoff = value;
+      assert.deepEqual(readFileSync(path), initial);
+      assert.deepEqual(value.oldTombstoneKey, derive(before.masterKey, 'tombstone', Buffer.from(vectorId, 'hex')));
+      newTombstoneKey = Buffer.from(value.newTombstoneKey);
+    },
+  });
   const currentCollection = collectionIds.get(collection);
   assert.equal(collectionIds.size, 1);
   assert.notEqual(currentCollection, collection);
@@ -111,12 +123,24 @@ test('rekey rotates future write keys, keeps history readable and preserves eras
   assert.equal(after.keyring.version, body.version + 1);
   assert.notEqual(after.keyring.kdf.salt, before.keyring.kdf.salt);
   assert.notDeepEqual(after.masterKey, before.masterKey);
-  for (const id of [profile, index]) assert.notDeepEqual(after.keys.get(id), before.keys.get(id));
+  assert.notDeepEqual(after.keys.get(profile), before.keys.get(profile));
+  assert.notEqual(indexKeyId, index);
+  assert.notDeepEqual(after.keys.get(indexKeyId), before.keys.get(index));
+  assert.equal(after.keys.has(index), false);
+  assert.deepEqual(handoff.collectionIds, collectionIds);
+  assert.equal(handoff.indexKeyId, indexKeyId);
+  assert.deepEqual(newTombstoneKey, derive(after.masterKey, 'tombstone', Buffer.from(vectorId, 'hex')));
+  assert.deepEqual(handoff.oldTombstoneKey, Buffer.alloc(32));
+  assert.deepEqual(handoff.newTombstoneKey, Buffer.alloc(32));
   assert.deepEqual(after.labels, before.labels);
   assert.deepEqual(after.keys.get(signing), before.keys.get(signing));
   const entry = (ring, id) => ring.keyring.keys.find(key => key.key_id === id);
   assert.notEqual(entry(after, signing).wrapped, entry(before, signing).wrapped);
-  assert.deepEqual(after.erased, before.erased);
+  assert.deepEqual(after.erased, new Map([...before.erased, [index, entry(after, index).destroyed_at]]));
+  assert.deepEqual(entry(after, index), {
+    key_id: index, kind: 'index', parent: 'master', state: 'destroyed', wrapped: null,
+    destroyed_at: entry(after, indexKeyId).created_at,
+  });
   assert.deepEqual(entry(after, erased), entry(before, erased));
   assert.throws(() => after.collectionEncryptionKey(erased), { code: 'ERASED' });
   const oldKey = before.collectionEncryptionKey(collection);
@@ -129,10 +153,13 @@ test('rekey rotates future write keys, keeps history readable and preserves eras
     [oldKey.toString('hex'), newKey.toString('hex')]);
 
   const again = rekeyAll(path, vectorId, { recoveryKey }, {
-    passphrase: third, currentCollectionIds: [currentCollection],
+    passphrase: third, currentCollectionIds: [currentCollection], historicalCollectionIds: [collection],
   });
   const latest = unlockByRecovery(path, vectorId, again.recoveryKey);
-  assert.equal(latest.keyring.keys.length, after.keyring.keys.length + 1);
+  assert.equal(latest.keyring.keys.length, after.keyring.keys.length + 2);
+  assert.deepEqual(entry(latest, index), entry(after, index));
+  assert.equal(entry(latest, indexKeyId).state, 'destroyed');
+  assert.notEqual(again.indexKeyId, indexKeyId);
   assert.deepEqual(latest.collectionEncryptionKey(collection), oldKey);
   assert.deepEqual(latest.collectionEncryptionKey(currentCollection), newKey);
 });
@@ -150,21 +177,21 @@ test('out-of-bounds headers and upgrades fail before scrypt', t => {
       assert.throws(() => unlockByRecovery(path, vectorId, vectorText), { code: 'KDF' });
       assert.throws(() => changePassphrase(path, vectorId, first, { passphrase: second }), { code: 'KDF' });
       assert.throws(() => rekeyAll(path, vectorId, { passphrase: first }, {
-        passphrase: second, currentCollectionIds: [cases.ids.collection],
+        passphrase: second, currentCollectionIds: [cases.ids.collection], historicalCollectionIds: [],
       }), { code: 'KDF' });
     }
     writeFileSync(path, vector('ring-p2.json'));
     for (const parallelism of [0, 1, 3]) {
       assert.throws(() => changePassphrase(path, vectorId, first, { passphrase: second, parallelism }), { code: 'KDF' });
       assert.throws(() => rekeyAll(path, vectorId, { passphrase: first }, {
-        passphrase: second, parallelism, currentCollectionIds: [cases.ids.collection],
+        passphrase: second, parallelism, currentCollectionIds: [cases.ids.collection], historicalCollectionIds: [],
       }), { code: 'KDF' });
     }
     assert.throws(() => create(path, { passphrase: first, parallelism: 3 }), { code: 'KDF' });
     writeFileSync(path, vector(cases.changed_keyring));
     assert.throws(() => changePassphrase(path, vectorId, first, { passphrase: second }), { code: 'SCHEMA' });
     assert.throws(() => rekeyAll(path, vectorId, { passphrase: first }, {
-      passphrase: second, currentCollectionIds: [cases.ids.collection],
+      passphrase: second, currentCollectionIds: [cases.ids.collection], historicalCollectionIds: [],
     }), { code: 'SCHEMA' });
     assert.equal(mockKdf.mock.callCount(), 0);
   } finally {
@@ -186,30 +213,249 @@ test('slot and vault transplantation fail authentication before the MAC check', 
   assert.throws(() => decodeKeyring(vector('entry-slot-swap.json'), { recoveryKey: vectorRecovery }, vectorId), { code: 'AUTH' });
 });
 
+test('rekey requires a full, disjoint partition and exactly one credential before scrypt', t => {
+  const ring = JSON.parse(vector(cases.keyring));
+  const { collection } = cases.ids;
+  const another = 'fe'.repeat(16);
+  ring.keys.push({ ...ring.keys.find(key => key.key_id === collection), key_id: another });
+  ring.keys.sort((a, b) => a.key_id.localeCompare(b.key_id));
+  const initial = Buffer.from(canonical(ring));
+  const path = testPath(t, initial);
+  const mockKdf = t.mock.method(crypto, 'scryptSync', () => assert.fail('scrypt must not run'));
+  syncBuiltinESMExports();
+  try {
+    const credential = { passphrase: first };
+    for (const [currentCollectionIds, historicalCollectionIds] of [
+      [[collection], []],
+      [[collection], [collection]],
+      [[collection], ['ff'.repeat(16)]],
+      [[collection, another], undefined],
+    ]) {
+      assert.throws(() => rekeyAll(path, vectorId, credential, {
+        passphrase: second, currentCollectionIds, historicalCollectionIds,
+      }), { code: 'KEY' });
+    }
+    assert.throws(() => rekeyAll(path, vectorId, { ...credential, recoveryKey: vectorText }, {
+      passphrase: second, currentCollectionIds: [collection], historicalCollectionIds: [another],
+    }), { code: 'KEY' });
+    assert.throws(() => decodeKeyring(initial, { ...credential, recoveryKey: vectorRecovery }, vectorId), { code: 'KEY' });
+    assert.equal(mockKdf.mock.callCount(), 0);
+    assert.deepEqual(readFileSync(path), initial);
+  } finally {
+    mockKdf.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('a throwing rekey handoff leaves the original bytes and clears borrowed keys', t => {
+  const initial = vector(cases.keyring);
+  const path = testPath(t, initial);
+  const failure = new Error('TEST ONLY staging failure');
+  let handoff;
+  const mockKdf = t.mock.method(crypto, 'scryptSync');
+  syncBuiltinESMExports();
+  try {
+    assert.throws(() => rekeyAll(path, vectorId, { passphrase: cases.passphrase }, {
+      passphrase: second, currentCollectionIds: [cases.ids.collection], historicalCollectionIds: [],
+      beforePublish(value) {
+        handoff = value;
+        throw failure;
+      },
+    }), error => error === failure);
+    assert.equal(mockKdf.mock.callCount(), 2);
+    assert.deepEqual(handoff.oldTombstoneKey, Buffer.alloc(32));
+    assert.deepEqual(handoff.newTombstoneKey, Buffer.alloc(32));
+    assert.deepEqual(readFileSync(path), initial);
+    assert.deepEqual(pendingFiles(path), []);
+  } finally {
+    mockKdf.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('a decoded invalid profile label clears the master, unwrapped keys and temporary buffers', t => {
+  const initial = vector(cases.keyring);
+  const original = decodeKeyring(initial, { recoveryKey: vectorRecovery }, vectorId);
+  const { mac: _mac, ...body } = original.keyring;
+  const profile = body.keys.find(key => key.kind === 'profile');
+  const salt = Buffer.from(vectorId, 'hex');
+  const invalidText = Buffer.from([0xff]);
+  const nonce = Buffer.alloc(12, 0xd1);
+  profile.label_enc = Buffer.concat([nonce, seal(derive(original.masterKey, 'profile-label', salt), nonce,
+    Buffer.from(canonical([body.format, vectorId, profile.key_id, 'profile-label', profile.parent, null])),
+    invalidText)]).toString('base64');
+  const mac = crypto.createHmac('sha256', derive(original.masterKey, 'keyring-mac', salt))
+    .update(canonical(body)).digest('base64');
+  const tampered = Buffer.from(canonical({ ...body, mac }));
+  const decryptions = t.mock.method(Buffer, 'concat');
+  const derivations = t.mock.method(crypto, 'hkdfSync');
+  syncBuiltinESMExports();
+  try {
+    assert.throws(() => decodeKeyring(tampered, { recoveryKey: vectorRecovery }, vectorId), { code: 'SCHEMA' });
+    const plaintext = decryptions.mock.calls.map(call => call.result);
+    assert.ok(plaintext.filter(bytes => bytes.length === 32).length >= 2);
+    assert.equal(plaintext.at(-1).length, invalidText.length);
+    for (const bytes of plaintext) assert.deepEqual(bytes, Buffer.alloc(bytes.length));
+    assert.deepEqual(derivations.mock.calls.map(call => call.arguments[3].toString()), [
+      'foundry/recovery-wrap/v1', 'foundry/keyring-mac/v1', 'foundry/profile-label/v1',
+    ]);
+    for (const call of derivations.mock.calls) assert.deepEqual(Buffer.from(call.result), Buffer.alloc(32));
+  } finally {
+    decryptions.mock.restore();
+    derivations.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
+
 test('printed recovery text rejects version, grouping, and checksum mistakes', () => {
   assert.deepEqual(decodeRecoveryKey(vectorText), vectorRecovery);
   assert.throws(() => decodeRecoveryKey('2' + vectorText.slice(1)), /format/u);
   assert.throws(() => decodeRecoveryKey(vectorText.replace('-', '')), /format/u);
   const wrong = vectorText.slice(0, -1) + (vectorText.endsWith('A') ? 'B' : 'A');
   assert.throws(() => decodeRecoveryKey(wrong), /checksum/u);
+  assert.throws(() => formatRecoveryKey(Buffer.alloc(31)), { code: 'KEY' });
+  assert.throws(() => formatRecoveryKey(Buffer.alloc(33)), { code: 'KEY' });
+
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  const payload = vectorText.replaceAll('-', '').slice(1, 53);
+  const withPadding = payload.slice(0, -1) + alphabet[alphabet.indexOf(payload.at(-1)) | 1];
+  const hash = crypto.createHash('sha256').update('1' + withPadding).digest();
+  const top20 = (hash[0] << 12) | (hash[1] << 4) | (hash[2] >> 4);
+  const checksum = [15, 10, 5, 0].map(shift => alphabet[(top20 >> shift) & 31]).join('');
+  const nonCanonical = '1-' + (withPadding + checksum).match(/.{4}/gu).join('-');
+  assert.throws(() => decodeRecoveryKey(nonCanonical), /padding/u);
 });
 
-test('competing or stale writers preserve the last published keyring', t => {
+function pendingFiles(path) {
+  return fs.readdirSync(dirname(path)).filter(name => name.startsWith(basename(path) + '.pending-'));
+}
+
+function startWriter(t, path, mode, ready) {
+  const child = fork(fileURLToPath(new URL('./keyring-writer.mjs', import.meta.url)), [path, mode], {
+    execArgv: [], windowsHide: true,
+  });
+  const messages = [];
+  child.on('message', message => messages.push(message));
+  const exited = once(child, 'exit');
+  const waiting = new Promise((resolve, reject) => {
+    function onMessage(message) {
+      if (message === ready) {
+        child.off('message', onMessage);
+        resolve();
+      }
+    }
+    child.on('message', onMessage);
+    exited.then(([code, signal]) => reject(new Error('Writer exited before readiness (' + (signal ?? code) + ').')), reject);
+  });
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    await exited;
+  });
+  return { child, messages, exited, waiting };
+}
+
+test('a killed lock holder leaves the old keyring readable and the next writer recovers', { timeout: 15_000 }, async t => {
   const initial = vector(cases.keyring);
   const next = vector(cases.changed_keyring);
   const path = testPath(t, initial);
-  const pending = path + '.pending';
-  writeFileSync(pending, next);
-  assert.throws(() => publishKeyring(path, next, initial), /in progress or was interrupted/u);
+  const writer = startWriter(t, path, 'hold', 'temp-synced');
+  await writer.waiting;
+  assert.equal(pendingFiles(path).length, 1);
+  if (process.platform === 'win32') {
+    const killed = spawnSync('taskkill.exe', ['/F', '/PID', String(writer.child.pid)], { windowsHide: true, timeout: 5000 });
+    assert.ifError(killed.error);
+    // Restricted runners may forbid taskkill from opening the PID. The parent already holds its process handle.
+    if (killed.status !== 0) assert.ok(writer.child.kill('SIGKILL'), killed.stderr.toString());
+  } else {
+    assert.ok(writer.child.kill('SIGKILL'));
+  }
+  assert.notDeepEqual(await writer.exited, [0, null]);
+  assert.equal(pendingFiles(path).length, 1);
   assert.deepEqual(readFileSync(path), initial);
-  assert.deepEqual(readFileSync(pending), next);
-  fs.unlinkSync(pending);
-  assert.throws(() => publishKeyring(path, next, next), /changed during rewrite/u);
-  assert.deepEqual(readFileSync(path), initial);
-  assert.equal(fs.existsSync(pending), false);
+  assert.equal(unlockByRecovery(path, vectorId, vectorText).keyring.version, JSON.parse(initial).version);
+  const unrelated = join(dirname(path), 'different.json.pending-' + 'ab'.repeat(16));
+  const similar = path + '.pending-keep';
+  writeFileSync(unrelated, '');
+  writeFileSync(similar, '');
   publishKeyring(path, next, initial);
   assert.deepEqual(readFileSync(path), next);
-  assert.equal(fs.existsSync(pending), false);
+  assert.deepEqual(pendingFiles(path), [basename(similar)]);
+  assert.ok(fs.existsSync(unrelated));
+});
+
+test('concurrent writers serialize and the loser rejects its stale input', { timeout: 15_000 }, async t => {
+  const initial = vector(cases.keyring);
+  const next = vector(cases.changed_keyring);
+  const path = testPath(t, initial);
+  const firstWriter = startWriter(t, path, 'hold', 'temp-synced');
+  await firstWriter.waiting;
+  const laterWriter = startWriter(t, path, 'compete', 'attempting');
+  await laterWriter.waiting;
+  writeFileSync(path + '.release', '');
+  assert.deepEqual(await firstWriter.exited, [0, null]);
+  assert.deepEqual(await laterWriter.exited, [0, null]);
+  assert.deepEqual(firstWriter.messages, ['attempting', 'temp-synced', 'published']);
+  assert.deepEqual(laterWriter.messages, ['attempting', 'stale']);
+  assert.deepEqual(readFileSync(path), next);
+  assert.deepEqual(pendingFiles(path), []);
+});
+
+test('POSIX syncs and closes the temp file, then renames and syncs its parent directory',
+  { skip: process.platform === 'win32' }, t => {
+    const initial = vector(cases.keyring);
+    const path = testPath(t, initial);
+    const event = [];
+    const mocks = ['openSync', 'writeFileSync', 'fsyncSync', 'closeSync', 'renameSync'].map(name => {
+      const real = fs[name];
+      return t.mock.method(fs, name, (...args) => {
+        const result = real(...args);
+        event.push({ name, args, result });
+        return result;
+      });
+    });
+    syncBuiltinESMExports();
+    try {
+      publishKeyring(path, vector(cases.changed_keyring), initial);
+    } finally {
+      mocks.forEach(mock => mock.mock.restore());
+      syncBuiltinESMExports();
+    }
+    const start = event.findIndex(call => call.name === 'openSync' && call.args[1] === 'wx');
+    const calls = event.slice(start);
+    assert.deepEqual(calls.map(call => call.name), [
+      'openSync', 'writeFileSync', 'fsyncSync', 'closeSync', 'renameSync', 'openSync', 'fsyncSync', 'closeSync',
+    ]);
+    const temp = calls[0];
+    const directory = calls[5];
+    for (const call of calls.slice(1, 4)) assert.equal(call.args[0], temp.result);
+    assert.deepEqual(calls[4].args, [temp.args[0], path]);
+    assert.deepEqual(directory.args, [dirname(path), 'r']);
+    for (const call of calls.slice(6)) assert.equal(call.args[0], directory.result);
+  });
+
+test('temp cleanup preserves the primary write error', t => {
+  const initial = vector(cases.keyring);
+  const path = testPath(t, initial);
+  const failure = new Error('TEST ONLY write failure');
+  const write = t.mock.method(fs, 'writeFileSync', () => { throw failure; });
+  const closeSync = fs.closeSync;
+  const close = t.mock.method(fs, 'closeSync', fd => {
+    const isTemp = fs.fstatSync(fd).size === 0;
+    closeSync(fd);
+    if (isTemp) throw new Error('TEST ONLY close failure');
+  });
+  const unlink = t.mock.method(fs, 'unlinkSync', () => { throw new Error('TEST ONLY cleanup failure'); });
+  syncBuiltinESMExports();
+  try {
+    assert.throws(() => publishKeyring(path, vector(cases.changed_keyring), initial), error => error === failure);
+    assert.equal(unlink.mock.callCount(), 1);
+    assert.deepEqual(readFileSync(path), initial);
+  } finally {
+    write.mock.restore();
+    close.mock.restore();
+    unlink.mock.restore();
+    syncBuiltinESMExports();
+  }
 });
 
 test('Windows retries a transient sharing violation', { skip: process.platform !== 'win32' }, t => {
@@ -218,14 +464,19 @@ test('Windows retries a transient sharing violation', { skip: process.platform !
   const path = testPath(t, initial);
   const rename = fs.renameSync;
   let attempts = 0;
+  const wait = t.mock.method(Atomics, 'wait', () => 'timed-out');
   const mockRename = t.mock.method(fs, 'renameSync', (from, to) => {
-    if (++attempts === 1) throw Object.assign(new Error('TEST ONLY sharing violation'), { code: 'EPERM' });
+    if (++attempts <= 9) throw Object.assign(new Error('TEST ONLY sharing violation'), { code: 'EPERM' });
     return rename(from, to);
   });
   syncBuiltinESMExports();
   try {
     publishKeyring(path, next, initial);
-    assert.equal(attempts, 2);
+    assert.equal(attempts, 10);
+    const delays = wait.mock.calls.map(call => call.arguments[3]);
+    assert.ok(delays.slice(1).every((delay, index) => delay >= delays[index]));
+    const retryBudget = delays.reduce((total, delay) => total + delay, 0);
+    assert.ok(retryBudget >= 1750 && retryBudget <= 2250);
     assert.deepEqual(readFileSync(path), next);
   } finally {
     mockRename.mock.restore();
@@ -233,21 +484,57 @@ test('Windows retries a transient sharing violation', { skip: process.platform !
   }
 });
 
-test('the descriptor adapter rejects argv and environment secrets before reading input', () => {
-  const script = fileURLToPath(new URL('./key-probe.mjs', import.meta.url));
-  for (const [args, env, error] of [
-    [['--passphrase', first], {}, /Unexpected command-line arguments/u],
-    [[first], {}, /Unexpected command-line arguments/u],
-    [[], { FOUNDRY_VAULT_PASSPHRASE: first }, /Secret environment variables are refused/u],
-    [[], { FOUNDRY_RECOVERY_KEY: vectorText }, /Secret environment variables are refused/u],
-  ]) {
-    const result = spawnSync(process.execPath, [script, 'create', ...args], {
-      input: 'TEST ONLY invalid JSON', env: { ...process.env, ...env }, encoding: 'utf8', timeout: 10_000,
-    });
-    assert.ifError(result.error);
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, error);
-    assert.equal(result.stdout, '');
-    assert.ok(!result.stderr.includes('TEST ONLY'));
+test('the input guard inspects parsed options, declared positionals and scoped environment names', () => {
+  const parsed = args => parseArgs({
+    args, strict: false, tokens: true, options: { all: { type: 'boolean' }, vault: { type: 'string' } },
+  });
+  const cliError = /Unexpected command-line arguments/u;
+  for (const name of ['passphrase', 'password', 'recovery-key', 'secret']) {
+    for (const args of [['--' + name], ['--' + name, first], ['--' + name + '=' + first]]) {
+      assert.throws(() => guardSecretInput(parsed(args), {}, 1), cliError);
+    }
   }
+  assert.throws(() => guardSecretInput(parsed([first]), {}), cliError);
+  assert.throws(() => guardSecretInput(parsed(['target', '--', first]), {}, 1), cliError);
+  assert.doesNotThrow(() => guardSecretInput(parsed(['--all', '--vault', 'target']), {}));
+  assert.doesNotThrow(() => guardSecretInput(parsed(['--all', 'target']), {}, 1));
+
+  for (const name of [
+    'FOUNDRY_PASS', 'FOUNDRY_PASSWD', 'FOUNDRY_PASSWORD', 'FOUNDRY_VAULT_PASSPHRASE', 'FOUNDRY_VAULT_SECRET',
+    'FOUNDRY_MASTER_KEY', 'FOUNDRY_RECOVERY_KEY', 'FOUNDRY_TOKEN', 'VAULT_PASSWORD',
+  ]) {
+    assert.throws(() => guardSecretInput(parsed([]), { [name]: '' }), /Secret environment variables are refused/u);
+  }
+  assert.doesNotThrow(() => guardSecretInput(parsed([]), {
+    FOUNDRY_PASSPHRASE: undefined, RESTIC_PASSWORD: first, BUILD_PASS: first, RECOVERY_MODE: first,
+  }));
+});
+
+test('descriptor reads preserve UTF-8 across chunks, enforce the byte cap and clear all read buffers', t => {
+  const path = testPath(t);
+  const read = t.mock.method(fs, 'readSync');
+  syncBuiltinESMExports();
+  const boundary = 'x'.repeat(4095) + '\u{1f512}' + '\n' + 'y'.repeat(65536 - 4100);
+  assert.equal(Buffer.byteLength(boundary), 65536);
+  for (const [input, expected] of [
+    [boundary, undefined],
+    [boundary + 'z', /exceeds 64 KiB/u],
+    [Buffer.from([0xff]), /valid UTF-8/u],
+  ]) {
+    writeFileSync(path, input);
+    const fd = fs.openSync(path, 'r');
+    read.mock.resetCalls();
+    try {
+      if (expected) assert.throws(() => readSecretFromFd(fd), expected);
+      else assert.equal(readSecretFromFd(fd), boundary);
+      const buffers = read.mock.calls.filter(call => call.arguments[0] === fd)
+        .map(call => call.arguments[1]);
+      assert.ok(buffers.length > 0);
+      for (const buffer of buffers) assert.deepEqual(buffer, Buffer.alloc(buffer.length));
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+  read.mock.restore();
+  syncBuiltinESMExports();
 });

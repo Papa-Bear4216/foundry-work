@@ -1,12 +1,13 @@
+import { parseArgs } from 'node:util';
 import {
   changePassphrase, create, guardSecretInput, readSecretFromFd, rekeyAll, unlockByPassphrase, unlockByRecovery,
-} from '../src/index.ts';
+} from '../dist/index.js';
 
 // TEST ONLY: the caller supplies synthetic credentials over stdin.
 const path = 'KEYRING.json';
 const [command, ...args] = process.argv.slice(2);
 try {
-  guardSecretInput(args, process.env);
+  guardSecretInput(parseArgs({ args, strict: false, tokens: true }), process.env);
 } catch (error) {
   process.stderr.write(error.message + '\n');
   process.exit(1);

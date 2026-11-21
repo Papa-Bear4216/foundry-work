@@ -66,12 +66,29 @@ declare module 'node:fs' {
   import type { Buffer } from 'node:buffer';
 
   export function readFileSync(pathOrFd: string | number): Buffer;
+  export function readSync(fd: number, buffer: Buffer, offset: number, length: number, position: null): number;
+  export function readdirSync(path: string, options: { withFileTypes: true }): { name: string; isFile(): boolean }[];
+  export function openSync(path: string, flags: 'r'): number;
   export function openSync(path: string, flags: 'wx', mode: number): number;
   export function writeFileSync(fd: number, data: Uint8Array): void;
   export function fsyncSync(fd: number): void;
   export function closeSync(fd: number): void;
   export function renameSync(source: string, target: string): void;
   export function unlinkSync(path: string): void;
+}
+
+declare module 'node:path' {
+  export function basename(path: string): string;
+  export function dirname(path: string): string;
+  export function join(...paths: string[]): string;
+}
+
+declare module 'node:sqlite' {
+  export class DatabaseSync {
+    constructor(path: string, options: { timeout: number });
+    exec(sql: string): void;
+    close(): void;
+  }
 }
 
 declare module 'node:process' {

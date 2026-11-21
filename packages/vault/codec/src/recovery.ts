@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
+import { check } from './bytes.ts';
 
 const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 const VERSION = '1';
@@ -26,6 +27,7 @@ function checksum(payload: string): string {
 }
 
 export function formatRecoveryKey(key: Buffer): string {
+  check(key.length === 32, 'KEY');
   const payload = base32(key);
   const groups = (payload + checksum(payload)).match(/.{4}/gu)!;
   return VERSION + '-' + groups.join('-');

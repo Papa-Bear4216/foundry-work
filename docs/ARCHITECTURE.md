@@ -369,10 +369,11 @@ must be kept in step across copies.
 - Use the canonical JSON and field encodings in section 4.5. The positive `version`
   starts at 1. Each rewrite increments it and uses a temp file, fsync and rename.
   `vault_id` must match the vault being opened.
-- Writers use an exclusive sibling `.pending` file, compare the current keyring to
-  the authenticated input before publishing, and retry transient Windows rename
-  failures. If a writer is interrupted, confirm the writer has exited and inspect
-  the published keyring before removing its abandoned `.pending` file.
+- A sibling SQLite database holds a writer lock that the OS releases when a process
+  exits. Under the lock, writers remove abandoned temp files for that keyring and
+  compare the published keyring to the authenticated input. They sync a uniquely
+  named temp file before renaming it over the keyring. POSIX writers also sync the
+  parent directory. Windows writers retry transient rename failures.
 - `keys` is sorted by ascending ASCII `key_id`. IDs are unique 16-byte identifiers.
   The kinds are `profile`, `collection`, `index` and `signing`. Profile, index and
   signing entries have parent `master`. A collection's parent is a profile entry ID,

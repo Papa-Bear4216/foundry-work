@@ -7,5 +7,6 @@ export type { ChainPosition, Manifest, ManifestFile } from './manifest.ts';
 export { blobId, collectionIdKey, decodeKeyring, encodeKeyring } from './keyring.ts';
 export type { KdfParallelism, Unlock } from './keyring.ts';
 export { changePassphrase, create, rekeyAll, unlockByPassphrase, unlockByRecovery } from './keys.ts';
+export type { RekeyHandoff } from './keys.ts';
 export { decodeRecoveryKey } from './recovery.ts';
 export { guardSecretInput, readSecretFromFd } from './secret-input.ts';
