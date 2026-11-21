@@ -42,6 +42,8 @@ export {
   replaceFileWithRetry,
   scanFdRange,
   scanLog,
+  type AppendBlockOptions,
+  type ExpectedLogPrecondition,
   type StreamScanState,
 } from './log.js';
 
@@ -109,32 +111,35 @@ export {
 } from './eval/fixture.js';
 export {
   CASES as EVAL_CASES,
-  type AbstainExpectation,
-  type AnswerPatternSpec,
+  normalizeEvalValue,
+  type AcceptOption,
+  type AnswerType,
   type CaseQuery,
   type CitationPrefix,
-  type CiteExpectation,
   type EvalCase,
   type EvalExpectation,
-  type OrCiteOption,
 } from './eval/cases.js';
-export { AGENT_RULES_TEXT, buildEvalPrompt } from './eval/prompt.js';
+export { AGENT_RULES_TEXT, answerTypeHint, buildEvalPrompt } from './eval/prompt.js';
 export {
   DEFAULT_CASE_TIMEOUT_MS,
   MAX_ABSTAIN_PAYLOAD_BYTES,
+  MAX_CASE_TIMEOUT_MS,
   MAX_EVAL_CASE_PROBLEMS,
+  SNAPSHOT_GIT_TIMEOUT_MS,
+  assertValidCaseTimeoutMs,
   buildModelChildEnv,
   deriveModelName,
   estimateTokens,
   estimateTokensFromBytes,
   formatDryRunPrompts,
   formatEvalText,
-  matchesAnswerSpec,
+  gitSnapshotCommand,
   runEval,
   runEvalDryRun,
   runModelCommand,
   scoreEvalAnswer,
   selectEvalCases,
+  snapshotFileIntegrity,
   stripFixturePaths,
   type EvalCaseResult,
   type EvalDryRunCase,
@@ -144,6 +149,7 @@ export {
   type EvalOutcomeCounts,
   type EvalResult,
   type EvalScoreResult,
+  type FileIntegritySnapshot,
   type ModelCommandOptions,
   type ModelCommandResult,
 } from './eval/runner.js';

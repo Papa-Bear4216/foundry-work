@@ -4,6 +4,7 @@ import { addFact } from './add.js';
 import { MAX_ANSWER_BYTES, checkAnswer, formatCheckAnswerText } from './check-answer.js';
 import { assertDigestProject, generateDigest } from './digest.js';
 import {
+  MAX_CASE_TIMEOUT_MS,
   formatDryRunPrompts,
   formatEvalText,
   runEval,
@@ -244,12 +245,12 @@ function parseCliArgs(argv: readonly string[]): ParsedArgs {
         break;
       case '--case-timeout-ms': {
         const raw = next();
-        if (!/^\d{1,9}$/.test(raw)) {
-          throw new Error('--case-timeout-ms must be a positive integer');
+        if (!/^\d{1,10}$/.test(raw)) {
+          throw new Error(`--case-timeout-ms must be an integer between 1 and ${MAX_CASE_TIMEOUT_MS}`);
         }
         const parsed = Number.parseInt(raw, 10);
-        if (!Number.isFinite(parsed) || parsed < 1) {
-          throw new Error('--case-timeout-ms must be a positive integer');
+        if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > MAX_CASE_TIMEOUT_MS) {
+          throw new Error(`--case-timeout-ms must be an integer between 1 and ${MAX_CASE_TIMEOUT_MS}`);
         }
         caseTimeoutMs = parsed;
         break;
@@ -423,7 +424,7 @@ function usageText(): string {
     '  facts digest --project <p> [--max-sensitivity <tier>] [--json]   (writes digest.<project>.md beside the index; at most 6,000 bytes)',
     '  facts check-answer <file> [--max-sensitivity <tier>] [--json]   (every non-blank line: a statement with [fact:<id>] or [asserted:<id>], or ABSTAIN: <text>)',
     '  facts eval --model-cmd <exe> [--model-arg <arg>]... [--model-name <label>] [--case-timeout-ms <n>] [--cases <id,...>] [--project <p>] [--agent <name>] [--log <file>] [--json] [--stats]',
-    '             (--model-cmd must be a real executable, shell: false; on Windows .cmd/.bat shims are rejected — pass interpreter and script, e.g. --model-cmd node --model-arg path/to/cli.js)',
+    '             (--model-cmd must be a real executable, shell: false; model args are resolved from eval\'s empty temp cwd so script paths must be absolute; on Windows .cmd/.bat shims are rejected — pass interpreter and absolute script path, e.g. --model-cmd node --model-arg C:\\path\\to\\cli.js; --case-timeout-ms max 2147483647)',
     '  facts eval --dry-run [--cases <id,...>] [--json] [--stats]   (print deterministic prompts without running a model)',
     '  facts usage [--since <iso>] [--project <p>] [--log <file>] [--json] [--stats]   (measured and estimated totals kept separate)',
     '  facts add ... --from-agent --model <id> --task <label> --input-tokens <n> --output-tokens <n> [--tokens-measured]',

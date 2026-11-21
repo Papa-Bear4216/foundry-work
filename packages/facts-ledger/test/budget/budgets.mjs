@@ -17,7 +17,6 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { blockCount, project } from '../../bench/fixture.mjs';
 import { CASES } from '../../dist/eval/cases.js';
-import { gateFactCatalog } from '../../dist/eval/fixture.js';
 import { MAX_ANSWER_BYTES, MAX_STORED_PROBLEMS } from '../../dist/check-answer.js';
 import { MAX_LINE_BYTES } from '../../dist/log.js';
 import { formatCheckedPredicateClaim } from '../../dist/normalize.js';
@@ -255,16 +254,14 @@ try {
     cited.push(`[fact:${blockId(3 * (i * 61 + 1))}.0]`);
   }
   writeFileSync(answerPath, `Probe statement. ${cited.join(' ')}\nABSTAIN: nothing else.\n`);
-  const catalog = gateFactCatalog();
   const questionHash = (q) => createHash('sha256').update(q.trim()).digest('hex');
   const evalAnswersPath = join(root, 'eval-answers.json');
   const evalAnswers = Object.fromEntries(
     CASES.map((c) => {
       const key = questionHash(c.question);
-      if ('cite' in c.expect) {
-        const entry = catalog.get(c.expect.cite);
-        const text = entry?.note ? `${entry.claim} ${entry.note}` : (entry?.claim ?? '');
-        return [key, `${text} [${c.expect.as}:${c.expect.cite}]\n`];
+      if (c.expect.accept && c.expect.accept.length > 0 && !c.expect.abstain) {
+        const opt = c.expect.accept[0];
+        return [key, `ANSWER: ${opt.values[0]} [${opt.as}:${opt.id}]\n`];
       }
       return [key, 'ABSTAIN: no current citable fact answers this question.\n'];
     }),
@@ -278,7 +275,7 @@ try {
       "import { readFileSync } from 'node:fs';",
       'const answers = JSON.parse(readFileSync(process.argv[2], "utf8"));',
       'const prompt = readFileSync(0, "utf8");',
-      'const m = /=== Question ===\\r?\\n([\\s\\S]+)$/.exec(prompt);',
+      'const m = /=== Question ===\\r?\\n([^\\r\\n]+)/.exec(prompt);',
       'const key = m ? createHash("sha256").update(m[1].trim()).digest("hex") : "";',
       'process.stdout.write(answers[key] ?? "ABSTAIN: unknown question.\\n");',
     ].join('\n'),

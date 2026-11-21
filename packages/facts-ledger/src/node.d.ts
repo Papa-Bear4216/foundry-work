@@ -154,9 +154,17 @@ declare module 'node:crypto' {
 }
 
 declare module 'node:fs' {
-  export function openSync(path: string, flags: string, mode?: number): number;
+  export const constants: {
+    readonly O_RDONLY: number;
+    readonly O_RDWR: number;
+    readonly O_APPEND: number;
+    readonly O_CREAT: number;
+    readonly O_EXCL: number;
+    readonly O_NONBLOCK?: number;
+  };
+  export function openSync(path: string, flags: string | number, mode?: number): number;
   export function closeSync(fd: number): void;
-  export function fstatSync(fd: number): { size: number };
+  export function fstatSync(fd: number): { size: number; isFile(): boolean };
   export function fstatSync(
     fd: number,
     options: { bigint: true },

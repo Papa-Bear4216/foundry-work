@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile, spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -186,4 +187,55 @@ test('treats UTF-8 BOM lines as bad lines and normalizes explicit undefined/empt
   // Lone surrogates encode identically as U+FFFD in UTF-8 and must compare equal (total order).
   assert.equal(compareBytewise('\uD800', '\uD801'), 0);
   assert.equal(compareBytewise('\uD801', '\uD800'), 0);
+});
+
+test('appendBlock enforces optional expectedLog precondition under the writer lock without side effects on mismatch', (t) => {
+  const path = logPath(t);
+  const sha = (buf) => createHash('sha256').update(buf).digest('hex');
+
+  // Expecting an existing log when absent throws without creating the file.
+  assert.throws(
+    () => appendBlock(path, fixture, { expectedLog: { size: 10, sha256: '0'.repeat(64) } }),
+    /precondition failed.*absent/,
+  );
+  assert.equal(existsSync(path), false, 'failed existing-log precondition must not create file');
+
+  // Expecting absent succeeds when absent and creates the file with the block.
+  const first = appendBlock(path, fixture, { expectedLog: 'absent' });
+  const afterFirst = readFileSync(path);
+  assert.equal(first.parent, null);
+
+  // Expecting absent now fails because the file exists, without modifying it.
+  assert.throws(
+    () => appendBlock(path, fixture, { expectedLog: 'absent' }),
+    /precondition failed.*already exists/,
+  );
+  assert.deepEqual(readFileSync(path), afterFirst);
+
+  // Expecting wrong size or wrong hash fails without appending.
+  assert.throws(
+    () => appendBlock(path, fixture, { expectedLog: { size: afterFirst.length + 1, sha256: sha(afterFirst) } }),
+    /precondition failed/,
+  );
+  assert.throws(
+    () => appendBlock(path, fixture, { expectedLog: { size: afterFirst.length, sha256: 'f'.repeat(64) } }),
+    /precondition failed/,
+  );
+  assert.deepEqual(readFileSync(path), afterFirst);
+
+  // Matching size and sha256 appends cleanly through the same descriptor.
+  const second = appendBlock(path, fixture, {
+    expectedLog: { size: afterFirst.length, sha256: sha(afterFirst) },
+  });
+  assert.equal(second.parent, first.id);
+  assert.deepEqual(read(path).blocks, [first, second]);
+
+  // Empty existing file also fails expectedLog: 'absent'.
+  const emptyPath = logPath(t);
+  writeFileSync(emptyPath, '');
+  assert.throws(
+    () => appendBlock(emptyPath, fixture, { expectedLog: 'absent' }),
+    /precondition failed.*already exists/,
+  );
+  assert.equal(readFileSync(emptyPath).length, 0);
 });

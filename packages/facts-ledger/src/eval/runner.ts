@@ -1,11 +1,14 @@
 // Step Zero 10.3: model-in-the-loop evaluation harness (`facts eval`).
 // Spawns any local command without a shell, feeds each case's deterministic prompt on stdin,
-// judges answers with `checkAnswer` plus committed expected-answer patterns, enforces fixture
-// and result-log integrity checks, and appends one summary block on full non-selection runs.
+// judges structured answers with `checkAnswer` plus declared exact values, chains fixture
+// integrity snapshots across cases, enforces result-log preconditions under the append lock,
+// and appends one summary block on full non-selection runs.
 import { execFile, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   closeSync,
+  constants as fsConstants,
+  fstatSync,
   mkdtempSync,
   openSync,
   readSync,
@@ -27,20 +30,19 @@ import { generateDigest } from '../digest.js';
 import { FreshnessChecker } from '../freshness.js';
 import { collectGarbage } from '../gc.js';
 import { resolveGitExecutable } from '../git.js';
-import { appendBlock } from '../log.js';
+import { appendBlock, type ExpectedLogPrecondition } from '../log.js';
 import { formatQueryText, queryFacts, sanitizeInlineText } from '../query.js';
 import { loadRepoMap } from '../repos.js';
 import { type Block, type Sensitivity, type TokenUsage } from '../types.js';
-import {
-  CASES,
-  type AnswerPatternSpec,
-  type EvalCase,
-  type OrCiteOption,
-} from './cases.js';
+import { CASES, normalizeEvalValue, type EvalCase } from './cases.js';
 import { NOW_MS, PROJECT, buildGateFixture, type GateFixture } from './fixture.js';
 import { buildEvalPrompt } from './prompt.js';
 
 export const DEFAULT_CASE_TIMEOUT_MS = 120_000;
+/** Maximum timeout accepted by Node.js `setTimeout` (signed 32-bit int max). */
+export const MAX_CASE_TIMEOUT_MS = 2_147_483_647;
+/** Timeout for synchronous git integrity snapshot commands (R4, A-29). */
+export const SNAPSHOT_GIT_TIMEOUT_MS = 10_000;
 /** Cap on `ABSTAIN:` payload bytes for eval scoring (L1, A-29). */
 export const MAX_ABSTAIN_PAYLOAD_BYTES = 200;
 /** Maximum diagnostic problem entries kept per case in memory and output (F7, A-29). */
@@ -113,6 +115,8 @@ export interface EvalOptions {
   readonly logPath: string;
   readonly project: string;
   readonly agent: string;
+  /** Optional per-case completion hook (fires after scoring a case, before the next case). */
+  readonly onCaseComplete?: (result: EvalCaseResult) => void | Promise<void>;
 }
 
 export interface ModelCommandOptions {
@@ -135,7 +139,7 @@ export interface EvalScoreResult {
   readonly problems: readonly AnswerProblem[];
 }
 
-interface FileIntegritySnapshot {
+export interface FileIntegritySnapshot {
   readonly exists: boolean;
   readonly size: number;
   readonly sha256: string;
@@ -156,6 +160,9 @@ const fatalUtf8 = new TextDecoder('utf-8', { fatal: true });
 const CITATION_RE = /\[(fact|asserted):([^\]\s]*)\]/g;
 const FACT_ID_RE = /^[0-9a-f]{12}\.\d{1,4}$/;
 const ABSTAIN_RE = /^ABSTAIN:\s*\S/;
+const STRUCTURED_ANSWER_RE = /^ANSWER:\s*(.+?)\s+\[(fact|asserted):([0-9a-f]{12}\.\d{1,4})\]$/;
+const OPEN_READ_NONBLOCK =
+  fsConstants.O_RDONLY | (typeof fsConstants.O_NONBLOCK === 'number' ? fsConstants.O_NONBLOCK : 0);
 
 /** Deterministic token estimator: UTF-8 byte length / 4, rounded up (A-29). */
 export function estimateTokens(text: string): number {
@@ -173,6 +180,17 @@ export function deriveModelName(modelCmd: string): string {
     .replace(/^[^A-Za-z0-9]+/, '')
     .slice(0, 100);
   return cleaned.length > 0 ? cleaned : 'command';
+}
+
+export function assertValidCaseTimeoutMs(timeoutMs: number, label = '--case-timeout-ms'): void {
+  if (
+    !Number.isFinite(timeoutMs) ||
+    !Number.isInteger(timeoutMs) ||
+    timeoutMs < 1 ||
+    timeoutMs > MAX_CASE_TIMEOUT_MS
+  ) {
+    throw new Error(`${label} must be an integer between 1 and ${MAX_CASE_TIMEOUT_MS}`);
+  }
 }
 
 /**
@@ -246,27 +264,57 @@ export function stripFixturePaths(prompt: string, paths: readonly string[]): str
   return out;
 }
 
-function snapshotFileIntegrity(filePath: string): FileIntegritySnapshot {
+/**
+ * Snapshot a file without risking a hang on special files (R4): open with `O_NONBLOCK` where
+ * supported, `fstat` the descriptor and require a regular file, hash at most the size captured
+ * by `fstat`, and verify the size did not change during the read.
+ */
+export function snapshotFileIntegrity(filePath: string): FileIntegritySnapshot {
   let fd: number;
   try {
-    fd = openSync(filePath, 'r');
+    fd = openSync(filePath, OPEN_READ_NONBLOCK);
   } catch (err) {
-    if ((err as { code?: string }).code === 'ENOENT') {
+    const code = (err as { code?: string }).code;
+    if (code === 'ENOENT') {
       return { exists: false, size: 0, sha256: 'absent' };
+    }
+    if (code === 'ENXIO' || code === 'EISDIR') {
+      throw new Error(
+        `Integrity violation: snapshot target is not a regular file (${code}): ${basename(filePath)}`,
+      );
     }
     throw err;
   }
   try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) {
+      throw new Error(
+        `Integrity violation: snapshot target is not a regular file: ${basename(filePath)}`,
+      );
+    }
+    const expectedSize = st.size;
     const hash = createHash('sha256');
     const buf = new Uint8Array(64 * 1024);
-    let size = 0;
-    for (;;) {
-      const n = readSync(fd, buf, 0, buf.length, null);
+    let totalRead = 0;
+    while (totalRead < expectedSize) {
+      const toRead = Math.min(buf.length, expectedSize - totalRead);
+      const n = readSync(fd, buf, 0, toRead, totalRead);
       if (n <= 0) break;
-      size += n;
+      totalRead += n;
       hash.update(buf.subarray(0, n));
     }
-    return { exists: true, size, sha256: hash.digest('hex') };
+    if (totalRead !== expectedSize) {
+      throw new Error(
+        `Integrity violation: snapshot file size changed during read (${expectedSize} -> ${totalRead}): ${basename(filePath)}`,
+      );
+    }
+    const stAfter = fstatSync(fd);
+    if (!stAfter.isFile() || stAfter.size !== expectedSize) {
+      throw new Error(
+        `Integrity violation: snapshot file size changed during read (${expectedSize} -> ${stAfter.size}): ${basename(filePath)}`,
+      );
+    }
+    return { exists: true, size: expectedSize, sha256: hash.digest('hex') };
   } finally {
     closeSync(fd);
   }
@@ -290,13 +338,36 @@ function readOnlyGitEnv(): Record<string, string> {
   };
 }
 
-function gitSnapshotCommand(repoDir: string, args: readonly string[]): string {
+export function gitSnapshotCommand(
+  repoDir: string,
+  args: readonly string[],
+  timeoutMs = SNAPSHOT_GIT_TIMEOUT_MS,
+): string {
   const r = spawnSync(
     resolveGitExecutable(),
     ['-c', 'core.fsmonitor=false', '-c', 'protocol.allow=never', ...args],
-    { cwd: repoDir, env: readOnlyGitEnv(), windowsHide: true, shell: false },
+    {
+      cwd: repoDir,
+      env: readOnlyGitEnv(),
+      windowsHide: true,
+      shell: false,
+      timeout: timeoutMs,
+    },
   );
-  if (r.error) throw new Error(`Fixture integrity git ${args.join(' ')} failed: ${r.error.message}`);
+  if (r.error) {
+    const code = (r.error as { code?: string }).code;
+    if (code === 'ETIMEDOUT') {
+      throw new Error(
+        `Integrity violation: fixture git ${args.join(' ')} timed out after ${timeoutMs} ms`,
+      );
+    }
+    throw new Error(`Fixture integrity git ${args.join(' ')} failed: ${r.error.message}`);
+  }
+  if (r.signal) {
+    throw new Error(
+      `Integrity violation: fixture git ${args.join(' ')} terminated by signal ${r.signal}`,
+    );
+  }
   if (r.status !== 0) {
     throw new Error(`Fixture integrity git ${args.join(' ')} failed: ${decoder.decode(r.stderr).trim()}`);
   }
@@ -314,17 +385,25 @@ function snapshotFixtureIntegrity(fx: GateFixture): FixtureIntegritySnapshot {
   };
 }
 
-function diffFixtureIntegrity(
+function diffImmutableFixtureIntegrity(
   before: FixtureIntegritySnapshot,
   after: FixtureIntegritySnapshot,
 ): string[] {
   const diffs: string[] = [];
   if (!sameFileIntegrity(before.ledger, after.ledger)) diffs.push('fixture ledger changed');
-  if (!sameFileIntegrity(before.index, after.index)) diffs.push('fixture index changed');
-  if (!sameFileIntegrity(before.indexWal, after.indexWal)) diffs.push('fixture index WAL changed');
   if (!sameFileIntegrity(before.repos, after.repos)) diffs.push('fixture repos.json changed');
   if (before.gitHead !== after.gitHead) diffs.push('fixture git HEAD changed');
   if (before.gitStatus !== after.gitStatus) diffs.push('fixture git working tree changed');
+  return diffs;
+}
+
+function diffFixtureIntegrity(
+  before: FixtureIntegritySnapshot,
+  after: FixtureIntegritySnapshot,
+): string[] {
+  const diffs = diffImmutableFixtureIntegrity(before, after);
+  if (!sameFileIntegrity(before.index, after.index)) diffs.push('fixture index changed');
+  if (!sameFileIntegrity(before.indexWal, after.indexWal)) diffs.push('fixture index WAL changed');
   return diffs;
 }
 
@@ -435,7 +514,7 @@ function concatBytes(chunks: readonly Uint8Array[], totalBytes: number): Uint8Ar
 /**
  * Spawn the model executable directly (`shell: false`), write `prompt` to stdin and require
  * `stdin.end` to complete without error (including EPIPE, F5), collect stdout capped at
- * `MAX_ANSWER_BYTES`, catch synchronous spawn failures (F4), and enforce `timeoutMs`.
+ * `MAX_ANSWER_BYTES`, catch synchronous spawn failures (F4), and enforce `timeoutMs` (<= 2^31 - 1).
  */
 export function runModelCommand(
   executablePath: string,
@@ -444,7 +523,8 @@ export function runModelCommand(
   timeoutMs = DEFAULT_CASE_TIMEOUT_MS,
   options: ModelCommandOptions = {},
 ): Promise<ModelCommandResult> {
-  const effectiveTimeoutMs = Math.max(1, timeoutMs);
+  assertValidCaseTimeoutMs(timeoutMs, 'timeoutMs');
+  const effectiveTimeoutMs = timeoutMs;
   return new Promise((resolvePromise) => {
     const useDetachedGroup = process.platform !== 'win32';
     let child: ChildProcess;
@@ -602,26 +682,16 @@ export function runModelCommand(
   });
 }
 
-/** Match a statement (with citation markers stripped) against committed key-term patterns (F1). */
-export function matchesAnswerSpec(text: string, spec: AnswerPatternSpec): boolean {
-  for (const pattern of spec.answer) {
-    if (!new RegExp(pattern, 'i').test(text)) return false;
-  }
-  if (spec.mustNot) {
-    for (const forbidden of spec.mustNot) {
-      if (new RegExp(forbidden, 'i').test(text)) return false;
-    }
-  }
-  return true;
-}
-
 function compareProblems(a: AnswerProblem, b: AnswerProblem): number {
   return a.line - b.line || (a.problem < b.problem ? -1 : a.problem > b.problem ? 1 : 0);
 }
 
 /**
- * Deterministic scoring of a checked answer against a case's committed expectation (F1, F3, F7, L1, A-29).
- * `unsupportedProblems = checkerProblems + offTargetStatements`.
+ * Deterministic structured-answer scoring against a case's declared acceptance set (R1, F7, L1, A-29).
+ * Requires exactly ONE non-blank line: either `ANSWER: <value> [fact:<id>]` /
+ * `ANSWER: <value> [asserted:<id>]` (exact normalised value + citation match, single citation,
+ * no extra text) or `ABSTAIN: <reason>` (<= 200 UTF-8 bytes).
+ * Any extra or malformed checker-clean line counts toward `offTargetStatements` / `unsupportedProblems`.
  * Stored diagnostics are bounded to `MAX_EVAL_CASE_PROBLEMS` entries.
  */
 export function scoreEvalAnswer(
@@ -656,27 +726,25 @@ export function scoreEvalAnswer(
   }
 
   const invalidSet = new Set(check.invalidCitations);
-  const acceptedOptions: readonly OrCiteOption[] =
-    'cite' in evalCase.expect
-      ? [
-          {
-            id: evalCase.expect.cite,
-            as: evalCase.expect.as,
-            answer: evalCase.expect.answer,
-            ...(evalCase.expect.mustNot ? { mustNot: evalCase.expect.mustNot } : {}),
-          },
-        ]
-      : (evalCase.expect.orCite ?? []);
-  const acceptedByKey = new Map<string, OrCiteOption>(
-    acceptedOptions.map((opt) => [`${opt.as}:${opt.id}`, opt]),
-  );
+  const acceptedValuesByCite = new Map<string, Set<string>>();
+  for (const opt of evalCase.expect.accept ?? []) {
+    const key = `${opt.as}:${opt.id}`;
+    let set = acceptedValuesByCite.get(key);
+    if (!set) {
+      set = new Set<string>();
+      acceptedValuesByCite.set(key, set);
+    }
+    for (const v of opt.values) {
+      set.add(normalizeEvalValue(v));
+    }
+  }
 
   let offTargetStatements = 0;
-  let validAbstentions = 0;
-  let acceptedStatements = 0;
-  let matchedTarget = false;
+  let nonBlankLines = 0;
+  let validAbstain = false;
+  let matchedAccept = false;
 
-  // Iterate line by line without allocating substrings for ordinary uncited lines.
+  // Iterate line by line without allocating substrings for ordinary uncited lines (F7).
   const startOffset = answerText.startsWith('\ufeff') ? 1 : 0;
   let pos = startOffset;
   let lineNo = 0;
@@ -699,15 +767,24 @@ export function scoreEvalAnswer(
       if (nextBracket !== -1 && nextBracket < s) {
         nextBracket = answerText.indexOf('[', s);
       }
-      if (nextBracket === -1 || nextBracket >= e) continue;
+      if (nextBracket === -1 || nextBracket >= e) {
+        nonBlankLines++;
+        continue;
+      }
     }
 
     const line = hasNonAsciiEdge ? answerText.slice(s, e).trim() : answerText.slice(s, e);
     if (line.length === 0) continue;
+    nonBlankLines++;
 
     if (line.startsWith('ABSTAIN:')) {
       // Lines that already failed checkAnswer are counted in checkerProblems, not double-counted.
       if (!ABSTAIN_RE.test(line) || /\[(fact|asserted):/.test(line)) {
+        continue;
+      }
+      if (nonBlankLines > 1) {
+        offTargetStatements++;
+        recordDiagnostic(lineNo, 'extra line: answer must be exactly one non-blank line');
         continue;
       }
       const payload = line.slice('ABSTAIN:'.length).trim();
@@ -715,7 +792,7 @@ export function scoreEvalAnswer(
         offTargetStatements++;
         recordDiagnostic(lineNo, `ABSTAIN payload exceeds ${MAX_ABSTAIN_PAYLOAD_BYTES} bytes`);
       } else {
-        validAbstentions++;
+        validAbstain = true;
       }
       continue;
     }
@@ -730,7 +807,6 @@ export function scoreEvalAnswer(
       continue;
     }
     let hasCheckerIssue = false;
-    const lineCites: Array<{ readonly kind: 'fact' | 'asserted'; readonly id: string }> = [];
     for (const m of found) {
       const kind = m[1] as 'fact' | 'asserted';
       const id = m[2] ?? '';
@@ -738,37 +814,45 @@ export function scoreEvalAnswer(
         hasCheckerIssue = true;
         break;
       }
-      lineCites.push({ kind, id });
     }
     if (hasCheckerIssue) continue;
 
-    // Checker-clean statement line: verify every citation on the line is accepted and patterns match.
-    const statementText = line.replace(CITATION_RE, ' ').trim();
-    let allCitesAccepted = true;
-    let allPatternsMatched = true;
-    for (const cite of lineCites) {
-      const opt = acceptedByKey.get(`${cite.kind}:${cite.id}`);
-      if (!opt) {
-        allCitesAccepted = false;
-        break;
-      }
-      if (!matchesAnswerSpec(statementText, opt)) {
-        allPatternsMatched = false;
-      }
+    // Checker-clean statement line: enforce single-line, single-citation structured ANSWER format.
+    if (nonBlankLines > 1) {
+      offTargetStatements++;
+      recordDiagnostic(lineNo, 'extra line: answer must be exactly one non-blank line');
+      continue;
     }
-
-    if (!allCitesAccepted) {
+    if (found.length !== 1) {
+      offTargetStatements++;
+      recordDiagnostic(lineNo, 'off-target statement: ANSWER line must carry exactly one citation');
+      continue;
+    }
+    const match = STRUCTURED_ANSWER_RE.exec(line);
+    if (!match) {
+      offTargetStatements++;
+      recordDiagnostic(
+        lineNo,
+        'off-target statement: line must match "ANSWER: <value> [fact:<id>]" or "ANSWER: <value> [asserted:<id>]" with no extra text',
+      );
+      continue;
+    }
+    const rawValue = match[1] as string;
+    const kind = match[2] as 'fact' | 'asserted';
+    const id = match[3] as string;
+    const acceptedValues = acceptedValuesByCite.get(`${kind}:${id}`);
+    if (!acceptedValues) {
       offTargetStatements++;
       recordDiagnostic(lineNo, 'off-target statement: citation is not accepted for this case');
-    } else if (!allPatternsMatched) {
-      offTargetStatements++;
-      recordDiagnostic(lineNo, 'off-target statement: answer does not match expected pattern');
-    } else {
-      acceptedStatements++;
-      if ('cite' in evalCase.expect) {
-        matchedTarget = true;
-      }
+      continue;
     }
+    const normalized = normalizeEvalValue(rawValue);
+    if (!acceptedValues.has(normalized)) {
+      offTargetStatements++;
+      recordDiagnostic(lineNo, 'off-target statement: answer value is not in accepted set');
+      continue;
+    }
+    matchedAccept = true;
   }
 
   keptProblems.sort(compareProblems);
@@ -777,24 +861,14 @@ export function scoreEvalAnswer(
   let outcome: EvalOutcome;
   if (!check.ok) {
     outcome = 'unsupported';
-  } else if ('cite' in evalCase.expect) {
-    if (offTargetStatements > 0) {
-      outcome = 'wrong';
-    } else if (matchedTarget) {
-      outcome = 'correct';
-    } else if (validAbstentions > 0) {
-      outcome = 'abstained_wrongly';
-    } else {
-      outcome = 'wrong';
-    }
+  } else if (offTargetStatements > 0) {
+    outcome = 'wrong';
+  } else if (matchedAccept) {
+    outcome = 'correct';
+  } else if (validAbstain) {
+    outcome = evalCase.expect.abstain ? 'abstained_correctly' : 'abstained_wrongly';
   } else {
-    if (offTargetStatements > 0) {
-      outcome = 'wrong';
-    } else if (validAbstentions > 0 || acceptedStatements > 0) {
-      outcome = 'abstained_correctly';
-    } else {
-      outcome = 'wrong';
-    }
+    outcome = 'wrong';
   }
 
   return {
@@ -870,17 +944,16 @@ export function formatDryRunPrompts(dryRun: EvalDryRunResult): string {
 /**
  * Run the model-in-the-loop harness on the synthetic fixture in a fresh temp directory.
  * Isolates the model in a separate empty temp cwd with stripped `FACTS_LEDGER_*` env vars,
- * verifies fixture and result-log integrity before grading/appending, and appends one result
- * block to `options.logPath` only on full (non-`--cases`) runs (A-29).
+ * chains fixture integrity snapshots across every case (before query, after query, after model,
+ * after grading), enforces result-log precondition inside `appendBlock`'s writer lock, and
+ * appends one result block to `options.logPath` only on full (non-`--cases`) runs (A-29).
  */
 export async function runEval(options: EvalOptions): Promise<EvalResult> {
   if (!options.modelCmd || options.modelCmd.trim().length === 0) {
     throw new Error('--model-cmd is required (or pass --dry-run to inspect prompts)');
   }
   const caseTimeoutMs = options.caseTimeoutMs ?? DEFAULT_CASE_TIMEOUT_MS;
-  if (!Number.isFinite(caseTimeoutMs) || !Number.isInteger(caseTimeoutMs) || caseTimeoutMs < 1) {
-    throw new Error('--case-timeout-ms must be a positive integer');
-  }
+  assertValidCaseTimeoutMs(caseTimeoutMs, '--case-timeout-ms');
   const modelName = options.modelName ?? deriveModelName(options.modelCmd);
   // Validate the model label up front so a bad --model-name fails before running 50 cases.
   validateTokenUsage({ model: modelName, task: 'facts-eval', input: 0, output: 0, measured: false });
@@ -892,6 +965,9 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
   const modelArgs = options.modelArgs ?? [];
   const childEnv = buildModelChildEnv(process.env);
   const resultLogBefore = snapshotFileIntegrity(options.logPath);
+  const expectedLog: ExpectedLogPrecondition = resultLogBefore.exists
+    ? { size: resultLogBefore.size, sha256: resultLogBefore.sha256 }
+    : 'absent';
 
   const counts = {
     correct: 0,
@@ -934,12 +1010,24 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
       return cached;
     };
 
+    // R2: keep one running snapshot chained across all cases.
+    let lastSnapshot = snapshotFixtureIntegrity(fx);
     let lastOutputLarge = false;
     for (const c of cases) {
       if (lastOutputLarge) {
         collectGarbage();
         lastOutputLarge = false;
       }
+
+      // Verify fixture is unchanged since the end of the previous case (or initial build).
+      const beforeQuery = snapshotFixtureIntegrity(fx);
+      const betweenDiffs = diffFixtureIntegrity(lastSnapshot, beforeQuery);
+      if (betweenDiffs.length > 0) {
+        throw new Error(
+          `Fixture integrity check failed before case ${c.id} (${betweenDiffs.join('; ')}); aborting eval without appending a block`,
+        );
+      }
+
       const { text, ...rest } = c.query;
       const queryResult = await queryFacts({
         logPath: fx.logPath,
@@ -957,25 +1045,37 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
       const inputTokens = estimateTokens(prompt);
       totalInputTokens += inputTokens;
 
-      const fixtureBefore = snapshotFixtureIntegrity(fx);
+      // Capture the new running snapshot after the harness's own query/digest maintenance;
+      // immutable files (ledger, repos.json, git HEAD/status) must never change during query.
+      const afterQuery = snapshotFixtureIntegrity(fx);
+      const queryImmutableDiffs = diffImmutableFixtureIntegrity(beforeQuery, afterQuery);
+      if (queryImmutableDiffs.length > 0) {
+        throw new Error(
+          `Fixture integrity check failed during case ${c.id} query (${queryImmutableDiffs.join('; ')}); aborting eval without appending a block`,
+        );
+      }
+      lastSnapshot = afterQuery;
+
       const modelRun = await runModelCommand(options.modelCmd, modelArgs, prompt, caseTimeoutMs, {
         cwd: modelCwd,
         env: childEnv,
       });
-      const fixtureAfter = snapshotFixtureIntegrity(fx);
-      const fixtureDiffs = diffFixtureIntegrity(fixtureBefore, fixtureAfter);
-      if (fixtureDiffs.length > 0) {
+
+      const afterModel = snapshotFixtureIntegrity(fx);
+      const afterModelDiffs = diffFixtureIntegrity(lastSnapshot, afterModel);
+      if (afterModelDiffs.length > 0) {
         throw new Error(
-          `Fixture integrity check failed after case ${c.id} (${fixtureDiffs.join('; ')}); aborting eval without appending a block`,
+          `Fixture integrity check failed after case ${c.id} (${afterModelDiffs.join('; ')}); aborting eval without appending a block`,
         );
       }
 
       const outputTokens = estimateTokensFromBytes(modelRun.outputBytes);
       totalOutputTokens += outputTokens;
 
+      let caseResult: EvalCaseResult;
       if (!modelRun.ok) {
         counts.error++;
-        caseResults.push({
+        caseResult = {
           id: c.id,
           group: c.group,
           outcome: 'error',
@@ -985,52 +1085,74 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
           input_tokens: inputTokens,
           output_tokens: outputTokens,
           error: modelRun.error ?? 'Model command failed',
-        });
-        continue;
-      }
+        };
+      } else {
+        let check: CheckAnswerResult;
+        try {
+          check = await checkAnswer(modelRun.output, {
+            logPath: fx.logPath,
+            indexPath: fx.indexPath,
+            repos,
+            nowMs: NOW_MS,
+            maxProblems: MAX_EVAL_CASE_PROBLEMS,
+            ...(c.query.maxSensitivity ? { maxSensitivity: c.query.maxSensitivity } : {}),
+          });
+        } catch (err) {
+          const msg = sanitizeInlineText((err as Error).message);
+          check = {
+            ok: false,
+            statements: 0,
+            abstentions: 0,
+            citations: 0,
+            problemCount: 1,
+            problems: [{ line: 0, problem: msg }],
+            invalidCitations: [],
+          };
+        }
 
-      let check: CheckAnswerResult;
-      try {
-        check = await checkAnswer(modelRun.output, {
-          logPath: fx.logPath,
-          indexPath: fx.indexPath,
-          repos,
-          nowMs: NOW_MS,
-          maxProblems: MAX_EVAL_CASE_PROBLEMS,
-          ...(c.query.maxSensitivity ? { maxSensitivity: c.query.maxSensitivity } : {}),
-        });
-      } catch (err) {
-        const msg = sanitizeInlineText((err as Error).message);
-        check = {
-          ok: false,
-          statements: 0,
-          abstentions: 0,
-          citations: 0,
-          problemCount: 1,
-          problems: [{ line: 0, problem: msg }],
-          invalidCitations: [],
+        // Verify grading saw the exact same fixture state the prompt came from.
+        const afterGrade = snapshotFixtureIntegrity(fx);
+        const afterGradeDiffs = diffFixtureIntegrity(lastSnapshot, afterGrade);
+        if (afterGradeDiffs.length > 0) {
+          throw new Error(
+            `Fixture integrity check failed during case ${c.id} grading (${afterGradeDiffs.join('; ')}); aborting eval without appending a block`,
+          );
+        }
+
+        const scored = scoreEvalAnswer(c, modelRun.output, check);
+        counts[scored.outcome]++;
+        totalCheckerProblems += scored.checkerProblems;
+        totalOffTargetStatements += scored.offTargetStatements;
+        unsupportedClaims += scored.unsupportedProblems;
+        caseResult = {
+          id: c.id,
+          group: c.group,
+          outcome: scored.outcome,
+          checker_problems: scored.checkerProblems,
+          off_target_statements: scored.offTargetStatements,
+          unsupported_problems: scored.unsupportedProblems,
+          input_tokens: inputTokens,
+          output_tokens: outputTokens,
+          ...(scored.problems.length > 0 ? { problems: scored.problems } : {}),
         };
       }
 
-      const scored = scoreEvalAnswer(c, modelRun.output, check);
-      counts[scored.outcome]++;
-      totalCheckerProblems += scored.checkerProblems;
-      totalOffTargetStatements += scored.offTargetStatements;
-      unsupportedClaims += scored.unsupportedProblems;
-      caseResults.push({
-        id: c.id,
-        group: c.group,
-        outcome: scored.outcome,
-        checker_problems: scored.checkerProblems,
-        off_target_statements: scored.offTargetStatements,
-        unsupported_problems: scored.unsupportedProblems,
-        input_tokens: inputTokens,
-        output_tokens: outputTokens,
-        ...(scored.problems.length > 0 ? { problems: scored.problems } : {}),
-      });
+      caseResults.push(caseResult);
+      if (options.onCaseComplete) {
+        await options.onCaseComplete(caseResult);
+      }
       if (modelRun.outputBytes >= 65_536) {
         lastOutputLarge = true;
       }
+    }
+
+    // Final fixture verification after the last case before releasing temp fixture / appending.
+    const afterAll = snapshotFixtureIntegrity(fx);
+    const afterAllDiffs = diffFixtureIntegrity(lastSnapshot, afterAll);
+    if (afterAllDiffs.length > 0) {
+      throw new Error(
+        `Fixture integrity check failed after final case (${afterAllDiffs.join('; ')}); aborting eval without appending a block`,
+      );
     }
   } finally {
     rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5 });
@@ -1048,31 +1170,37 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
     measured: false,
   });
 
-  const resultLogAfter = snapshotFileIntegrity(options.logPath);
-  if (!sameFileIntegrity(resultLogBefore, resultLogAfter)) {
-    throw new Error(
-      `Result log changed during eval run (size ${resultLogBefore.size} -> ${resultLogAfter.size}, sha256 ${resultLogBefore.sha256.slice(0, 12)} -> ${resultLogAfter.sha256.slice(0, 12)}); refusing to append eval block`,
-    );
-  }
-
   let block: Block | null = null;
-  if (!subset) {
+  if (subset) {
+    // Selection runs never append, but still report if the result log was tampered with.
+    const resultLogAfter = snapshotFileIntegrity(options.logPath);
+    if (!sameFileIntegrity(resultLogBefore, resultLogAfter)) {
+      throw new Error(
+        `Result log changed during eval run (size ${resultLogBefore.size} -> ${resultLogAfter.size}, sha256 ${resultLogBefore.sha256.slice(0, 12)} -> ${resultLogAfter.sha256.slice(0, 12)}); refusing to append eval block`,
+      );
+    }
+  } else {
     const perCase = caseResults.map((r) => `${r.id}:${r.outcome}`).join(' ');
     const summaryLine =
       `passes_bar=${passesBar} cases=${casesRun} unsupported_claims=${unsupportedClaims} ` +
       `checker_problems=${totalCheckerProblems} off_target_statements=${totalOffTargetStatements} ` +
       `correct=${counts.correct} wrong=${counts.wrong} abstained_correctly=${counts.abstained_correctly} ` +
       `abstained_wrongly=${counts.abstained_wrongly} unsupported=${counts.unsupported} error=${counts.error}`;
-    block = appendBlock(options.logPath, {
-      schema: 2,
-      agent: options.agent,
-      project: options.project,
-      status: 'done',
-      intent: `facts eval: ${modelName} unsupported=${unsupportedClaims}/${casesRun}`,
-      reasoning: `Model-in-the-loop eval (${casesRun} cases): ${summaryLine}.`,
-      verification: `${summaryLine} | ${perCase}`,
-      token_usage: tokenUsage,
-    });
+    // R3: result-log precondition is verified inside `appendBlock`'s writer lock on the exact fd.
+    block = appendBlock(
+      options.logPath,
+      {
+        schema: 2,
+        agent: options.agent,
+        project: options.project,
+        status: 'done',
+        intent: `facts eval: ${modelName} unsupported=${unsupportedClaims}/${casesRun}`,
+        reasoning: `Model-in-the-loop eval (${casesRun} cases): ${summaryLine}.`,
+        verification: `${summaryLine} | ${perCase}`,
+        token_usage: tokenUsage,
+      },
+      { expectedLog },
+    );
   }
 
   return {
