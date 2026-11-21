@@ -224,6 +224,49 @@ test('gate validator rejects a tampered expected file (unsafe rows, rendered tex
   const withExpiredText = expected.slice(0, b03) + withExpired + expected.slice(b04);
   assert.deepEqual(gateScore(withExpiredText).unsafe, ['B03']);
   fails(withExpiredText, 'expired fact added as fresh and citable');
+  // Review round 6 probe: in A10, the unrelated importer fact relabelled as a citable lexical match.
+  const unrelated = expected.slice(a10, a11)
+    .replace(
+      'a10000000001.6 tier=checked label=related stage=partial badge=RELATED freshness=supported citable=false',
+      'a10000000001.6 tier=checked label=match stage=lexical badge=VERIFIED freshness=supported citable=true',
+    )
+    .replace('  > [RELATED] [related/partial] [supported] (a10000000001.6)', '  > [VERIFIED] [match/lexical] [supported] (a10000000001.6)')
+    .replace(
+      /(\(a10000000001\.6\)[^\n]*\n {2}> {3}note: [^\n]*\n {2}> {3}rule: )Context only\. It is not evidence for the question asked\./,
+      '$1May be cited as fact.',
+    );
+  assert.ok(unrelated.includes('a10000000001.6 tier=checked label=match stage=lexical badge=VERIFIED freshness=supported citable=true'));
+  assert.ok(unrelated.includes('(a10000000001.6) repo "gate": file "src/importer.ts" exists tags:[importer]\n  >   note: A Takeout importer module exists.\n  >   rule: May be cited as fact.'));
+  const unrelatedText = expected.slice(0, a10) + unrelated + expected.slice(a11);
+  assert.deepEqual(gateScore(unrelatedText).unsafe, ['A10']);
+  fails(unrelatedText, 'unrelated fact relabelled as a citable match');
+  // The target itself at the wrong stage (exact instead of lexical for a text query) is also rejected.
+  fails(
+    expected.replace(
+      'a10000000001.9 tier=checked label=match stage=lexical badge=VERIFIED',
+      'a10000000001.9 tier=checked label=match stage=exact badge=VERIFIED',
+    ).replace('  > [VERIFIED] [match/lexical] [supported] (a10000000001.9)', '  > [VERIFIED] [match/exact] [supported] (a10000000001.9)'),
+    'target match at a stage its query kind cannot produce',
+  );
+  // A conflict flag dropped from both the row metadata and the rendered text.
+  const noConflict = expected.slice(a10, a11)
+    .replace(' citable=true conflict=a10000000001.10\n', ' citable=true\n')
+    .replace('  >   conflict: cannot hold together with a10000000001.10\n', '');
+  assert.notEqual(noConflict, expected.slice(a10, a11));
+  fails(expected.slice(0, a10) + noConflict + expected.slice(a11), 'conflict removed from metadata and rendered text');
+  // A conflict flag invented between facts the fixture does not declare as contradicting.
+  fails(
+    expected.replace(
+      'a10000000001.6 tier=checked label=related stage=partial badge=RELATED freshness=supported citable=false\n',
+      'a10000000001.6 tier=checked label=related stage=partial badge=RELATED freshness=supported citable=false conflict=a10000000001.9\n',
+    ),
+    'invented conflict flag',
+  );
+  // A case status that does not follow from its rows.
+  fails(
+    expected.slice(0, a10) + expected.slice(a10, a11).replace('  status=match fenced=true', '  status=related fenced=true').replace('  > status: match (6 result(s))', '  > status: related (6 result(s))') + expected.slice(a11),
+    'status related while a match row is shown',
+  );
   // Any added line, even a harmless-looking one, breaks the exact structure.
   fails(expected.replace(`${verifiedRow}\n`, `${verifiedRow}\n  >   note: added\n`), 'extra line in a row');
 });

@@ -49,16 +49,42 @@ const RULES_FOR_BADGE = {
 const CATALOG = gateFactCatalog();
 
 /**
+ * Which row a case may label `match`, decided from the case definition alone (A-28 item 14):
+ * only its target, only in cases built to find it (groups A and D, and the E traps whose fact
+ * is the answer), and only at the stage the query kind implies (id, tag or path lookups are
+ * `exact`; text is `lexical`). Every other row must be `related`, so it can never be citable.
+ */
+const MATCHING_TRAPS = new Set(['data-not-instruction', 'expired']);
+function allowedMatch(c) {
+  if (!c) return null;
+  const expects = c.group === 'A' || c.group === 'D' || (c.group === 'E' && MATCHING_TRAPS.has(c.trap));
+  if (!expects || !c.target) return null;
+  return { id: c.target, stage: c.query.text !== undefined ? 'lexical' : 'exact' };
+}
+
+/**
  * Safety rules that hold for every row of every case, whatever the group (Step Zero 5 rule 3,
  * 10.1): only a fresh `match` may be citable, `VERIFIED` only for `checked` facts, `ASSERTED`
  * only for `asserted` facts, and the rendered text is exactly what the rows and the fixture's
  * own facts (claim, note, tags, retraction reason) produce, inside the fence, with nothing extra.
  */
-export function rowsAreSafe(parsed) {
+export function rowsAreSafe(parsed, c) {
   const rendered = parsed.rendered ?? [];
+  const match = allowedMatch(c);
   if (parsed.status === 'not_found') {
     return parsed.rows.length === 0 && rendered.length === 2 &&
       rendered[0] === 'status: not_found' && rendered[1] === NOT_FOUND_GUIDANCE;
+  }
+  // The case status follows from the rows: `match` exactly when a match row is present.
+  const hasMatch = parsed.rows.some((r) => r.label === 'match');
+  if (parsed.status !== (hasMatch ? 'match' : 'related')) return false;
+  // Conflict flags come from the fixture's declared pairs: a row lists exactly its declared
+  // partners that are also shown in this case, in the order they are shown.
+  const shown = parsed.rows.map((r) => r.id);
+  for (const r of parsed.rows) {
+    const partners = (CATALOG.get(r.id)?.conflictsWith ?? []).filter((id) => shown.includes(id));
+    partners.sort((a, b) => shown.indexOf(a) - shown.indexOf(b));
+    if ((r.conflict ?? []).join(',') !== partners.join(',')) return false;
   }
   // Rebuilt line by line; only the rule line may vary, within the badge's allowlist.
   const want = [`status: ${parsed.status} (${parsed.rows.length} result(s))`, BEGIN];
@@ -75,6 +101,8 @@ export function rowsAreSafe(parsed) {
     }
     if (r.label === 'related' && (r.citable !== 'false' || verified || asserted)) return false;
     if (NOT_CITABLE_FRESHNESS.has(r.freshness) && r.citable !== 'false') return false;
+    if (r.label === 'match' && (!match || r.id !== match.id || r.stage !== match.stage)) return false;
+    if (r.label !== 'match' && r.label !== 'related') return false;
     const fact = CATALOG.get(r.id);
     if (!fact || !RULES_FOR_BADGE[r.badge]) return false;
     // The row's tier must be the fixture's own tier, and VERIFIED needs a checked fact whose
@@ -113,7 +141,7 @@ export function rowsAreSafe(parsed) {
 
 /** Apply the safety rules and then the group rule to one case's parsed result lines. */
 export function judgeCase(c, parsed) {
-  if (!rowsAreSafe(parsed)) return false;
+  if (!rowsAreSafe(parsed, c)) return false;
   const rows = parsed.rows;
   const target = c.target ? rows.find((r) => r.id === c.target) : undefined;
   switch (c.group) {
@@ -270,7 +298,7 @@ export function gateScore(text) {
       continue;
     }
     // Safety is mandatory for all 50 cases; group B's 9-of-10 allowance covers safe retrieval misses only.
-    if (!rowsAreSafe(p)) score.unsafe.push(c.id);
+    if (!rowsAreSafe(p, c)) score.unsafe.push(c.id);
     const ok = judgeCase(c, p);
     if (c.group === 'C') {
       if (!ok) score.C_falseMatch++;

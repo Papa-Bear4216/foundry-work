@@ -271,8 +271,11 @@ const EXPECTED_STATE = {
   'a40000000004.0': 'supported',
 };
 
+/** The only contradicting pair the fixture builds: src/legacy.ts "exists" against "is absent". */
+const CONFLICT_PAIRS = [['a10000000001.9', 'a10000000001.10']];
+
 /**
- * fact_id -> { tier, check, claim, note, tags, retractionReason, expected } for every fixture fact, defined
+ * fact_id -> { tier, check, claim, note, tags, retractionReason, expected, conflictsWith } for every fixture fact, defined
  * here, not by the renderer. The gate checks every row's tier against this, so a snapshot cannot
  * promote an asserted (free-text) fact to a checked one.
  */
@@ -297,6 +300,7 @@ export function gateFactCatalog() {
         tags: f.tags,
         retractionReason: retracted.get(f.fact_id) ?? null,
         expected: EXPECTED_STATE[f.fact_id],
+        conflictsWith: CONFLICT_PAIRS.flatMap(([a, b]) => (a === f.fact_id ? [b] : b === f.fact_id ? [a] : [])),
       });
     }
   }
