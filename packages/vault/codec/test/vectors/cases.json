@@ -1,6 +1,7 @@
 {
   "warning": "TEST ONLY: all credentials, keys, salts, nonces and content are synthetic.",
   "passphrase": "TEST ONLY café 🔒",
+  "changed_passphrase": "TEST ONLY changed 🔒",
   "recovery_key": "3434343434343434343434343434343434343434343434343434343434343434",
   "metadata": {
     "format": "foundry-vault/1",
@@ -16,6 +17,7 @@
     "erased": "05050505050505050505050505050505"
   },
   "keyring": "ring.json",
+  "changed_keyring": "ring-passphrase-changed.json",
   "record_cases": [
     {
       "name": "event",
@@ -352,6 +354,21 @@
       "asset": "ring-p2.json"
     },
     {
+      "name": "changed-passphrase",
+      "asset": "ring-passphrase-changed.json",
+      "changed_passphrase": true
+    },
+    {
+      "name": "recovery-after-passphrase-change",
+      "asset": "ring-passphrase-changed.json",
+      "recovery": true
+    },
+    {
+      "name": "old-passphrase-after-change",
+      "asset": "ring-passphrase-changed.json",
+      "error": "AUTH"
+    },
+    {
       "name": "wrong-passphrase",
       "asset": "ring.json",
       "wrong_passphrase": true,
@@ -409,10 +426,16 @@
       "error": "SCHEMA"
     },
     {
-      "name": "recovery-kdf-aad",
-      "asset": "live-kdf-aad.json",
+      "name": "master-slot-swap-recovery",
+      "asset": "master-slot-swap.json",
       "recovery": true,
       "error": "AUTH"
+    },
+    {
+      "name": "recovery-kdf-tamper-after-change",
+      "recovery": true,
+      "error": "MAC",
+      "asset": "changed-kdf-tamper.json"
     }
   ]
 }

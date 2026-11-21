@@ -78,7 +78,8 @@ class Vectors(unittest.TestCase):
                 if case.get("recovery"):
                     credential = {"recovery_key": bytes.fromhex(CASES["recovery_key"])}
                 else:
-                    credential = {"passphrase": "TEST ONLY wrong" if case.get("wrong_passphrase") else CASES["passphrase"]}
+                    passphrase = CASES["changed_passphrase"] if case.get("changed_passphrase") else CASES["passphrase"]
+                    credential = {"passphrase": "TEST ONLY wrong" if case.get("wrong_passphrase") else passphrase}
                 result = self.expect(case, lambda: unlock(asset(case["asset"]), case.get("vault_id", self.vault_id),
                                                            **credential))
                 if result is not None:

@@ -1,14 +1,16 @@
 import assert from 'node:assert/strict';
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { createHmac } from 'node:crypto';
+import { createHmac, scryptSync } from 'node:crypto';
 import {
   FRAME_BYTES, GENESIS_HASH, encodeKeyring, encodeManifest, encodeRecord, sha256, signingPublicKey,
 } from '../src/index.ts';
-import { canonical, derive } from '../src/bytes.ts';
+import { canonical, derive, seal } from '../src/bytes.ts';
+import type { Json } from '../src/bytes.ts';
 import type { Manifest } from '../src/index.ts';
 
 // TEST ONLY. Fixed credentials, key bytes, salts and nonces are synthetic and public.
 const passphrase = 'TEST ONLY cafe\u0301 \u{1f512}';
+const changedPassphrase = 'TEST ONLY changed \u{1f512}';
 const vaultId = '10'.repeat(16);
 const wrongVault = '11'.repeat(16);
 const ids = { collection: '01'.repeat(16), profile: '02'.repeat(16), index: '03'.repeat(16),
@@ -25,7 +27,7 @@ const date = '2026-01-02T03:04:05Z';
 let nonceByte = 0x40;
 const live = { state: 'active', created_at: date } as const;
 const ringInput = {
-  vaultId, version: Number.MAX_SAFE_INTEGER, masterKey: master, entries: [
+  vaultId, version: Number.MAX_SAFE_INTEGER - 1, masterKey: master, entries: [
     { key_id: ids.profile, kind: 'profile', parent: 'master', key: profile, label: 'fixture \u{1f512}', ...live },
     { key_id: ids.collection, kind: 'collection', parent: ids.profile, key: collection, ...live },
     { key_id: ids.index, kind: 'index', parent: 'master', key: indexKey, ...live },
@@ -36,6 +38,31 @@ const ringInput = {
 const testEntropy = (size: number) => Buffer.alloc(size, nonceByte++);
 const keyring = encodeKeyring(ringInput, passphrase, recoveryKey, testEntropy);
 const strongerRing = encodeKeyring({ ...ringInput, parallelism: 2 }, passphrase, recoveryKey, testEntropy);
+
+function withKeyringMac(body: Record<string, Json>): Buffer {
+  const mac = createHmac('sha256', derive(master, 'keyring-mac', salt)).update(canonical(body)).digest('base64');
+  return Buffer.from(canonical({ ...body, mac }));
+}
+
+// Simulate a V-2 rewrite using the known MK and the new passphrase as the only secrets.
+const { mac: _, ...previousRing } = JSON.parse(keyring.toString());
+const changedSalt = testEntropy(32);
+const changedKdf = { ...previousRing.kdf, p: 2, salt: changedSalt.toString('base64') };
+const changedKey = scryptSync(Buffer.from(changedPassphrase), changedSalt, 32,
+  { N: changedKdf.N, r: changedKdf.r, p: changedKdf.p, maxmem: 256 * 1024 * 1024 });
+const changedNonce = testEntropy(12);
+const changedAad = Buffer.from(canonical([
+  previousRing.format, previousRing.vault_id, 'master', 'master', 'passphrase', changedKdf,
+]));
+const changedRing = withKeyringMac({
+  ...previousRing,
+  version: previousRing.version + 1,
+  kdf: changedKdf,
+  master: {
+    ...previousRing.master,
+    by_passphrase: Buffer.concat([changedNonce, seal(changedKey, changedNonce, changedAad, master)]).toString('base64'),
+  },
+});
 const metadata = { format: 'foundry-vault/1', vault_id: vaultId, created_at: date,
   signing_public_key: signingPublicKey(signing).toString('base64') };
 const dir = new URL('./vectors/', import.meta.url);
@@ -164,8 +191,12 @@ manifestCases.push(
     Buffer.concat([read(genesis.asset), Buffer.from('\n')])), error: 'CANONICAL' },
 );
 const ring = save('ring.json', keyring);
+const changed = save('ring-passphrase-changed.json', changedRing);
 const keyringCases: object[] = [{ name: 'passphrase', asset: ring }, { name: 'recovery', asset: ring, recovery: true },
   { name: 'scrypt-at-ceiling', asset: save('ring-p2.json', strongerRing) },
+  { name: 'changed-passphrase', asset: changed, changed_passphrase: true },
+  { name: 'recovery-after-passphrase-change', asset: changed, recovery: true },
+  { name: 'old-passphrase-after-change', asset: changed, error: 'AUTH' },
   { name: 'wrong-passphrase', asset: ring, wrong_passphrase: true, error: 'AUTH' },
   { name: 'keyring-vault', asset: ring, vault_id: wrongVault, error: 'KEY' }];
 for (const [name, error, edit, remac] of [
@@ -185,17 +216,22 @@ for (const [name, error, edit, remac] of [
 ] as const) {
   const data = JSON.parse(keyring.toString());
   edit(data);
-  if (remac) {
-    delete data.mac;
-    data.mac = createHmac('sha256', derive(master, 'keyring-mac', salt)).update(canonical(data)).digest('base64');
-  }
-  keyringCases.push({ name, asset: save(name + '.json', Buffer.from(canonical(data))), error });
+  if (remac) delete data.mac;
+  const bytes = remac ? withKeyringMac(data) : Buffer.from(canonical(data));
+  keyringCases.push({ name, asset: save(name + '.json', bytes), error });
 }
-keyringCases.push({ name: 'recovery-kdf-aad', asset: 'live-kdf-aad.json', recovery: true, error: 'AUTH' });
+const tamperedRing = JSON.parse(changedRing.toString());
+tamperedRing.kdf.p = 1;
+keyringCases.push(
+  { name: 'master-slot-swap-recovery', asset: 'master-slot-swap.json', recovery: true, error: 'AUTH' },
+  { name: 'recovery-kdf-tamper-after-change', recovery: true, error: 'MAC',
+    asset: save('changed-kdf-tamper.json', Buffer.from(canonical(tamperedRing))) },
+);
 save('VAULT.json', Buffer.from(canonical(metadata)));
 save('cases.json', Buffer.from(JSON.stringify({
   warning: 'TEST ONLY: all credentials, keys, salts, nonces and content are synthetic.',
-  passphrase, recovery_key: recoveryKey.toString('hex'), metadata, ids, keyring: ring,
+  passphrase, changed_passphrase: changedPassphrase, recovery_key: recoveryKey.toString('hex'), metadata, ids,
+  keyring: ring, changed_keyring: changed,
   record_cases: recordCases, manifest_cases: manifestCases, keyring_cases: keyringCases,
 }, null, 2) + '\n'));
 if (checkOnly) assert.deepEqual(readdirSync(dir).filter(name => name !== '.gitattributes').sort(), [...assets.keys()].sort());

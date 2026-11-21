@@ -96,7 +96,7 @@ def unlock(raw, vault_id, *, passphrase=None, recovery_key=None):
     slot = "passphrase" if passphrase is not None else "recovery"
     kek = (hashlib.scrypt(passphrase.encode(), salt=salt, n=131072, r=8, p=kdf["p"], dklen=32, maxmem=256 << 20)
            if passphrase is not None else vk(recovery_key, "recovery-wrap"))
-    mk = unwrap(kek, wraps[slot], "master", "master", slot, kdf)
+    mk = unwrap(kek, wraps[slot], "master", "master", slot, kdf if slot == "passphrase" else None)
     check(hmac.compare_digest(mac, hmac.digest(vk(mk, "keyring-mac"), canonical(ring), "sha256")), "MAC")
     keys = {}
     for key_id in sorted(index, key=lambda i: index[i]["kind"] == "collection"):

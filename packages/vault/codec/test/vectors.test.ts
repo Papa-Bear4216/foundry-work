@@ -63,13 +63,27 @@ for (const vector of suite.manifest_cases) {
   });
 }
 
+test('keyring: passphrase rewrite preserves the recovery wrap and entry bytes', () => {
+  const before = unlocked.keyring;
+  const after = JSON.parse(asset(suite.changed_keyring).toString());
+  assert.equal(after.version, before.version + 1);
+  assert.equal(after.kdf.p, 2);
+  assert.notEqual(after.kdf.salt, before.kdf.salt);
+  assert.notEqual(after.master.by_passphrase, before.master.by_passphrase);
+  assert.equal(after.master.by_recovery, before.master.by_recovery);
+  assert.deepEqual(after.keys, before.keys);
+  assert.notEqual(after.mac, before.mac);
+});
+
 for (const vector of suite.keyring_cases) {
   test('keyring: ' + vector.name, () => {
+    const passphrase = vector.changed_passphrase ? suite.changed_passphrase : suite.passphrase;
     const credential = vector.recovery ? { recoveryKey: Buffer.from(suite.recovery_key, 'hex') }
-      : { passphrase: vector.wrong_passphrase ? 'TEST ONLY wrong' : suite.passphrase };
+      : { passphrase: vector.wrong_passphrase ? 'TEST ONLY wrong' : passphrase };
     const result = expect(() => decodeKeyring(asset(vector.asset), credential, vector.vault_id ?? vaultId),
       vector.error);
     if (result) {
+      assert.deepEqual(result.masterKey, unlocked.masterKey);
       assert.deepEqual(result.collectionEncryptionKey(suite.ids.collection), initialKey);
       assert.deepEqual(signingPublicKey(result.keys.get(suite.ids.signing)!), publicKey);
       assert.equal(result.labels.get(suite.ids.profile), 'fixture \u{1f512}');

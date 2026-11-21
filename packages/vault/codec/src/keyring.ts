@@ -142,7 +142,7 @@ export function encodeKeyring(
   const recovery = vaultKey(recoveryKey, vaultId, 'recovery-wrap');
   const master = {
     by_passphrase: wrap(passKey, entropy(12), aad(vaultId, 'master', 'master', 'passphrase', kdf), masterKey),
-    by_recovery: wrap(recovery, entropy(12), aad(vaultId, 'master', 'master', 'recovery', kdf), masterKey),
+    by_recovery: wrap(recovery, entropy(12), aad(vaultId, 'master', 'master', 'recovery'), masterKey),
   };
   const keysById = new Map(entries.flatMap(entry => entry.state === 'active' ? [[entry.key_id, entry.key]] : []));
   const keys: Entry[] = [...entries].sort((a, b) => a.key_id < b.key_id ? -1 : Number(a.key_id > b.key_id))
@@ -178,7 +178,7 @@ export function decodeKeyring(bytes: Buffer, credential: Unlock, expectedVaultId
     ? unwrap(passphraseKey(credential.passphrase, kdf),
       aad(vaultId, 'master', 'master', 'passphrase', kdf), master.by_passphrase)
     : unwrap(vaultKey(credential.recoveryKey, vaultId, 'recovery-wrap'),
-      aad(vaultId, 'master', 'master', 'recovery', kdf), master.by_recovery);
+      aad(vaultId, 'master', 'master', 'recovery'), master.by_recovery);
   check(timingSafeEqual(base64(storedMac, 32), mac(body, masterKey)), 'MAC');
 
   const unwrapped = new Map<string, Buffer>();

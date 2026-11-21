@@ -313,9 +313,10 @@ verification. See section 9 and the V-0 measurements.
 
 256 random bits, shown once as grouped base32 text and as a QR code for printing. It
 unwraps MK independently of the passphrase. The wizard asks the user to type back four
-groups before it continues. Changing the passphrase re-wraps MK and leaves the same recovery key valid. Both master
-wraps authenticate the current KDF header, including the salt. A V-2 command that changes
-that header needs the existing recovery key to refresh its wrap in the same rewrite.
+groups before it continues. Changing the passphrase or KDF parameters leaves the same
+recovery key valid. Either change uses a fresh salt, re-wraps MK under the new
+passphrase-derived key, keeps `master.by_recovery` byte-identical, and recomputes the
+keyring MAC. The rewrite can use the current passphrase to unlock MK and needs no recovery key.
 
 - The text form carries a version character and a checksum, so a typing mistake is
   reported as a mistake and not as a wrong key.
@@ -369,19 +370,24 @@ must be kept in step across copies.
   | Field | `key_id` | `kind` | `parent` | `kdf_or_null` | Encryption key |
   |---|---|---|---|---|---|
   | `master.by_passphrase` | `master` | `master` | `passphrase` | complete `kdf` object | scrypt KEK |
-  | `master.by_recovery` | `master` | `master` | `recovery` | complete `kdf` object | recovery wrapping key |
+  | `master.by_recovery` | `master` | `master` | `recovery` | JSON null | recovery wrapping key |
   | `keys[].wrapped` | entry key ID | entry kind | entry parent | JSON null | MK or raw parent PK |
   | `keys[].label_enc` | profile key ID | `profile-label` | `master` | JSON null | profile label key |
 
+- Both master wraps bind the format, vault ID and slot label in their AAD to prevent
+  moving a wrap between vaults or slots. The passphrase slot also binds the complete
+  KDF header (`name`, `N`, `r`, `p` and `salt`). The recovery slot's AAD is independent
+  of the passphrase KDF header.
 - Derive the 32-byte recovery wrapping, profile label and keyring MAC keys using
   HKDF-SHA256 with the 16 raw vault ID bytes as salt. For recovery, use the 32 raw
   recovery bytes and ASCII info `foundry/recovery-wrap/v1`. For the other two, use
   MK and ASCII info `foundry/profile-label/v1` and `foundry/keyring-mac/v1`,
   respectively.
-- `mac` is base64 of raw HMAC-SHA256 over the canonical keyring object with its
-  `mac` member removed, using the keyring MAC key. Check the format, KDF bounds and
-  vault ID, unwrap MK using either credential, and verify the MAC with a constant-time
-  comparison before using entry keys or accepting erasure states. Unwrap parents first.
+- `mac` is base64 of raw HMAC-SHA256 over the canonical keyring object, including
+  the KDF header, with only its `mac` member removed. Use the keyring MAC key. Check
+  the format, KDF bounds and vault ID, unwrap MK using either credential, and verify
+  the MAC with a constant-time comparison before using entry keys or accepting erasure
+  states. Unwrap parents first.
 - Size: keys exist per profile and per collection, never per item, so the file stays in
   the tens of kilobytes. A design with a random key per item was rejected for v1: it needs
   a transactional key store and makes every keyring backup a larger erasure liability.
