@@ -4,9 +4,11 @@ export { FRAME_BYTES, decodeRecord, decryptRecord, encodeRecord, scanRecords } f
 export type { RecordFields } from './record.ts';
 export { GENESIS_HASH, decodeManifest, decodeVaultMetadata, encodeManifest, signingPublicKey, verifySegment } from './manifest.ts';
 export type { ChainPosition, Manifest, ManifestFile } from './manifest.ts';
-export { blobId, collectionIdKey, decodeKeyring, encodeKeyring } from './keyring.ts';
-export type { KdfParallelism, Unlock } from './keyring.ts';
-export { changePassphrase, create, rekeyAll, unlockByPassphrase, unlockByRecovery } from './keys.ts';
+export { blobId, collectionIdKey, decodeKeyring, encodeKeyring, UnlockSession } from './keyring.ts';
+export type { KdfParallelism, Unlock, VaultCredential } from './keyring.ts';
+export {
+  changePassphrase, create, rekeyAll, resetPassphrase, unlockByPassphrase, unlockByRecovery, unlockVault,
+} from './keys.ts';
 export type { RekeyHandoff } from './keys.ts';
 export { decodeRecoveryKey } from './recovery.ts';
 export { guardSecretInput, readSecretFromFd } from './secret-input.ts';

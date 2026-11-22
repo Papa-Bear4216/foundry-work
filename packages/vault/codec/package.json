@@ -9,10 +9,11 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test --test-concurrency=1 test/vectors.test.ts test/root-checks.test.mjs test/keys.test.mjs test/vault.test.mjs test/replay.test.mjs test/index-keys.test.mjs",
+    "test": "node --test --test-concurrency=1 test/vectors.test.ts test/root-checks.test.mjs test/keys.test.mjs test/vault.test.mjs test/replay.test.mjs test/index-keys.test.mjs test/session.test.mjs",
     "budgets": "node test/key-budgets.mjs",
     "vault-budgets": "node test/vault-budgets.mjs",
     "replay-budgets": "node test/replay-budgets.mjs",
+    "session-budgets": "node test/session-budgets.mjs",
     "vectors": "node test/generate-vectors.ts"
   }
 }

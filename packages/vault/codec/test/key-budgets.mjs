@@ -26,6 +26,7 @@ for (const [label, command, input] of [
   ['unlock by passphrase (p=2)', 'unlock-passphrase', { vaultId, passphrase: current }],
   ['unlock by recovery', 'unlock-recovery', { vaultId, recoveryKey }],
   ['passphrase change (p=2)', 'change', { vaultId, current, passphrase }],
+  ['passphrase reset with the recovery key (p=2)', 'reset-passphrase', { vaultId, recoveryKey, passphrase }],
   ['rekey all (p=2)', 'rekey', { vaultId, current, passphrase, currentCollectionIds, historicalCollectionIds }],
 ]) {
   using directory = mkdtempDisposableSync(join(tmpdir(), 'vault-key-budget-'));
@@ -38,7 +39,7 @@ for (const [label, command, input] of [
   const published = readFileSync(path);
   if (command === 'create') {
     assert.equal(JSON.parse(published).version, 1);
-  } else if (command === 'change' || command === 'rekey') {
+  } else if (command === 'change' || command === 'reset-passphrase' || command === 'rekey') {
     assert.equal(JSON.parse(published).version, initialVersion + 1);
   } else {
     assert.deepEqual(published, initial);
