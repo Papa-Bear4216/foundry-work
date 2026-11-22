@@ -10,6 +10,7 @@ also requires a recorded decision in [DECISIONS.md](DECISIONS.md).
 | Package | License | Why it cannot be avoided |
 | --- | --- | --- |
 | better-sqlite3-multiple-ciphers | MIT | SQLCipher encrypted working index adapter (decided in D-10); transitive dependency: `node-addon-api` (MIT). |
+| node-addon-api | MIT | Version 8.9.2, transitive dependency of `better-sqlite3-multiple-ciphers` 13.2.0. Provides C++ headers used to build the native addon. Prebuilt binaries ship, and Foundry code never loads the headers. |
 
 TypeScript (Apache-2.0) is a build dependency. Gitleaks (MIT) is a standalone CI
 tool. Neither ships with the facts ledger.
