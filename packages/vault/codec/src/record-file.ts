@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
 import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
-import { check } from './bytes.ts';
+import { check, clearPlaintext } from './bytes.ts';
 import {
   checkFrameSize, decodeRecordHeader, decryptFrame, eventSequence, FRAME_BYTES, FRAME_OVERHEAD, HEADER_BYTES, recordKey,
 } from './record.ts';
@@ -58,6 +58,20 @@ export class StreamScanner {
     fd: number, record: DiskRecord, hash?: ReturnType<typeof createHash>,
     plaintext?: { vaultId: string; key: Buffer; consume: (chunk: Buffer) => void },
   ): void {
+    for (const chunk of this.frameChunks(fd, record, hash, plaintext)) {
+      try {
+        plaintext!.consume(chunk);
+      } finally {
+        clearPlaintext(chunk);
+      }
+    }
+  }
+
+  /** Yields owned plaintext buffers only after their FVR1 frame tags have been verified. */
+  *frameChunks(
+    fd: number, record: DiskRecord, hash?: ReturnType<typeof createHash>,
+    plaintext?: { vaultId: string; key: Buffer },
+  ): Generator<Buffer, void, undefined> {
     let offset = record.offset + HEADER_BYTES;
     let index = 0;
     hash?.update(record.header);
@@ -74,13 +88,8 @@ export class StreamScanner {
         if (hash || key) readExactly(fd, this.#frame.subarray(4, frameLength), offset - frameLength + 4);
         hash?.update(this.#frame.subarray(0, frameLength));
         if (plaintext && key) {
-          const chunk = decryptFrame(record.header, plaintext.vaultId, key,
+          yield decryptFrame(record.header, plaintext.vaultId, key,
             this.#frame.subarray(4, frameLength), index, offset === record.end);
-          try {
-            plaintext.consume(chunk);
-          } finally {
-            chunk.fill(0);
-          }
         }
         index++;
       }

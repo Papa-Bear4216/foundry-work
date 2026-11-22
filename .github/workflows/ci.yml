@@ -110,6 +110,8 @@ jobs:
         run: npm --prefix packages/vault/codec run budgets
       - name: Vault append, close and verification peak RSS (pinned runtime)
         run: npm --prefix packages/vault/codec run vault-budgets
+      - name: Vault replay and streamed blob peak RSS (pinned runtime)
+        run: npm --prefix packages/vault/codec run replay-budgets
 
   v0-measure:
     concurrency:
