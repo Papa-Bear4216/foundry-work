@@ -1,6 +1,6 @@
 import { parseArgs } from 'node:util';
 import {
-  changePassphrase, create, guardSecretInput, readSecretFromFd, rekeyAll, unlockByPassphrase, unlockByRecovery,
+  changePassphrase, create, guardSecretInput, readSecretFromFd, rekeyAll, resetPassphrase, unlockByPassphrase, unlockByRecovery,
 } from '../dist/index.js';
 
 // TEST ONLY: the caller supplies synthetic credentials over stdin.
@@ -27,6 +27,9 @@ try {
       break;
     case 'change':
       changePassphrase(path, input.vaultId, input.current, input);
+      break;
+    case 'reset-passphrase':
+      resetPassphrase(path, input.vaultId, input.recoveryKey, input);
       break;
     case 'rekey':
       rekeyAll(path, input.vaultId, { passphrase: input.current }, input);

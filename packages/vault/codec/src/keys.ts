@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { check } from './bytes.ts';
 import {
   changeKeyringPassphrase, createUnlockSession, decodeKeyring, encodeKeyring, nextKeyringVersion, readKeyring,
-  replacementParallelism, snapshotCredential, unlockKeyring, validateParallelism, vaultKey,
+  replacementParallelism, resetKeyringPassphrase, snapshotCredential, unlockKeyring, validateParallelism, vaultKey,
 } from './keyring.ts';
 import type { KdfParallelism, UnlockSession, VaultCredential } from './keyring.ts';
 import { publishKeyring } from './keyring-file.ts';
@@ -73,6 +73,23 @@ export function changePassphrase(
   const previous = readFileSync(path);
   const next = changeKeyringPassphrase(previous, vaultId, currentPassphrase, replacement.passphrase, replacement.parallelism);
   publishKeyring(path, next, previous);
+}
+
+/**
+ * Forgotten passphrase: unlock with the printed recovery key and publish the same keyring with a new passphrase wrap of
+ * the SAME master key (new KDF salt). Rotates nothing; use rekeyAll when a credential may be known to someone else.
+ */
+export function resetPassphrase(
+  path: string, vaultId: string, recoveryKey: string, replacement: PassphraseOptions,
+): void {
+  const recovery = decodeRecoveryKey(recoveryKey);
+  try {
+    const previous = readFileSync(path);
+    const next = resetKeyringPassphrase(previous, vaultId, recovery, replacement.passphrase, replacement.parallelism);
+    publishKeyring(path, next, previous);
+  } finally {
+    recovery.fill(0);
+  }
 }
 
 interface RekeyOptions extends PassphraseOptions {

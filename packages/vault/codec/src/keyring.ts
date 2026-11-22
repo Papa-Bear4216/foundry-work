@@ -275,11 +275,30 @@ export function updateIndexEntry(
 export function changeKeyringPassphrase(
   bytes: Buffer, vaultId: string, current: string, replacement: string, parallelism?: KdfParallelism,
 ): Buffer {
+  return rewrapPassphraseSlot(bytes, vaultId, { passphrase: current }, replacement, parallelism);
+}
+
+/** Re-wrap the unchanged master key under a new passphrase after unlocking it with the 32-byte recovery key. */
+export function resetKeyringPassphrase(
+  bytes: Buffer, vaultId: string, recoveryKey: Buffer, replacement: string, parallelism?: KdfParallelism,
+): Buffer {
+  return rewrapPassphraseSlot(bytes, vaultId, { recoveryKey }, replacement, parallelism);
+}
+
+/**
+ * Shared body of changeKeyringPassphrase and resetKeyringPassphrase: unlock the master key with the given credential,
+ * then encode the same keyring with a new KDF block, a new passphrase wrap of the same master key, `by_recovery` and
+ * `keys` unchanged, the next version and a MAC under the same master key. Nothing is rotated.
+ */
+function rewrapPassphraseSlot(
+  bytes: Buffer, vaultId: string, input: VaultCredential, replacement: string, parallelism?: KdfParallelism,
+): Buffer {
+  const credential = snapshotCredential(input, false) as VaultCredential;
   if (parallelism !== undefined) validateParallelism(parallelism);
   const keyring = readKeyring(bytes, vaultId);
   const version = nextKeyringVersion(keyring.version);
   const kdf = newKdf(replacementParallelism(keyring.kdf.p, parallelism), randomBytes);
-  const masterKey = unlockMaster(keyring, { passphrase: current });
+  const masterKey = unlockMaster(keyring, credential);
   try {
     return encodeBody({
       format: FORMAT, vault_id: vaultId, version, kdf, keys: keyring.keys,

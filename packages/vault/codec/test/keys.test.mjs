@@ -11,10 +11,11 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { canonical, derive, seal } from '../src/bytes.ts';
 import { publishKeyring } from '../src/keyring-file.ts';
+import { getKdfCallCountForTest, resetKdfCallCountForTest } from '../src/keyring.ts';
 import { formatRecoveryKey } from '../src/recovery.ts';
 import {
-  changePassphrase, create, decodeKeyring, decodeRecord, decodeRecoveryKey, rekeyAll,
-  guardSecretInput, readSecretFromFd, signingPublicKey, unlockByPassphrase, unlockByRecovery,
+  changePassphrase, create, decodeKeyring, decodeRecord, decodeRecoveryKey, rekeyAll, resetPassphrase,
+  guardSecretInput, readSecretFromFd, signingPublicKey, unlockByPassphrase, unlockByRecovery, unlockVault,
 } from '../src/index.ts';
 
 // TEST ONLY: these credentials and all generated keyrings are synthetic.
@@ -537,4 +538,138 @@ test('descriptor reads preserve UTF-8 across chunks, enforce the byte cap and cl
   }
   read.mock.restore();
   syncBuiltinESMExports();
+});
+
+function outcome(action) {
+  try {
+    action();
+    return 'ok';
+  } catch (error) {
+    return error.code ?? `${error.constructor.name}: ${error.message}`;
+  }
+}
+
+test('resetPassphrase with the recovery key re-wraps the same master key under a new passphrase and rotates nothing', t => {
+  const path = testPath(t, vector(cases.keyring));
+  const before = unlockByRecovery(path, vectorId, vectorText);
+  assert.deepEqual(unlockByPassphrase(path, vectorId, cases.passphrase).masterKey, before.masterKey);
+
+  resetPassphrase(path, vectorId, vectorText, { passphrase: second });
+  const after = unlockByPassphrase(path, vectorId, second);
+  assert.deepEqual(after.masterKey, before.masterKey);
+  assert.throws(() => unlockByPassphrase(path, vectorId, cases.passphrase), { code: 'AUTH' });
+  assert.deepEqual(unlockByRecovery(path, vectorId, vectorText).masterKey, before.masterKey);
+  assert.ok(before.keys.size > 0);
+  assert.deepEqual(after.keys, before.keys);
+  assert.deepEqual(after.labels, before.labels);
+  assert.deepEqual(after.erased, before.erased);
+  assert.deepEqual(after.keyring.keys, before.keyring.keys);
+  assert.equal(after.keyring.version, before.keyring.version + 1);
+  assert.equal(after.keyring.master.by_recovery, before.keyring.master.by_recovery);
+  assert.notEqual(after.keyring.master.by_passphrase, before.keyring.master.by_passphrase);
+  assert.notEqual(after.keyring.kdf.salt, before.keyring.kdf.salt);
+  assert.equal(after.keyring.kdf.p, before.keyring.kdf.p);
+  assert.notEqual(after.keyring.mac, before.keyring.mac);
+  assert.deepEqual(pendingFiles(path), []);
+  const { collection } = cases.ids;
+  assert.deepEqual(pythonUnlock(readFileSync(path), vectorId, second, vectorText, [collection]),
+    [before.collectionEncryptionKey(collection).toString('hex')]);
+});
+
+test('resetPassphrase failures give the same error as unlockByRecovery or changePassphrase and leave the file byte-identical', t => {
+  const initial = vector(cases.keyring);
+  const ringP2 = vector('ring-p2.json');
+  const otherId = 'a1'.repeat(16);
+  const wrongKey = formatRecoveryKey(Buffer.alloc(32, 0x5a));
+  const checksumTypo = vectorText.slice(0, -1) + (vectorText.endsWith('A') ? 'B' : 'A');
+  const tamper = edit => {
+    const ring = JSON.parse(initial);
+    edit(ring);
+    return Buffer.from(canonical(ring));
+  };
+  const tamperedMac = tamper(ring => {
+    const mac = Buffer.from(ring.mac, 'base64');
+    mac[0] ^= 1;
+    ring.mac = mac.toString('base64');
+  });
+  const tamperedEntry = tamper(ring => {
+    ring.keys.find(key => key.state === 'active').created_at = '2001-01-01T00:00:00Z';
+  });
+  const reset = (id, key, options = {}) => path => resetPassphrase(path, id, key, { passphrase: second, ...options });
+  const byRecovery = (id, key) => path => unlockByRecovery(path, id, key);
+  const change = parallelism => path => changePassphrase(path, vectorId, cases.passphrase, { passphrase: second, parallelism });
+  for (const [label, bytes, resetCall, referenceCall, expected] of [
+    ['wrong recovery key', initial, reset(vectorId, wrongKey), byRecovery(vectorId, wrongKey), 'AUTH'],
+    ['wrong vault ID', initial, reset(otherId, vectorText), byRecovery(otherId, vectorText), 'KEY'],
+    ['malformed recovery text', initial, reset(vectorId, '1-ABCD'), byRecovery(vectorId, '1-ABCD'),
+      'Error: Invalid recovery key format.'],
+    ['recovery checksum typo', initial, reset(vectorId, checksumTypo), byRecovery(vectorId, checksumTypo),
+      'Error: Recovery key checksum mismatch.'],
+    ['parallelism 0', initial, reset(vectorId, vectorText, { parallelism: 0 }), change(0), 'KDF'],
+    ['parallelism 3', initial, reset(vectorId, vectorText, { parallelism: 3 }), change(3), 'KDF'],
+    ['parallelism as text', initial, reset(vectorId, vectorText, { parallelism: '2' }), change('2'), 'KDF'],
+    ['parallelism below the current value', ringP2, reset(vectorId, vectorText, { parallelism: 1 }), change(1), 'KDF'],
+    ['tampered MAC', tamperedMac, reset(vectorId, vectorText), byRecovery(vectorId, vectorText), 'MAC'],
+    ['tampered key entry', tamperedEntry, reset(vectorId, vectorText), byRecovery(vectorId, vectorText), 'MAC'],
+  ]) {
+    const resetPath = testPath(t, bytes);
+    const referencePath = testPath(t, bytes);
+    resetKdfCallCountForTest();
+    const resetOutcome = outcome(() => resetCall(resetPath));
+    assert.equal(getKdfCallCountForTest(), 0, label);
+    assert.equal(resetOutcome, outcome(() => referenceCall(referencePath)), label);
+    assert.equal(resetOutcome, expected, label);
+    assert.deepEqual(readFileSync(resetPath), bytes, label);
+    assert.deepEqual(pendingFiles(resetPath), [], label);
+  }
+});
+
+test('resetPassphrase runs scrypt exactly once and unlocking with the recovery key runs it zero times', t => {
+  const path = testPath(t, vector(cases.keyring));
+  resetKdfCallCountForTest();
+  unlockByRecovery(path, vectorId, vectorText);
+  assert.equal(getKdfCallCountForTest(), 0);
+  resetKdfCallCountForTest();
+  resetPassphrase(path, vectorId, vectorText, { passphrase: second });
+  assert.equal(getKdfCallCountForTest(), 1);
+  resetKdfCallCountForTest();
+  unlockByRecovery(path, vectorId, vectorText);
+  assert.equal(getKdfCallCountForTest(), 0);
+});
+
+test('an UnlockSession opened before resetPassphrase still decodes the keyring after it', t => {
+  const path = testPath(t, vector(cases.keyring));
+  const session = unlockVault(path, vectorId, { recoveryKey: Buffer.from(vectorRecovery) });
+  try {
+    const before = decodeKeyring(readFileSync(path), { session }, vectorId);
+    resetPassphrase(path, vectorId, vectorText, { passphrase: second });
+    const after = decodeKeyring(readFileSync(path), { session }, vectorId);
+    assert.equal(after.keyring.version, before.keyring.version + 1);
+    assert.equal(after.keyring.mac, unlockByRecovery(path, vectorId, vectorText).keyring.mac);
+    assert.notEqual(after.keyring.mac, before.keyring.mac);
+    assert.deepEqual(after.masterKey, before.masterKey);
+    assert.deepEqual(after.keys, before.keys);
+  } finally {
+    session.dispose();
+  }
+});
+
+test('resetPassphrase validates the replacement passphrase exactly as changePassphrase does', t => {
+  const initial = vector(cases.keyring);
+  // The empty string is accepted by changePassphrase today, so parity means resetPassphrase accepts it too.
+  for (const [value, expected] of [['', 'ok'], ['TEST ONLY \ud800', 'KEY'], [42, 'KEY'], [undefined, 'KEY'], [null, 'KEY']]) {
+    const resetPath = testPath(t, initial);
+    const changePath = testPath(t, initial);
+    const resetOutcome = outcome(() => resetPassphrase(resetPath, vectorId, vectorText, { passphrase: value }));
+    const changeOutcome = outcome(() => changePassphrase(changePath, vectorId, cases.passphrase, { passphrase: value }));
+    assert.equal(resetOutcome, changeOutcome, String(value));
+    assert.equal(resetOutcome, expected, String(value));
+    if (expected === 'ok') {
+      assert.deepEqual(unlockByPassphrase(resetPath, vectorId, value).masterKey,
+        unlockByRecovery(changePath, vectorId, vectorText).masterKey);
+    } else {
+      assert.deepEqual(readFileSync(resetPath), initial, String(value));
+      assert.deepEqual(pendingFiles(resetPath), [], String(value));
+    }
+  }
 });

@@ -6,7 +6,9 @@ export { GENESIS_HASH, decodeManifest, decodeVaultMetadata, encodeManifest, sign
 export type { ChainPosition, Manifest, ManifestFile } from './manifest.ts';
 export { blobId, collectionIdKey, decodeKeyring, encodeKeyring, UnlockSession } from './keyring.ts';
 export type { KdfParallelism, Unlock, VaultCredential } from './keyring.ts';
-export { changePassphrase, create, rekeyAll, unlockByPassphrase, unlockByRecovery, unlockVault } from './keys.ts';
+export {
+  changePassphrase, create, rekeyAll, resetPassphrase, unlockByPassphrase, unlockByRecovery, unlockVault,
+} from './keys.ts';
 export type { RekeyHandoff } from './keys.ts';
 export { decodeRecoveryKey } from './recovery.ts';
 export { guardSecretInput, readSecretFromFd } from './secret-input.ts';
