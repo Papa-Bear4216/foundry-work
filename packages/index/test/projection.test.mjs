@@ -1,0 +1,194 @@
+import assert from 'node:assert/strict';
+import { existsSync, mkdtempDisposableSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { test } from 'node:test';
+import { openVaultReplay } from '../../vault/codec/dist/index.js';
+import { applyIncremental, initializeSchema, openSqlDriver, rebuildIndex, search, searchIndex, updateIndex } from '../dist/index.js';
+import { ids, note, syntheticVault, systemEvent, tombstone } from './fixture.mjs';
+
+const scratchKey = () => Buffer.alloc(32, 234);
+
+function fixture(t) {
+  const temp = mkdtempDisposableSync(join(tmpdir(), 'foundry-v4-projection-'));
+  const vault = syntheticVault(join(temp.path, 'vault'));
+  const cleanup = [];
+  t.after(() => {
+    for (const close of cleanup) close();
+    vault.writable();
+    temp.remove();
+  });
+  const options = { directory: join(temp.path, 'index'), vaultDirectory: vault.directory, credential: vault.credential };
+  return { vault, options, temp, cleanup };
+}
+
+function catalog(options) {
+  const db = new DatabaseSync(join(options.directory, 'generations.sqlite'), { readOnly: true });
+  try { return db.prepare('SELECT * FROM catalog').get(); } finally { db.close(); }
+}
+
+function generation(options, id) {
+  return join(options.directory, `generation-${id}.sqlite`);
+}
+
+function readGeneration(vault, options, work) {
+  const { active } = catalog(options);
+  const ring = vault.unlock();
+  const db = openSqlDriver(generation(options, active), { key: ring.keys.get(active) });
+  try { return work(db); } finally {
+    db.close();
+    ring.masterKey.fill(0);
+    for (const key of ring.keys.values()) key.fill(0);
+  }
+}
+
+function canonical(db) {
+  const tables = db.prepare(`
+    SELECT name FROM pragma_table_list WHERE schema='main' AND type IN ('table', 'virtual')
+      AND name NOT LIKE 'sqlite_%' ORDER BY name
+  `).all();
+  const contents = {};
+  db.exec("CREATE VIRTUAL TABLE temp.term_positions USING fts5vocab(main, 'chunks_fts', 'instance')");
+  db.exec("INSERT INTO chunks_fts(chunks_fts, rank) VALUES ('integrity-check', 1)");
+  assert.equal(db.prepare("SELECT rtreecheck('places_rtree') AS ok").get().ok, 'ok');
+  for (const { name } of [...tables, { name: 'term_positions' }]) {
+    const quote = '"' + name.replaceAll('"', '""') + '"';
+    contents[name] = db.prepare(`SELECT * FROM ${quote}`).all().map(row =>
+      JSON.stringify(row, (_key, value) => ArrayBuffer.isView(value) ? Buffer.from(value).toString('hex') : value)).sort();
+  }
+  db.exec('DROP TABLE temp.term_positions');
+  return contents;
+}
+
+test('two-pass rebuild equals real incremental batches across every table after withdrawal and key destruction', t => {
+  const { vault, options, temp, cleanup } = fixture(t);
+  const path = join(temp.path, 'incremental.sqlite');
+  const incremental = openSqlDriver(path, { key: scratchKey(), create: true });
+  cleanup.push(() => incremental.close());
+  initializeSchema(incremental);
+  const sync = () => {
+    const input = openVaultReplay(vault.directory, vault.credential);
+    const key = vault.tombstoneKey();
+    try { return applyIncremental(incremental, input, {}, key); } finally {
+      key.fill(0);
+      input.close();
+    }
+  };
+  let lostSeq;
+  const redacted = 'TEST ONLY obsolete lantern fabrication';
+  vault.write(writer => {
+    lostSeq = note(writer, 'retired-note', 'TEST ONLY erased cobalt', { collection: 'test-erased', keyId: ids.erase });
+    const liveSeq = note(writer, 'alpha', 'TEST ONLY searchable amber lamp', { body: {
+      place: { ts: 1, lat_e7: 300000000, lng_e7: -900000000, accuracy_m: 12 },
+    } });
+    note(writer, 'redacted-note', redacted);
+    note(writer, 'withdrawn-note', 'TEST ONLY withdrawn copper', { collection: 'test-withdrawn' });
+    writer.appendBatch([
+      systemEvent('node.created', { node_id: 'node-a', kind: 'topic', canonical_key: 'topic-a', evidence_event_seq: liveSeq }),
+      systemEvent('node.created', { node_id: 'node-b', kind: 'topic', canonical_key: 'topic-b', evidence_event_seq: liveSeq }),
+      systemEvent('node.created', { node_id: 'node-c', kind: 'topic', canonical_key: 'topic-c', evidence_event_seq: lostSeq }),
+      systemEvent('edge.inferred', { src: 'node-a', dst: 'node-b', kind: 'related', evidence: [lostSeq, liveSeq], confidence: 0.8 }),
+      systemEvent('layout.placed', { node_id: 'node-a', x: 7, y: 4 }),
+      systemEvent('layout.placed', { node_id: 'node-c', x: 2, y: 8 }),
+    ]);
+    writer.closeSegment();
+  });
+  sync();
+  assert.equal(search(incremental, 'cobalt').length, 1);
+  incremental.prepare('INSERT INTO vectors VALUES (?, ?, ?, ?, ?)').run(
+    lostSeq * 1024, 'test/model', 3, 0.01, Buffer.from([1, 2, 3]),
+  );
+  assert.equal(search(incremental, 'copper').length, 1);
+  assert.equal(search(incremental, 'lantern').length, 1);
+  assert.equal(rebuildIndex(options).skipped, 0);
+  const first = catalog(options).active;
+
+  vault.write(writer => {
+    writer.appendBatch([
+      systemEvent('consent.withdrawn', { collection: 'test-withdrawn' }),
+      systemEvent('redaction.applied', { target_ref: 'redacted-note', tombstone: tombstone(vault, redacted) }),
+      systemEvent('key.destroyed', { key_id: ids.erase }),
+    ]);
+    note(writer, 'reimported', redacted);
+    note(writer, 'other', 'TEST ONLY searchable amber cabinet', {
+      profile: 'other', collection: 'test-extra', tier: 'restricted', ts: '2026-02-01T00:00:00Z', source: 'test/export',
+    });
+  });
+  vault.destroyCollection();
+  const result = sync();
+  assert.equal(result.skipped, 2);
+  assert.equal(result.hiddenChanged, true);
+  assert.equal(search(incremental, 'cobalt OR copper OR lantern').length, 0);
+  assert.throws(() => searchIndex(options, 'cobalt'), /Working index is stale/);
+  assert.equal(updateIndex(options).skipped, 2);
+  assert.deepEqual(searchIndex(options, 'amber', {
+    from: '2026-01-30', until: '2026-03-01', profile: 'other', collection: 'test-extra',
+    tier: 'restricted', source: 'test/export',
+  }).map(({ item_id, source, imported_at }) => [item_id, source, imported_at]),
+  [['other', 'test/export', '2026-02-01T00:00:00.000Z']]);
+  assert.equal(searchIndex(options, 'amber', { until: '2026-02-01' })[0].event_seq, 2);
+  assert.equal(searchIndex(options, 'cobalt OR copper OR lantern').length, 0);
+  assert.notEqual(catalog(options).active, first);
+  assert.equal(vault.unlock().keyring.keys.find(key => key.key_id === first).state, 'destroyed');
+  const rebuilt = readGeneration(vault, options, db => canonical(db));
+  assert.deepEqual(rebuilt, canonical(incremental));
+  assert.equal(rebuilt.graph_edge_evidence.length, 1);
+  assert.equal(rebuilt.graph_positions.length, 1);
+  assert.equal(rebuilt.vectors.length, 0);
+  assert.ok(rebuilt.graph_events.every(row => !row.includes('topic-c')));
+  assert.equal(rebuilt.places_rtree.length, 1);
+});
+
+test('rebuild resumes committed event and blob batches, publishes atomically, and retries retirement', t => {
+  const { vault, options } = fixture(t);
+  vault.write(writer => note(writer, 'initial', 'TEST ONLY initial quartz'));
+  updateIndex(options);
+  const old = catalog(options).active;
+  vault.write(writer => {
+    for (let i = 0; i < 160; i++) note(writer, `synthetic-${i}`, `TEST ONLY quartz ${i}`);
+  });
+  assert.throws(() => rebuildIndex({ ...options, projection: {
+    checkpoint(phase, position) { if (phase === 'events' && position >= 128) throw new Error('TEST ONLY events'); },
+  } }), /TEST ONLY events/);
+  const staged = catalog(options).staged;
+  assert.equal(catalog(options).active, old);
+  assert.ok(existsSync(generation(options, staged)));
+  assert.throws(() => rebuildIndex({ ...options, projection: {
+    checkpoint(phase, position) { if (phase === 'blobs' && position > 0) throw new Error('TEST ONLY blobs'); },
+  } }), /TEST ONLY blobs/);
+  assert.equal(catalog(options).staged, staged);
+  assert.throws(() => rebuildIndex({ ...options, afterPublish() { throw new Error('TEST ONLY publication'); } }),
+    /TEST ONLY publication/);
+  assert.equal(catalog(options).retiring, old);
+  assert.equal(catalog(options).active, staged);
+  assert.equal(vault.unlock().keyring.keys.find(key => key.key_id === old).state, 'active');
+  assert.throws(() => searchIndex(options, 'quartz'), /Working index is stale/);
+  updateIndex(options);
+  const results = searchIndex(options, 'quartz', { limit: 200 });
+  assert.equal(results.length, 161);
+  assert.equal(catalog(options).retiring, null);
+  assert.equal(vault.unlock().keyring.keys.find(key => key.key_id === old).state, 'destroyed');
+  assert.equal(existsSync(generation(options, old)), false);
+});
+
+test('a changed replay boundary discards partial work and an older vault is rejected', t => {
+  const { vault, options } = fixture(t);
+  vault.write(writer => note(writer, 'initial', 'TEST ONLY boundary needle'));
+  updateIndex(options);
+  const olderRing = readFileSync(vault.keyring);
+  assert.throws(() => rebuildIndex({ ...options, projection: {
+    checkpoint() { throw new Error('TEST ONLY stop partial'); },
+  } }), /TEST ONLY stop partial/);
+  const stale = catalog(options).staged;
+  vault.write(writer => {
+    writer.appendBatch([systemEvent('redaction.applied', { target_ref: 'initial' })]);
+    note(writer, 'visible', 'TEST ONLY boundary needle retained');
+  });
+  assert.throws(() => searchIndex(options, 'needle'), /Working index is stale/);
+  updateIndex(options);
+  assert.deepEqual(searchIndex(options, 'needle').map(hit => hit.item_id), ['visible']);
+  assert.equal(vault.unlock().keyring.keys.find(key => key.key_id === stale).state, 'destroyed');
+  writeFileSync(vault.keyring, olderRing);
+  assert.throws(() => searchIndex(options, 'needle'), { code: 'PROJECTION' });
+});

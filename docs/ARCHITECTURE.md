@@ -475,6 +475,12 @@ The index holds extracted plaintext, so it is encrypted at rest.
   win32-x64 and linux-x64 (and linux-arm64 before Mode A ships) for the pinned Node version.
   A Node major upgrade is a deliberate change with that CI proof, never automatic.
 
+V-4 pins SQLCipher legacy 4 settings and reads back all 14 values listed in the V-0
+measurement report. It checks the schema under the supplied key before enabling WAL.
+The built-in adapter requires a caller-provided affirmative disk-encryption check.
+Destruction of a generation key protects obsolete SQLCipher pages. Plain SQLite
+relies on the platform for protection of any copies left by the filesystem.
+
 ### 5.6 Unlocking without a daemon
 
 There is no agent process holding keys. A `KeyCache` port offers three behaviours:
@@ -624,6 +630,22 @@ destroyed key are skipped and counted. To shorten recovery after losing the work
 device, a vault session may also write an encrypted index snapshot to the second copy; it
 is a convenience, never a source of truth.
 
+The generation catalog contains opaque key identifiers, replay stamps and progress
+bounds. A separate writer lock serializes index refresh and publication. An
+interrupted build resumes at committed projection checkpoints if its captured
+boundary, keyring policy and deriver version still agree. Otherwise it starts a
+fresh generation and retires the abandoned key. The catalog publishes the completed
+generation and records the pending retirement in one transaction. An interrupted
+retirement is retried before the next managed operation.
+
+For V-4 replay, an import's item identifier comes from its event body or defaults
+to the decimal event sequence. Its blob reference is resolved under the event's
+collection key. The index records locators for visible referenced blobs. The
+default deriver streams UTF-8 `text/plain`, with a limit of 1,024 chunks per item.
+Importers can supply a versioned deriver for other formats. Withdrawal targets
+can identify an item, event, collection, profile or key. Redaction tombstone
+HMACs also exclude imported copies of the original bytes.
+
 ### 6.3 Search
 
 1. Full text: FTS5 with BM25, filters on date, source, profile, collection, tier.
@@ -631,6 +653,11 @@ is a convenience, never a source of truth.
    third of a second over about fifty thousand chunks on a two-core low-power CPU; the
    number must be re-measured here before it is quoted anywhere.
 3. Results always carry `item_id`, `event_seq`, source and import date so an answer can cite them.
+
+Managed search checks the published generation against the verified vault boundary.
+A stale generation requires a separate index update before it can serve results.
+Full-text ranking keeps the best BM25 chunk per item. Date filters use the event's
+import time, with an inclusive lower bound and an exclusive upper bound.
 
 ## 7. Importers
 
