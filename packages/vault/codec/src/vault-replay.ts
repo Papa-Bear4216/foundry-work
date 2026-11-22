@@ -126,6 +126,44 @@ export function openVaultReplay(directory: string, credential: Unlock, { anchor 
     const packBySegment = new Map(streams[2].map(stream => [`${stream.segment}/${stream.name}`, stream]));
     const skipped = erased + open.erased;
     let closed = false;
+    const active = new Set<() => void>();
+
+    function track<T, R>(generator: Generator<T, R, undefined>): Generator<T, R, undefined> {
+      let endedByClose = closed;
+      const closeIterator = () => {
+        endedByClose = true;
+        active.delete(closeIterator);
+        generator.return(undefined as R);
+      };
+      if (!closed) active.add(closeIterator);
+      const iterator = Object.create(
+        Object.getPrototypeOf(Object.getPrototypeOf(generator)),
+      ) as Generator<T, R, undefined>;
+      iterator.next = () => {
+        if (endedByClose) check(false, 'KEY');
+        try {
+          const result = generator.next();
+          if (result.done) active.delete(closeIterator);
+          return result;
+        } catch (error) {
+          active.delete(closeIterator);
+          throw error;
+        }
+      };
+      iterator.return = (value: R) => {
+        active.delete(closeIterator);
+        return generator.return(value);
+      };
+      iterator.throw = (error: unknown) => {
+        if (endedByClose) check(false, 'KEY');
+        active.delete(closeIterator);
+        const result = generator.throw(error);
+        if (!result.done && !closed) active.add(closeIterator);
+        return result;
+      };
+      iterator[Symbol.iterator] = () => iterator;
+      return iterator;
+    }
 
     function* replay({ withdrawalsOnly = false }: ReplayOptions = {}): Generator<VaultReplayItem, { skipped: number }, undefined> {
       check(!closed, 'KEY');
@@ -240,11 +278,28 @@ export function openVaultReplay(directory: string, credential: Unlock, { anchor 
         lastEventSequence: open.last,
       },
       skipped,
-      replay,
-      streamBlob,
+      replay(options?: ReplayOptions) {
+        return track(replay(options));
+      },
+      streamBlob(location: ReplayLocation) {
+        return track(streamBlob(location));
+      },
       close() {
         closed = true;
-        clearKeys(unlocked);
+        try {
+          let firstError: unknown;
+          for (const closeIterator of [...active]) {
+            try {
+              closeIterator();
+            } catch (error) {
+              firstError ??= error;
+            }
+          }
+          active.clear();
+          if (firstError !== undefined) throw firstError;
+        } finally {
+          clearKeys(unlocked);
+        }
       },
     };
   } catch (error) {

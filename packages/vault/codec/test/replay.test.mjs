@@ -3,7 +3,8 @@ import { appendFileSync, mkdtempDisposableSync, readFileSync, statSync, writeFil
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { encodeRecord, FRAME_BYTES, openVaultReplay, VaultWriter, verifyVaultDeep } from '../src/index.ts';
+import { encodeRecord, FRAME_BYTES, openVaultReplay, VaultFormatError, VaultWriter, verifyVaultDeep } from '../src/index.ts';
+import { setFrameKeyObserverForTest } from '../src/record-file.ts';
 import { blob, cases, event, fixture, identity, keyId, keyringPath, writable } from './vault-fixture.mjs';
 
 const credential = () => ({ recoveryKey: Buffer.from(cases.recovery_key, 'hex') });
@@ -174,4 +175,47 @@ test('replay detects a valid ciphertext replacement at a captured location', t =
   writeFileSync(path, raw);
   assert.throws(() => source.streamBlob(location).next(), { code: 'FILE_HASH' });
   assert.throws(() => source.replay().next(), { code: 'FILE_HASH' });
+});
+
+test('close ends paused streamBlob and replay iterators, zeroes derived keys immediately, and rejects later reads', t => {
+  const vault = setup(t);
+  const payload = Buffer.alloc(FRAME_BYTES + 1, 0x42);
+  vault.write(writer => writer.appendBatch([event('TEST ONLY paused replay'), blob(payload)]));
+  const source = openVaultReplay(vault.directory, credential());
+  t.after(() => source.close());
+  const items = [...source.replay()];
+  const blobItem = items.find(item => item.type === 'blob');
+  assert.ok(blobItem);
+
+  const pausedReplay = source.replay();
+  const unstarted = source.streamBlob(blobItem.location);
+  assert.equal(pausedReplay.next().done, false);
+
+  const observed = [];
+  setFrameKeyObserverForTest(keys => observed.push(keys));
+  t.after(() => setFrameKeyObserverForTest(undefined));
+
+  const stream = source.streamBlob(blobItem.location);
+  const firstChunk = stream.next();
+  assert.equal(firstChunk.done, false);
+  assert.deepEqual(firstChunk.value, payload.subarray(0, FRAME_BYTES));
+  firstChunk.value.fill(0);
+
+  // Derived collection and record keys are live while the blob iterator is paused.
+  assert.equal(observed.length, 1);
+  assert.equal(observed[0].collectionKey.length, 32);
+  assert.equal(observed[0].recordKey.length, 32);
+  assert.ok(observed[0].collectionKey.some(byte => byte !== 0));
+  assert.ok(observed[0].recordKey.some(byte => byte !== 0));
+
+  // close() terminates active iterators so finally blocks wipe derived keys immediately.
+  source.close();
+  assert.deepEqual(observed[0].collectionKey, Buffer.alloc(32));
+  assert.deepEqual(observed[0].recordKey, Buffer.alloc(32));
+
+  // Any later next() fails with the existing closed error (KEY); return() stays safe.
+  assert.throws(() => stream.next(), error => error instanceof VaultFormatError && error.code === 'KEY');
+  assert.throws(() => pausedReplay.next(), error => error instanceof VaultFormatError && error.code === 'KEY');
+  assert.throws(() => unstarted.next(), error => error instanceof VaultFormatError && error.code === 'KEY');
+  assert.equal(stream.return().done, true);
 });

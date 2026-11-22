@@ -352,11 +352,11 @@ function unlockMaster(keyring: Keyring, credential: Unlock): Buffer {
   check(credential !== null && typeof credential === 'object', 'KEY');
   const passphrase = 'passphrase' in credential;
   const recovery = 'recoveryKey' in credential;
-  const session = 'session' in credential;
+  const session = 'session' in credential && credential.session !== undefined;
   check(Number(passphrase) + Number(recovery) + Number(session) === 1, 'KEY');
 
   if (session) {
-    const state = sessionState.get(credential.session);
+    const state = sessionState.get((credential as { session: UnlockSession }).session);
     check(state && !state.disposed && state.vaultId === vaultId, 'KEY');
     const masterKey = Buffer.from(state.masterKey);
     try {
@@ -369,8 +369,8 @@ function unlockMaster(keyring: Keyring, credential: Unlock): Buffer {
   }
 
   const slot = passphrase ? 'passphrase' : 'recovery';
-  const wrappingKey = passphrase ? passphraseKey(credential.passphrase, kdf)
-    : vaultKey(credential.recoveryKey, vaultId, 'recovery-wrap');
+  const wrappingKey = passphrase ? passphraseKey((credential as { passphrase: string }).passphrase, kdf)
+    : vaultKey((credential as { recoveryKey: Buffer }).recoveryKey, vaultId, 'recovery-wrap');
   let masterKey: Buffer;
   try {
     masterKey = unwrap(wrappingKey, aad(vaultId, 'master', 'master', slot, passphrase ? kdf : undefined),
@@ -388,7 +388,8 @@ function unlockMaster(keyring: Keyring, credential: Unlock): Buffer {
 }
 
 export function createUnlockSession(bytes: Buffer, vaultId: string, credential: VaultCredential): UnlockSession {
-  check(credential !== null && typeof credential === 'object' && !('session' in credential), 'KEY');
+  check(credential !== null && typeof credential === 'object'
+    && (!('session' in credential) || (credential as { session?: unknown }).session === undefined), 'KEY');
   const ring = readKeyring(bytes, vaultId);
   const masterKey = unlockMaster(ring, credential);
   try {

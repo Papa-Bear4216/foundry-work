@@ -50,7 +50,8 @@ export function create(path: string, { passphrase, parallelism = 1 }: Passphrase
 export function unlockVault(
   keyringPath: string, vaultId: string, credential: VaultCredential,
 ): UnlockSession {
-  check(credential !== null && typeof credential === 'object' && !('session' in credential), 'KEY');
+  check(credential !== null && typeof credential === 'object'
+    && (!('session' in credential) || (credential as { session?: unknown }).session === undefined), 'KEY');
   return createUnlockSession(readFileSync(keyringPath), vaultId, credential);
 }
 
@@ -110,11 +111,16 @@ export function rekeyAll(path: string, vaultId: string, credential: Credential, 
   check(credential !== null && typeof credential === 'object', 'KEY');
   const hasPassphrase = 'passphrase' in credential;
   const hasRecovery = 'recoveryKey' in credential;
-  const hasSession = 'session' in credential;
+  const hasSession = 'session' in credential && credential.session !== undefined;
   check(Number(hasPassphrase) + Number(hasRecovery) + Number(hasSession) === 1, 'KEY');
-  const oldRecovery = hasRecovery ? decodeRecoveryKey(credential.recoveryKey) : undefined;
+  const oldRecovery = hasRecovery ? decodeRecoveryKey((credential as { recoveryKey: string }).recoveryKey) : undefined;
   try {
-    const unlocked = unlockKeyring(ring, hasRecovery ? { recoveryKey: oldRecovery! } : credential);
+    const unlocked = unlockKeyring(
+      ring,
+      hasRecovery ? { recoveryKey: oldRecovery! }
+        : hasPassphrase ? { passphrase: (credential as { passphrase: string }).passphrase }
+          : { session: (credential as { session: UnlockSession }).session },
+    );
     const generated: Buffer[] = [];
     try {
       const newKey = () => {

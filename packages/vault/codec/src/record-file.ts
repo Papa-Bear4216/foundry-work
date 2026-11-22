@@ -50,6 +50,15 @@ export function diskRecord(fd: number, offset: number, size: number, header: Buf
   return { ...fields, header, offset, end: offset + HEADER_BYTES + Number(bodyLength) };
 }
 
+let frameKeyObserver: ((keys: { collectionKey: Buffer; recordKey: Buffer }) => void) | undefined;
+
+/** @internal Test-only hook observing derived key buffers held by an active frameChunks iterator. */
+export function setFrameKeyObserverForTest(
+  observer: ((keys: { collectionKey: Buffer; recordKey: Buffer }) => void) | undefined,
+): void {
+  frameKeyObserver = observer;
+}
+
 export class StreamScanner {
   readonly #header = Buffer.alloc(HEADER_BYTES);
   readonly #frame = Buffer.allocUnsafe(FRAME_BYTES + FRAME_OVERHEAD);
@@ -77,6 +86,9 @@ export class StreamScanner {
     hash?.update(record.header);
     const key = plaintext && recordKey(record.header, plaintext.key);
     try {
+      if (plaintext && key && frameKeyObserver) {
+        frameKeyObserver({ collectionKey: plaintext.key, recordKey: key });
+      }
       while (offset < record.end) {
         const remaining = record.end - offset;
         check(remaining >= FRAME_OVERHEAD, 'LENGTH');

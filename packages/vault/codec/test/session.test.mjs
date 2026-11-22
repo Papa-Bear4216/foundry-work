@@ -12,6 +12,7 @@ import {
 import {
   getKdfCallCountForTest, isSessionMasterKeyZeroedForTest, resetKdfCallCountForTest,
 } from '../src/keyring.ts';
+import { formatRecoveryKey } from '../src/recovery.ts';
 import { blob, cases, event, fixture, identity, keyId, keyringPath, writable } from './vault-fixture.mjs';
 
 // TEST ONLY: all credentials, keys and content are synthetic.
@@ -346,5 +347,98 @@ test('wrong vaultId, rekeyed keyring, and tampered keyring fail KEY or AUTH with
     assert.equal(getKdfCallCountForTest(), 0);
   } finally {
     sessionC.dispose();
+  }
+});
+
+test('legacy credentials with session: undefined unlock the committed fixture while mixed real sessions fail KEY', t => {
+  const fixtureBytes = readFileSync(new URL('./vectors/' + cases.keyring, import.meta.url));
+  const vaultId = identity.vaultId;
+  const recoveryText = formatRecoveryKey(recoveryKey());
+  const rekeyOptions = {
+    passphrase: 'TEST ONLY rekey legacy dispatch',
+    currentCollectionIds: [keyId],
+    historicalCollectionIds: [],
+  };
+
+  // Both legacy forms with session: undefined unlock the committed fixture via decodeKeyring.
+  const byRecovery = decodeKeyring(fixtureBytes, { recoveryKey: recoveryKey(), session: undefined }, vaultId);
+  const byPassphrase = decodeKeyring(fixtureBytes, { passphrase: cases.passphrase, session: undefined }, vaultId);
+  try {
+    assert.deepEqual(byPassphrase.masterKey, byRecovery.masterKey);
+    assert.equal(byRecovery.keyring.version, 9007199254740990);
+  } finally {
+    byRecovery.masterKey.fill(0);
+    for (const k of byRecovery.keys.values()) k.fill(0);
+    byPassphrase.masterKey.fill(0);
+    for (const k of byPassphrase.keys.values()) k.fill(0);
+  }
+
+  // Both legacy forms with session: undefined unlock the committed fixture via rekeyAll.
+  const temp = mkdtempDisposableSync(join(tmpdir(), 'foundry-legacy-cred-'));
+  t.after(() => temp.remove());
+  const pathRecovery = join(temp.path, 'ring-recovery.json');
+  writeFileSync(pathRecovery, fixtureBytes);
+  const rekeyedByRecovery = rekeyAll(pathRecovery, vaultId, { recoveryKey: recoveryText, session: undefined }, rekeyOptions);
+  assert.equal(rekeyedByRecovery.collectionIds.size, 1);
+  assert.equal(JSON.parse(readFileSync(pathRecovery, 'utf8')).version, 9007199254740991);
+
+  const pathPassphrase = join(temp.path, 'ring-passphrase.json');
+  writeFileSync(pathPassphrase, fixtureBytes);
+  const rekeyedByPassphrase = rekeyAll(pathPassphrase, vaultId, { passphrase: cases.passphrase, session: undefined }, rekeyOptions);
+  assert.equal(rekeyedByPassphrase.collectionIds.size, 1);
+  assert.equal(JSON.parse(readFileSync(pathPassphrase, 'utf8')).version, 9007199254740991);
+
+  // unlockVault also accepts legacy forms with session: undefined and rejects bare { session: undefined }.
+  const pathFixture = join(temp.path, 'ring-fixture.json');
+  writeFileSync(pathFixture, fixtureBytes);
+  const session = unlockVault(pathFixture, vaultId, { recoveryKey: recoveryKey(), session: undefined });
+  try {
+    resetKdfCallCountForTest();
+    // A real session combined with a passphrase or recovery key fails KEY with zero KDF calls and no write.
+    assert.throws(() => decodeKeyring(fixtureBytes, { passphrase: cases.passphrase, session }, vaultId), { code: 'KEY' });
+    assert.throws(() => decodeKeyring(fixtureBytes, { recoveryKey: recoveryKey(), session }, vaultId), { code: 'KEY' });
+    assert.throws(() => decodeKeyring(fixtureBytes, { session: undefined }, vaultId), { code: 'KEY' });
+    assert.throws(() => rekeyAll(pathFixture, vaultId, { passphrase: cases.passphrase, session }, rekeyOptions), { code: 'KEY' });
+    assert.throws(() => rekeyAll(pathFixture, vaultId, { recoveryKey: recoveryText, session }, rekeyOptions), { code: 'KEY' });
+    assert.throws(() => rekeyAll(pathFixture, vaultId, { session: undefined }, rekeyOptions), { code: 'KEY' });
+    assert.throws(() => unlockVault(pathFixture, vaultId, { passphrase: cases.passphrase, session }), { code: 'KEY' });
+    assert.throws(() => unlockVault(pathFixture, vaultId, { recoveryKey: recoveryKey(), session }), { code: 'KEY' });
+    assert.throws(() => unlockVault(pathFixture, vaultId, { session: undefined }), { code: 'KEY' });
+    assert.deepEqual(readFileSync(pathFixture), fixtureBytes);
+    assert.equal(getKdfCallCountForTest(), 0);
+  } finally {
+    session.dispose();
+  }
+});
+
+test('rekeyAll runs scrypt twice with a passphrase-backed session and once with a recovery-backed session', t => {
+  const vault = setupVault(t, 'vault-rekey-kdf');
+  const rekeyOptions = {
+    passphrase: 'TEST ONLY rekey replacement passphrase',
+    currentCollectionIds: [keyId],
+    historicalCollectionIds: [],
+  };
+
+  // Passphrase-backed session: 1 scrypt to open the session + 1 scrypt to wrap the new master key = 2.
+  resetKdfCallCountForTest();
+  const passphraseSession = unlockVault(vault.path, vault.vaultId, { passphrase: cases.passphrase });
+  try {
+    assert.equal(getKdfCallCountForTest(), 1);
+    rekeyAll(vault.path, vault.vaultId, { session: passphraseSession }, rekeyOptions);
+    assert.equal(getKdfCallCountForTest(), 2);
+  } finally {
+    passphraseSession.dispose();
+  }
+
+  // Recovery-backed session: 0 scrypt to open the session + 1 scrypt to wrap the new master key = 1.
+  writeFileSync(vault.path, vault.initialKeyring);
+  resetKdfCallCountForTest();
+  const recoverySession = unlockVault(vault.path, vault.vaultId, { recoveryKey: recoveryKey() });
+  try {
+    assert.equal(getKdfCallCountForTest(), 0);
+    rekeyAll(vault.path, vault.vaultId, { session: recoverySession }, rekeyOptions);
+    assert.equal(getKdfCallCountForTest(), 1);
+  } finally {
+    recoverySession.dispose();
   }
 });
