@@ -1,6 +1,6 @@
 import { IndexError } from './driver.ts';
 import type { SqlDriver } from './driver.ts';
-import { exists, integer, object, optionalString, string } from './event.ts';
+import { integer, object, optionalString, string } from './event.ts';
 
 const graphKinds = new Set(['node.created', 'node.merged', 'edge.inferred', 'layout.placed', 'layout.moved', 'layout.epoch']);
 export const isGraphEvent = (kind: string): boolean => graphKinds.has(kind);
@@ -14,6 +14,32 @@ export function projectGraph(db: SqlDriver): void {
   `);
   const remove = db.prepare('DELETE FROM graph_events WHERE event_seq = ?');
   const replace = db.prepare('UPDATE graph_events SET body = ? WHERE event_seq = ?');
+  const findNode = db.prepare('SELECT 1 FROM graph_nodes WHERE node_id = ?');
+  const findEvidence = db.prepare('SELECT 1 FROM event_origin WHERE event_seq = ?');
+  const insertNode = db.prepare(
+    'INSERT INTO graph_nodes (node_id, kind, canonical_key, label, profile) VALUES (?, ?, ?, ?, ?)',
+  );
+  const insertEdge = db.prepare(`
+    INSERT INTO graph_edges (edge_id, src, dst, kind, evidence_event_seq, inferred, confidence)
+    VALUES (?, ?, ?, ?, ?, 1, ?)
+  `);
+  const insertEdgeEvidence = db.prepare('INSERT INTO graph_edge_evidence VALUES (?, ?)');
+  const upsertPosition = db.prepare(`
+    INSERT INTO graph_positions VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(node_id) DO UPDATE SET epoch=excluded.epoch, x=excluded.x, y=excluded.y,
+      z=excluded.z, placed_event_seq=excluded.placed_event_seq
+  `);
+  const markMerged = db.prepare('UPDATE graph_nodes SET merged_into = ? WHERE node_id = ?');
+  const moveEdgeSrc = db.prepare('UPDATE graph_edges SET src = ? WHERE src = ?');
+  const moveEdgeDst = db.prepare('UPDATE graph_edges SET dst = ? WHERE dst = ?');
+  const movePosition = db.prepare(`
+    UPDATE graph_positions SET node_id = ? WHERE node_id = ?
+      AND NOT EXISTS (SELECT 1 FROM graph_positions WHERE node_id = ?)
+  `);
+  const deletePosition = db.prepare('DELETE FROM graph_positions WHERE node_id = ?');
+  const hasNode = (id: string) => findNode.get(id) !== undefined;
+  const hasEvidence = (id: number) => findEvidence.get(id) !== undefined;
+
   let after = 0;
   for (;;) {
     const batch = events.all(after);
@@ -23,8 +49,6 @@ export function projectGraph(db: SqlDriver): void {
       after = seq;
       const kind = row.kind as string;
       const body = object(JSON.parse(row.body as string), kind);
-      const hasNode = (id: string) => exists(db, 'SELECT 1 FROM graph_nodes WHERE node_id = ?', id);
-      const hasEvidence = (id: number) => exists(db, 'SELECT 1 FROM event_origin WHERE event_seq = ?', id);
 
       switch (kind) {
         case 'node.created': {
@@ -34,9 +58,8 @@ export function projectGraph(db: SqlDriver): void {
             break;
           }
           const canonical = string(body.canonical_key, 'canonical_key');
-          db.prepare('INSERT INTO graph_nodes (node_id, kind, canonical_key, label, profile) VALUES (?, ?, ?, ?, ?)')
-            .run(string(body.node_id, 'node_id'), string(body.kind, 'node kind'), canonical,
-              optionalString(body.label, 'label') ?? canonical, row.profile);
+          insertNode.run(string(body.node_id, 'node_id'), string(body.kind, 'node kind'), canonical,
+            optionalString(body.label, 'label') ?? canonical, row.profile);
           break;
         }
         case 'edge.inferred': {
@@ -60,12 +83,8 @@ export function projectGraph(db: SqlDriver): void {
           if (typeof body.confidence !== 'number' || !(body.confidence >= 0 && body.confidence <= 1)) {
             throw new IndexError('PROJECTION', 'Expected graph confidence between zero and one.');
           }
-          db.prepare(`
-            INSERT INTO graph_edges (edge_id, src, dst, kind, evidence_event_seq, inferred, confidence)
-            VALUES (?, ?, ?, ?, ?, 1, ?)
-          `).run(seq, src, dst, string(body.kind, 'edge kind'), evidence[0], body.confidence);
-          const insert = db.prepare('INSERT INTO graph_edge_evidence VALUES (?, ?)');
-          for (const ref of evidence) insert.run(seq, ref);
+          insertEdge.run(seq, src, dst, string(body.kind, 'edge kind'), evidence[0], body.confidence);
+          for (const ref of evidence) insertEdgeEvidence.run(seq, ref);
           break;
         }
         case 'layout.epoch':
@@ -79,11 +98,7 @@ export function projectGraph(db: SqlDriver): void {
             remove.run(seq);
             break;
           }
-          db.prepare(`
-            INSERT INTO graph_positions VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(node_id) DO UPDATE SET epoch=excluded.epoch, x=excluded.x, y=excluded.y,
-              z=excluded.z, placed_event_seq=excluded.placed_event_seq
-          `).run(id, body.epoch === undefined ? epoch : integer(body.epoch, 'epoch'), integer(body.x, 'x'),
+          upsertPosition.run(id, body.epoch === undefined ? epoch : integer(body.epoch, 'epoch'), integer(body.x, 'x'),
             integer(body.y, 'y'), body.z === undefined ? 0 : integer(body.z, 'z'), seq);
           break;
         }
@@ -94,14 +109,11 @@ export function projectGraph(db: SqlDriver): void {
             remove.run(seq);
             break;
           }
-          db.prepare('UPDATE graph_nodes SET merged_into = ? WHERE node_id = ?').run(survivor, id);
-          db.prepare('UPDATE graph_edges SET src = ? WHERE src = ?').run(survivor, id);
-          db.prepare('UPDATE graph_edges SET dst = ? WHERE dst = ?').run(survivor, id);
-          db.prepare(`
-            UPDATE graph_positions SET node_id = ? WHERE node_id = ?
-              AND NOT EXISTS (SELECT 1 FROM graph_positions WHERE node_id = ?)
-          `).run(survivor, id, survivor);
-          db.prepare('DELETE FROM graph_positions WHERE node_id = ?').run(id);
+          markMerged.run(survivor, id);
+          moveEdgeSrc.run(survivor, id);
+          moveEdgeDst.run(survivor, id);
+          movePosition.run(survivor, id, survivor);
+          deletePosition.run(id);
           break;
         }
       }

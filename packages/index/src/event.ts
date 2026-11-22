@@ -1,5 +1,4 @@
 import { IndexError } from './driver.ts';
-import type { SqlDriver } from './driver.ts';
 
 export function object(value: unknown, field: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -24,8 +23,4 @@ export function integer(value: unknown, field: string): number {
 
 export function optionalString(value: unknown, field: string): string | null {
   return value == null ? null : string(value, field);
-}
-
-export function exists(db: SqlDriver, sql: string, ...values: (string | number)[]): boolean {
-  return db.prepare(sql).get(...values) !== undefined;
 }

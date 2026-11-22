@@ -69,16 +69,51 @@ function progress(db: SqlDriver, phase: string, version: number): number {
   return row.last_event_seq as number;
 }
 
-function saveProgress(db: SqlDriver, phase: string, version: number, position: number): void {
-  db.prepare(`
-    INSERT INTO projection_state VALUES (?, ?, ?)
-    ON CONFLICT (projection) DO UPDATE SET deriver_version=excluded.deriver_version,
-      last_event_seq=excluded.last_event_seq
-  `).run(phase, version, position);
+function prepareStatements(db: SqlDriver) {
+  return {
+    saveProgress: db.prepare(`
+      INSERT INTO projection_state VALUES (?, ?, ?)
+      ON CONFLICT (projection) DO UPDATE SET deriver_version=excluded.deriver_version,
+        last_event_seq=excluded.last_event_seq
+    `),
+    saveBlobCursor: db.prepare("INSERT OR REPLACE INTO meta VALUES ('rebuild_blob_cursor', ?)"),
+    insertHidden: db.prepare('INSERT OR IGNORE INTO hidden VALUES (?, ?)'),
+    isHidden: db.prepare(`
+      SELECT 1 FROM hidden WHERE (scope, target) IN (
+        ('item', ?), ('event', ?), ('key', ?), ('profile', ?), ('collection', ?)
+      )
+    `),
+    insertOrigin: db.prepare('INSERT INTO event_origin VALUES (?, ?, ?, ?)'),
+    insertGraphEvent: db.prepare('INSERT INTO graph_events VALUES (?, ?, ?)'),
+    insertItem: db.prepare(`
+      INSERT INTO items (item_id, event_seq, source, profile, collection, tier, sensitivity,
+        title, path, mime, size, source_at, imported_at, blob_id, key_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `),
+    insertPlace: db.prepare('INSERT INTO places VALUES (?, ?, ?, ?, ?, ?)'),
+    pendingItems: db.prepare(`
+      SELECT item_id, event_seq, mime, source, collection FROM items
+      WHERE key_id=? AND blob_id=? AND derived=0 AND event_seq>? ORDER BY event_seq LIMIT ${batchSize}
+    `),
+    hasItemForBlob: db.prepare('SELECT 1 FROM items WHERE key_id=? AND blob_id=? LIMIT 1'),
+    hasTombstone: db.prepare("SELECT 1 FROM hidden WHERE scope='tombstone' AND target=?"),
+    deleteTombstonedOrigin: db.prepare(
+      'DELETE FROM event_origin WHERE event_seq IN (SELECT event_seq FROM items WHERE key_id=? AND blob_id=?)',
+    ),
+    insertChunk: db.prepare('INSERT INTO chunks VALUES (?, ?, ?, ?)'),
+    insertLocation: db.prepare('INSERT OR IGNORE INTO blob_locator VALUES (?, ?, ?, ?, ?, ?, ?)'),
+    markDerived: db.prepare('UPDATE items SET derived=1 WHERE event_seq=?'),
+  };
 }
 
-function recordHidden(db: SqlDriver, entry: VaultReplayItem): void {
-  const insert = db.prepare('INSERT OR IGNORE INTO hidden VALUES (?, ?)');
+type Statements = ReturnType<typeof prepareStatements>;
+
+function saveProgress(stmts: Statements, phase: string, version: number, position: number): void {
+  stmts.saveProgress.run(phase, version, position);
+}
+
+function recordHidden(stmts: Statements, entry: VaultReplayItem): void {
+  const insert = stmts.insertHidden;
   if (entry.type === 'skipped') {
     insert.run('key', entry.keyId);
     return;
@@ -127,7 +162,7 @@ function purge(db: SqlDriver): void {
   `);
 }
 
-function projectEvent(db: SqlDriver, { event, seq, keyId }: Event): void {
+function projectEvent(stmts: Statements, { event, seq, keyId }: Event): void {
   const { kind } = event;
   if (typeof kind !== 'string' || withdrawalKinds.has(kind)) return;
   const graph = isGraphEvent(kind);
@@ -135,31 +170,23 @@ function projectEvent(db: SqlDriver, { event, seq, keyId }: Event): void {
   const profile = optionalString(event.profile, 'profile');
   const collection = optionalString(event.collection, 'collection');
   const itemId = kind === 'item.imported' ? optionalString(body?.item_id, 'item_id') ?? String(seq) : null;
-  if (db.prepare(`
-    SELECT 1 FROM hidden WHERE (scope, target) IN (
-      ('item', ?), ('event', ?), ('key', ?), ('profile', ?), ('collection', ?)
-    )
-  `).get(itemId, String(seq), keyId, profile, collection)) return;
+  if (stmts.isHidden.get(itemId, String(seq), keyId, profile, collection)) return;
 
-  db.prepare('INSERT INTO event_origin VALUES (?, ?, ?, ?)').run(seq, keyId, profile, collection);
+  stmts.insertOrigin.run(seq, keyId, profile, collection);
   if (graph) {
-    db.prepare('INSERT INTO graph_events VALUES (?, ?, ?)').run(seq, kind, JSON.stringify(body));
+    stmts.insertGraphEvent.run(seq, kind, JSON.stringify(body));
   } else if (itemId !== null && body) {
     const blob = string(body.blob, 'blob id');
     if (!/^[0-9a-f]{64}$/u.test(blob)) throw new IndexError('PROJECTION', 'Invalid blob id.');
     const sourceAt = optionalString(body.source_ts, 'source timestamp');
-    db.prepare(`
-      INSERT INTO items (item_id, event_seq, source, profile, collection, tier, sensitivity,
-        title, path, mime, size, source_at, imported_at, blob_id, key_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(itemId, seq, string(event.source, 'source'), string(profile, 'profile'), string(collection, 'collection'),
+    stmts.insertItem.run(itemId, seq, string(event.source, 'source'), string(profile, 'profile'), string(collection, 'collection'),
       optionalString(event.tier ?? body.tier, 'tier') ?? 'public', optionalString(event.sensitivity, 'sensitivity'),
       optionalString(body.title, 'title'), optionalString(body.path, 'path'), optionalString(body.mime, 'mime'),
       body.size === undefined ? null : integer(body.size, 'size'), sourceAt === null ? null : importDate(sourceAt),
       importDate(string(event.ts, 'timestamp')), blob, keyId);
     if (body.place !== undefined) {
       const place = object(body.place, 'place');
-      db.prepare('INSERT INTO places VALUES (?, ?, ?, ?, ?, ?)').run(
+      stmts.insertPlace.run(
         seq, itemId, integer(place.ts, 'place timestamp'), integer(place.lat_e7, 'latitude'),
         integer(place.lng_e7, 'longitude'), place.accuracy_m == null ? null : integer(place.accuracy_m, 'accuracy'),
       );
@@ -184,32 +211,22 @@ function* clearingFrames(replay: Replay, location: Blob['location'], status: { c
 }
 
 function projectBlob(
-  db: SqlDriver, replay: Replay, entry: Blob, tombstoneKey: Uint8Array | undefined,
+  stmts: Statements, replay: Replay, entry: Blob, tombstoneKey: Uint8Array | undefined,
   derive: ProjectionOptions['derive'],
 ): void {
   const { keyId, blobId, location } = entry;
-  const items = db.prepare(`
-    SELECT item_id, event_seq, mime, source, collection FROM items
-    WHERE key_id=? AND blob_id=? AND derived=0 AND event_seq>? ORDER BY event_seq LIMIT ${batchSize}
-  `);
-  if (tombstoneKey && db.prepare('SELECT 1 FROM items WHERE key_id=? AND blob_id=? LIMIT 1').get(keyId, blobId)) {
+  if (tombstoneKey && stmts.hasItemForBlob.get(keyId, blobId)) {
     const digest = createHmac('sha256', tombstoneKey);
     for (const frame of clearingFrames(replay, location, { complete: false })) digest.update(frame);
-    if (db.prepare("SELECT 1 FROM hidden WHERE scope='tombstone' AND target=?").get(digest.digest('hex'))) {
-      db.prepare('DELETE FROM event_origin WHERE event_seq IN (SELECT event_seq FROM items WHERE key_id=? AND blob_id=?)')
-        .run(keyId, blobId);
+    if (stmts.hasTombstone.get(digest.digest('hex'))) {
+      stmts.deleteTombstonedOrigin.run(keyId, blobId);
       return;
     }
   }
 
-  const insertChunk = db.prepare('INSERT INTO chunks VALUES (?, ?, ?, ?)');
-  const insertLocation = db.prepare(`
-    INSERT OR IGNORE INTO blob_locator VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
-  const done = db.prepare('UPDATE items SET derived=1 WHERE event_seq=?');
   let after = 0;
   for (;;) {
-    const batch = items.all(keyId, blobId, after);
+    const batch = stmts.pendingItems.all(keyId, blobId, after);
     if (!batch.length) break;
     for (const row of batch) {
       const itemId = row.item_id as string;
@@ -226,28 +243,28 @@ function projectBlob(
         for (const chunk of chunks) {
           if (ord >= MAX_CHUNKS) throw new IndexError('PROJECTION', 'Deriver exceeded the chunk limit.');
           const chunkId = BigInt(eventSeq) * BigInt(MAX_CHUNKS) + BigInt(ord);
-          insertChunk.run(chunkId, itemId, ord++, chunk);
+          stmts.insertChunk.run(chunkId, itemId, ord++, chunk);
         }
         if (status.failure) throw status.failure.error;
         if (!status.complete) for (const _frame of frames) { /* Authenticate and clear the rest. */ }
       } finally {
         frames.return();
       }
-      insertLocation.run(blobId, row.collection, location.segment, location.stream, location.offset,
+      stmts.insertLocation.run(blobId, row.collection, location.segment, location.stream, location.offset,
         location.encodedLength, location.headerSha256);
-      done.run(eventSeq);
+      stmts.markDerived.run(eventSeq);
       after = eventSeq;
     }
   }
 }
 
-function finish(db: SqlDriver, version: number, lastEventSeq: number, skipped: number): void {
+function finish(db: SqlDriver, stmts: Statements, version: number, lastEventSeq: number, skipped: number): void {
   if (db.prepare('SELECT 1 FROM items WHERE derived=0 LIMIT 1').get()) {
     throw new IndexError('PROJECTION', 'An unhidden item refers to a missing blob under its collection key.');
   }
   purge(db);
   projectGraph(db);
-  for (const phase of ['hidden', 'events', 'blobs', 'complete']) saveProgress(db, phase, version, lastEventSeq);
+  for (const phase of ['hidden', 'events', 'blobs', 'complete']) saveProgress(stmts, phase, version, lastEventSeq);
   db.prepare("INSERT OR REPLACE INTO meta VALUES ('skipped_records', ?)").run(String(skipped));
   db.prepare("DELETE FROM meta WHERE key IN ('rebuild_hidden_done', 'rebuild_blob_cursor')").run();
   // Merge residual FTS segments and remove obsolete terms from the searchable snapshot.
@@ -272,20 +289,21 @@ export function applyIncremental(
   beforeApply?: (hiddenChanged: boolean) => void, beforeCommit?: () => void,
 ): ProjectionResult {
   const version = validateVersion(options);
+  const stmts = prepareStatements(db);
   return transaction(db, () => {
     const last = progress(db, 'complete', version);
     const lastEventSeq = requireForward(last, replay);
     const hiddenBefore = db.prepare('SELECT count(*) AS n FROM hidden').get()?.n;
-    for (const entry of replay.replay({ withdrawalsOnly: true })) recordHidden(db, entry);
+    for (const entry of replay.replay({ withdrawalsOnly: true })) recordHidden(stmts, entry);
     const hiddenChanged = hiddenBefore !== db.prepare('SELECT count(*) AS n FROM hidden').get()?.n;
     beforeApply?.(hiddenChanged);
     purge(db);
     const key = keyForTombstones(db, tombstoneKey);
     for (const entry of replay.replay()) {
-      if (entry.type === 'event' && entry.seq > last) projectEvent(db, entry);
-      if (entry.type === 'blob') projectBlob(db, replay, entry, key, options.derive);
+      if (entry.type === 'event' && entry.seq > last) projectEvent(stmts, entry);
+      if (entry.type === 'blob') projectBlob(stmts, replay, entry, key, options.derive);
     }
-    finish(db, version, lastEventSeq, replay.skipped);
+    finish(db, stmts, version, lastEventSeq, replay.skipped);
     beforeCommit?.();
     return { lastEventSeq, skipped: replay.skipped, hiddenChanged };
   });
@@ -327,6 +345,7 @@ export function applyRebuild(
   const lastEventSeq = requireForward(progress(db, 'complete', version), replay);
   const result = { lastEventSeq, skipped: replay.skipped, hiddenChanged: false };
   if (db.prepare("SELECT 1 FROM projection_state WHERE projection='complete'").get()) return result;
+  const stmts = prepareStatements(db);
   if (!db.prepare("SELECT 1 FROM meta WHERE key='rebuild_hidden_done'").get()) {
     let cursor = progress(db, 'hidden', version);
     const write = (entry: VaultReplayItem) => {
@@ -335,10 +354,10 @@ export function applyRebuild(
         if (entry.seq <= cursor) return;
         cursor = entry.seq;
       }
-      recordHidden(db, entry);
+      recordHidden(stmts, entry);
     };
     replayBatches(db, replay.replay({ withdrawalsOnly: true }), write,
-      () => saveProgress(db, 'hidden', version, cursor), () => options.checkpoint?.('hidden', cursor));
+      () => saveProgress(stmts, 'hidden', version, cursor), () => options.checkpoint?.('hidden', cursor));
     db.prepare("INSERT INTO meta VALUES ('rebuild_hidden_done', '1')").run();
   }
 
@@ -348,20 +367,20 @@ export function applyRebuild(
   const key = keyForTombstones(db, tombstoneKey);
   replayBatches(db, replay.replay(), entry => {
     if (entry.type === 'event' && entry.seq > seq) {
-      projectEvent(db, entry);
+      projectEvent(stmts, entry);
       seq = entry.seq;
     } else if (entry.type === 'blob' && ++blob > savedBlob) {
-      projectBlob(db, replay, entry, key, options.derive);
+      projectBlob(stmts, replay, entry, key, options.derive);
     }
   }, () => {
-    saveProgress(db, 'events', version, seq);
+    saveProgress(stmts, 'events', version, seq);
     if (blob > savedBlob) {
-      db.prepare("INSERT OR REPLACE INTO meta VALUES ('rebuild_blob_cursor', ?)").run(String(blob));
+      stmts.saveBlobCursor.run(String(blob));
     }
   }, () => {
     if (blob) options.checkpoint?.('blobs', blob);
     else options.checkpoint?.('events', seq);
   });
-  transaction(db, () => finish(db, version, lastEventSeq, replay.skipped));
+  transaction(db, () => finish(db, stmts, version, lastEventSeq, replay.skipped));
   return result;
 }

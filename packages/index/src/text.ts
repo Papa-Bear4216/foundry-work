@@ -12,9 +12,17 @@ export function* chunkText(frames: Iterable<Uint8Array>): Generator<string> {
     while (pending.length > target && emitted < MAX_CHUNKS) {
       const window = pending.slice(0, target);
       const paragraphs = window.lastIndexOf('\n\n');
-      const sentence = [...window.matchAll(/[.!?]\s/g)].at(-1)?.index;
-      let cut = paragraphs >= target / 2 ? paragraphs : (sentence ?? 0) + 1;
-      if (cut < target / 2) cut = target;
+      let cut = paragraphs >= target / 2 ? paragraphs : target;
+      if (paragraphs < target / 2) {
+        const min = Math.ceil(target / 2) - 1;
+        for (let i = window.length - 2; i >= min; i--) {
+          const ch = window[i];
+          if ((ch === '.' || ch === '!' || ch === '?') && /\s/u.test(window[i + 1])) {
+            cut = i + 1;
+            break;
+          }
+        }
+      }
       // Keep a UTF-16 surrogate pair within one chunk.
       if (/[\uD800-\uDBFF]/u.test(pending[cut - 1])) cut--;
       const chunk = pending.slice(0, cut).trim();

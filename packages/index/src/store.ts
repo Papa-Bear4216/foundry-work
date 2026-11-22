@@ -266,6 +266,7 @@ function rebuildLocked(ctx: Context, input: Capture, hiddenChanged = false): Pro
     UPDATE catalog SET active=?, snapshot=?, last_seq=?, retiring=active,
       staged=NULL, staged_snapshot=NULL, staged_version=NULL, keyring_floor=? WHERE singleton=1
   `).run(id, input.stamp, result.lastEventSeq, input.ring.keyring.version);
+  input.close();
   ctx.options.afterPublish?.();
   retirePending(ctx);
   return { ...result, hiddenChanged };
