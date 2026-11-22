@@ -9,7 +9,7 @@ import {
 } from './manifest.ts';
 import type { ChainPosition, ManifestFile } from './manifest.ts';
 import { readExactly, StreamScanner, streamFile } from './record-file.ts';
-import type { UnlockedKeyring } from './record-file.ts';
+import type { DiskRecord, UnlockedKeyring } from './record-file.ts';
 
 export const MANIFEST = 'MANIFEST.json';
 export const SIGNATURE = 'MANIFEST.sig';
@@ -18,9 +18,11 @@ export const SIGNATURE_PENDING = SIGNATURE + '.pending';
 export const HEAD = 'HEAD.json';
 export const HEAD_PENDING = HEAD + '.pending';
 export const VAULT_METADATA = 'VAULT.json';
+export const LOCK = '.writer.lock.sqlite';
 export const GENESIS: ChainPosition = { segment: 0, hash: GENESIS_HASH, lastEventSequence: 0 };
 export const OPEN_ARTIFACTS = [MANIFEST, SIGNATURE, MANIFEST_PENDING, SIGNATURE_PENDING];
 export type VaultMetadata = ReturnType<typeof decodeVaultMetadata>;
+type InspectRecord = (stream: string, record: DiskRecord) => void;
 
 export interface VaultAnchor {
   vaultId: string;
@@ -68,18 +70,28 @@ export function writePending(path: string, bytes: Buffer, beforeSync?: () => voi
   }
 }
 
-export function removePending(path: string): void {
+export function removePending(path: string): boolean {
   const stat = statIfPresent(path);
-  if (!stat) return;
+  if (!stat) return false;
   check(stat.isFile(), 'INVENTORY');
   unlinkSync(path);
+  return true;
+}
+
+export function checkRootInventory(directory: string): void {
+  const directories = ['keyring', 'segments', 'open'];
+  const files = [VAULT_METADATA, HEAD, HEAD_PENDING, LOCK, LOCK + '-journal', LOCK + '-wal', LOCK + '-shm'];
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    check((entry.isDirectory() && directories.includes(entry.name)) || (entry.isFile() && files.includes(entry.name)),
+      'INVENTORY');
+  }
 }
 
 export function headBytes(position: ChainPosition): Buffer {
   return Buffer.from(canonical({ segment: position.segment, manifest_sha256: position.hash }));
 }
 
-export function readHead(directory: string, name = HEAD) {
+export function readHead(directory: string, name = HEAD, errorCode: 'HEAD' | 'INVENTORY' = 'HEAD') {
   try {
     const value = parseCanonical(readDocument(join(directory, name), 'HEAD', 128));
     object(value, 'segment manifest_sha256');
@@ -88,7 +100,7 @@ export function readHead(directory: string, name = HEAD) {
     return { segment: value.segment, hash: value.manifest_sha256 };
   } catch (error) {
     if (!(error instanceof VaultFormatError)) throw error;
-    throw new VaultFormatError('HEAD');
+    throw new VaultFormatError(errorCode);
   }
 }
 
@@ -134,7 +146,7 @@ export function streamNames(directory: string, artifacts: readonly string[]): st
 
 export function scanStreams(
   directory: string, names: string[], previous: number, scanner: StreamScanner, unlocked?: UnlockedKeyring,
-  expected?: ManifestFile[],
+  expected?: ManifestFile[], inspect?: InspectRecord,
 ) {
   const keyIds = new Set<string>();
   const files: ManifestFile[] = [];
@@ -142,6 +154,7 @@ export function scanStreams(
   let last = previous;
   let first: number | null = null;
   let totalBytes = 0;
+  let erased = 0;
   const byName = expected && new Map(expected.map(file => [file.name, file]));
   for (const name of names) {
     const type = streamType(name);
@@ -149,6 +162,7 @@ export function scanStreams(
       const wanted = byName?.get(name);
       if (wanted) check(size === wanted.bytes, 'FILE_SIZE');
       const scanned = scanner.scan(fd, size, type, record => {
+        inspect?.(name, record);
         keyIds.add(record.keyId);
         if (type === 1) {
           check(record.context === BigInt(++last), 'SEQUENCE');
@@ -166,14 +180,16 @@ export function scanStreams(
     });
     if (result.bytes > 0) files.push({ name, bytes: result.bytes, sha256: result.sha256 });
     totalBytes += result.bytes;
+    erased += result.erased;
   }
   return {
-    files: files.sort((a, b) => a.name < b.name ? -1 : 1), keyIds, first, last, totalBytes, incomplete,
+    files: files.sort((a, b) => a.name < b.name ? -1 : 1), keyIds, first, last, totalBytes, incomplete, erased,
   };
 }
 
 export function scanSealed(
   directory: string, vault: VaultMetadata, scanner: StreamScanner, unlocked?: UnlockedKeyring, anchor?: VaultAnchor,
+  inspect?: (segment: number, ...args: Parameters<InspectRecord>) => void,
 ) {
   const root = join(directory, 'segments');
   check(statIfPresent(root)?.isDirectory(), 'INVENTORY');
@@ -191,6 +207,7 @@ export function scanSealed(
   }
   let position = GENESIS;
   let previous = GENESIS;
+  let erased = 0;
   for (const number of segments) {
     check(number === position.segment + 1, 'CHAIN');
     const path = join(root, segmentName(number));
@@ -200,27 +217,30 @@ export function scanSealed(
     const names = streamNames(path, [MANIFEST, SIGNATURE]);
     check(names.length === manifest.files.length
       && [...names].sort().every((name, index) => name === manifest.files[index].name), 'INVENTORY');
-    const result = scanStreams(path, names, position.lastEventSequence, scanner, unlocked, manifest.files);
+    const result = scanStreams(path, names, position.lastEventSequence, scanner, unlocked, manifest.files,
+      inspect && ((name, record) => inspect(number, name, record)));
+    erased += result.erased;
     checkManifestRecords(manifest, result.keyIds, result.first, result.last);
     previous = position;
     position = { segment: number, hash: sha256(bytes), lastEventSequence: result.last };
     if (anchor?.segment === number) check(anchor.manifestHash === position.hash, 'ANCHOR');
   }
-  return { position, previous };
+  return { position, previous, erased };
 }
 
 export function scanOpen(
   directory: string, last: number, scanner: StreamScanner, unlocked?: UnlockedKeyring, recovering = false,
+  inspect?: InspectRecord,
 ) {
-  if (!statIfPresent(directory)) return { last, files: [], totalBytes: 0, incomplete: [] };
+  if (!statIfPresent(directory)) return { last, files: [], totalBytes: 0, incomplete: [], erased: 0 };
   const names = streamNames(directory, recovering ? OPEN_ARTIFACTS : []);
-  const result = scanStreams(directory, names, last, scanner, unlocked);
+  const result = scanStreams(directory, names, last, scanner, unlocked, undefined, inspect);
   if (!recovering) {
     check(result.incomplete.length === 0, 'LENGTH');
-  } else if (result.incomplete.length) {
-    const tail = result.incomplete[0];
-    check(result.incomplete.length === 1
-      && tail.name === names.filter(name => streamType(name) === streamType(tail.name)).at(-1), 'LENGTH');
+  } else {
+    for (const tail of result.incomplete) {
+      check(tail.name === names.findLast(name => streamType(name) === streamType(tail.name)), 'LENGTH');
+    }
   }
   return result;
 }

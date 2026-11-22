@@ -11,19 +11,18 @@ import { blobId, collectionIdKey } from './keyring.ts';
 import { create } from './keys.ts';
 import { decodeVaultMetadata, encodeManifest, signingPublicKey, streamOrdinal } from './manifest.ts';
 import type { ChainPosition, Manifest } from './manifest.ts';
-import { StreamScanner, streamFile } from './record-file.ts';
+import { diskRecord, StreamScanner, streamFile } from './record-file.ts';
 import type { UnlockedKeyring } from './record-file.ts';
-import { encodeRecord, recordLength } from './record.ts';
+import { encodeRecord, HEADER_BYTES, recordLength } from './record.ts';
 import type { VaultRecordLocation } from './vault-reader.ts';
 import {
-  GENESIS, HEAD, HEAD_PENDING, headBytes, headMatches, makeReadOnly, MANIFEST, MANIFEST_PENDING, metadata, OPEN_ARTIFACTS,
+  GENESIS, HEAD, HEAD_PENDING, headBytes, headMatches, LOCK, makeReadOnly, MANIFEST, MANIFEST_PENDING, metadata, OPEN_ARTIFACTS,
   publishHead, readHead, removePending, replaceHead, scanOpen, scanSealed, segmentName, SIGNATURE, SIGNATURE_PENDING,
   statIfPresent, streamNames, streamType, VAULT_METADATA, writePending,
 } from './vault-directory.ts';
 
 const FILE_CAP = 64 * 1024 * 1024;
 const SEGMENT_CAP = 512 * 1024 * 1024;
-const LOCK = '.writer.lock.sqlite';
 
 type VaultIdentity = Pick<ReturnType<typeof create>, 'vaultId' | 'createdAt' | 'signingPublicKey'>;
 
@@ -108,6 +107,8 @@ export interface VaultWriterOptions {
   writer?: string;
   /** Synchronous process-kill checkpoints used by the crash suite. */
   checkpoint?: (point: VaultCrashPoint) => void;
+  /** Called for each sealed blob header encountered during startup indexing. */
+  onSealedBlobHeader?: () => void;
 }
 
 interface OpenStream {
@@ -125,6 +126,7 @@ export class VaultWriter {
   readonly #scanner = new StreamScanner();
   readonly #streams = new Map<1 | 2, OpenStream>();
   readonly #dirty = new Set<string>();
+  readonly #blobCandidates = new Map<string, VaultRecordLocation[]>();
   #position: ChainPosition = GENESIS;
   #last = 0;
   #totalBytes = 0;
@@ -145,13 +147,22 @@ export class VaultWriter {
       && signingPublicKey(seed).toString('base64') === vault.signing_public_key, 'KEY');
     check(options.writer === undefined || (typeof options.writer === 'string' && options.writer.length > 0));
     this.#signingSeed = seed;
-    const { position, previous } = scanSealed(directory, vault, this.#scanner);
+    const { position, previous } = scanSealed(directory, vault, this.#scanner, undefined, undefined,
+      (segment, stream, record) => {
+        if (record.type !== 2) return;
+        options.onSealedBlobHeader?.();
+        this.#indexBlob(record.keyId, record.end - record.offset, { segment, stream, offset: record.offset });
+      });
     this.#position = position;
     const head = readHead(directory);
     this.repairedHead = !headMatches(head, position);
     check(!this.repairedHead || (position.segment > 0 && headMatches(head, previous)
       && headMatches(readHead(directory, HEAD_PENDING), position)), 'HEAD');
-    const recovered = scanOpen(this.#open, position.lastEventSequence, this.#scanner, unlocked, true);
+    check(!this.repairedHead || !statIfPresent(this.#open), 'INVENTORY');
+    const recovered = scanOpen(this.#open, position.lastEventSequence, this.#scanner, unlocked, true, (stream, record) => {
+      if (record.type === 2) this.#indexBlob(record.keyId, record.end - record.offset,
+        { segment: position.segment + 1, stream, offset: record.offset });
+    });
     for (const tail of recovered.incomplete) {
       const path = join(this.#open, tail.name);
       if (tail.bytes === 0) {
@@ -174,8 +185,8 @@ export class VaultWriter {
     if (this.repairedHead) {
       syncDirectory(join(directory, 'segments'));
       replaceHead(directory);
-    } else {
-      removePending(join(directory, HEAD_PENDING));
+    } else if (removePending(join(directory, HEAD_PENDING))) {
+      syncDirectory(directory);
     }
     if (position.segment > 0) makeReadOnly(this.#segmentPath(position.segment));
     for (const file of recovered.files.sort((a, b) => streamOrdinal(a.name) - streamOrdinal(b.name))) {
@@ -272,31 +283,32 @@ export class VaultWriter {
     }
   }
 
+  #indexBlob(keyId: string, length: number, location: VaultRecordLocation): void {
+    const indexKey = `${keyId}:${length}`;
+    const candidates = this.#blobCandidates.get(indexKey);
+    const candidate = { ...location };
+    if (candidates) candidates.push(candidate);
+    else this.#blobCandidates.set(indexKey, [candidate]);
+  }
+
   #findBlob(keyId: string, id: string, length: number, identityKey: Buffer, key: Buffer): VaultRecordLocation | undefined {
-    for (let number = this.#position.segment + 1; number >= 1; number--) {
-      const segment = number > this.#position.segment ? null : number;
-      const directory = segment === null ? this.#open : this.#segmentPath(segment);
-      if (!statIfPresent(directory)) continue;
-      for (const stream of streamNames(directory, segment === null ? [] : [MANIFEST, SIGNATURE])) {
-        if (streamType(stream) !== 2) continue;
-        const found = streamFile(join(directory, stream), (fd, size) => {
-          let offset: number | undefined;
-          const result = this.#scanner.walk(fd, size, record => {
-            if (record.keyId !== keyId || record.end - record.offset !== length) return;
-            const hash = createHmac('sha256', identityKey);
-            this.#scanner.frames(fd, record, undefined, {
-              vaultId: this.#unlocked.keyring.vault_id, key, consume: bytes => { hash.update(bytes); },
-            });
-            if (hash.digest('hex') === id) {
-              offset = record.offset;
-              return false;
-            }
-          });
-          check(result.shortAt === undefined, 'LENGTH');
-          return offset;
+    const candidates = this.#blobCandidates.get(`${keyId}:${length}`);
+    if (!candidates) return undefined;
+    const header = Buffer.alloc(HEADER_BYTES);
+    for (const location of candidates) {
+      const directory = location.segment > this.#position.segment ? this.#open : this.#segmentPath(location.segment);
+      const matches = streamFile(join(directory, location.stream), (fd, size) => {
+        check(location.offset < size, 'LENGTH');
+        const record = diskRecord(fd, location.offset, size, header);
+        check(record && record.end - record.offset === length, 'LENGTH');
+        check(record.type === 2 && record.keyId === keyId, 'SCHEMA');
+        const hash = createHmac('sha256', identityKey);
+        this.#scanner.frames(fd, record, undefined, {
+          vaultId: this.#unlocked.keyring.vault_id, key, consume: bytes => { hash.update(bytes); },
         });
-        if (found !== undefined) return { segment: number, stream, offset: found };
-      }
+        return hash.digest('hex') === id;
+      });
+      if (matches) return { ...location };
     }
     return undefined;
   }
@@ -324,8 +336,14 @@ export class VaultWriter {
     const fd = newFile ? openSync(path, 'wx', 0o600) : openSync(path, 'r+');
     const offset = stream.bytes;
     try {
-      this.#point('before-write');
-      check(writeSync(fd, encoded, 0, length, offset) === length, 'LENGTH');
+      try {
+        this.#point('before-write');
+        check(writeSync(fd, encoded, 0, length, offset) === length, 'LENGTH');
+      } finally {
+        if (encoded.length >= 64 * 1024 && encoded.byteOffset === 0 && encoded.length === encoded.buffer.byteLength) {
+          encoded.buffer.transfer(0);
+        }
+      }
       this.#point('after-write');
     } finally {
       closeSync(fd);
@@ -334,9 +352,11 @@ export class VaultWriter {
     this.#streams.set(type, stream);
     this.#dirty.add(path);
     this.#totalBytes += length;
+    const location = { segment, stream: stream.name, offset };
     if (type === 1) this.#last = sequence;
+    else this.#indexBlob(keyId, length, location);
     if (this.#totalBytes >= SEGMENT_CAP) this.#seal();
-    return { segment, stream: stream.name, offset };
+    return location;
   }
 
   #syncDirty(): void {

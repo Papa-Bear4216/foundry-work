@@ -1,15 +1,17 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtempDisposableSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempDisposableSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
-  createVault, encodeRecord, readVaultRecord, rekeyAll, sha256, unlockByRecovery, VaultWriter, verifyVault, verifyVaultDeep,
+  createVault, encodeKeyring, encodeRecord, FRAME_BYTES, readVaultRecord, rekeyAll, sha256, unlockByRecovery,
+  VaultWriter, verifyVault, verifyVaultDeep,
 } from '../src/index.ts';
 import { formatRecoveryKey } from '../src/recovery.ts';
+import { checkFrameSize, FRAME_OVERHEAD } from '../src/record.ts';
 import { blob, cases, event, fixture, identity, keyId, keyringPath, unlockFixture, writable } from './vault-fixture.mjs';
 
 function makeVault(t) {
@@ -126,6 +128,111 @@ test('rekey keeps sealed history readable and scopes blob deduplication to a col
   assert.equal(verifyVaultDeep(directory, rotated).position.segment, 2);
 });
 
+test('blob candidate indexing visits each sealed blob header once per writer session', t => {
+  const { directory, unlocked } = makeVault(t);
+  const sealed = blob('TEST ONLY sealed blob');
+  withWriter(directory, unlocked, writer => {
+    writer.appendBatch([sealed, blob('TEST ONLY sealed peer')]);
+    writer.closeSegment();
+    writer.appendBatch([blob('TEST ONLY next segment')]);
+    writer.closeSegment();
+    writer.appendBatch([blob('TEST ONLY recovered open')]);
+  });
+  let headers = 0;
+  const writer = VaultWriter.open(directory, unlocked, { onSealedBlobHeader: () => { headers++; } });
+  try {
+    assert.equal(headers, 3);
+    assert.equal(writer.appendBatch([blob('TEST ONLY recovered open')])[0].duplicate, true);
+    for (let index = 0; index < 8; index++) {
+      const item = blob(`TEST ONLY new blob ${index}`);
+      const [stored, duplicate, fromSealed] = writer.appendBatch([item, item, sealed]);
+      assert.equal(stored.duplicate, false);
+      assert.deepEqual(duplicate, { ...stored, duplicate: true });
+      assert.equal(fromSealed.location.segment, 1);
+    }
+    writer.closeSegment();
+    assert.equal(writer.appendBatch([blob('TEST ONLY new blob 0')])[0].location.segment, 3);
+    assert.equal(headers, 3);
+  } finally {
+    writer.release();
+  }
+});
+
+// Re-encode a synthetic keyring so both the active and destroyed states are MAC-verified.
+function setCollectionState(directory, unlocked, destroyed) {
+  const collection = cases.ids.erased;
+  const date = identity.createdAt;
+  const entries = unlocked.keyring.keys.map(({ key_id, kind, parent, state, created_at, destroyed_at }) => {
+    const entry = { key_id, kind, parent };
+    if (key_id === collection) {
+      return destroyed ? { ...entry, state: 'destroyed', destroyed_at: date }
+        : { ...entry, state: 'active', created_at: date, key: Buffer.alloc(32, 0x42) };
+    }
+    if (state === 'destroyed') return { ...entry, state, destroyed_at };
+    return { ...entry, state, created_at, key: unlocked.keys.get(key_id), label: unlocked.labels.get(key_id) };
+  });
+  writeFileSync(keyringPath(directory), encodeKeyring({
+    vaultId: identity.vaultId, masterKey: unlocked.masterKey, version: destroyed ? 2 : 1, entries,
+  }, cases.passphrase, Buffer.from(cases.recovery_key, 'hex')));
+  return unlockFixture(directory);
+}
+
+test('deep verification reports erased counts only after checking later integrity and authentication', t => {
+  const { directory, unlocked } = makeVault(t);
+  const active = setCollectionState(directory, unlocked, false);
+  const destroyedId = cases.ids.erased;
+  const erasedLocation = withWriter(directory, active, writer => {
+    const [stored] = writer.appendBatch([{ ...event('TEST ONLY erased'), keyId: destroyedId }]);
+    writer.closeSegment();
+    writer.appendBatch([event('TEST ONLY later active')]);
+    writer.closeSegment();
+    writer.appendBatch([{ ...blob('TEST ONLY erased open'), keyId: destroyedId }, event('TEST ONLY active open')]);
+    return stored.location;
+  });
+  const erased = setCollectionState(directory, active, true);
+  assert.throws(() => verifyVaultDeep(directory, erased), { code: 'ERASED', message: 'ERASED: 2 record(s)' });
+  assert.throws(() => readVaultRecord(directory, erasedLocation, erased), { code: 'ERASED' });
+  writable(directory);
+  for (const [path, offset, code] of [
+    [join(segment(directory, 1), 'events-0001.fvr'), 75, 'FILE_HASH'],
+    [join(segment(directory, 2), 'events-0001.fvr'), 75, 'AUTH'],
+    [join(segment(directory, 2), 'MANIFEST.sig'), 0, 'SIGNATURE'],
+    [join(directory, 'HEAD.json'), 21, 'HEAD'],
+    [join(directory, 'open', 'events-0001.fvr'), 75, 'AUTH'],
+  ]) {
+    flip(path, offset);
+    assert.throws(() => verifyVaultDeep(directory, erased), { code });
+    flip(path, offset);
+  }
+});
+
+test('an open record survives destroyed-key recovery and is listed in the sealed manifest', t => {
+  const { directory, unlocked } = makeVault(t);
+  const active = setCollectionState(directory, unlocked, false);
+  const destroyedId = cases.ids.erased;
+  withWriter(directory, active, writer => {
+    writer.appendBatch([{ ...event('TEST ONLY erased before seal'), keyId: destroyedId }, event('TEST ONLY active')]);
+  });
+  const erased = setCollectionState(directory, active, true);
+  withWriter(directory, erased, writer => {
+    assert.deepEqual(writer.repairs, []);
+    assert.equal(writer.closeSegment().lastEventSequence, 2);
+  });
+  const manifest = JSON.parse(readFileSync(join(segment(directory, 1), 'MANIFEST.json')));
+  assert.ok(manifest.key_ids.includes(destroyedId));
+  assert.equal(verifyVault(directory).position.segment, 1);
+  assert.throws(() => verifyVaultDeep(directory, erased), { code: 'ERASED', message: 'ERASED: 1 record(s)' });
+});
+
+test('a full non-final frame must leave room for a nonempty final frame', () => {
+  const full = FRAME_BYTES + FRAME_OVERHEAD;
+  for (let tail = 1; tail <= FRAME_OVERHEAD; tail++) {
+    assert.throws(() => checkFrameSize(FRAME_BYTES, full + tail, 2, true), { code: 'LENGTH' });
+  }
+  checkFrameSize(FRAME_BYTES, full, 2, true);
+  checkFrameSize(FRAME_BYTES, full + FRAME_OVERHEAD + 1, 2, true);
+});
+
 test('truncates and reports only a physically short open tail', async t => {
   for (const length of [0, 1, 68, 69, 91]) {
     await t.test(`short record at ${length} bytes`, inner => {
@@ -156,6 +263,33 @@ test('truncates and reports only a physically short open tail', async t => {
       assert.equal(verifyVaultDeep(directory, unlocked).position.lastEventSequence, 2);
     });
   }
+});
+
+test('recovers a short tail in each stream type after an interrupted mixed batch', t => {
+  const { directory, unlocked } = makeVault(t);
+  const entries = withWriter(directory, unlocked, writer => writer.appendBatch([
+    event('TEST ONLY durable event'), blob('TEST ONLY durable blob'),
+  ]));
+  const key = unlocked.collectionEncryptionKey(keyId);
+  const tails = [
+    encodeRecord({ type: 1, keyId, context: 2n }, Buffer.from('{"seq":2}'), identity.vaultId, key),
+    encodeRecord({ type: 2, keyId, context: 0n }, Buffer.from('TEST ONLY partial blob'), identity.vaultId, key),
+  ];
+  key.fill(0);
+  const repairs = entries.map(({ location: { stream } }, index) => {
+    const path = join(directory, 'open', stream);
+    const intact = readFileSync(path);
+    const short = tails[index].subarray(0, -1);
+    writeFileSync(path, Buffer.concat([intact, short]));
+    return { stream, offset: intact.length, removedBytes: short.length };
+  });
+  assert.throws(() => verifyVault(directory), { code: 'LENGTH' });
+  withWriter(directory, unlocked, writer => {
+    assert.deepEqual(writer.repairs, repairs);
+    assert.equal(writer.appendBatch([event('TEST ONLY resumed')])[0].sequence, 2);
+    writer.closeSegment();
+  });
+  assert.equal(verifyVaultDeep(directory, unlocked).position.lastEventSequence, 2);
 });
 
 function flip(path, offset) {
@@ -191,7 +325,8 @@ const tamper = [
   }],
   ['truncated segment', 'FILE_SIZE', ({ events }) => writeFileSync(events, readFileSync(events).subarray(0, -1))],
   ['extra file', 'INVENTORY', ({ first }) => writeFileSync(join(first, 'pack-9999.fvr'), 'TEST ONLY extra')],
-  ['removed segment', 'CHAIN', ({ first }) => renameSync(first, join(first, '..', '..', 'removed'))],
+  ['extra file at the vault root', 'INVENTORY', ({ directory }) => writeFileSync(join(directory, 'extra'), 'TEST ONLY extra')],
+  ['removed segment', 'CHAIN', ({ directory, first }) => renameSync(first, join(directory, 'keyring', 'removed'))],
 ];
 
 test('tamper gate rejects changes to the authenticated inventory, chain, and HEAD', async t => {
@@ -260,6 +395,32 @@ const checkpoints = {
 };
 const childPath = fileURLToPath(new URL('./vault-crash-child.mjs', import.meta.url));
 
+test('writers in different processes serialize through the vault lock', async t => {
+  const { directory, unlocked } = makeVault(t);
+  const child = spawn(process.execPath, [childPath, directory, 'hold'], {
+    stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
+  });
+  const exit = once(child, 'close');
+  try {
+    const held = await Promise.race([
+      once(child.stdout, 'data', { signal: AbortSignal.timeout(15_000) }).then(([chunk]) => chunk.toString().trim()),
+      exit.then(() => { throw new Error('Child exited before acquiring the vault lock.'); }),
+    ]);
+    assert.equal(held, 'locked');
+    const start = performance.now();
+    withWriter(directory, unlocked, writer => {
+      assert.equal(writer.closeSegment().segment, 0);
+      assert.ok(performance.now() - start >= 100, 'Opening the vault should wait for the child lock.');
+    });
+    assert.deepEqual(await exit, [0, null]);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGKILL');
+      await exit;
+    }
+  }
+});
+
 async function killAt(directory, operation, point) {
   const child = spawn(process.execPath, [childPath, directory, operation, point], {
     stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
@@ -286,6 +447,24 @@ async function killAt(directory, operation, point) {
     }
   }
 }
+
+test('pending HEAD is allowed only for an interrupted head replacement with no open directory', async t => {
+  const { directory, unlocked } = makeVault(t);
+  const pending = join(directory, 'HEAD.json.pending');
+  const open = join(directory, 'open');
+  withWriter(directory, unlocked, writer => writer.appendBatch([blob('TEST ONLY pending head')]));
+  await killAt(directory, 'close', 'before-segment-rename');
+  assert.throws(() => verifyVault(directory), { code: 'INVENTORY' });
+  withWriter(directory, unlocked, writer => {
+    assert.equal(writer.repairedHead, false);
+    assert.throws(() => statSync(pending), { code: 'ENOENT' });
+  });
+  await killAt(directory, 'close', 'after-segment-rename');
+  assert.equal(verifyVault(directory).position.segment, 1);
+  mkdirSync(open);
+  assert.throws(() => verifyVault(directory), { code: 'INVENTORY' });
+  assert.throws(() => VaultWriter.open(directory, unlocked), { code: 'INVENTORY' });
+});
 
 test('killed appends and seals recover without losing closed history', async t => {
   for (const [operation, points] of Object.entries(checkpoints)) {

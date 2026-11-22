@@ -13,6 +13,10 @@ const writer = VaultWriter.open(directory, unlockFixture(directory), {
 try {
   if (operation === 'append') writer.appendBatch([event('TEST ONLY interrupted append')]);
   if (operation === 'close') writer.closeSegment();
+  if (operation === 'hold') {
+    writeSync(1, 'locked\n');
+    await new Promise(resolve => setTimeout(resolve, 750));
+  }
 } finally {
   writer.release();
 }

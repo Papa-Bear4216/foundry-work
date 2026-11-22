@@ -31,7 +31,7 @@ export function decodeRecordHeader(header: Buffer) {
 
 export function checkFrameSize(size: number, remaining: number, type: number, first: boolean): void {
   const length = FRAME_OVERHEAD + size;
-  check(length <= remaining && size <= FRAME_BYTES && (length === remaining || size === FRAME_BYTES)
+  check(size <= FRAME_BYTES && (length === remaining || (size === FRAME_BYTES && remaining - length > FRAME_OVERHEAD))
     && (size > 0 || (type === 2 && first)), 'LENGTH');
 }
 
@@ -147,13 +147,17 @@ export function decryptRecord(
   const { header, frames } = record;
   const key = recordKey(header, encryptionKey);
   const chunks: Buffer[] = [];
+  let plaintext: Buffer | undefined;
   try {
     for (const [index, frame] of frames.entries()) {
       chunks.push(decryptFrame(header, vaultId, key, frame, index, index === frames.length - 1));
     }
-    const plaintext = Buffer.concat(chunks);
+    plaintext = Buffer.concat(chunks);
     check(record.type === 2 || BigInt(eventSequence(plaintext)) === record.context, 'SEQUENCE');
     return plaintext;
+  } catch (error) {
+    plaintext?.fill(0);
+    throw error;
   } finally {
     key.fill(0);
     for (const chunk of chunks) chunk.fill(0);

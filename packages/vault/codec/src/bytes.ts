@@ -8,8 +8,8 @@ export type ErrorCode = 'VERSION' | 'SCHEMA' | 'CANONICAL' | 'LENGTH' | 'AUTH' |
 export class VaultFormatError extends Error {
   readonly code: ErrorCode;
 
-  constructor(code: ErrorCode) {
-    super(code);
+  constructor(code: ErrorCode, detail?: string) {
+    super(detail === undefined ? code : code + ': ' + detail);
     this.code = code;
     this.name = 'VaultFormatError';
   }

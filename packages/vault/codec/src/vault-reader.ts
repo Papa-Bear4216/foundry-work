@@ -1,11 +1,12 @@
 import { Buffer } from 'node:buffer';
 import { join } from 'node:path';
-import { check, integer } from './bytes.ts';
+import { check, integer, VaultFormatError } from './bytes.ts';
 import { diskRecord, StreamScanner, streamFile } from './record-file.ts';
 import type { UnlockedKeyring } from './record-file.ts';
 import { HEADER_BYTES } from './record.ts';
 import {
-  headMatches, metadata, readHead, scanOpen, scanSealed, segmentName, statIfPresent, streamType,
+  checkRootInventory, HEAD_PENDING, headMatches, metadata, readHead, scanOpen, scanSealed, segmentName, statIfPresent,
+  streamType,
 } from './vault-directory.ts';
 import type { VerifyOptions } from './vault-directory.ts';
 
@@ -18,11 +19,21 @@ export interface VaultRecordLocation {
 
 function verify(directory: string, { anchor }: VerifyOptions, unlocked?: UnlockedKeyring) {
   const vault = metadata(directory);
+  checkRootInventory(directory);
   if (unlocked) check(unlocked.keyring.vault_id === vault.vault_id, 'KEY');
   const scanner = new StreamScanner();
-  const { position } = scanSealed(directory, vault, scanner, unlocked, anchor);
-  check(headMatches(readHead(directory), position), 'HEAD');
-  const open = scanOpen(join(directory, 'open'), position.lastEventSequence, scanner, unlocked);
+  const { position, previous, erased } = scanSealed(directory, vault, scanner, unlocked, anchor);
+  const openPath = join(directory, 'open');
+  const head = readHead(directory);
+  if (statIfPresent(join(directory, HEAD_PENDING))) {
+    check(position.segment > 0 && headMatches(head, previous) && !statIfPresent(openPath)
+      && headMatches(readHead(directory, HEAD_PENDING, 'INVENTORY'), position), 'INVENTORY');
+  } else {
+    check(headMatches(head, position), 'HEAD');
+  }
+  const open = scanOpen(openPath, position.lastEventSequence, scanner, unlocked);
+  const erasedCount = erased + open.erased;
+  if (erasedCount) throw new VaultFormatError('ERASED', `${erasedCount} record(s)`);
   return {
     vault, position,
     open: { files: open.files.length, bytes: open.totalBytes, lastEventSequence: open.last },
