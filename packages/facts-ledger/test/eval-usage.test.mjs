@@ -2764,11 +2764,11 @@ test('facts eval (R7-r6 findings 1 & 2): 1,024-byte line cap and linear citation
   }
 });
 
-test('facts eval (R7-r6 finding 3): U+00A0 and Unicode Zs/TAB accepted after ANSWER:, rejected between value and citation', async (t) => {
+test('facts eval (R7-r6 finding 3, R8-r7 finding 3): zero or more Unicode Zs/TAB accepted after ANSWER:, NBSP rejected between value and citation', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'facts-eval-r7-nbsp-'));
   t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
 
-  // Direct parser checks for both placements of U+00A0 plus other Zs separators.
+  // Direct parser checks for zero-space, both placements of U+00A0, and other Zs separators.
   assert.deepEqual(parseStructuredAnswer('ANSWER:\u00a07 [fact:a10000000001.0]'), {
     kind: 'fact',
     id: 'a10000000001.0',
@@ -2788,11 +2788,37 @@ test('facts eval (R7-r6 finding 3): U+00A0 and Unicode Zs/TAB accepted after ANS
   assert.equal(parseStructuredAnswer('ANSWER: 7\u00a0 [fact:a10000000001.0]'), null);
   assert.equal(parseStructuredAnswer('ANSWER: 7 \u00a0 [fact:a10000000001.0]'), null);
   assert.equal(parseStructuredAnswer('ANSWER:\u00a07\u00a0[fact:a10000000001.0]'), null);
-  assert.equal(parseStructuredAnswer('ANSWER:7 [fact:a10000000001.0]'), null);
+  assert.deepEqual(parseStructuredAnswer('ANSWER:7 [fact:a10000000001.0]'), {
+    kind: 'fact',
+    id: 'a10000000001.0',
+    normalizedValue: '7',
+  });
+  assert.equal(parseStructuredAnswer('ANSWER:7[fact:a10000000001.0]'), null);
+  assert.equal(parseStructuredAnswer('ANSWER: [fact:a10000000001.0]'), null);
+  assert.equal(parseStructuredAnswer('ANSWER:\u00a0 [fact:a10000000001.0]'), null);
 
-  // End-to-end streaming eval checks on A01 for both placements of U+00A0.
+  // Direct checkAnswer + scoreEvalAnswer check on A01 for zero-space after ANSWER:.
+  const fx = buildEvalFixture(join(dir, 'direct-fx'));
+  rebuildIndex(fx.logPath, fx.indexPath);
+  const repos = loadRepoMap(fx.reposPath);
+  const a01 = CASES.find((c) => c.id === 'A01');
+  const zeroSpaceAnswer = 'ANSWER:7 [fact:a10000000001.0]\n';
+  const zeroSpaceCheck = await checkAnswer(zeroSpaceAnswer, {
+    logPath: fx.logPath,
+    indexPath: fx.indexPath,
+    repos,
+    nowMs: NOW_MS,
+    maxLineBytes: MAX_EVAL_LINE_BYTES,
+  });
+  const zeroSpaceScore = scoreEvalAnswer(a01, zeroSpaceAnswer, zeroSpaceCheck);
+  assert.equal(zeroSpaceCheck.ok, true);
+  assert.equal(zeroSpaceScore.outcome, 'correct');
+  assert.equal(zeroSpaceScore.unsupportedProblems, 0);
+
+  // End-to-end streaming eval checks on A01 for zero-space and both placements of U+00A0.
   const modelScript = writeFakeModel(dir, 'nbsp-model.mjs', QUESTION_HASH_MODEL_BODY);
   for (const [label, line, expectOutcome, expectUnsupported] of [
+    ['zero-space-after-colon', 'ANSWER:7 [fact:a10000000001.0]\n', 'correct', 0],
     ['nbsp-after-colon', 'ANSWER:\u00a07 [fact:a10000000001.0]\n', 'correct', 0],
     ['ideographic-space-after-colon', 'ANSWER:\u30007 [fact:a10000000001.0]\n', 'correct', 0],
     ['nbsp-between-value-and-cite', 'ANSWER: 7\u00a0[fact:a10000000001.0]\n', 'wrong', 1],

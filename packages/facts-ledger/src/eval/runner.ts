@@ -241,17 +241,18 @@ function isValidFactId(id: string): boolean {
 }
 
 /**
- * Linear-time structured answer parser (R6-r5 findings 3 & 4, R7 finding 3).
+ * Linear-time structured answer parser (R6-r5 findings 3 & 4, R7 finding 3, R8 finding 3).
  * Locates and validates the fixed `[fact:<id>]` / `[asserted:<id>]` suffix first in O(1),
- * accepts any Unicode space separator (Zs) or TAB between `ANSWER:` and the value, restricts
- * the value-to-citation separator strictly to ASCII space/TAB, and validates non-empty value
- * in O(N) with no regex backtracking.
+ * accepts zero or more Unicode space separators (Zs) or TAB between `ANSWER:` and the value,
+ * restricts the value-to-citation separator strictly to ASCII space/TAB, and validates a
+ * non-empty value in O(N) with no regex backtracking.
  */
 export function parseStructuredAnswer(
   line: string,
 ): { readonly kind: 'fact' | 'asserted'; readonly id: string; readonly normalizedValue: string } | null {
   const len = line.length;
-  if (len < ANSWER_PREFIX.length + 3 + MIN_CITATION_LEN) return null;
+  // Minimum valid line: `ANSWER:` + 1-char value + 1 ASCII space/TAB + `[fact:<12 hex>.<n>]`.
+  if (len < ANSWER_PREFIX.length + 2 + MIN_CITATION_LEN) return null;
   if (line.charCodeAt(len - 1) !== 0x5d /* ] */) return null;
   if (!line.startsWith(ANSWER_PREFIX)) return null;
 
@@ -284,8 +285,8 @@ export function parseStructuredAnswer(
   while (valueStart < valueEnd && isSpaceSeparatorOrTab(line.charCodeAt(valueStart))) {
     valueStart++;
   }
-  // Require at least one Unicode space separator (Zs) or TAB after `ANSWER:`, and a non-empty value.
-  if (valueStart === ANSWER_PREFIX.length || valueStart >= valueEnd) return null;
+  // Zero or more Unicode space separators (Zs) or TAB are allowed after `ANSWER:`; require a non-empty value.
+  if (valueStart >= valueEnd) return null;
 
   const rawValue = line.slice(valueStart, valueEnd);
   // Reject non-horizontal Unicode whitespace bordering the value (e.g. NBSP before citation, or BOM).
