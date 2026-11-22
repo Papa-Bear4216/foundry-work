@@ -99,6 +99,14 @@ export function sealInto(key: Buffer, nonce: Buffer, aad: Buffer, plaintext: Buf
   }
 }
 
+/** Wipe an owned plaintext buffer and immediately release dedicated frame-sized allocations. */
+export function clearPlaintext(buffer: Buffer): void {
+  buffer.fill(0);
+  if (buffer.length >= 64 * 1024 && buffer.byteOffset === 0 && buffer.length === buffer.buffer.byteLength) {
+    buffer.buffer.transfer(0);
+  }
+}
+
 export function open(key: Buffer, nonce: Buffer, aad: Buffer, sealed: Buffer): Buffer {
   const decipher = createDecipheriv('aes-256-gcm', key, nonce, { authTagLength: 16 });
   decipher.setAAD(aad);
@@ -112,7 +120,7 @@ export function open(key: Buffer, nonce: Buffer, aad: Buffer, sealed: Buffer): B
   } catch {
     throw new VaultFormatError('AUTH');
   } finally {
-    plaintext?.fill(0);
-    tail?.fill(0);
+    if (plaintext) clearPlaintext(plaintext);
+    if (tail) clearPlaintext(tail);
   }
 }
