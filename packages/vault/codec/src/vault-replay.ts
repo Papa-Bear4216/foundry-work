@@ -149,6 +149,8 @@ export function openVaultReplay(directory: string, credential: Unlock, { anchor 
         if (!running) generator.return(undefined as R);
       };
       const step = (resume: () => IteratorResult<T, R>): IteratorResult<T, R> => {
+        // A reentrant call on this running generator: the engine throws its own TypeError and no flag changes.
+        if (running) return resume();
         if (!started) {
           started = true;
           if (closed) {
@@ -166,6 +168,8 @@ export function openVaultReplay(directory: string, credential: Unlock, { anchor 
         } catch (error) {
           finished = true;
           active.delete(closeIterator);
+          // close() ran during this step: the read fails KEY, whatever error ended the step.
+          if (endedByClose) check(false, 'KEY');
           throw error;
         } finally {
           running = false;
@@ -187,7 +191,10 @@ export function openVaultReplay(directory: string, credential: Unlock, { anchor 
       ) as Generator<T, R, undefined>;
       iterator.next = () => step(() => generator.next());
       iterator.return = (value: R) => {
+        // On a running generator this call throws "already running" before any flag below changes; keep that order.
         const result = generator.return(value);
+        // Ended after close(): a later next() fails KEY, as it did before lazy tracking. Never joins `active`.
+        if (closed) endedByClose = true;
         started = true;
         finished = true;
         active.delete(closeIterator);

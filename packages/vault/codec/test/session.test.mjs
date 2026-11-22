@@ -472,6 +472,45 @@ test('credential fields are read once into a snapshot, so a getter that changes 
   }
 });
 
+test('session is read by value, not by presence: a proxy that hides session from `in` still fails KEY', t => {
+  const vault = setupVault(t, 'vault-session-value');
+  const real = unlockVault(vault.path, vault.vaultId, { recoveryKey: recoveryKey() });
+  try {
+    const hidden = () => new Proxy({ recoveryKey: recoveryKey() }, {
+      has: (target, key) => key === 'session' ? false : Reflect.has(target, key),
+      get: (target, key, receiver) => key === 'session' ? real : Reflect.get(target, key, receiver),
+    });
+    // A defined session at a credential-only entry point fails KEY.
+    assert.throws(() => unlockVault(vault.path, vault.vaultId, hidden()), { code: 'KEY' });
+    assert.throws(() => createUnlockSession(readFileSync(vault.path), vault.vaultId, hidden()), { code: 'KEY' });
+    // Two credentials (recovery key and session) fail KEY.
+    assert.throws(() => decodeKeyring(readFileSync(vault.path), hidden(), vault.vaultId), { code: 'KEY' });
+  } finally {
+    real.dispose();
+  }
+
+  // A passphrase getter that changes its answer is read exactly once (one KDF run).
+  let reads = 0;
+  const credential = {};
+  Object.defineProperty(credential, 'passphrase', {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return reads === 1 ? cases.passphrase : 'TEST ONLY wrong passphrase';
+    },
+  });
+  const session = unlockVault(vault.path, vault.vaultId, credential);
+  session.dispose();
+  assert.equal(reads, 1);
+});
+
+test('the new entry points validate the credential shape before any file read or keyring parse', t => {
+  const temp = mkdtempDisposableSync(join(tmpdir(), 'foundry-session-order-'));
+  t.after(() => temp.remove());
+  assert.throws(() => unlockVault(join(temp.path, 'missing-keyring.json'), identity.vaultId, {}), { code: 'KEY' });
+  assert.throws(() => createUnlockSession(Buffer.from('TEST ONLY not a keyring'), identity.vaultId, {}), { code: 'KEY' });
+});
+
 test('rekeyAll runs scrypt twice with a passphrase-backed session and once with a recovery-backed session', t => {
   const vault = setupVault(t, 'vault-rekey-kdf');
   const rekeyOptions = {

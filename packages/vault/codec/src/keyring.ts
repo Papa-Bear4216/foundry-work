@@ -367,9 +367,10 @@ export function readKeyring(bytes: Buffer, expectedVaultId: string): Keyring {
 
 /**
  * Reads `passphrase`, `recoveryKey` and `session` from the caller's object at most once each into a fresh object that
- * holds only the chosen field, so later validation never sees a getter's second answer. Presence uses `in`, and a
- * credential is a session only when its `session` value is defined. With `allowSession: false`, a defined session
- * fails KEY. Field values are returned raw; callers validate their types.
+ * holds only the chosen field, so later validation never sees a getter's second answer. `passphrase` and `recoveryKey`
+ * use `in` for presence; `session` is read exactly once by value, and a credential is a session only when that value
+ * is defined. With `allowSession: false`, a defined session fails KEY. Field values are returned raw; callers validate
+ * their types.
  */
 export function snapshotCredential(
   credential: unknown, allowSession: boolean,
@@ -378,10 +379,9 @@ export function snapshotCredential(
   const source = credential as Record<string, unknown>;
   const hasPassphrase = 'passphrase' in source;
   const hasRecovery = 'recoveryKey' in source;
-  const hasSessionKey = 'session' in source;
   const passphrase = hasPassphrase ? source.passphrase : undefined;
   const recoveryKey = hasRecovery ? source.recoveryKey : undefined;
-  const session = hasSessionKey ? source.session : undefined;
+  const session = source.session;
   const hasSession = session !== undefined;
   check(allowSession || !hasSession, 'KEY');
   check(Number(hasPassphrase) + Number(hasRecovery) + Number(hasSession) === 1, 'KEY');

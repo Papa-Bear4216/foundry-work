@@ -303,3 +303,146 @@ test('iterators join the active set on their first next, so 1,000 dropped unstar
   assert.throws(() => createdBeforeClose.next(), error => error instanceof VaultFormatError && error.code === 'KEY');
   assert.equal(activeReplayIteratorCountForTest(source), 0);
 });
+
+const isKey = error => error instanceof VaultFormatError && error.code === 'KEY';
+
+test('a reentrant next() or throw() on a running iterator leaves its tracking unchanged, so close() still wipes its keys', t => {
+  const vault = setup(t);
+  const payload = Buffer.alloc(FRAME_BYTES + 1, 0x42);
+  vault.write(writer => writer.appendBatch([blob(payload)]));
+  const observed = [];
+  t.after(() => setFrameKeyObserverForTest(undefined));
+
+  for (const reenter of [it => it.next(), it => it.throw(new Error('TEST ONLY reentrant throw'))]) {
+    const source = openVaultReplay(vault.directory, credential());
+    t.after(() => source.close());
+    const [{ location }] = [...source.replay()];
+    observed.length = 0;
+    setFrameKeyObserverForTest(keys => observed.push(keys));
+
+    let iterator;
+    let caught = 'not called';
+    const trapLocation = {
+      ...location,
+      get segment() {
+        try {
+          reenter(iterator);
+          caught = undefined;
+        } catch (error) {
+          caught = error;
+        }
+        return location.segment;
+      },
+    };
+    iterator = source.streamBlob(trapLocation);
+    const first = iterator.next();
+    assert.ok(caught instanceof TypeError && !(caught instanceof VaultFormatError));
+    assert.equal(first.done, false);
+    assert.deepEqual(first.value, payload.subarray(0, FRAME_BYTES));
+    first.value.fill(0);
+    assert.equal(activeReplayIteratorCountForTest(source), 1);
+    assert.equal(observed.length, 1);
+    assert.ok(observed[0].collectionKey.some(byte => byte !== 0));
+    assert.ok(observed[0].recordKey.some(byte => byte !== 0));
+
+    source.close();
+    assert.deepEqual(observed[0].collectionKey, Buffer.alloc(32));
+    assert.deepEqual(observed[0].recordKey, Buffer.alloc(32));
+    assert.equal(activeReplayIteratorCountForTest(source), 0);
+    assert.throws(() => iterator.next(), isKey);
+  }
+});
+
+test('a running read closed by one getter fails KEY when a later getter throws; without close the getter error is rethrown', t => {
+  const vault = setup(t);
+  const payload = Buffer.alloc(FRAME_BYTES + 1, 0x42);
+  vault.write(writer => writer.appendBatch([blob(payload)]));
+  const observed = [];
+  t.after(() => setFrameKeyObserverForTest(undefined));
+
+  // Without close: the read rethrows the getter's own error object.
+  const plain = openVaultReplay(vault.directory, credential());
+  t.after(() => plain.close());
+  const [{ location }] = [...plain.replay()];
+  const own = new Error('TEST ONLY getter');
+  const throwing = { ...location, get stream() { throw own; } };
+  assert.throws(() => plain.streamBlob(throwing).next(), error => error === own);
+  assert.equal(activeReplayIteratorCountForTest(plain), 0);
+
+  // With close in getter A and a throw in later getter B: the read fails KEY.
+  const source = openVaultReplay(vault.directory, credential());
+  t.after(() => source.close());
+  setFrameKeyObserverForTest(keys => observed.push(keys));
+  const paused = source.streamBlob(location);
+  const firstChunk = paused.next();
+  assert.equal(firstChunk.done, false);
+  firstChunk.value.fill(0);
+  assert.equal(observed.length, 1);
+  assert.ok(observed[0].collectionKey.some(byte => byte !== 0));
+  assert.ok(observed[0].recordKey.some(byte => byte !== 0));
+
+  const trapLocation = {
+    ...location,
+    get segment() {
+      source.close();
+      return location.segment;
+    },
+    get stream() {
+      throw new Error('TEST ONLY getter');
+    },
+  };
+  assert.throws(() => source.streamBlob(trapLocation).next(), isKey);
+  assert.deepEqual(observed[0].collectionKey, Buffer.alloc(32));
+  assert.deepEqual(observed[0].recordKey, Buffer.alloc(32));
+  assert.equal(observed.length, 1);
+  assert.equal(activeReplayIteratorCountForTest(source), 0);
+});
+
+test('close, return, next fails KEY on a never-started iterator; the other close and return orders keep their results', t => {
+  const vault = setup(t);
+  const payload = Buffer.alloc(FRAME_BYTES + 1, 0x42);
+  vault.write(writer => writer.appendBatch([event('TEST ONLY close return order'), blob(payload)]));
+  const location = (() => {
+    const source = openVaultReplay(vault.directory, credential());
+    try {
+      return [...source.replay()].find(item => item.type === 'blob').location;
+    } finally {
+      source.close();
+    }
+  })();
+  const kinds = {
+    replay: source => source.replay(),
+    streamBlob: source => source.streamBlob(location),
+  };
+  const orders = [
+    { name: 'never started: close, return, next', start: false, closeFirst: true, expectKey: true },
+    { name: 'never started: return, close, next', start: false, closeFirst: false, expectKey: false },
+    { name: 'started: close, return, next', start: true, closeFirst: true, expectKey: true },
+    { name: 'started: return, close, next', start: true, closeFirst: false, expectKey: false },
+  ];
+  for (const [kind, create] of Object.entries(kinds)) {
+    for (const order of orders) {
+      const source = openVaultReplay(vault.directory, credential());
+      t.after(() => source.close());
+      const iterator = create(source);
+      if (order.start) {
+        const first = iterator.next();
+        assert.equal(first.done, false, `${kind} ${order.name}`);
+        if (Buffer.isBuffer(first.value)) first.value.fill(0);
+      }
+      if (order.closeFirst) {
+        source.close();
+        iterator.return();
+      } else {
+        iterator.return();
+        source.close();
+      }
+      if (order.expectKey) {
+        assert.throws(() => iterator.next(), isKey, `${kind} ${order.name}`);
+      } else {
+        assert.deepEqual(iterator.next(), { done: true, value: undefined }, `${kind} ${order.name}`);
+      }
+      assert.equal(activeReplayIteratorCountForTest(source), 0, `${kind} ${order.name}`);
+    }
+  }
+});
