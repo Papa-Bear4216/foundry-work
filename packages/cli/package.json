@@ -1,0 +1,20 @@
+{
+  "name": "foundry-cli",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "engines": { "node": "24.22.3" },
+  "bin": { "foundry": "./dist/main.js" },
+  "exports": "./dist/cli.js",
+  "scripts": {
+    "build": "npm --prefix ../importers run build && npm --prefix ../index run build && tsc -p tsconfig.json",
+    "typecheck": "npm --prefix ../importers run build && npm --prefix ../index run build && tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test --test-concurrency=1 test/units.test.mjs test/commands.test.mjs test/import.test.mjs test/process.test.mjs test/secrets.test.mjs"
+  },
+  "dependencies": {
+    "foundry-index": "0.0.0",
+    "importers": "0.0.0",
+    "vault": "0.0.0"
+  }
+}
