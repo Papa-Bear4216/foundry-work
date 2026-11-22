@@ -127,9 +127,11 @@ export {
 export { AGENT_RULES_TEXT, answerTypeHint, buildEvalPrompt } from './eval/prompt.js';
 export {
   DEFAULT_CASE_TIMEOUT_MS,
+  EVAL_ABSTAIN_REASONS,
   MAX_ABSTAIN_PAYLOAD_BYTES,
   MAX_CASE_TIMEOUT_MS,
   MAX_EVAL_CASE_PROBLEMS,
+  MAX_EVAL_LINE_BYTES,
   SNAPSHOT_GIT_TIMEOUT_MS,
   assertValidCaseTimeoutMs,
   buildModelChildEnv,
@@ -139,6 +141,8 @@ export {
   formatDryRunPrompts,
   formatEvalText,
   gitSnapshotCommand,
+  parseEvalAbstainReason,
+  parseStructuredAnswer,
   runEval,
   runEvalDryRun,
   runModelCommand,

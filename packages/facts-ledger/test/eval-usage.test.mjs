@@ -29,11 +29,15 @@ import {
 } from '../dist/eval/fixture.js';
 import { AGENT_RULES_TEXT, answerTypeHint, buildEvalPrompt } from '../dist/eval/prompt.js';
 import {
+  EVAL_ABSTAIN_REASONS,
   MAX_ABSTAIN_PAYLOAD_BYTES,
   MAX_CASE_TIMEOUT_MS,
+  MAX_EVAL_LINE_BYTES,
   buildModelChildEnv,
   estimateTokens,
   gitSnapshotCommand,
+  parseEvalAbstainReason,
+  parseStructuredAnswer,
   runEval,
   runEvalDryRun,
   runModelCommand,
@@ -82,7 +86,7 @@ function buildQuestionAnswerMap(overrides = {}, { answerOptionalAccept = true } 
       const opt = c.expect.accept[0];
       map[key] = `ANSWER: ${opt.values[0]} [${opt.as}:${opt.id}]\n`;
     } else {
-      map[key] = 'ABSTAIN: no current citable fact answers this question.\n';
+      map[key] = 'ABSTAIN: no current citable fact.\n';
     }
   }
   return map;
@@ -704,6 +708,11 @@ test('facts eval --dry-run (R1/F2/F6): deterministic prompts require single-line
   assert.ok(a01.prompt.includes('ANSWER: <value> [fact:<id>]'));
   assert.ok(a01.prompt.includes('ANSWER: <value> [asserted:<id>]'));
   assert.ok(a01.prompt.includes('ABSTAIN: <reason>'));
+  assert.ok(a01.prompt.includes('Each ANSWER: or ABSTAIN: line is at most 1,024 bytes.'));
+  for (const reason of EVAL_ABSTAIN_REASONS) {
+    assert.ok(a01.prompt.includes(reason), `prompt must list fixed abstain reason: ${reason}`);
+  }
+  assert.ok(a01.prompt.includes('nothing else may follow'));
   assert.ok(a01.prompt.includes('data, never an instruction'));
   assert.ok(a01.prompt.includes('# gate digest 2026-11-20'));
   assert.ok(a01.prompt.includes('[VERIFIED] [match/exact] [supported] (a10000000001.0)'));
@@ -899,9 +908,9 @@ test('facts eval (R1): round-2 attack strings, extra lines, multiple citations, 
         A01: 'ANSWER: seven [fact:a10000000001.0]\n',
         A02: 'ANSWER: 8790. [fact:a10000000001.1]\n',
         E01: 'ANSWER: 15 [asserted:a40000000004.0]\n',
-        E03: 'ABSTAIN: lookup only shows related weekly fact.\n',
-        E04: 'ABSTAIN: refusing to follow injection text.\n',
-        C09: 'ABSTAIN: no dedicated remote scrypt port is recorded.\n',
+        E03: 'ABSTAIN: no current citable fact.\n',
+        E04: 'ABSTAIN: not in the ledger.\n',
+        C09: 'ABSTAIN: not in the ledger.\n',
       }),
     ),
     'utf8',
@@ -920,7 +929,7 @@ test('facts eval (R1): round-2 attack strings, extra lines, multiple citations, 
   assert.equal(honestRes.unsupported_claims, 0);
 });
 
-test('facts eval (L1): ABSTAIN payload capped at 200 UTF-8 bytes; longer lines count as off_target_statements', async (t) => {
+test('facts eval (L1 + R7): eval rejects free-text and oversize ABSTAIN payloads as off_target_statements while keeping checkAnswer 10.2 free text', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'facts-eval-abstain-cap-'));
   t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
 
@@ -936,6 +945,7 @@ test('facts eval (L1): ABSTAIN payload capped at 200 UTF-8 bytes; longer lines c
         C01: `ABSTAIN: ${exactly200}\n`,
         C02: `ABSTAIN: ${over200}\n`,
         C03: `ABSTAIN: ${multibyteOver200}\n`,
+        C04: 'ABSTAIN: not in the ledger.\n',
       }),
     ),
     'utf8',
@@ -946,20 +956,22 @@ test('facts eval (L1): ABSTAIN payload capped at 200 UTF-8 bytes; longer lines c
     modelCmd: process.execPath,
     modelArgs: [modelScript, answersPath],
     modelName: 'abstain-cap',
-    caseIds: ['C01', 'C02', 'C03'],
+    caseIds: ['C01', 'C02', 'C03', 'C04'],
     logPath: join(dir, 'ledger.jsonl'),
     project: 'foundry',
     agent: 'eval-tester',
   });
-  assert.equal(res.cases[0].outcome, 'abstained_correctly');
-  assert.equal(res.cases[0].off_target_statements, 0);
+  assert.equal(res.cases[0].outcome, 'wrong');
+  assert.equal(res.cases[0].off_target_statements, 1);
   assert.equal(res.cases[1].outcome, 'wrong');
   assert.equal(res.cases[1].off_target_statements, 1);
   assert.equal(res.cases[2].outcome, 'wrong');
   assert.equal(res.cases[2].off_target_statements, 1);
+  assert.equal(res.cases[3].outcome, 'abstained_correctly');
+  assert.equal(res.cases[3].off_target_statements, 0);
   assert.equal(res.checker_problems, 0);
-  assert.equal(res.off_target_statements, 2);
-  assert.equal(res.unsupported_claims, 2);
+  assert.equal(res.off_target_statements, 3);
+  assert.equal(res.unsupported_claims, 3);
 });
 
 test('facts eval (b): citing stale group D fact produces unsupported and fails bar', async (t) => {
@@ -1166,7 +1178,7 @@ test('facts eval (F6): model runs in isolated empty cwd with stripped FACTS_LEDG
       'readFileSync(0, "utf8");',
       'const leaked = Object.keys(process.env).filter((k) => k.toUpperCase().startsWith("FACTS_LEDGER_"));',
       'writeFileSync(process.argv[2], JSON.stringify({ cwd: process.cwd(), entries: readdirSync(process.cwd()), leaked }), "utf8");',
-      'process.stdout.write("ABSTAIN: probed.\\n");',
+      'process.stdout.write("ABSTAIN: not in the ledger.\\n");',
     ].join('\n'),
   );
 
@@ -1529,7 +1541,7 @@ test('facts eval (R5): --case-timeout-ms rejects 2147483648 at CLI and library e
   const abstainScript = writeFakeModel(
     dir,
     'ok.mjs',
-    "import { readFileSync } from 'node:fs'; readFileSync(0, 'utf8'); process.stdout.write('ABSTAIN: ok.\\n');\n",
+    "import { readFileSync } from 'node:fs'; readFileSync(0, 'utf8'); process.stdout.write('ABSTAIN: not in the ledger.\\n');\n",
   );
 
   // CLI rejects 2147483648 (Node timer max + 1) and 0.
@@ -1753,7 +1765,7 @@ test('facts eval (e): abstain-all model scores A/B as abstained_wrongly and C/D/
     [
       "import { readFileSync } from 'node:fs';",
       'readFileSync(0, "utf8");',
-      'process.stdout.write("ABSTAIN: not enough verified evidence.\\n");',
+      'process.stdout.write("ABSTAIN: no current citable fact.\\n");',
     ].join('\n'),
   );
 
@@ -2525,7 +2537,7 @@ test('facts eval (R6-r5 finding 3 streaming control chars & line separators): re
   const crlfRes = await runStreamingPair(
     'ok-crlf',
     'ANSWER: 7 [fact:a10000000001.0]\r\n',
-    'ABSTAIN: no current citable fact answers this question.\r\n',
+    'ABSTAIN: no current citable fact.\r\n',
   );
   assert.equal(crlfRes.counts.correct, 1);
   assert.equal(crlfRes.counts.abstained_correctly, 1);
@@ -2534,7 +2546,7 @@ test('facts eval (R6-r5 finding 3 streaming control chars & line separators): re
   const tabCrlfRes = await runStreamingPair(
     'ok-tab-crlf',
     'ANSWER:\t7\t[fact:a10000000001.0]\r\n\t \r\n',
-    '\tABSTAIN:\tunknown.\r\n\r\n',
+    '\tABSTAIN:\tfact is stale.\r\n\r\n',
   );
   assert.equal(tabCrlfRes.counts.correct, 1);
   assert.equal(tabCrlfRes.counts.abstained_correctly, 1);
@@ -2611,4 +2623,263 @@ test('facts eval (R6-r5 finding 4 linear-time structured parser): 250 KiB spaces
   assert.equal(evalRes.off_target_statements, 1);
   assert.equal(evalRes.unsupported_claims, 1);
   assert.ok(evalElapsedMs < 15_000, `streaming runEval on 250 KiB spaces payload unexpectedly slow: ${evalElapsedMs.toFixed(1)} ms`);
+});
+
+test('facts eval (R7-r6 findings 1 & 2): 1,024-byte line cap and linear citation scan grade 43,680x [fact:, 256 KB combining marks (<1 s), and 256x 1,024-byte [fact: lines (<2 s)', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'facts-eval-r7-cap-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
+
+  assert.equal(MAX_EVAL_LINE_BYTES, 1024);
+
+  const fx = buildEvalFixture(join(dir, 'fx'));
+  rebuildIndex(fx.logPath, fx.indexPath);
+  const repos = loadRepoMap(fx.reposPath);
+  const a01 = CASES.find((c) => c.id === 'A01');
+  assert.ok(a01);
+
+  const baseCheckOpts = {
+    logPath: fx.logPath,
+    indexPath: fx.indexPath,
+    repos,
+    nowMs: NOW_MS,
+    readOnlyIndex: true,
+  };
+
+  // 1) Reviewer's 43,680 x `[fact:` + LF line (262,081 bytes, under MAX_ANSWER_BYTES).
+  const factRepeatLine = `${'[fact:'.repeat(43_680)}\n`;
+  assert.ok(Buffer.byteLength(factRepeatLine, 'utf8') < MAX_ANSWER_BYTES);
+
+  // Eval path (with 1,024-byte line cap): skips citation scan and grades malformed in < 1 s.
+  const t1Start = performance.now();
+  const factRepeatCheckedEval = await checkAnswer(factRepeatLine, {
+    ...baseCheckOpts,
+    maxLineBytes: MAX_EVAL_LINE_BYTES,
+  });
+  const factRepeatScoredEval = scoreEvalAnswer(a01, factRepeatLine, factRepeatCheckedEval);
+  const t1Elapsed = performance.now() - t1Start;
+  assert.ok(t1Elapsed < 1_000, `43,680 x [fact: eval grading must finish in < 1 s, took ${t1Elapsed.toFixed(1)} ms`);
+  assert.equal(factRepeatCheckedEval.ok, true);
+  assert.equal(factRepeatScoredEval.outcome, 'wrong');
+  assert.equal(factRepeatScoredEval.offTargetStatements, 1);
+  assert.equal(factRepeatScoredEval.unsupportedProblems, 1);
+
+  // Plain checker path (no line cap, e.g. `facts check-answer`): single-pass scanner also finishes in < 1 s
+  // and preserves malformed-citation diagnostics.
+  const t1PlainStart = performance.now();
+  const factRepeatCheckedPlain = await checkAnswer(factRepeatLine, baseCheckOpts);
+  const t1PlainElapsed = performance.now() - t1PlainStart;
+  assert.ok(t1PlainElapsed < 1_000, `43,680 x [fact: plain checkAnswer must finish in < 1 s, took ${t1PlainElapsed.toFixed(1)} ms`);
+  assert.equal(factRepeatCheckedPlain.ok, false);
+  assert.ok(factRepeatCheckedPlain.problems.some((p) => p.problem === 'malformed citation'));
+  assert.ok(factRepeatCheckedPlain.problems.some((p) => p.problem === 'statement without a citation'));
+
+  // 2) Reviewer's ~256 KB combining-mark value (`7` + alternating U+0315 and U+0300, under MAX_ANSWER_BYTES).
+  const combiningPayload = `ANSWER: 7${'\u0315\u0300'.repeat(65_000)} [fact:a10000000001.0]\n`;
+  assert.ok(Buffer.byteLength(combiningPayload, 'utf8') > 250 * 1024);
+  assert.ok(Buffer.byteLength(combiningPayload, 'utf8') <= MAX_ANSWER_BYTES);
+
+  const t2Start = performance.now();
+  const combiningChecked = await checkAnswer(combiningPayload, {
+    ...baseCheckOpts,
+    maxLineBytes: MAX_EVAL_LINE_BYTES,
+  });
+  const combiningScored = scoreEvalAnswer(a01, combiningPayload, combiningChecked);
+  const t2Elapsed = performance.now() - t2Start;
+  assert.ok(t2Elapsed < 1_000, `256 KB combining-mark value must grade in < 1 s, took ${t2Elapsed.toFixed(1)} ms`);
+  assert.equal(combiningScored.outcome, 'wrong');
+  assert.equal(combiningScored.offTargetStatements, 1);
+  assert.equal(combiningScored.unsupportedProblems, 1);
+
+  // 3) 256 lines of 1,024 bytes each made of `[fact:` repeats must grade in < 2 s total.
+  const line1024 = `${'[fact:'.repeat(170)}[fac`;
+  assert.equal(Buffer.byteLength(line1024, 'utf8'), MAX_EVAL_LINE_BYTES);
+  const lines256 = `${line1024}\n`.repeat(256);
+  const t3Start = performance.now();
+  const scanner256 = createAnswerScanner(MAX_STORED_PROBLEMS, undefined, { maxLineBytes: MAX_EVAL_LINE_BYTES });
+  for (let i = 0; i < 256; i++) {
+    scanner256.feedChunk(`${line1024}\n`);
+  }
+  const check256 = await scanner256.finalize(baseCheckOpts);
+  const scored256 = scoreEvalAnswer(a01, lines256, check256);
+  const t3Elapsed = performance.now() - t3Start;
+  assert.ok(t3Elapsed < 2_000, `256 x 1,024-byte [fact: lines must grade in < 2 s, took ${t3Elapsed.toFixed(1)} ms`);
+  assert.equal(check256.ok, false);
+  assert.equal(check256.problemCount, 512); // malformed citation + statement without a citation per line
+  assert.equal(scored256.outcome, 'unsupported');
+  assert.equal(scored256.unsupportedProblems, 512);
+
+  // 4) Streaming `runEval` end-to-end on both reviewer inputs + 255x 1,024-byte `[fact:` lines + exact 1,024/1,025 byte boundaries.
+  const exact1024Suffix = '7 [fact:a10000000001.0]';
+  // `ANSWER:` (7) + spaces + `7 [fact:a10000000001.0]` (23) = 30 -> 994 spaces = exact 1,024 UTF-8 bytes.
+  const exact1024Ascii = `ANSWER:${' '.repeat(MAX_EVAL_LINE_BYTES - 7 - exact1024Suffix.length)}${exact1024Suffix}\r\n`;
+  assert.equal(Buffer.byteLength(exact1024Ascii.slice(0, -2), 'utf8'), 1024);
+  const over1025Ascii = `ANSWER:${' '.repeat(MAX_EVAL_LINE_BYTES + 1 - 7 - exact1024Suffix.length)}${exact1024Suffix}\r\n`;
+  assert.equal(Buffer.byteLength(over1025Ascii.slice(0, -2), 'utf8'), 1025);
+  // Multi-byte UTF-8 boundary: `ANSWER:` (7) + 331 x U+3000 (993 bytes, Zs) + 1 space (1) + suffix (23) = 1,024 bytes.
+  const exact1024Utf8 = `ANSWER:${'\u3000'.repeat(331)} ${exact1024Suffix}\n`;
+  assert.equal(Buffer.byteLength(exact1024Utf8.slice(0, -1), 'utf8'), 1024);
+  const over1025Utf8 = `ANSWER:${'\u3000'.repeat(331)}  ${exact1024Suffix}\n`;
+  assert.equal(Buffer.byteLength(over1025Utf8.slice(0, -1), 'utf8'), 1025);
+
+  const lines255UnderCap = `${line1024}\n`.repeat(255);
+  assert.ok(Buffer.byteLength(lines255UnderCap, 'utf8') <= MAX_ANSWER_BYTES);
+
+  const payloadFile = join(dir, 'payload.txt');
+  const fileModel = writeFakeModel(
+    dir,
+    'file-stream-model.mjs',
+    [
+      "import { readFileSync } from 'node:fs';",
+      'readFileSync(0, "utf8");',
+      'const buf = readFileSync(process.argv[2]);',
+      'const step = Number(process.argv[3]) || 4096;',
+      'for (let i = 0; i < buf.length; i += step) {',
+      '  process.stdout.write(buf.subarray(i, Math.min(buf.length, i + step)));',
+      '}',
+    ].join('\n'),
+  );
+
+  for (const [label, payload, step, expectOutcome, expectUnsupported] of [
+    ['stream-43680-fact', factRepeatLine, 4096, 'wrong', 1],
+    ['stream-256k-combining', combiningPayload, 4096, 'wrong', 1],
+    ['stream-255x1024-fact', lines255UnderCap, 4096, 'unsupported', 510],
+    ['stream-exact-1024-crlf-split', exact1024Ascii, 1025, 'correct', 0],
+    ['stream-over-1025-crlf-split', over1025Ascii, 1025, 'wrong', 1],
+    ['stream-exact-1024-utf8', exact1024Utf8, 37, 'correct', 0],
+    ['stream-over-1025-utf8', over1025Utf8, 37, 'wrong', 1],
+  ]) {
+    writeFileSync(payloadFile, payload, 'utf8');
+    const res = await runEval({
+      modelCmd: process.execPath,
+      modelArgs: [fileModel, payloadFile, String(step)],
+      modelName: label,
+      caseIds: ['A01'],
+      logPath: join(dir, `ledger-${label}.jsonl`),
+      project: 'foundry',
+      agent: 'eval-tester',
+    });
+    assert.equal(res.cases[0].outcome, expectOutcome, `${label} expected ${expectOutcome}, got ${res.cases[0].outcome}`);
+    assert.equal(res.unsupported_claims, expectUnsupported, `${label} unsupported_claims mismatch`);
+    assert.equal(res.counts.error, 0, `${label} must not error`);
+  }
+});
+
+test('facts eval (R7-r6 finding 3): U+00A0 and Unicode Zs/TAB accepted after ANSWER:, rejected between value and citation', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'facts-eval-r7-nbsp-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
+
+  // Direct parser checks for both placements of U+00A0 plus other Zs separators.
+  assert.deepEqual(parseStructuredAnswer('ANSWER:\u00a07 [fact:a10000000001.0]'), {
+    kind: 'fact',
+    id: 'a10000000001.0',
+    normalizedValue: '7',
+  });
+  assert.deepEqual(parseStructuredAnswer('ANSWER:\u2003\u00a0\t7 [fact:a10000000001.0]'), {
+    kind: 'fact',
+    id: 'a10000000001.0',
+    normalizedValue: '7',
+  });
+  assert.deepEqual(parseStructuredAnswer('ANSWER:\u30007\t[fact:a10000000001.0]'), {
+    kind: 'fact',
+    id: 'a10000000001.0',
+    normalizedValue: '7',
+  });
+  assert.equal(parseStructuredAnswer('ANSWER: 7\u00a0[fact:a10000000001.0]'), null);
+  assert.equal(parseStructuredAnswer('ANSWER: 7\u00a0 [fact:a10000000001.0]'), null);
+  assert.equal(parseStructuredAnswer('ANSWER: 7 \u00a0 [fact:a10000000001.0]'), null);
+  assert.equal(parseStructuredAnswer('ANSWER:\u00a07\u00a0[fact:a10000000001.0]'), null);
+  assert.equal(parseStructuredAnswer('ANSWER:7 [fact:a10000000001.0]'), null);
+
+  // End-to-end streaming eval checks on A01 for both placements of U+00A0.
+  const modelScript = writeFakeModel(dir, 'nbsp-model.mjs', QUESTION_HASH_MODEL_BODY);
+  for (const [label, line, expectOutcome, expectUnsupported] of [
+    ['nbsp-after-colon', 'ANSWER:\u00a07 [fact:a10000000001.0]\n', 'correct', 0],
+    ['ideographic-space-after-colon', 'ANSWER:\u30007 [fact:a10000000001.0]\n', 'correct', 0],
+    ['nbsp-between-value-and-cite', 'ANSWER: 7\u00a0[fact:a10000000001.0]\n', 'wrong', 1],
+    ['nbsp-padded-between-value-and-cite', 'ANSWER: 7 \u00a0 [fact:a10000000001.0]\n', 'wrong', 1],
+  ]) {
+    const answersPath = join(dir, `${label}.json`);
+    writeFileSync(answersPath, JSON.stringify(buildQuestionAnswerMap({ A01: line })), 'utf8');
+    const res = await runEval({
+      modelCmd: process.execPath,
+      modelArgs: [modelScript, answersPath],
+      modelName: label,
+      caseIds: ['A01'],
+      logPath: join(dir, `ledger-${label}.jsonl`),
+      project: 'foundry',
+      agent: 'eval-tester',
+    });
+    assert.equal(res.cases[0].outcome, expectOutcome, `${label} expected ${expectOutcome}, got ${res.cases[0].outcome}`);
+    assert.equal(res.unsupported_claims, expectUnsupported, `${label} unsupported_claims mismatch`);
+  }
+});
+
+test('facts eval (R7-r6 finding 4): eval-only fixed four-reason ABSTAIN grammar rejects hidden clauses and uppercase citations while checkAnswer keeps 10.2 free text', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'facts-eval-r7-abstain-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
+
+  // Direct parser checks.
+  for (const reason of EVAL_ABSTAIN_REASONS) {
+    assert.equal(parseEvalAbstainReason(`ABSTAIN: ${reason}`), reason);
+    assert.equal(parseEvalAbstainReason(`ABSTAIN: ${reason}.`), reason);
+    assert.equal(parseEvalAbstainReason(`ABSTAIN:\t ${reason}.\t`), reason);
+  }
+  for (const bad of [
+    'ABSTAIN: unknown. src/old-sync.ts exists.',
+    'ABSTAIN: unknown [FACT:a20000000002.1]',
+    'ABSTAIN: no current citable fact. extra clause.',
+    'ABSTAIN: no current citable fact [FACT:a20000000002.1]',
+    'ABSTAIN: No current citable fact.',
+    'ABSTAIN: FACT IS STALE',
+    'ABSTAIN: fact is stale..',
+    'ABSTAIN: fact is stale .',
+    'ABSTAIN:no current citable fact',
+    'ABSTAIN:\u00a0no current citable fact',
+  ]) {
+    assert.equal(parseEvalAbstainReason(bad), null, `must reject ABSTAIN: ${bad}`);
+  }
+
+  // Streaming `runEval` regressions on D02.
+  const modelScript = writeFakeModel(dir, 'abstain-model.mjs', QUESTION_HASH_MODEL_BODY);
+  for (const [label, line, expectOutcome, expectUnsupported] of [
+    ['hidden-clause-d02', 'ABSTAIN: unknown. src/old-sync.ts exists.\n', 'wrong', 1],
+    ['uppercase-cite-d02', 'ABSTAIN: unknown [FACT:a20000000002.1]\n', 'wrong', 1],
+    ['fixed-plus-clause-d02', 'ABSTAIN: no current citable fact. src/old-sync.ts exists.\n', 'wrong', 1],
+    ['case-mismatch-d02', 'ABSTAIN: No current citable fact.\n', 'wrong', 1],
+    ['valid-no-current', 'ABSTAIN: no current citable fact.\n', 'abstained_correctly', 0],
+    ['valid-stale-no-dot', 'ABSTAIN: fact is stale\n', 'abstained_correctly', 0],
+    ['valid-conflict', 'ABSTAIN: facts conflict.\n', 'abstained_correctly', 0],
+    ['valid-not-in-ledger', 'ABSTAIN: not in the ledger\n', 'abstained_correctly', 0],
+  ]) {
+    const answersPath = join(dir, `${label}.json`);
+    writeFileSync(answersPath, JSON.stringify(buildQuestionAnswerMap({ D02: line })), 'utf8');
+    const res = await runEval({
+      modelCmd: process.execPath,
+      modelArgs: [modelScript, answersPath],
+      modelName: label,
+      caseIds: ['D02'],
+      logPath: join(dir, `ledger-${label}.jsonl`),
+      project: 'foundry',
+      agent: 'eval-tester',
+    });
+    assert.equal(res.cases[0].outcome, expectOutcome, `${label} expected ${expectOutcome}, got ${res.cases[0].outcome}`);
+    assert.equal(res.unsupported_claims, expectUnsupported, `${label} unsupported_claims mismatch`);
+    if (expectOutcome !== 'abstained_correctly') {
+      assert.equal(res.counts.abstained_correctly, 0, `${label} must NOT score abstained_correctly`);
+      assert.equal(res.off_target_statements, 1, `${label} must count 1 off-target statement`);
+    }
+  }
+
+  // Verify `checkAnswer` itself keeps Step Zero 10.2 free-text ABSTAIN unchanged.
+  const fx = buildGateFixture(join(dir, 'gate-fx'));
+  const repos = loadRepoMap(fx.reposPath);
+  const freeCheck = await checkAnswer('ABSTAIN: unknown. src/old-sync.ts exists.\n', {
+    logPath: fx.logPath,
+    indexPath: fx.indexPath,
+    repos,
+    nowMs: NOW_MS,
+  });
+  assert.equal(freeCheck.ok, true);
+  assert.equal(freeCheck.abstentions, 1);
+  assert.equal(freeCheck.problemCount, 0);
 });

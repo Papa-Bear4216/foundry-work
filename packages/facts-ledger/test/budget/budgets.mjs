@@ -263,7 +263,7 @@ try {
         const opt = c.expect.accept[0];
         return [key, `ANSWER: ${opt.values[0]} [${opt.as}:${opt.id}]\n`];
       }
-      return [key, 'ABSTAIN: no current citable fact answers this question.\n'];
+      return [key, 'ABSTAIN: no current citable fact.\n'];
     }),
   );
   writeFileSync(evalAnswersPath, JSON.stringify(evalAnswers));
@@ -277,7 +277,7 @@ try {
       'const prompt = readFileSync(0, "utf8");',
       'const m = /=== Question ===\\r?\\n([^\\r\\n]+)/.exec(prompt);',
       'const key = m ? createHash("sha256").update(m[1].trim()).digest("hex") : "";',
-      'process.stdout.write(answers[key] ?? "ABSTAIN: unknown question.\\n");',
+      'process.stdout.write(answers[key] ?? "ABSTAIN: not in the ledger.\\n");',
     ].join('\n'),
   );
   const invalidFloodModelPath = join(root, 'invalid-flood-model.mjs');

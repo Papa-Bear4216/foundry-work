@@ -16,13 +16,128 @@ export const MAX_ANSWER_BYTES = 256 * 1024;
 export const MAX_DISTINCT_CITATIONS = 500;
 export const MAX_STORED_PROBLEMS = 20;
 
-const CITATION_RE = /\[(fact|asserted):([^\]\s]*)\]/g;
 const FACT_ID_RE = /^[0-9a-f]{12}\.\d{1,4}$/;
 const ABSTAIN_RE = /^ABSTAIN:[ \t]*\S/;
 
 /** Horizontal whitespace only: ASCII space (0x20) or TAB (0x09). */
 function isHorizontalWhitespace(code: number): boolean {
   return code === 0x20 || code === 0x09;
+}
+
+/** Match JavaScript `\s` code units for single-pass citation scanning. */
+function isJsWhitespace(code: number): boolean {
+  if (code === 0x20 || (code >= 0x09 && code <= 0x0d)) return true;
+  if (code < 0xa0) return false;
+  return (
+    code === 0xa0 ||
+    code === 0x1680 ||
+    (code >= 0x2000 && code <= 0x200a) ||
+    code === 0x2028 ||
+    code === 0x2029 ||
+    code === 0x202f ||
+    code === 0x205f ||
+    code === 0x3000 ||
+    code === 0xfeff
+  );
+}
+
+function isWordChar(code: number): boolean {
+  return (
+    (code >= 0x30 && code <= 0x39) ||
+    (code >= 0x41 && code <= 0x5a) ||
+    (code >= 0x61 && code <= 0x7a) ||
+    code === 0x5f
+  );
+}
+
+/** Plain linear UTF-8 byte length scan over `text[start..end)` with optional early exit. */
+function utf8ByteLengthSpan(text: string, start: number, end: number, limit?: number): number {
+  let bytes = 0;
+  for (let i = start; i < end; i++) {
+    const code = text.charCodeAt(i);
+    if (code <= 0x7f) {
+      bytes += 1;
+    } else if (code <= 0x7ff) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < end) {
+      const next = text.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        i++;
+      } else {
+        bytes += 3;
+      }
+    } else {
+      bytes += 3;
+    }
+    if (limit !== undefined && bytes > limit) return bytes;
+  }
+  return bytes;
+}
+
+/** Return true iff `text[start..end)` encodes to strictly more than `maxBytes` UTF-8 bytes. */
+function utf8ByteLengthExceeds(text: string, start: number, end: number, maxBytes: number): boolean {
+  const len = end - start;
+  if (len > maxBytes) return true;
+  if (len * 3 <= maxBytes) return false;
+  return utf8ByteLengthSpan(text, start, end, maxBytes) > maxBytes;
+}
+
+/**
+ * Single-pass linear-time citation extractor equivalent to `\[(fact|asserted):([^\]\s]*)\]`
+ * plus loose `\[(fact|asserted)\b` count. When scanning from `[fact:`/`[asserted:` reaches
+ * whitespace or end-of-line before `]`, no intervening `[` can close before that boundary,
+ * so the cursor jumps directly past it in O(N) total time.
+ */
+function scanCitationsSinglePass(
+  line: string,
+): { readonly found: readonly { readonly kind: 'fact' | 'asserted'; readonly id: string }[]; readonly loose: number } {
+  const len = line.length;
+  let loose = 0;
+  let lpos = 0;
+  while (lpos < len) {
+    const open = line.indexOf('[', lpos);
+    if (open === -1) break;
+    let after = -1;
+    if (line.startsWith('fact', open + 1)) after = open + 5;
+    else if (line.startsWith('asserted', open + 1)) after = open + 9;
+    if (after !== -1 && (after === len || !isWordChar(line.charCodeAt(after)))) {
+      loose++;
+    }
+    lpos = open + 1;
+  }
+
+  const found: Array<{ readonly kind: 'fact' | 'asserted'; readonly id: string }> = [];
+  let pos = 0;
+  while (pos < len) {
+    const open = line.indexOf('[', pos);
+    if (open === -1) break;
+    let kind: 'fact' | 'asserted' | null = null;
+    let idStart = -1;
+    if (line.startsWith('fact:', open + 1)) {
+      kind = 'fact';
+      idStart = open + 6;
+    } else if (line.startsWith('asserted:', open + 1)) {
+      kind = 'asserted';
+      idStart = open + 10;
+    } else {
+      pos = open + 1;
+      continue;
+    }
+    let stop = idStart;
+    while (stop < len) {
+      const code = line.charCodeAt(stop);
+      if (code === 0x5d /* ] */ || isJsWhitespace(code)) break;
+      stop++;
+    }
+    if (stop < len && line.charCodeAt(stop) === 0x5d /* ] */) {
+      found.push({ kind, id: line.slice(idStart, stop) });
+      pos = stop + 1;
+    } else {
+      pos = stop + 1;
+    }
+  }
+  return { found, loose };
 }
 
 /**
@@ -55,11 +170,16 @@ export interface PendingCitation {
 
 export type NonBlankLineCallback = (
   lineNo: number,
-  kind: 'abstain' | 'statement',
+  kind: 'abstain' | 'statement' | 'oversize',
   syntaxClean: boolean,
   line?: string,
   citations?: readonly PendingCitation[],
 ) => void;
+
+export interface AnswerScannerOptions {
+  /** Optional per-line UTF-8 byte cap (used by eval before regex/citation/NFKC parsing). */
+  readonly maxLineBytes?: number;
+}
 
 export interface AnswerScanner {
   feedChunk(chunk: string): void;
@@ -86,6 +206,8 @@ export interface CheckAnswerOptions {
   readonly maxProblems?: number;
   /** Open the pre-built index strictly read-only and fail closed without rebuilding on failure. */
   readonly readOnlyIndex?: boolean;
+  /** Optional per-line UTF-8 byte cap (eval only; omitted by gate and `facts check-answer`). */
+  readonly maxLineBytes?: number;
 }
 
 interface CitationVerdict {
@@ -105,8 +227,11 @@ function compareProblems(a: AnswerProblem, b: AnswerProblem): number {
 export function createAnswerScanner(
   maxProblems = MAX_STORED_PROBLEMS,
   onNonBlankLine?: NonBlankLineCallback,
+  scannerOptions?: AnswerScannerOptions,
 ): AnswerScanner {
   const cap = Math.max(0, Math.floor(maxProblems));
+  const maxLineBytes =
+    scannerOptions?.maxLineBytes !== undefined ? Math.max(1, Math.floor(scannerOptions.maxLineBytes)) : undefined;
   const problems: AnswerProblem[] = [];
   let problemCount = 0;
   const recordProblem = (line: number, problem: string): void => {
@@ -130,6 +255,7 @@ export function createAnswerScanner(
   let lineNo = 0;
   let started = false;
   let carry = '';
+  let carryOverLimit = false;
   let finished = false;
 
   const processSlowLine = (line: string): void => {
@@ -142,7 +268,7 @@ export function createAnswerScanner(
       } else {
         abstentions++;
       }
-      if (/\[(fact|asserted):/.test(line)) {
+      if (line.includes('[fact:') || line.includes('[asserted:')) {
         recordProblem(lineNo, 'ABSTAIN line must not cite facts');
         syntaxClean = false;
       }
@@ -155,9 +281,7 @@ export function createAnswerScanner(
       onNonBlankLine?.(lineNo, 'statement', false);
       return;
     }
-    const found = [...line.matchAll(CITATION_RE)];
-    // Any other bracket that starts like a citation is malformed.
-    const loose = (line.match(/\[(fact|asserted)\b/g) ?? []).length;
+    const { found, loose } = scanCitationsSinglePass(line);
     let syntaxClean = true;
     if (loose !== found.length) {
       recordProblem(lineNo, 'malformed citation');
@@ -170,8 +294,8 @@ export function createAnswerScanner(
     }
     const lineCitations: PendingCitation[] = [];
     for (const m of found) {
-      const kind = m[1] as 'fact' | 'asserted';
-      const id = m[2] ?? '';
+      const kind = m.kind;
+      const id = m.id;
       if (!FACT_ID_RE.test(id)) {
         recordProblem(lineNo, `invalid fact id in ${kind}: citation`);
         syntaxClean = false;
@@ -198,6 +322,11 @@ export function createAnswerScanner(
     endedWithLf: boolean,
   ): number => {
     const lineEnd = endedWithLf && end > start && text.charCodeAt(end - 1) === 0x0d ? end - 1 : end;
+    if (maxLineBytes !== undefined && utf8ByteLengthExceeds(text, start, lineEnd, maxLineBytes)) {
+      hasNonBlankLine = true;
+      onNonBlankLine?.(lineNo, 'oversize', true);
+      return nextBracket;
+    }
     if (hasDisallowedControlChar(text, start, lineEnd)) {
       hasNonBlankLine = true;
       let s = start;
@@ -243,25 +372,58 @@ export function createAnswerScanner(
         if (pos >= chunk.length) return;
       }
     }
+    if (carryOverLimit) {
+      const nl = chunk.indexOf('\n', pos);
+      if (nl === -1) return;
+      carryOverLimit = false;
+      carry = '';
+      lineNo++;
+      hasNonBlankLine = true;
+      onNonBlankLine?.(lineNo, 'oversize', true);
+      pos = nl + 1;
+      if (pos >= chunk.length) return;
+    }
     if (carry.length > 0) {
       const nl = chunk.indexOf('\n', pos);
       if (nl === -1) {
+        const segLen = chunk.length - pos;
+        if (maxLineBytes !== undefined && carry.length + segLen > maxLineBytes + 1) {
+          carry = '';
+          carryOverLimit = true;
+          return;
+        }
         carry += pos === 0 ? chunk : chunk.slice(pos);
         return;
       }
-      const combined = carry + chunk.slice(pos, nl);
-      carry = '';
-      lineNo++;
-      processSpan(combined, 0, combined.length, -2, true);
-      pos = nl + 1;
-      if (pos >= chunk.length) return;
+      const segLen = nl - pos;
+      if (maxLineBytes !== undefined && carry.length + segLen > maxLineBytes + 1) {
+        carry = '';
+        lineNo++;
+        hasNonBlankLine = true;
+        onNonBlankLine?.(lineNo, 'oversize', true);
+        pos = nl + 1;
+        if (pos >= chunk.length) return;
+      } else {
+        const combined = carry + chunk.slice(pos, nl);
+        carry = '';
+        lineNo++;
+        processSpan(combined, 0, combined.length, -2, true);
+        pos = nl + 1;
+        if (pos >= chunk.length) return;
+      }
     }
 
     let nextBracket = chunk.indexOf('[', pos);
     while (pos < chunk.length) {
       const nl = chunk.indexOf('\n', pos);
       if (nl === -1) {
-        carry = pos === 0 ? chunk : chunk.slice(pos);
+        const segLen = chunk.length - pos;
+        if (maxLineBytes !== undefined && segLen > maxLineBytes + 1) {
+          carry = '';
+          carryOverLimit = true;
+        } else {
+          carry = pos === 0 ? chunk : chunk.slice(pos);
+        }
         break;
       }
       lineNo++;
@@ -273,7 +435,13 @@ export function createAnswerScanner(
   const finish = (): void => {
     if (finished) return;
     finished = true;
-    if (carry.length > 0) {
+    if (carryOverLimit) {
+      carryOverLimit = false;
+      carry = '';
+      lineNo++;
+      hasNonBlankLine = true;
+      onNonBlankLine?.(lineNo, 'oversize', true);
+    } else if (carry.length > 0) {
       const remaining = carry;
       carry = '';
       lineNo++;
@@ -347,7 +515,11 @@ export async function checkAnswer(text: string, options: CheckAnswerOptions): Pr
   if (Buffer.byteLength(text, 'utf8') > MAX_ANSWER_BYTES) {
     throw new Error(`Answer exceeds ${MAX_ANSWER_BYTES} bytes`);
   }
-  const scanner = createAnswerScanner(options.maxProblems ?? MAX_STORED_PROBLEMS);
+  const scanner = createAnswerScanner(
+    options.maxProblems ?? MAX_STORED_PROBLEMS,
+    undefined,
+    options.maxLineBytes !== undefined ? { maxLineBytes: options.maxLineBytes } : undefined,
+  );
   scanner.feedChunk(text);
   return scanner.finalize(options);
 }

@@ -46,8 +46,17 @@ export const DEFAULT_CASE_TIMEOUT_MS = 120_000;
 export const MAX_CASE_TIMEOUT_MS = 2_147_483_647;
 /** Timeout for synchronous git integrity snapshot commands (R4, A-29). */
 export const SNAPSHOT_GIT_TIMEOUT_MS = 10_000;
-/** Cap on `ABSTAIN:` payload bytes for eval scoring (L1, A-29). */
+/** Cap on `ABSTAIN:` payload bytes (legacy export; eval now enforces the four fixed reasons, A-29 item 10). */
 export const MAX_ABSTAIN_PAYLOAD_BYTES = 200;
+/** Cap on any eval answer line in UTF-8 bytes before regex, citation scan, or NFKC (A-29 L6 & item 21). */
+export const MAX_EVAL_LINE_BYTES = 1024;
+/** Fixed case-sensitive ASCII `ABSTAIN:` reasons accepted by `facts eval` (A-29 item 10 & item 21). */
+export const EVAL_ABSTAIN_REASONS = [
+  'no current citable fact',
+  'fact is stale',
+  'facts conflict',
+  'not in the ledger',
+] as const;
 /** Maximum diagnostic problem entries kept per case in memory and output (F7, A-29). */
 export const MAX_EVAL_CASE_PROBLEMS = MAX_STORED_PROBLEMS;
 
@@ -166,6 +175,8 @@ interface FixtureIntegritySnapshot {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8');
 const ANSWER_PREFIX = 'ANSWER:';
+const ABSTAIN_PREFIX = 'ABSTAIN:';
+const EVAL_ABSTAIN_REASON_SET: ReadonlySet<string> = new Set(EVAL_ABSTAIN_REASONS);
 const MIN_CITATION_LEN = 21; // "[fact:000000000000.0]"
 const MAX_CITATION_LEN = 28; // "[asserted:000000000000.0000]"
 const OPEN_READ_NONBLOCK =
@@ -175,12 +186,42 @@ function isHorizontalWhitespace(code: number): boolean {
   return code === 0x20 || code === 0x09;
 }
 
+/** Unicode Space_Separator (Zs) or ASCII TAB (U+0009), accepted between `ANSWER:` and the value (R7). */
+function isSpaceSeparatorOrTab(code: number): boolean {
+  return (
+    code === 0x20 ||
+    code === 0x09 ||
+    code === 0xa0 ||
+    code === 0x1680 ||
+    (code >= 0x2000 && code <= 0x200a) ||
+    code === 0x202f ||
+    code === 0x205f ||
+    code === 0x3000
+  );
+}
+
 function trimHorizontalWhitespace(text: string): string {
   let start = 0;
   let end = text.length;
   while (start < end && isHorizontalWhitespace(text.charCodeAt(start))) start++;
   while (end > start && isHorizontalWhitespace(text.charCodeAt(end - 1))) end--;
   return start === 0 && end === text.length ? text : text.slice(start, end);
+}
+
+/**
+ * Parse an eval `ABSTAIN: <reason>` line against the fixed four-reason grammar (R7, A-29 item 10).
+ * Accepts horizontal whitespace (space or TAB) around `<reason>` and one optional trailing period,
+ * matching case-sensitively against `EVAL_ABSTAIN_REASONS`.
+ */
+export function parseEvalAbstainReason(line: string): string | null {
+  if (!line.startsWith(ABSTAIN_PREFIX)) return null;
+  const rest = line.slice(ABSTAIN_PREFIX.length);
+  if (rest.length === 0 || !isHorizontalWhitespace(rest.charCodeAt(0))) return null;
+  let reason = trimHorizontalWhitespace(rest);
+  if (reason.endsWith('.')) {
+    reason = reason.slice(0, -1);
+  }
+  return EVAL_ABSTAIN_REASON_SET.has(reason) ? reason : null;
 }
 
 function isValidFactId(id: string): boolean {
@@ -200,16 +241,17 @@ function isValidFactId(id: string): boolean {
 }
 
 /**
- * Linear-time structured answer parser (R6-r5 findings 3 & 4).
+ * Linear-time structured answer parser (R6-r5 findings 3 & 4, R7 finding 3).
  * Locates and validates the fixed `[fact:<id>]` / `[asserted:<id>]` suffix first in O(1),
- * then validates the `ANSWER:` prefix, horizontal-whitespace-only separator (space or TAB),
- * and non-empty value in O(N) with no regex backtracking.
+ * accepts any Unicode space separator (Zs) or TAB between `ANSWER:` and the value, restricts
+ * the value-to-citation separator strictly to ASCII space/TAB, and validates non-empty value
+ * in O(N) with no regex backtracking.
  */
 export function parseStructuredAnswer(
   line: string,
 ): { readonly kind: 'fact' | 'asserted'; readonly id: string; readonly normalizedValue: string } | null {
   const len = line.length;
-  if (len < ANSWER_PREFIX.length + 2 + MIN_CITATION_LEN) return null;
+  if (len < ANSWER_PREFIX.length + 3 + MIN_CITATION_LEN) return null;
   if (line.charCodeAt(len - 1) !== 0x5d /* ] */) return null;
   if (!line.startsWith(ANSWER_PREFIX)) return null;
 
@@ -239,13 +281,14 @@ export function parseStructuredAnswer(
   if (valueEnd === citeOpen) return null;
 
   let valueStart = ANSWER_PREFIX.length;
-  while (valueStart < valueEnd && isHorizontalWhitespace(line.charCodeAt(valueStart))) {
+  while (valueStart < valueEnd && isSpaceSeparatorOrTab(line.charCodeAt(valueStart))) {
     valueStart++;
   }
-  if (valueStart >= valueEnd) return null;
+  // Require at least one Unicode space separator (Zs) or TAB after `ANSWER:`, and a non-empty value.
+  if (valueStart === ANSWER_PREFIX.length || valueStart >= valueEnd) return null;
 
   const rawValue = line.slice(valueStart, valueEnd);
-  // Reject non-horizontal Unicode whitespace (e.g. NBSP, CR, line separators) bordering the value.
+  // Reject non-horizontal Unicode whitespace bordering the value (e.g. NBSP before citation, or BOM).
   if (rawValue.trim() !== rawValue) return null;
 
   return {
@@ -801,7 +844,7 @@ function compareProblems(a: AnswerProblem, b: AnswerProblem): number {
 interface FirstAbstainLine {
   readonly kind: 'abstain';
   readonly lineNo: number;
-  readonly payloadOverLimit: boolean;
+  readonly validReason: boolean;
 }
 
 interface FirstStatementLine {
@@ -822,12 +865,14 @@ interface EvalStreamingScorer {
 
 /**
  * Incremental structured-answer scorer paired with `createAnswerScanner`. Retains only the
- * first syntactically-clean line's parsed structure plus bounded extra-line diagnostics,
+ * first syntactically-clean line's parsed structure plus bounded extra-line/oversize diagnostics,
  * avoiding buffering full answer strings during eval runs.
  */
 function createEvalAnswerScorer(evalCase: EvalCase): EvalStreamingScorer {
   let nonBlankLines = 0;
   let firstLine: FirstAbstainLine | FirstStatementLine | null = null;
+  let oversizeCount = 0;
+  const oversizeDiagnostics: AnswerProblem[] = [];
   let extraAbstainCount = 0;
   const extraAbstainDiagnostics: AnswerProblem[] = [];
   const extraStatementLines: Array<{
@@ -837,15 +882,24 @@ function createEvalAnswerScorer(evalCase: EvalCase): EvalStreamingScorer {
 
   const onNonBlankLine: NonBlankLineCallback = (lineNo, kind, syntaxClean, line, citations) => {
     nonBlankLines++;
+    if (kind === 'oversize') {
+      oversizeCount++;
+      if (oversizeDiagnostics.length < MAX_EVAL_CASE_PROBLEMS) {
+        oversizeDiagnostics.push({
+          line: lineNo,
+          problem: `malformed line: exceeds ${MAX_EVAL_LINE_BYTES} bytes`,
+        });
+      }
+      return;
+    }
     if (!syntaxClean) return;
 
     if (nonBlankLines === 1) {
       if (kind === 'abstain') {
-        const payload = trimHorizontalWhitespace((line ?? '').slice('ABSTAIN:'.length));
         firstLine = {
           kind: 'abstain',
           lineNo,
-          payloadOverLimit: Buffer.byteLength(payload, 'utf8') > MAX_ABSTAIN_PAYLOAD_BYTES,
+          validReason: parseEvalAbstainReason(line ?? '') !== null,
         };
         return;
       }
@@ -923,9 +977,12 @@ function createEvalAnswerScorer(evalCase: EvalCase): EvalStreamingScorer {
 
     if (firstLine !== null) {
       if (firstLine.kind === 'abstain') {
-        if (firstLine.payloadOverLimit) {
+        if (!firstLine.validReason) {
           offTargetStatements++;
-          recordDiagnostic(firstLine.lineNo, `ABSTAIN payload exceeds ${MAX_ABSTAIN_PAYLOAD_BYTES} bytes`);
+          recordDiagnostic(
+            firstLine.lineNo,
+            `off-target statement: ABSTAIN reason must be one of: ${EVAL_ABSTAIN_REASONS.join(', ')}`,
+          );
         } else {
           validAbstain = true;
         }
@@ -972,6 +1029,11 @@ function createEvalAnswerScorer(evalCase: EvalCase): EvalStreamingScorer {
           }
         }
       }
+    }
+
+    offTargetStatements += oversizeCount;
+    for (const diag of oversizeDiagnostics) {
+      recordDiagnostic(diag.line, diag.problem);
     }
 
     offTargetStatements += extraAbstainCount;
@@ -1022,11 +1084,11 @@ function createEvalAnswerScorer(evalCase: EvalCase): EvalStreamingScorer {
 }
 
 /**
- * Deterministic structured-answer scoring against a case's declared acceptance set (R1, F7, L1, A-29).
- * Requires exactly ONE non-blank line: either `ANSWER: <value> [fact:<id>]` /
- * `ANSWER: <value> [asserted:<id>]` (exact normalised value + citation match, single citation,
- * no extra text) or `ABSTAIN: <reason>` (<= 200 UTF-8 bytes).
- * Any extra or malformed checker-clean line counts toward `offTargetStatements` / `unsupportedProblems`.
+ * Deterministic structured-answer scoring against a case's declared acceptance set (R1, F7, R7, A-29).
+ * Requires exactly ONE non-blank line of at most `MAX_EVAL_LINE_BYTES` (1,024) UTF-8 bytes: either
+ * `ANSWER: <value> [fact:<id>]` / `ANSWER: <value> [asserted:<id>]` (exact normalised value + citation
+ * match, single citation, no extra text) or `ABSTAIN: <reason>` matching one of `EVAL_ABSTAIN_REASONS`.
+ * Any oversize, extra, or malformed checker-clean line counts toward `offTargetStatements` / `unsupportedProblems`.
  * Stored diagnostics are bounded to `MAX_EVAL_CASE_PROBLEMS` entries.
  */
 export function scoreEvalAnswer(
@@ -1035,7 +1097,7 @@ export function scoreEvalAnswer(
   check: CheckAnswerResult,
 ): EvalScoreResult {
   const scorer = createEvalAnswerScorer(evalCase);
-  const scanner = createAnswerScanner(0, scorer.onNonBlankLine);
+  const scanner = createAnswerScanner(0, scorer.onNonBlankLine, { maxLineBytes: MAX_EVAL_LINE_BYTES });
   scanner.feedChunk(answerText);
   scanner.finish();
   return scorer.finalize(check);
@@ -1243,7 +1305,9 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
       // Stream stdout chunks directly into the incremental line scanner/scorer so a 256 KiB
       // answer is never buffered as raw chunks + concatenated bytes + decoded full string.
       const scorer = createEvalAnswerScorer(c);
-      const scanner = createAnswerScanner(MAX_EVAL_CASE_PROBLEMS, scorer.onNonBlankLine);
+      const scanner = createAnswerScanner(MAX_EVAL_CASE_PROBLEMS, scorer.onNonBlankLine, {
+        maxLineBytes: MAX_EVAL_LINE_BYTES,
+      });
       const modelRun = await runModelCommand(options.modelCmd, modelArgs, prompt, caseTimeoutMs, {
         cwd: modelCwd,
         env: childEnv,
