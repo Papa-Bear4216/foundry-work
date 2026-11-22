@@ -14,7 +14,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test --test-concurrency=1 test/log.test.mjs test/index-query.test.mjs test/add-verify.test.mjs test/digest.test.mjs test/gate.test.mjs",
+    "test": "npm run build && node --test --test-concurrency=1 test/log.test.mjs test/index-query.test.mjs test/add-verify.test.mjs test/digest.test.mjs test/gate.test.mjs test/eval-usage.test.mjs",
     "gate": "node test/gate/run-gate.mjs",
     "budgets": "node test/budget/budgets.mjs"
   }

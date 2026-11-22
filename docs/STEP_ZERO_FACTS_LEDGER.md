@@ -310,8 +310,8 @@ A short text file an agent reads at the start of a session instead of rediscover
 | `facts rebuild` | Rebuild the index from the log |
 | `facts doctor` | Unparseable lines, duplicate ids, facts without evidence, index drift |
 | `facts check-answer <file>` | Citation checker, section 10.2 |
-| `facts eval --model-cmd "<cmd>"` | Model-in-the-loop run, section 10.3 |
-| `facts usage [--since …]` | Token use per agent and task, from `token_usage` |
+| `facts eval --model-cmd <exe> [--model-arg <arg>]…` | Model-in-the-loop run, section 10.3 (no shell; `--dry-run` prints prompts) |
+| `facts usage [--since …] [--project …]` | Token use per agent and task, from `token_usage` (measured and estimated kept separate) |
 
 Every command accepts `--stats`, which prints peak memory and elapsed time on exit.
 
@@ -452,6 +452,7 @@ number is changed by a recorded decision before code is written against it.
 - Hash-chaining blocks for tamper evidence.
 - Marking facts stale automatically from a git post-commit hook.
 - Regular-expression predicates.
+- Held-out or independently varied question sets for `facts eval` qualification runs.
 - A hosted or shared ledger. Out of scope; the file is local.
 
 ## 13. Open points for the builder

@@ -14,6 +14,7 @@ declare const process: {
   readonly env: Record<string, string | undefined>;
   exitCode: number | undefined;
   kill(pid: number, signal?: string | number): boolean;
+  nextTick(callback: () => void): void;
   resourceUsage(): { maxRSS: number };
   readonly hrtime: {
     bigint(): bigint;
@@ -64,6 +65,12 @@ declare class URL {
 declare function setTimeout(callback: () => void, ms: number): unknown;
 declare function clearTimeout(handle: unknown): void;
 
+declare module 'node:buffer' {
+  export const Buffer: {
+    byteLength(text: string, encoding?: 'utf8'): number;
+  };
+}
+
 declare module 'node:child_process' {
   export interface ChildReadable {
     on(event: 'data', listener: (chunk: string | Uint8Array) => void): this;
@@ -72,8 +79,11 @@ declare module 'node:child_process' {
   }
 
   export interface ChildWritable {
+    readonly errored?: Error | null;
+    readonly writableFinished?: boolean;
     on(event: 'error', listener: (err: Error) => void): this;
-    end(data: string): void;
+    on(event: 'finish', listener: () => void): this;
+    end(data: string, callback?: () => void): void;
     destroy(): void;
   }
 
@@ -130,6 +140,8 @@ declare module 'node:child_process' {
     args: readonly string[],
     options: {
       stdio: readonly ['pipe', 'pipe', 'pipe'];
+      cwd?: string;
+      env?: Record<string, string | undefined>;
       windowsHide?: boolean;
       shell?: boolean;
       detached?: boolean;
@@ -139,18 +151,26 @@ declare module 'node:child_process' {
 
 declare module 'node:crypto' {
   export function randomUUID(): string;
-  export interface Sha256Hash {
-    update(data: Uint8Array | string): Sha256Hash;
-    copy(): Sha256Hash;
+  export interface HashDigest {
+    update(data: Uint8Array | string): HashDigest;
+    copy(): HashDigest;
     digest(encoding: 'hex'): string;
   }
-  export function createHash(algorithm: 'sha256'): Sha256Hash;
+  export function createHash(algorithm: 'sha256' | 'sha1'): HashDigest;
 }
 
 declare module 'node:fs' {
-  export function openSync(path: string, flags: string, mode?: number): number;
+  export const constants: {
+    readonly O_RDONLY: number;
+    readonly O_RDWR: number;
+    readonly O_APPEND: number;
+    readonly O_CREAT: number;
+    readonly O_EXCL: number;
+    readonly O_NONBLOCK?: number;
+  };
+  export function openSync(path: string, flags: string | number, mode?: number): number;
   export function closeSync(fd: number): void;
-  export function fstatSync(fd: number): { size: number };
+  export function fstatSync(fd: number): { size: number; isFile(): boolean };
   export function fstatSync(
     fd: number,
     options: { bigint: true },
@@ -163,6 +183,11 @@ declare module 'node:fs' {
   export function realpathSync(path: string): string;
   export function fsyncSync(fd: number): void;
   export function mkdirSync(path: string, options: { recursive: true }): string | undefined;
+  export function mkdtempSync(prefix: string): string;
+  export function rmSync(
+    path: string,
+    options?: { recursive?: boolean; force?: boolean; maxRetries?: number },
+  ): void;
   export function readSync(
     fd: number,
     buffer: Uint8Array,
@@ -171,6 +196,7 @@ declare module 'node:fs' {
     position: number | null,
   ): number;
   export function writeSync(fd: number, buffer: Uint8Array): number;
+  export function writeFileSync(path: string, data: Uint8Array | string): void;
   export function renameSync(oldPath: string, newPath: string): void;
   export function unlinkSync(path: string): void;
   export function existsSync(path: string): boolean;
@@ -180,6 +206,7 @@ declare module 'node:fs' {
 
 declare module 'node:os' {
   export function homedir(): string;
+  export function tmpdir(): string;
 }
 
 declare module 'node:path' {

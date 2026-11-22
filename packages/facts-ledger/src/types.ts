@@ -217,6 +217,8 @@ export interface QueryOptions {
   /** Optional batch lookup run once over all results before they are assessed (A-28). */
   readonly freshnessPrefetch?: (facts: readonly IndexedFact[], nowMs: number) => void;
   readonly nowMs?: number;
+  /** Open the pre-built index strictly read-only and fail closed without rebuilding on failure. */
+  readonly readOnlyIndex?: boolean;
 }
 
 export interface QueryResultItem {

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
   closeSync,
+  constants as fsConstants,
   fstatSync,
   fsyncSync,
   mkdirSync,
@@ -308,13 +309,186 @@ function shortId(): string {
   return randomUUID().replaceAll('-', '').slice(0, 12);
 }
 
+export type ExpectedLogPrecondition =
+  | 'absent'
+  | { readonly size: number; readonly sha256: string };
+
+export interface AppendBlockOptions {
+  /**
+   * Optional precondition checked inside the writer lock on the exact file descriptor written
+   * through, before parent lookup or append. Mismatch throws without appending or creating a log.
+   */
+  readonly expectedLog?: ExpectedLogPrecondition;
+}
+
+function hashFdBounded(fd: number, expectedSize: number): { readonly size: number; readonly sha256: string } {
+  const hash = createHash('sha256');
+  const buf = new Uint8Array(64 * 1024);
+  let totalRead = 0;
+  while (totalRead < expectedSize) {
+    const toRead = Math.min(buf.length, expectedSize - totalRead);
+    const n = readSync(fd, buf, 0, toRead, totalRead);
+    if (n <= 0) break;
+    totalRead += n;
+    hash.update(buf.subarray(0, n));
+  }
+  const stAfter = fstatSync(fd);
+  if (!stAfter.isFile() || totalRead !== expectedSize || stAfter.size !== expectedSize) {
+    throw new Error(
+      `Result log changed while checking precondition (size ${expectedSize} -> ${stAfter.size})`,
+    );
+  }
+  return { size: totalRead, sha256: hash.digest('hex') };
+}
+
+function openLogForAppendWithPrecondition(
+  logPath: string,
+  expectedLog: ExpectedLogPrecondition | undefined,
+): number {
+  if (expectedLog === undefined) {
+    return openSync(logPath, 'a+', 0o600);
+  }
+  if (expectedLog === 'absent') {
+    let fd: number;
+    try {
+      fd = openSync(logPath, 'ax+', 0o600);
+    } catch (err) {
+      if ((err as { code?: string }).code === 'EEXIST') {
+        throw new Error(
+          'Result log changed during eval run (precondition failed: expected absent log, but file already exists); refusing to append',
+        );
+      }
+      throw err;
+    }
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.size !== 0) {
+      closeSync(fd);
+      throw new Error(
+        `Result log changed during eval run (precondition failed: expected absent log, got size ${st.size}); refusing to append`,
+      );
+    }
+    return fd;
+  }
+
+  if (
+    !Number.isSafeInteger(expectedLog.size) ||
+    expectedLog.size < 0 ||
+    !/^[0-9a-f]{64}$/.test(expectedLog.sha256)
+  ) {
+    throw new Error('Invalid expectedLog precondition');
+  }
+
+  const nonBlock = typeof fsConstants.O_NONBLOCK === 'number' ? fsConstants.O_NONBLOCK : 0;
+  let fd: number;
+  try {
+    fd = openSync(logPath, fsConstants.O_RDWR | fsConstants.O_APPEND | nonBlock);
+  } catch (err) {
+    const code = (err as { code?: string }).code;
+    if (code === 'ENOENT') {
+      throw new Error(
+        `Result log changed during eval run (precondition failed: expected size ${expectedLog.size} sha256 ${expectedLog.sha256.slice(0, 12)}, but file is absent); refusing to append`,
+      );
+    }
+    if (code === 'ENXIO' || code === 'EISDIR') {
+      throw new Error(
+        `Result log changed during eval run (precondition failed: target log is not a regular file: ${code}); refusing to append`,
+      );
+    }
+    throw err;
+  }
+
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) {
+      throw new Error(
+        'Result log changed during eval run (precondition failed: target log is not a regular file); refusing to append',
+      );
+    }
+    const actual = hashFdBounded(fd, st.size);
+    if (actual.size !== expectedLog.size || actual.sha256 !== expectedLog.sha256) {
+      throw new Error(
+        `Result log changed during eval run (precondition failed: size ${expectedLog.size} -> ${actual.size}, sha256 ${expectedLog.sha256.slice(0, 12)} -> ${actual.sha256.slice(0, 12)}); refusing to append`,
+      );
+    }
+    return fd;
+  } catch (err) {
+    closeSync(fd);
+    throw err;
+  }
+}
+
+/**
+ * Find the most recent valid block id for `project` by scanning backwards from EOF in
+ * `MAX_LINE_BYTES` chunks. Matches a forward `scanFdRange` pass byte-for-byte while avoiding
+ * parsing all historical blocks when `supersedes === null`.
+ */
+function findLastProjectParent(
+  fd: number,
+  size: number,
+  project: string,
+  needsSeparator: boolean,
+): string | null {
+  if (size <= 0) return null;
+  const chunk = new Uint8Array(MAX_LINE_BYTES);
+  const lineBuf = new Uint8Array(MAX_LINE_BYTES - 1);
+  let pos = needsSeparator ? size : size - 1;
+  let tailLen = 0;
+  let overflow = false;
+
+  const tryLine = (): string | null => {
+    if (!overflow && tailLen > 0) {
+      const block = parseBlock(lineBuf.subarray(lineBuf.length - tailLen));
+      if (block && block.project === project) {
+        return block.id;
+      }
+    }
+    tailLen = 0;
+    overflow = false;
+    return null;
+  };
+
+  while (pos > 0) {
+    const readStart = Math.max(0, pos - chunk.length);
+    const toRead = pos - readStart;
+    let totalRead = 0;
+    while (totalRead < toRead) {
+      const n = readSync(fd, chunk, totalRead, toRead - totalRead, readStart + totalRead);
+      if (n <= 0) break;
+      totalRead += n;
+    }
+    pos = readStart;
+    let end = totalRead;
+    while (end > 0) {
+      const lf = chunk.lastIndexOf(LF, end - 1);
+      const segStart = lf < 0 ? 0 : lf + 1;
+      const segLen = end - segStart;
+      if (!overflow && tailLen + segLen <= lineBuf.length) {
+        if (segLen > 0) {
+          lineBuf.set(chunk.subarray(segStart, end), lineBuf.length - tailLen - segLen);
+          tailLen += segLen;
+        }
+      } else {
+        overflow = true;
+      }
+      if (lf >= 0) {
+        const hit = tryLine();
+        if (hit !== null) return hit;
+        end = lf;
+      } else {
+        break;
+      }
+    }
+  }
+  return tryLine();
+}
+
 /** Append and flush one block while holding the shared SQLite writer lock. */
-export function appendBlock(logPath: string, input: BlockInput): Block {
+export function appendBlock(logPath: string, input: BlockInput, options?: AppendBlockOptions): Block {
   mkdirSync(dirname(logPath), { recursive: true });
   const lock = new DatabaseSync(`${logPath}.lock.sqlite`, { timeout: 5000 });
   try {
     lock.exec('BEGIN IMMEDIATE');
-    const fd = openSync(logPath, 'a+', 0o600);
+    const fd = openLogForAppendWithPrecondition(logPath, options?.expectedLog);
     try {
       const size = fstatSync(fd).size;
       const lastByte = new Uint8Array(1);
@@ -329,20 +503,22 @@ export function appendBlock(logPath: string, input: BlockInput): Block {
       let parent: string | null = null;
       let target: Block | undefined;
       let resolved = false;
-      scanFdRange(
-        fd,
-        0,
-        1,
-        size,
-        (block) => {
-          if (block.project === input.project) parent = block.id;
-          if (supersedes !== null) {
+      if (supersedes === null) {
+        parent = findLastProjectParent(fd, size, input.project, needsSeparator);
+      } else {
+        scanFdRange(
+          fd,
+          0,
+          1,
+          size,
+          (block) => {
+            if (block.project === input.project) parent = block.id;
             if (block.id === supersedes) target = block;
             if (block.supersedes === supersedes) resolved = true;
-          }
-        },
-        needsSeparator,
-      );
+          },
+          needsSeparator,
+        );
+      }
 
       if (supersedes !== null) {
         if (!target) throw new Error(`Unknown block: ${supersedes}`);

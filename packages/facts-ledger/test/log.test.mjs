@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile, spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -186,4 +187,114 @@ test('treats UTF-8 BOM lines as bad lines and normalizes explicit undefined/empt
   // Lone surrogates encode identically as U+FFFD in UTF-8 and must compare equal (total order).
   assert.equal(compareBytewise('\uD800', '\uD801'), 0);
   assert.equal(compareBytewise('\uD801', '\uD800'), 0);
+});
+
+test('appendBlock enforces optional expectedLog precondition under the writer lock without side effects on mismatch', (t) => {
+  const path = logPath(t);
+  const sha = (buf) => createHash('sha256').update(buf).digest('hex');
+
+  // Expecting an existing log when absent throws without creating the file.
+  assert.throws(
+    () => appendBlock(path, fixture, { expectedLog: { size: 10, sha256: '0'.repeat(64) } }),
+    /precondition failed.*absent/,
+  );
+  assert.equal(existsSync(path), false, 'failed existing-log precondition must not create file');
+
+  // Expecting absent succeeds when absent and creates the file with the block.
+  const first = appendBlock(path, fixture, { expectedLog: 'absent' });
+  const afterFirst = readFileSync(path);
+  assert.equal(first.parent, null);
+
+  // Expecting absent now fails because the file exists, without modifying it.
+  assert.throws(
+    () => appendBlock(path, fixture, { expectedLog: 'absent' }),
+    /precondition failed.*already exists/,
+  );
+  assert.deepEqual(readFileSync(path), afterFirst);
+
+  // Expecting wrong size or wrong hash fails without appending.
+  assert.throws(
+    () => appendBlock(path, fixture, { expectedLog: { size: afterFirst.length + 1, sha256: sha(afterFirst) } }),
+    /precondition failed/,
+  );
+  assert.throws(
+    () => appendBlock(path, fixture, { expectedLog: { size: afterFirst.length, sha256: 'f'.repeat(64) } }),
+    /precondition failed/,
+  );
+  assert.deepEqual(readFileSync(path), afterFirst);
+
+  // Matching size and sha256 appends cleanly through the same descriptor.
+  const second = appendBlock(path, fixture, {
+    expectedLog: { size: afterFirst.length, sha256: sha(afterFirst) },
+  });
+  assert.equal(second.parent, first.id);
+  assert.deepEqual(read(path).blocks, [first, second]);
+
+  // Empty existing file also fails expectedLog: 'absent'.
+  const emptyPath = logPath(t);
+  writeFileSync(emptyPath, '');
+  assert.throws(
+    () => appendBlock(emptyPath, fixture, { expectedLog: 'absent' }),
+    /precondition failed.*already exists/,
+  );
+  assert.equal(readFileSync(emptyPath).length, 0);
+});
+
+test('appendBlock backward parent lookup matches forward scan across 64 KiB chunks, oversized lines, and unterminated tails', (t) => {
+  const path = logPath(t);
+  const mkLine = (id, project, pad = '') =>
+    JSON.stringify({
+      id,
+      ts: '2026-11-21T00:00:00+00:00',
+      agent: 'tester',
+      project,
+      parent: null,
+      trace_id: id,
+      status: 'done',
+      intent: 'test',
+      reasoning: pad || 'ok',
+      actions: [],
+      verification: null,
+      touches: [],
+      supersedes: null,
+      schema: 2,
+    });
+
+  // Alpha block at offset 0, followed by >70 KiB of beta blocks, an oversized >64 KiB alpha line
+  // (must be skipped like scanFdRange), blank lines, corrupt JSON, and an unterminated gamma tail.
+  const lines = [
+    mkLine('000000000001', 'alpha'),
+    mkLine('000000000002', 'beta', 'b'.repeat(40_000)),
+    mkLine('000000000003', 'beta', 'c'.repeat(40_000)),
+    mkLine('000000000004', 'alpha', 'x'.repeat(MAX_LINE_BYTES + 100)),
+    '',
+    '{corrupt json line',
+    mkLine('000000000005', 'gamma'),
+  ];
+  // Omit trailing LF on the last gamma block to verify unterminated-tail parent recovery.
+  writeFileSync(path, lines.join('\n'), 'utf8');
+
+  const gammaNext = appendBlock(path, {
+    agent: 'tester',
+    project: 'gamma',
+    intent: 'after unterminated',
+    reasoning: 'ok',
+  });
+  assert.equal(gammaNext.parent, '000000000005');
+
+  const alphaNext = appendBlock(path, {
+    agent: 'tester',
+    project: 'alpha',
+    intent: 'skips oversized alpha and crosses 64 KiB chunk boundary',
+    reasoning: 'ok',
+  });
+  assert.equal(alphaNext.parent, '000000000001');
+
+  const unseenNext = appendBlock(path, {
+    agent: 'tester',
+    project: 'unseen-project',
+    intent: 'no prior block for project',
+    reasoning: 'ok',
+  });
+  assert.equal(unseenNext.parent, null);
 });
