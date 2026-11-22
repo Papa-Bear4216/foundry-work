@@ -9,7 +9,7 @@ function errorCode(error: unknown): string | undefined {
   return (error as { code?: string } | null)?.code;
 }
 
-function renameWithRetry(source: string, target: string): void {
+export function renameWithRetry(source: string, target: string): void {
   const wait = new Int32Array(new SharedArrayBuffer(4));
   for (let attempt = 0; ; attempt++) {
     try {
@@ -20,6 +20,27 @@ function renameWithRetry(source: string, target: string): void {
         || !['EACCES', 'EBUSY', 'EPERM'].includes(errorCode(error) ?? '')) throw error;
       Atomics.wait(wait, 0, 0, Math.min(10 * 2 ** attempt, 400));
     }
+  }
+}
+
+export function acquireWriterLock(path: string): DatabaseSync {
+  const lock = new DatabaseSync(path, { timeout: 5000 });
+  try {
+    lock.exec('BEGIN IMMEDIATE');
+    return lock;
+  } catch (error) {
+    lock.close();
+    throw error;
+  }
+}
+
+export function syncDirectory(directory: string): void {
+  if (platform === 'win32') return;
+  const fd = openSync(directory, 'r');
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
   }
 }
 
@@ -35,9 +56,8 @@ function readExisting(path: string): Buffer | undefined {
 export function publishKeyring(path: string, next: Buffer, previous?: Buffer, beforeRename?: () => void): void {
   const directory = dirname(path);
   const prefix = basename(path) + '.pending-';
-  const lock = new DatabaseSync(path + '.lock.sqlite', { timeout: 5000 });
+  const lock = acquireWriterLock(path + '.lock.sqlite');
   try {
-    lock.exec('BEGIN IMMEDIATE');
     for (const name of readdirSync(directory, { withFileTypes: true })) {
       if (name.isFile() && name.name.startsWith(prefix) && /^[0-9a-f]{32}$/u.test(name.name.slice(prefix.length))) {
         unlinkSync(join(directory, name.name));
@@ -64,14 +84,7 @@ export function publishKeyring(path: string, next: Buffer, previous?: Buffer, be
       try { unlinkSync(pending); } catch { /* Preserve the original failure. */ }
       throw error;
     }
-    if (platform !== 'win32') {
-      const dirFd = openSync(directory, 'r');
-      try {
-        fsyncSync(dirFd);
-      } finally {
-        closeSync(dirFd);
-      }
-    }
+    syncDirectory(directory);
   } finally {
     lock.close();
   }

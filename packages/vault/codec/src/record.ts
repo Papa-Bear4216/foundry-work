@@ -1,16 +1,38 @@
 import { Buffer, isUtf8 } from 'node:buffer';
 import { randomBytes } from 'node:crypto';
-import { check, derive, hex, open, seal, VaultFormatError } from './bytes.ts';
+import { check, derive, hex, open, sealInto, VaultFormatError } from './bytes.ts';
 
 export const FRAME_BYTES = 1024 * 1024;
-const HEADER_BYTES = 69;
-const OVERHEAD = 20;
+export const HEADER_BYTES = 69;
+export const FRAME_OVERHEAD = 20;
 const MAX_EVENT_CONTEXT = BigInt(Number.MAX_SAFE_INTEGER);
+const MAGIC = Buffer.from('FVR1');
 
 export interface RecordFields {
   type: 1 | 2;
   keyId: string;
   context: bigint;
+}
+
+export function recordLength(plaintextBytes: number): number {
+  return HEADER_BYTES + plaintextBytes + Math.max(1, Math.ceil(plaintextBytes / FRAME_BYTES)) * FRAME_OVERHEAD;
+}
+
+export function decodeRecordHeader(header: Buffer) {
+  check(header.length === HEADER_BYTES, 'LENGTH');
+  check(header.subarray(0, 4).equals(MAGIC), 'VERSION');
+  const type = header[4];
+  const context = header.readBigUInt64BE(53);
+  checkFields(type, context);
+  const bodyLength = header.readBigUInt64BE(61);
+  check(bodyLength >= BigInt(FRAME_OVERHEAD), 'LENGTH');
+  return { type, context, keyId: header.subarray(5, 21).toString('hex'), bodyLength };
+}
+
+export function checkFrameSize(size: number, remaining: number, type: number, first: boolean): void {
+  const length = FRAME_OVERHEAD + size;
+  check(size <= FRAME_BYTES && (length === remaining || (size === FRAME_BYTES && remaining - length > FRAME_OVERHEAD))
+    && (size > 0 || (type === 2 && first)), 'LENGTH');
 }
 
 function checkFields(type: number, context: bigint): asserts type is 1 | 2 {
@@ -34,24 +56,29 @@ export function encodeRecord(
   check(salt.length === 32);
   check(fields.type === 2 || BigInt(eventSequence(plaintext)) === fields.context, 'SEQUENCE');
   const count = Math.max(1, Math.ceil(plaintext.length / FRAME_BYTES));
-  const header = Buffer.alloc(HEADER_BYTES);
-  header.set(Buffer.from('FVR1'));
+  const output = Buffer.allocUnsafe(recordLength(plaintext.length));
+  const header = output.subarray(0, HEADER_BYTES);
+  header.set(MAGIC);
   header[4] = fields.type;
   header.set(Buffer.from(fields.keyId, 'hex'), 5);
   header.set(salt, 21);
   header.writeBigUInt64BE(fields.context, 53);
-  header.writeBigUInt64BE(BigInt(plaintext.length + count * OVERHEAD), 61);
+  header.writeBigUInt64BE(BigInt(output.length - HEADER_BYTES), 61);
 
   const key = derive(encryptionKey, 'record-key', salt);
-  const chunks = [header];
-  for (let i = 0; i < count; i++) {
-    const frame = plaintext.subarray(i * FRAME_BYTES, (i + 1) * FRAME_BYTES);
-    const length = Buffer.alloc(4);
-    length.writeUInt32BE(frame.length, 0);
-    const { nonce, aad } = frameParameters(header, vaultId, BigInt(i), i === count - 1);
-    chunks.push(length, seal(key, nonce, aad, frame));
+  try {
+    let offset = HEADER_BYTES;
+    for (let i = 0; i < count; i++) {
+      const frame = plaintext.subarray(i * FRAME_BYTES, (i + 1) * FRAME_BYTES);
+      output.writeUInt32BE(frame.length, offset);
+      const { nonce, aad } = frameParameters(header, vaultId, BigInt(i), i === count - 1);
+      sealInto(key, nonce, aad, frame, output, offset + 4);
+      offset += FRAME_OVERHEAD + frame.length;
+    }
+    return output;
+  } finally {
+    key.fill(0);
   }
-  return Buffer.concat(chunks);
 }
 
 interface ScannedRecord extends RecordFields {
@@ -64,26 +91,20 @@ export function* scanRecords(stream: Buffer): Generator<ScannedRecord, void, und
   while (start < stream.length) {
     check(stream.length - start >= HEADER_BYTES, 'LENGTH');
     const header = stream.subarray(start, start + HEADER_BYTES);
-    check(header.subarray(0, 4).equals(Buffer.from('FVR1')), 'VERSION');
-    const type = header[4];
-    const context = header.readBigUInt64BE(53);
-    checkFields(type, context);
-    const bodyLength = header.readBigUInt64BE(61);
+    const { type, context, keyId, bodyLength } = decodeRecordHeader(header);
     let offset = start + HEADER_BYTES;
-    check(bodyLength >= BigInt(OVERHEAD) && bodyLength <= BigInt(stream.length - offset), 'LENGTH');
+    check(bodyLength <= BigInt(stream.length - offset), 'LENGTH');
     const end = offset + Number(bodyLength);
     const frames: Buffer[] = [];
     while (offset < end) {
-      check(end - offset >= OVERHEAD, 'LENGTH');
+      check(end - offset >= FRAME_OVERHEAD, 'LENGTH');
       const size = stream.readUInt32BE(offset);
-      const next = offset + OVERHEAD + size;
-      const final = next === end;
-      check(next <= end && size <= FRAME_BYTES && (final || size === FRAME_BYTES)
-        && (size > 0 || (type === 2 && frames.length === 0)), 'LENGTH');
+      checkFrameSize(size, end - offset, type, frames.length === 0);
+      const next = offset + FRAME_OVERHEAD + size;
       frames.push(stream.subarray(offset + 4, next));
       offset = next;
     }
-    yield { header, frames, type, context, keyId: header.subarray(5, 21).toString('hex') };
+    yield { header, frames, type, context, keyId };
     start = end;
   }
 }
@@ -108,18 +129,39 @@ export function eventSequence(bytes: Buffer): number {
   return seq;
 }
 
+export function recordKey(header: Buffer, encryptionKey: Buffer): Buffer {
+  return derive(encryptionKey, 'record-key', header.subarray(21, 53));
+}
+
+export function decryptFrame(
+  header: Buffer, vaultId: string, key: Buffer, frame: Buffer, index: number, final: boolean,
+): Buffer {
+  const { nonce, aad } = frameParameters(header, vaultId, BigInt(index), final);
+  return open(key, nonce, aad, frame);
+}
+
 export function decryptRecord(
   record: ScannedRecord,
   vaultId: string, encryptionKey: Buffer,
 ): Buffer {
   const { header, frames } = record;
-  const key = derive(encryptionKey, 'record-key', header.subarray(21, 53));
-  const plaintext = Buffer.concat(frames.map((frame, index) => {
-    const { nonce, aad } = frameParameters(header, vaultId, BigInt(index), index === frames.length - 1);
-    return open(key, nonce, aad, frame);
-  }));
-  check(record.type === 2 || BigInt(eventSequence(plaintext)) === record.context, 'SEQUENCE');
-  return plaintext;
+  const key = recordKey(header, encryptionKey);
+  const chunks: Buffer[] = [];
+  let plaintext: Buffer | undefined;
+  try {
+    for (const [index, frame] of frames.entries()) {
+      chunks.push(decryptFrame(header, vaultId, key, frame, index, index === frames.length - 1));
+    }
+    plaintext = Buffer.concat(chunks);
+    check(record.type === 2 || BigInt(eventSequence(plaintext)) === record.context, 'SEQUENCE');
+    return plaintext;
+  } catch (error) {
+    plaintext?.fill(0);
+    throw error;
+  } finally {
+    key.fill(0);
+    for (const chunk of chunks) chunk.fill(0);
+  }
 }
 
 export function decodeRecord(bytes: Buffer, vaultId: string, encryptionKey: Buffer): RecordFields & { plaintext: Buffer } {

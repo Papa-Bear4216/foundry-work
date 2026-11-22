@@ -108,8 +108,8 @@ def unlock(raw, vault_id, *, passphrase=None, recovery_key=None):
                 check(bool(utf8(label)))
     def collection_key(key_id, *, identity=False):
         entry = index.get(key_id, {})
-        check(entry.get("state") != "destroyed", "ERASED")
         check(entry.get("kind") == "collection", "KEY")
+        check(entry.get("state") == "active", "ERASED")
         return vk(keys[key_id], "collection-id" if identity else "collection-encryption")
     return collection_key
 def utf8(raw):

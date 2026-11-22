@@ -327,9 +327,11 @@ export function unlockKeyring(keyring: Keyring, credential: Unlock) {
   return {
     keyring, masterKey, keys: unwrapped, labels, erased,
     collectionEncryptionKey(keyId: string): Buffer {
-      check(!erased.has(keyId), 'ERASED');
+      const entry = keys.find(entry => entry.key_id === keyId && entry.kind === 'collection');
+      check(entry, 'KEY');
+      check(entry.state === 'active', 'ERASED');
       const key = unwrapped.get(keyId);
-      check(key && keys.some(entry => entry.key_id === keyId && entry.kind === 'collection'), 'KEY');
+      check(key, 'KEY');
       return vaultKey(key, vaultId, 'collection-encryption');
     },
   };

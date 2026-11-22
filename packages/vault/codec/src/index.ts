@@ -10,3 +10,9 @@ export { changePassphrase, create, rekeyAll, unlockByPassphrase, unlockByRecover
 export type { RekeyHandoff } from './keys.ts';
 export { decodeRecoveryKey } from './recovery.ts';
 export { guardSecretInput, readSecretFromFd } from './secret-input.ts';
+export { createVault, initializeVault, VaultWriter } from './vault-writer.ts';
+export type { VaultAppend, VaultAppendResult, VaultCrashPoint, VaultWriterOptions } from './vault-writer.ts';
+export { readVaultRecord, verifyVault, verifyVaultDeep } from './vault-reader.ts';
+export type { VaultRecordLocation } from './vault-reader.ts';
+export type { VaultAnchor, VerifyOptions } from './vault-directory.ts';
+export type { UnlockedKeyring } from './record-file.ts';
