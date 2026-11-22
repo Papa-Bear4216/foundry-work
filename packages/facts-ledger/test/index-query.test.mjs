@@ -2059,10 +2059,14 @@ test('command embedder terminates descendant process tree on timeout and stdout 
     'utf8',
   );
 
+  // Pre-build the SQLite index so subtest 3 measures the semantic query deadline against
+  // the hanging command embedder rather than cold index creation on a slow CI runner.
+  rebuildIndex(logPath);
+
   // 1) Direct createCommandEmbedder timeout kills descendant process before settling.
   const hangPidFile = join(dir, 'hang.pid');
   await assert.rejects(
-    () => createCommandEmbedder(process.execPath, [wrapperPath, hangPidFile, 'hang'], 'cmd', 600).embed(['probe']),
+    () => createCommandEmbedder(process.execPath, [wrapperPath, hangPidFile, 'hang'], 'cmd', 2_000).embed(['probe']),
     /timed out/,
   );
   assert.equal(existsSync(hangPidFile), true);
@@ -2081,18 +2085,25 @@ test('command embedder terminates descendant process tree on timeout and stdout 
   cleanupPids.push(floodPid);
   assert.throws(() => process.kill(floodPid, 0), { code: 'ESRCH' });
 
-  // 3) queryFacts semanticTimeoutMs still awaits command cleanup without early Promise.race leak.
+  // 3) queryFacts semanticTimeoutMs still awaits command cleanup without early Promise.race leak,
+  // and must fire well below the embedder's own 20s timeout.
   const queryPidFile = join(dir, 'query-hang.pid');
+  const queryStartedMs = Date.now();
   await assert.rejects(
     () =>
       queryFacts({
         logPath,
         text: 'unrelated semantic trigger',
-        embedder: createCommandEmbedder(process.execPath, [wrapperPath, queryPidFile, 'hang'], 'cmd', 10_000),
-        semanticTimeoutMs: 600,
+        embedder: createCommandEmbedder(process.execPath, [wrapperPath, queryPidFile, 'hang'], 'cmd', 20_000),
+        semanticTimeoutMs: 2_000,
         nowMs,
       }),
     /timed out/,
+  );
+  const queryElapsedMs = Date.now() - queryStartedMs;
+  assert.ok(
+    queryElapsedMs < 10_000,
+    `Expected 2s queryFacts semanticTimeoutMs to fire well below 20s embedder timeout (took ${queryElapsedMs} ms)`,
   );
   assert.equal(existsSync(queryPidFile), true);
   const queryPid = Number(readFileSync(queryPidFile, 'utf8'));

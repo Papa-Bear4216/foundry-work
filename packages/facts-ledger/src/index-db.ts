@@ -1074,6 +1074,69 @@ export function syncIndex(
   return withIndexLock(indexPath, () => syncIndexUnlocked(logPath, indexPath, options));
 }
 
+/** Error thrown when a strict read-only index open fails closed (missing, corrupt, WAL present, or out of sync). */
+export class ReadOnlyIndexError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ReadOnlyIndexError';
+  }
+}
+
+/**
+ * Open an already-built SQLite index strictly read-only and fail closed (never rebuild, sync, or mutate).
+ * Used by `facts eval` across query, digest, and grading after the initial build so any missing,
+ * corrupt, out-of-sync, or WAL-mutated index immediately aborts the run.
+ */
+export function openIndexReadOnlyStrict(
+  logPath: string,
+  indexPath: string = defaultIndexPath(logPath),
+): { readonly db: DatabaseSync; readonly syncResult: IndexSyncResult } {
+  assertDistinctIndexPath(logPath, indexPath);
+  if (!existsSync(indexPath)) {
+    throw new ReadOnlyIndexError(`index file is missing (${basename(indexPath)})`);
+  }
+  if (existsSync(`${indexPath}-wal`)) {
+    throw new ReadOnlyIndexError(`unexpected WAL file present (${basename(indexPath)}-wal)`);
+  }
+  const warm = tryOpenWarmReadOnly(logPath, indexPath);
+  if (!warm) {
+    throw new ReadOnlyIndexError(`index is corrupt, unreadable, or out of sync (${basename(indexPath)})`);
+  }
+  try {
+    const qc = warm.db.prepare('PRAGMA quick_check').get();
+    if (!qc || qc['quick_check'] !== 'ok') {
+      throw new ReadOnlyIndexError(`index failed SQLite quick_check (${basename(indexPath)})`);
+    }
+    const pageCountRow = warm.db.prepare('PRAGMA page_count').get();
+    const pageSizeRow = warm.db.prepare('PRAGMA page_size').get();
+    const pageCount = Number(pageCountRow?.['page_count'] ?? -1);
+    const pageSize = Number(pageSizeRow?.['page_size'] ?? -1);
+    const st = statSync(indexPath);
+    if (!st.isFile() || pageCount <= 0 || pageSize <= 0 || st.size !== pageCount * pageSize) {
+      throw new ReadOnlyIndexError(`index file size does not match SQLite pages (${basename(indexPath)})`);
+    }
+    if (existsSync(`${indexPath}-wal`)) {
+      throw new ReadOnlyIndexError(`unexpected WAL file present (${basename(indexPath)}-wal)`);
+    }
+    return warm;
+  } catch (err) {
+    try {
+      warm.db.exec('ROLLBACK');
+    } catch {
+      // Ignore rollback cleanup failure on strict read-only error.
+    }
+    try {
+      warm.db.close();
+    } catch {
+      // Ignore close cleanup failure on strict read-only error.
+    }
+    if (err instanceof ReadOnlyIndexError) {
+      throw err;
+    }
+    throw new ReadOnlyIndexError(`index integrity verification failed (${basename(indexPath)})`);
+  }
+}
+
 /**
  * Synchronize the index (read-only when warm, otherwise under the cross-generation sidecar lock)
  * and return an open read-only snapshot handle pinned to that exact SQLite generation.

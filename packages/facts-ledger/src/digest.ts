@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { dirname, join } from 'node:path';
 import { TextEncoder } from 'node:util';
 import { FreshnessChecker } from './freshness.js';
-import { assertDistinctIndexPath, defaultIndexPath, openSyncedIndexForQuery } from './index-db.js';
+import { assertDistinctIndexPath, defaultIndexPath, openIndexReadOnlyStrict, openSyncedIndexForQuery } from './index-db.js';
 import { compareBytewise, replaceFileWithRetry } from './log.js';
 import { allowedSensitivities, classifyPresentation, listFactsPage } from './query.js';
 import type { RepoMap } from './repos.js';
@@ -45,6 +45,8 @@ export interface DigestOptions {
   readonly write?: boolean;
   /** Storage flags (`--log`, `--index`) to repeat in the closing query command. */
   readonly queryFlags?: readonly string[];
+  /** Open the pre-built index strictly read-only and fail closed without rebuilding on failure. */
+  readonly readOnlyIndex?: boolean;
 }
 
 export interface DigestResult {
@@ -212,7 +214,9 @@ function buildDigest(options: DigestOptions, indexPath: string, path: string): D
   let proposals: string[] = [];
   let decisions: string[] = [];
 
-  const { db, syncResult } = openSyncedIndexForQuery(options.logPath, indexPath, false);
+  const { db, syncResult } = options.readOnlyIndex
+    ? openIndexReadOnlyStrict(options.logPath, indexPath)
+    : openSyncedIndexForQuery(options.logPath, indexPath, false);
   const badLines = syncResult.badLines;
   try {
     let afterId: string | undefined;
