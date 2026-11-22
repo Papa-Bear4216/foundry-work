@@ -37,7 +37,8 @@ export { ArchiveError } from './archive/errors.js';
 export type { ArchiveErrorCode } from './archive/errors.js';
 export { openZipFile, openZipReader, validateArchivePath } from './archive/zip-reader.js';
 export type { RandomAccessReader, ZipOpenOptions } from './archive/zip-reader.js';
-export { comparePartNames, openArchive } from './archive/multipart.js';
+export { comparePartNames, openArchive, parsePartName } from './archive/multipart.js';
+export type { ParsedPartName } from './archive/multipart.js';
 
 export { ItemSkipError } from './importers/errors.js';
 export { getParamValue, parseContentLine } from './importers/content-line.js';

@@ -891,38 +891,75 @@ test('accepts streamed ZIP64 bit-3 entries with 0xffffffff local sizes and zero 
   }
 });
 
-test('enforces Takeout part ordinal validation only on recognised Takeout part names when opening a single file via openArchive (Round 2 Finding 3 & Round 3 Finding 3)', async t => {
+test('enforces Takeout part ordinal validation only on recognised Takeout part names when opening a single file via openArchive (Round 2 Finding 3, Round 3 Finding 3 & Round 4)', async t => {
   const dir = makeTempDir(t, 'foundry-r2-f3-');
 
-  const part2 = join(dir, 'takeout-20261121T000000Z-002.zip');
-  await writeZipArchive(part2, [{ path: 'Takeout/b.txt', data: Buffer.from('part 2 only') }]);
-  await assert.rejects(
-    () => openArchive(part2),
-    err => err instanceof ArchiveError && err.code === 'INVALID_MULTIPART' && /part 1/i.test(err.message),
-  );
+  // Timestamped and timestamp-free Takeout part 002 (and set-suffixed part 002) must fail directly AND inside a single-file folder.
+  for (const badPartName of [
+    'takeout-20261121T000000Z-002.zip',
+    'takeout-20261121T000000Z-3-002.zip',
+    'takeout-002.zip',
+    'takeout-set-002.zip',
+    'takeout-3-002.zip',
+  ]) {
+    const partPath = join(dir, badPartName);
+    await writeZipArchive(partPath, [{ path: 'Takeout/b.txt', data: Buffer.from(`part 2: ${badPartName}`) }]);
+    await assert.rejects(
+      () => openArchive(partPath),
+      err => err instanceof ArchiveError && err.code === 'INVALID_MULTIPART' && /part 1/i.test(err.message),
+      `expected direct openArchive(${badPartName}) to fail with INVALID_MULTIPART`,
+    );
 
-  const part2Versioned = join(dir, 'takeout-20261121T000000Z-3-002.zip');
-  await writeZipArchive(part2Versioned, [{ path: 'Takeout/b2.txt', data: Buffer.from('versioned part 2 only') }]);
-  await assert.rejects(
-    () => openArchive(part2Versioned),
-    err => err instanceof ArchiveError && err.code === 'INVALID_MULTIPART' && /part 1/i.test(err.message),
-  );
+    const loneDir = makeTempDir(t, 'foundry-r4-lone-part2-dir-');
+    await writeZipArchive(join(loneDir, badPartName), [{ path: 'Takeout/b.txt', data: Buffer.from(`dir part 2: ${badPartName}`) }]);
+    await assert.rejects(
+      () => openArchive(loneDir),
+      err => err instanceof ArchiveError && err.code === 'INVALID_MULTIPART' && /part 1/i.test(err.message),
+      `expected directory openArchive containing only ${badPartName} to fail with INVALID_MULTIPART`,
+    );
+  }
 
-  const part0 = join(dir, 'takeout-20261121T000000Z-000.zip');
-  await writeZipArchive(part0, [{ path: 'Takeout/z.txt', data: Buffer.from('part 0 invalid') }]);
-  await assert.rejects(
-    () => openArchive(part0),
-    err => err instanceof ArchiveError && err.code === 'INVALID_MULTIPART',
-  );
+  for (const zeroPartName of ['takeout-20261121T000000Z-000.zip', 'takeout-000.zip', 'takeout-set-000.zip']) {
+    const part0 = join(dir, zeroPartName);
+    await writeZipArchive(part0, [{ path: 'Takeout/z.txt', data: Buffer.from('part 0 invalid') }]);
+    await assert.rejects(
+      () => openArchive(part0),
+      err => err instanceof ArchiveError && err.code === 'INVALID_MULTIPART',
+    );
+  }
 
-  // Part 001 opened directly is allowed (missing final part is deferred per A-36)
-  const part1 = join(dir, 'takeout-20261121T000000Z-001.zip');
-  await writeZipArchive(part1, [{ path: 'Takeout/a.txt', data: Buffer.from('part 1') }]);
-  const arch1 = await openArchive(part1);
+  // Part 001 opened directly or as a lone file in a folder is allowed (missing final part is deferred per A-36)
+  for (const part1Name of ['takeout-20261121T000000Z-001.zip', 'takeout-001.zip', 'takeout-set-001.zip']) {
+    const part1 = join(dir, part1Name);
+    await writeZipArchive(part1, [{ path: 'Takeout/a.txt', data: Buffer.from(`part 1: ${part1Name}`) }]);
+    const arch1 = await openArchive(part1);
+    try {
+      assert.equal(arch1.entries.length, 1);
+    } finally {
+      await arch1.close();
+    }
+
+    const part1Dir = makeTempDir(t, 'foundry-r4-lone-part1-dir-');
+    await writeZipArchive(join(part1Dir, part1Name), [{ path: 'Takeout/a.txt', data: Buffer.from(`dir part 1: ${part1Name}`) }]);
+    const arch1Dir = await openArchive(part1Dir);
+    try {
+      assert.equal(arch1Dir.entries.length, 1);
+      assert.deepEqual(arch1Dir.parts, [part1Name]);
+    } finally {
+      await arch1Dir.close();
+    }
+  }
+
+  // Timestamp-free multi-part folder (`takeout-001.zip` + `takeout-002.zip`) still opens as one unified archive
+  const tsFreeMultiDir = makeTempDir(t, 'foundry-r4-tsfree-multi-');
+  await writeZipArchive(join(tsFreeMultiDir, 'takeout-001.zip'), [{ path: 'Takeout/a.txt', data: Buffer.from('p1') }]);
+  await writeZipArchive(join(tsFreeMultiDir, 'takeout-002.zip'), [{ path: 'Takeout/b.txt', data: Buffer.from('p2') }]);
+  const archTsFreeMulti = await openArchive(tsFreeMultiDir);
   try {
-    assert.equal(arch1.entries.length, 1);
+    assert.deepEqual(archTsFreeMulti.parts, ['takeout-001.zip', 'takeout-002.zip']);
+    assert.equal(archTsFreeMulti.entries.length, 2);
   } finally {
-    await arch1.close();
+    await archTsFreeMulti.close();
   }
 
   // Non-part archive filenames (including numbered standalone names like Calendar-2024.zip) open as single archives

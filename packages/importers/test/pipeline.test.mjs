@@ -1007,10 +1007,14 @@ test('imports valid streamed ZIP64 archive (Python zipfile force_zip64 layout) a
   assert.equal(verifyVault(vaultBad).position.lastEventSequence, 0);
 });
 
-test('rejects direct import of Takeout part 002 with zero writes while non-part and numbered standalone archives import normally (Round 2 Finding 3 & Round 3 Finding 3)', async t => {
+test('rejects direct and single-folder import of Takeout part 002 (timestamped and timestamp-free) with zero writer calls while takeout-001 and standalone archives import normally (Round 2 Finding 3, Round 3 Finding 3 & Round 4)', async t => {
   const root = mkdtempSync(join(tmpdir(), 'foundry-v5-r2-f3-'));
   t.after(() => makeWritableAndRemove(root));
   const part2Path = join(root, 'takeout-20261121T000000Z-002.zip');
+  const tsFreePart2Path = join(root, 'takeout-002.zip');
+  const tsFreeSetPart2Path = join(root, 'takeout-set-002.zip');
+  const tsFreePart2Dir = mkdtempSync(join(root, 'lone-takeout-002-dir-'));
+  const tsFreePart1Path = join(root, 'takeout-001.zip');
   const singlePath = join(root, 'personal-export.zip');
   const calendar2024Path = join(root, 'Calendar-2024.zip');
   const mailBackupPath = join(root, 'mail-backup-002.zip');
@@ -1018,9 +1022,16 @@ test('rejects direct import of Takeout part 002 with zero writes while non-part 
   const passphrase = 'TEST ONLY v5 r2 f3 passphrase';
 
   const vcf = generateSyntheticVcards(2, 1301);
+  const vcfPart1 = generateSyntheticVcards(1, 1304);
   const ics = generateSyntheticIcalendar(1, 1302);
   const mbox = generateSyntheticMbox(1, 1303);
   await writeZipArchive(part2Path, [{ path: 'Takeout/Contacts/contacts.vcf', data: vcf, compression: 'deflate' }]);
+  await writeZipArchive(tsFreePart2Path, [{ path: 'Takeout/Contacts/contacts.vcf', data: vcf, compression: 'deflate' }]);
+  await writeZipArchive(tsFreeSetPart2Path, [{ path: 'Takeout/Contacts/contacts.vcf', data: vcf, compression: 'deflate' }]);
+  await writeZipArchive(join(tsFreePart2Dir, 'takeout-002.zip'), [
+    { path: 'Takeout/Contacts/contacts.vcf', data: vcf, compression: 'deflate' },
+  ]);
+  await writeZipArchive(tsFreePart1Path, [{ path: 'Takeout/Contacts/part1.vcf', data: vcfPart1, compression: 'deflate' }]);
   await writeZipArchive(singlePath, [{ path: 'Takeout/Contacts/contacts.vcf', data: vcf, compression: 'deflate' }]);
   await writeZipArchive(calendar2024Path, [{ path: 'Takeout/Calendar/year2024.ics', data: ics, compression: 'deflate' }]);
   await writeZipArchive(mailBackupPath, [{ path: 'Takeout/Mail/backup.mbox', data: mbox, compression: 'deflate' }]);
@@ -1028,13 +1039,47 @@ test('rejects direct import of Takeout part 002 with zero writes while non-part 
   const { vaultId, collectionKeyId } = createTestVaultWithCollections(vaultDir, passphrase);
   const unlocked = unlockByPassphrase(join(vaultDir, 'keyring', 'keyring.json'), vaultId, passphrase);
 
-  await assert.rejects(
-    () => openArchive(part2Path),
-    err => err instanceof ArchiveError && err.code === 'INVALID_MULTIPART' && /part 1/i.test(err.message),
-  );
-  assert.equal(readAllVaultRecords(vaultDir, unlocked).events.length, 0);
+  let writerCalls = 0;
+  const spyWriter = {
+    appendBatch() {
+      writerCalls += 1;
+      throw new Error('writer must not be called for invalid multipart archive');
+    },
+    closeSegment() {
+      writerCalls += 1;
+      throw new Error('writer must not be called for invalid multipart archive');
+    },
+  };
+
+  for (const invalidTarget of [part2Path, tsFreePart2Path, tsFreeSetPart2Path, tsFreePart2Dir]) {
+    await assert.rejects(
+      async () => {
+        const archive = await openArchive(invalidTarget);
+        try {
+          await importArchive({
+            archive,
+            writer: spyWriter,
+            importers: DEFAULT_IMPORTERS,
+            resolveCollectionKeyId: () => collectionKeyId,
+            vaultDir,
+            unlocked,
+            readVaultRecord,
+          });
+        } finally {
+          await archive.close();
+        }
+      },
+      err => err instanceof ArchiveError && err.code === 'INVALID_MULTIPART' && /part 1/i.test(err.message),
+      `expected ${invalidTarget} to fail with INVALID_MULTIPART`,
+    );
+  }
+  assert.equal(writerCalls, 0);
+  const emptyRecords = readAllVaultRecords(vaultDir, unlocked);
+  assert.equal(emptyRecords.events.length, 0);
+  assert.equal(emptyRecords.blobs.length, 0);
 
   for (const [zipFile, expectedNew] of [
+    [tsFreePart1Path, 1],
     [singlePath, 2],
     [calendar2024Path, 1],
     [mailBackupPath, 1],
@@ -1058,7 +1103,7 @@ test('rejects direct import of Takeout part 002 with zero writes while non-part 
       await archive.close();
     }
   }
-  assert.equal(verifyVaultDeep(vaultDir, unlocked).position.lastEventSequence, 4);
+  assert.equal(verifyVaultDeep(vaultDir, unlocked).position.lastEventSequence, 5);
 });
 
 test('rejects concurrent importArchive calls sharing one writer with typed BUSY error and zero duplicates (Round 2 Finding 8)', async t => {

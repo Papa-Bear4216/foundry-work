@@ -6,20 +6,51 @@ import { getEntryDedupKey, openZipFile } from './zip-reader.js';
 import type { ZipOpenOptions } from './zip-reader.js';
 
 const PART_PATTERN = /^(.+)-(\d+)\.zip$/i;
-/** Recognised Google Takeout multi-part export filenames (`takeout-<YYYYMMDDTHHMMSSZ>[-<set>]-<NNN>.zip`). */
-const TAKEOUT_PART_PATTERN = /^(takeout-\d{8}T\d{6}Z(?:-\d+)?)-(\d+)\.zip$/i;
+/**
+ * Prefix check for recognised Google Takeout multi-part export filenames:
+ * `takeout-<NNN>.zip`, `takeout-<set>-<NNN>.zip`, and
+ * `takeout-<YYYYMMDDTHHMMSSZ>[-<set>]-<NNN>.zip`.
+ */
+const TAKEOUT_PREFIX_PATTERN = /^takeout(?:$|-)/i;
+
+export interface ParsedPartName {
+  readonly prefix: string;
+  readonly ordinal: number;
+  readonly isTakeoutPart: boolean;
+}
+
+/**
+ * Shared part-name parser used by single-file validation, multi-part folder validation,
+ * and part sorting so single-file Takeout checks cannot drift from the directory path.
+ */
+export function parsePartName(name: string): ParsedPartName | undefined {
+  const match = PART_PATTERN.exec(name);
+  if (!match) return undefined;
+  const prefix = match[1]!;
+  const ordinal = Number.parseInt(match[2]!, 10);
+  return {
+    prefix,
+    ordinal,
+    isTakeoutPart: TAKEOUT_PREFIX_PATTERN.test(prefix),
+  };
+}
 
 /**
  * Deterministic comparator for multi-part Takeout zip filenames (e.g. takeout-...-001.zip, -002.zip).
  * Sorts matching prefix+part-number numerically and falls back to raw bytewise code-unit order.
  */
 export function comparePartNames(a: string, b: string): number {
-  const ma = PART_PATTERN.exec(a);
-  const mb = PART_PATTERN.exec(b);
-  if (ma && mb && ma[1] === mb[1]) {
-    const na = Number.parseInt(ma[2]!, 10);
-    const nb = Number.parseInt(mb[2]!, 10);
-    if (na !== nb) return na - nb;
+  const pa = parsePartName(a);
+  const pb = parsePartName(b);
+  if (
+    pa &&
+    pb &&
+    pa.prefix === pb.prefix &&
+    Number.isSafeInteger(pa.ordinal) &&
+    Number.isSafeInteger(pb.ordinal) &&
+    pa.ordinal !== pb.ordinal
+  ) {
+    return pa.ordinal - pb.ordinal;
   }
   return a < b ? -1 : a > b ? 1 : 0;
 }
@@ -32,18 +63,18 @@ export function comparePartNames(a: string, b: string): number {
 function validateAndOrderPartNames(zipNames: readonly string[]): string[] {
   if (zipNames.length === 1) {
     const only = zipNames[0]!;
-    // Apply the single-file ordinal check ONLY to recognised Takeout part names so
-    // ordinary standalone archives with numeric suffixes (e.g. Calendar-2024.zip) open normally.
-    const match = TAKEOUT_PART_PATTERN.exec(only);
-    if (match) {
-      const ordinal = Number.parseInt(match[2]!, 10);
-      if (!Number.isSafeInteger(ordinal) || ordinal < 1) {
+    // Apply the single-file ordinal check ONLY to recognised Takeout part names
+    // (names starting with `takeout-`, parsed with the same parser as the directory path)
+    // so ordinary standalone archives with numeric suffixes (e.g. Calendar-2024.zip) open normally.
+    const part = parsePartName(only);
+    if (part?.isTakeoutPart) {
+      if (!Number.isSafeInteger(part.ordinal) || part.ordinal < 1) {
         throw new ArchiveError('INVALID_MULTIPART', `Invalid archive part ordinal in ${only}.`);
       }
-      if (ordinal !== 1) {
+      if (part.ordinal !== 1) {
         throw new ArchiveError(
           'INVALID_MULTIPART',
-          `Missing archive part 1 for export prefix "${match[1]}": found starting part ${ordinal} (${only}).`,
+          `Missing archive part 1 for export prefix "${part.prefix}": found starting part ${part.ordinal} (${only}).`,
         );
       }
     }
@@ -55,15 +86,14 @@ function validateAndOrderPartNames(zipNames: readonly string[]): string[] {
   const seenOrdinals = new Map<number, string>();
 
   for (const name of zipNames) {
-    const match = PART_PATTERN.exec(name);
-    if (!match) {
+    const part = parsePartName(name);
+    if (!part) {
       throw new ArchiveError(
         'INVALID_MULTIPART',
         `Archive directory contains multiple .zip files without consistent "<prefix>-<ordinal>.zip" naming: ${name}`,
       );
     }
-    const prefix = match[1]!;
-    const ordinal = Number.parseInt(match[2]!, 10);
+    const { prefix, ordinal } = part;
     if (!Number.isSafeInteger(ordinal) || ordinal < 1) {
       throw new ArchiveError('INVALID_MULTIPART', `Invalid archive part ordinal in ${name}.`);
     }
