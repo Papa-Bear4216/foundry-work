@@ -26,7 +26,7 @@ export function syntheticVault(directory, create = true) {
 
   const unlock = () => decodeKeyring(readFileSync(keyring), credential, vaultId);
   return {
-    directory, vaultId, keyring, credential, unlock,
+    directory, vaultId, keyring, credential, passphraseCredential: { passphrase }, unlock,
     write(work) {
       const unlocked = unlock();
       const writer = VaultWriter.open(directory, unlocked);

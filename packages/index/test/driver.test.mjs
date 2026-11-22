@@ -62,6 +62,35 @@ test('an unloadable native binary fails closed before a database is created', ()
   assert.deepEqual(readdirSync(dir.path), []);
 });
 
+test('a missing parent directory is a format error when creating a cipher index', () => {
+  using dir = fixture();
+  assert.throws(() => openSqlDriver(join(dir.path, 'missing', 'index.sqlite'), { key, create: true }),
+    { name: 'IndexError', code: 'FORMAT' });
+  assert.deepEqual(readdirSync(dir.path), []);
+});
+
+test('empty, page-aligned and mid-page truncation are rejected without touching files', () => {
+  using dir = fixture();
+  for (const [adapter, options] of [
+    ['cipher', { key }],
+    ['plain', { adapter: 'plain', allowPlain: true, checkDiskEncryption: () => true }],
+  ]) {
+    const path = join(dir.path, `${adapter}.sqlite`);
+    const db = openSqlDriver(path, { ...options, create: true });
+    db.exec('CREATE TABLE sample (data BLOB); INSERT INTO sample VALUES (zeroblob(8192));');
+    db.close();
+    const original = readFileSync(path);
+    const before = readdirSync(dir.path);
+    for (const length of [0, original.length - 4096, original.length - 1]) {
+      const truncated = original.subarray(0, length);
+      writeFileSync(path, truncated);
+      assert.throws(() => openSqlDriver(path, options), { name: 'IndexError', code: 'FORMAT' }, `${adapter} ${length}`);
+      assert.deepEqual(readdirSync(dir.path), before);
+      assert.deepEqual(readFileSync(path), truncated);
+    }
+  }
+});
+
 test('plain requires an explicit opt-in and a positive disk encryption check', () => {
   using dir = fixture();
   const path = join(dir.path, 'plain.sqlite');
@@ -77,8 +106,13 @@ test('plain requires an explicit opt-in and a positive disk encryption check', (
     assert.equal(checked, path);
     return true;
   };
-  const db = openSqlDriver(path, { adapter: 'plain', create: true, allowPlain: true, checkDiskEncryption });
+  const policy = { adapter: 'plain', create: true, allowPlain: true, checkDiskEncryption };
+  assert.throws(() => openSqlDriver(path, { ...policy, key }), { code: 'CONFIG' });
+  assert.equal(existsSync(path), false);
+  const db = openSqlDriver(path, policy);
   try {
+    assert.equal(db.prepare('PRAGMA temp_store').get().temp_store, 2);
+    assert.equal(db.prepare('PRAGMA secure_delete').get().secure_delete, 1);
     initializeSchema(db);
     assert.equal(db.prepare('PRAGMA user_version').get().user_version, 1);
   } finally {
@@ -135,8 +169,9 @@ test('large transactions keep UTF-8 and UTF-16LE markers out of db, WAL, journal
   using dir = fixture();
   const marker = 'FOUNDRY_TEST_ONLY_MARKER_613427';
   const encoded = [Buffer.from(marker, 'utf8'), Buffer.from(marker, 'utf16le')];
-  const original = { TMP: process.env.TMP, TEMP: process.env.TEMP, SQLITE_TMPDIR: process.env.SQLITE_TMPDIR };
-  Object.assign(process.env, { TMP: dir.path, TEMP: dir.path, SQLITE_TMPDIR: dir.path });
+  const tempVariables = ['TMP', 'TEMP', 'TMPDIR', 'SQLITE_TMPDIR'];
+  const original = tempVariables.map(name => [name, process.env[name]]);
+  for (const name of tempVariables) process.env[name] = dir.path;
   try {
     for (const mode of ['WAL', 'DELETE', 'TRUNCATE']) {
       const path = join(dir.path, `marker-${mode}.sqlite`);
@@ -184,7 +219,7 @@ test('large transactions keep UTF-8 and UTF-16LE markers out of db, WAL, journal
       for (const bytes of encoded) assert.equal(readFileSync(path).includes(bytes), false);
     }
   } finally {
-    for (const [name, value] of Object.entries(original)) {
+    for (const [name, value] of original) {
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;
     }

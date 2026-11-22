@@ -24,7 +24,9 @@ declare module 'node:crypto' {
   ): ArrayBuffer;
 }
 declare module 'node:fs' {
-  export function lstatSync(path: string): { size: number; isFile(): boolean; isDirectory(): boolean };
+  interface Stats { size: number; isFile(): boolean; isDirectory(): boolean }
+  export function lstatSync(path: string): Stats;
+  export function lstatSync(path: string, options: { throwIfNoEntry: false }): Stats | undefined;
   export function existsSync(path: string): boolean;
   export function mkdirSync(path: string, options: { recursive: true; mode: number }): string | undefined;
   export function readFileSync(path: string): import('node:buffer').Buffer;

@@ -1,5 +1,5 @@
 import { Buffer } from 'node:buffer';
-import { existsSync } from 'node:fs';
+import { lstatSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -39,11 +39,12 @@ export type IndexPolicy =
 export type OpenOptions = IndexPolicy & { key?: Uint8Array; create?: boolean };
 const require = createRequire(import.meta.url);
 const timeout = 5000;
+const pageSize = 4096;
 
 export const SQLCIPHER_PARAMETERS = Object.freeze([
   ['cipher', "'sqlcipher'", 'sqlcipher'],
   ['legacy', 4, 4],
-  ['legacy_page_size', 4096, 4096],
+  ['legacy_page_size', pageSize, pageSize],
   ['kdf_iter', 256000, 256000],
   ['fast_kdf_iter', 2, 2],
   ['hmac_use', 1, 1],
@@ -60,16 +61,22 @@ for (const parameter of SQLCIPHER_PARAMETERS) Object.freeze(parameter);
 
 function openCipher(path: string, key: Uint8Array | undefined, create: boolean): NativeDriver {
   if (key?.byteLength !== 32) throw new IndexError('KEY', 'SQLCipher requires a raw 32-byte index key.');
+  let Database: Addon;
+  try {
+    Database = require('better-sqlite3-multiple-ciphers') as Addon;
+  } catch {
+    throw new IndexError('ADDON', 'SQLCipher adapter could not load for this Node runtime.');
+  }
   let db: NativeDriver;
   try {
-    const Database = require('better-sqlite3-multiple-ciphers') as Addon;
     db = new Database(path, { fileMustExist: !create, timeout });
   } catch (error) {
-    const code = (error as { code?: unknown }).code;
-    if (typeof code === 'string' && code.startsWith('SQLITE_')) {
-      throw new IndexError('FORMAT', 'SQLCipher could not open the index file.');
+    // The package loads its native binding lazily inside the constructor.
+    const code = (error as { code?: unknown })?.code;
+    if (code === 'ERR_DLOPEN_FAILED' || code === 'MODULE_NOT_FOUND') {
+      throw new IndexError('ADDON', 'SQLCipher native addon could not load for this Node runtime.');
     }
-    throw new IndexError('ADDON', 'SQLCipher native addon could not load for this Node runtime.');
+    throw new IndexError('FORMAT', 'SQLCipher could not open the index file.');
   }
 
   try {
@@ -109,13 +116,24 @@ export function assertIndexPolicy(path: string, policy: IndexPolicy): void {
 /** Open the actual index file. File creation must be requested explicitly. */
 export function openSqlDriver(path: string, options: OpenOptions = {}): SqlDriver {
   assertIndexPolicy(path, options);
+  if (options.adapter === 'plain' && options.key !== undefined) {
+    throw new IndexError('CONFIG', 'Plain SQLite does not accept an index key.');
+  }
   const create = options.create === true;
+  if (!create) {
+    let file;
+    try {
+      file = lstatSync(path);
+    } catch {
+      throw new IndexError('FORMAT', 'SQLite could not find the existing index file.');
+    }
+    if (!file.isFile() || file.size === 0 || file.size % pageSize !== 0) {
+      throw new IndexError('FORMAT', 'An existing index must be a regular file containing whole SQLite pages.');
+    }
+  }
   let db: SqlDriver;
   if (options.adapter === 'plain') {
     try {
-      // readOnly would prevent updating existing indexes. The filesystem check
-      // happens before opening; managed generation operations serialize callers.
-      if (!create && !existsSync(path)) throw new IndexError('FORMAT', 'Plain SQLite index file is missing.');
       db = new DatabaseSync(path, { timeout, allowExtension: false });
     } catch {
       throw new IndexError('FORMAT', 'Plain SQLite could not open the index file.');
@@ -124,7 +142,13 @@ export function openSqlDriver(path: string, options: OpenOptions = {}): SqlDrive
     db = openCipher(path, options.key, create);
   }
   try {
-    if (options.adapter === 'plain') db.exec('PRAGMA temp_store = MEMORY; PRAGMA secure_delete = ON;');
+    if (options.adapter === 'plain') {
+      db.exec(`PRAGMA page_size = ${pageSize}; PRAGMA temp_store = MEMORY; PRAGMA secure_delete = ON;`);
+      if (db.prepare('PRAGMA temp_store').get()?.temp_store !== 2 ||
+          db.prepare('PRAGMA secure_delete').get()?.secure_delete !== 1) {
+        throw new IndexError('CONFIG', 'Plain SQLite rejected the required temp_store or secure_delete setting.');
+      }
+    }
     const extensions = db.prepare("SELECT sqlite_compileoption_used('ENABLE_FTS5') AS fts, " +
       "sqlite_compileoption_used('ENABLE_RTREE') AS rtree").get();
     if (extensions?.fts !== 1 || extensions.rtree !== 1) {

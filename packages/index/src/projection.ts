@@ -23,6 +23,7 @@ export interface DeriveItem {
 
 export interface ProjectionOptions {
   version?: number;
+  /** Frames are borrowed until the next read. Copy any bytes needed after advancing. */
   derive?: (item: DeriveItem, frames: Iterable<Uint8Array>) => Iterable<string>;
   /** Test hook called after a rebuild batch is durably committed. */
   checkpoint?: (phase: 'hidden' | 'events' | 'blobs', position: number) => void;
@@ -166,6 +167,22 @@ function projectEvent(db: SqlDriver, { event, seq, keyId }: Event): void {
   }
 }
 
+function* clearingFrames(replay: Replay, location: Blob['location'], status: { complete: boolean; failure?: { error: unknown } }) {
+  try {
+    for (const frame of replay.streamBlob(location)) {
+      try {
+        yield frame;
+      } finally {
+        frame.fill(0);
+      }
+    }
+    status.complete = true;
+  } catch (error) {
+    status.failure = { error };
+    throw error;
+  }
+}
+
 function projectBlob(
   db: SqlDriver, replay: Replay, entry: Blob, tombstoneKey: Uint8Array | undefined,
   derive: ProjectionOptions['derive'],
@@ -177,7 +194,7 @@ function projectBlob(
   `);
   if (tombstoneKey && db.prepare('SELECT 1 FROM items WHERE key_id=? AND blob_id=? LIMIT 1').get(keyId, blobId)) {
     const digest = createHmac('sha256', tombstoneKey);
-    for (const frame of replay.streamBlob(location)) digest.update(frame);
+    for (const frame of clearingFrames(replay, location, { complete: false })) digest.update(frame);
     if (db.prepare("SELECT 1 FROM hidden WHERE scope='tombstone' AND target=?").get(digest.digest('hex'))) {
       db.prepare('DELETE FROM event_origin WHERE event_seq IN (SELECT event_seq FROM items WHERE key_id=? AND blob_id=?)')
         .run(keyId, blobId);
@@ -198,16 +215,21 @@ function projectBlob(
       const itemId = row.item_id as string;
       const eventSeq = row.event_seq as number;
       const mime = row.mime as string | null;
-      const frames = replay.streamBlob(location);
+      const status: { complete: boolean; failure?: { error: unknown } } = { complete: false };
+      const frames = clearingFrames(replay, location, status);
+      // Keep ownership here so a deriver's iterator close cannot abort authentication.
+      const borrowed = { [Symbol.iterator]: () => ({ next: () => frames.next() }) };
       let ord = 0;
       try {
-        const chunks = derive?.({ itemId, eventSeq, mime, source: row.source as string }, frames) ??
-          (mime?.split(';', 1)[0].trim().toLowerCase() === 'text/plain' ? chunkText(frames) : []);
+        const chunks = derive?.({ itemId, eventSeq, mime, source: row.source as string }, borrowed) ??
+          (mime?.split(';', 1)[0].trim().toLowerCase() === 'text/plain' ? chunkText(borrowed) : []);
         for (const chunk of chunks) {
           if (ord >= MAX_CHUNKS) throw new IndexError('PROJECTION', 'Deriver exceeded the chunk limit.');
           const chunkId = BigInt(eventSeq) * BigInt(MAX_CHUNKS) + BigInt(ord);
           insertChunk.run(chunkId, itemId, ord++, chunk);
         }
+        if (status.failure) throw status.failure.error;
+        if (!status.complete) for (const _frame of frames) { /* Authenticate and clear the rest. */ }
       } finally {
         frames.return();
       }

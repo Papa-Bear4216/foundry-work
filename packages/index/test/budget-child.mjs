@@ -5,14 +5,15 @@ import { DatabaseSync } from 'node:sqlite';
 import { openSqlDriver, rebuildIndex, searchIndex, updateIndex } from '../dist/index.js';
 import { appendCorpus, syntheticVault } from './fixture.mjs';
 
-const [phase, root] = process.argv.slice(2);
+const [phase, root, credential] = process.argv.slice(2);
 const directory = join(root, 'index');
 const vaultDirectory = join(root, 'vault');
 const firstCount = 4000;
 const addedCount = 2000;
 const total = firstCount + addedCount;
 const vault = syntheticVault(vaultDirectory, phase === 'seed');
-const options = { directory, vaultDirectory, credential: vault.credential };
+const options = { directory, vaultDirectory,
+  credential: credential === 'passphrase' ? vault.passphraseCredential : vault.credential };
 const start = performance.now();
 let result;
 switch (phase) {
@@ -60,4 +61,5 @@ switch (phase) {
   default:
     throw new Error('Unknown benchmark operation.');
 }
-console.log(JSON.stringify({ phase, ms: Math.round(performance.now() - start), peakRssKiB: process.resourceUsage().maxRSS, ...result }));
+console.log(JSON.stringify({ phase, credential, ms: Math.round(performance.now() - start),
+  peakRssKiB: process.resourceUsage().maxRSS, ...result }));

@@ -1,6 +1,6 @@
 import type { Buffer } from 'node:buffer';
 import { createHash, hkdfSync, randomBytes } from 'node:crypto';
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, unlinkSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { platform } from 'node:process';
 import { DatabaseSync } from 'node:sqlite';
@@ -208,7 +208,8 @@ function published<T>(ctx: Context, input: Capture, id: string, work: (db: SqlDr
   if (entry?.kind !== 'index' || entry.state !== 'active') {
     throw new IndexError('KEY', 'The published index generation key is unavailable. Rebuild the working index.');
   }
-  const db = openSqlDriver(indexPath(ctx, id), { ...ctx.policy, key: input.ring.keys.get(id) });
+  const key = ctx.policy.adapter === 'plain' ? undefined : input.ring.keys.get(id);
+  const db = openSqlDriver(indexPath(ctx, id), { ...ctx.policy, key });
   try {
     assertSchema(db);
     return work(db);
@@ -226,9 +227,10 @@ function rebuildLocked(ctx: Context, input: Capture, hiddenChanged = false): Pro
   let id = state.staged;
   const stagedKey = input.ring.keyring.keys.find(key => key.key_id === id);
   if (id && (state.staged_snapshot !== input.stamp || state.staged_version !== version ||
-      (existsSync(indexPath(ctx, id)) && stagedKey?.state !== 'active'))) {
+      (stagedKey ? stagedKey.state !== 'active' : existsSync(indexPath(ctx, id))))) {
     // If the process stopped before staging a key, no entry exists to retire.
     if (stagedKey) retireIndexKey(ctx.keyring, ctx.vaultId, ctx.options.credential, id);
+    ctx.catalog.exec('UPDATE catalog SET staged=NULL, staged_snapshot=NULL, staged_version=NULL WHERE singleton=1');
     removeGeneration(ctx, id);
     id = null;
   }
@@ -241,7 +243,11 @@ function rebuildLocked(ctx: Context, input: Capture, hiddenChanged = false): Pro
   const key = stageIndexKey(ctx.keyring, ctx.vaultId, ctx.options.credential, id);
   let result: ProjectionResult;
   try {
-    const db = openSqlDriver(path, { ...ctx.policy, key, create: !existsSync(path) });
+    const stagedFile = lstatSync(path, { throwIfNoEntry: false });
+    const empty = stagedFile?.isFile() && stagedFile.size === 0;
+    if (empty) removeGeneration(ctx, id);
+    const db = openSqlDriver(path, { ...ctx.policy, key: ctx.policy.adapter === 'plain' ? undefined : key,
+      create: !stagedFile || empty });
     try {
       initializeSchema(db);
       result = applyRebuild(db, input.replay, ctx.options.projection, input.tombstone);
@@ -272,6 +278,7 @@ function updateLocked(ctx: Context, input: Capture): ProjectionResult {
   }
   if (staged || !active) return rebuildLocked(ctx, input);
 
+  let hiddenChanged = false;
   try {
     return published(ctx, input, active, db => {
       const version = validateVersion(ctx.options.projection ?? {});
@@ -281,8 +288,9 @@ function updateLocked(ctx: Context, input: Capture): ProjectionResult {
         input.checkKeys();
         return { lastEventSeq: last, skipped: input.replay.skipped, hiddenChanged: false };
       }
-      const result = applyIncremental(db, input.replay, ctx.options.projection, input.tombstone, hiddenChanged => {
-        if (hiddenChanged) throw requiresRebuild;
+      const result = applyIncremental(db, input.replay, ctx.options.projection, input.tombstone, changed => {
+        hiddenChanged = changed;
+        if (changed) throw requiresRebuild;
       }, input.checkKeys);
       ctx.catalog.prepare('UPDATE catalog SET snapshot=?, last_seq=?, keyring_floor=? WHERE singleton=1')
         .run(input.stamp, result.lastEventSeq, input.ring.keyring.version);
@@ -290,7 +298,7 @@ function updateLocked(ctx: Context, input: Capture): ProjectionResult {
     });
   } catch (error) {
     if (error !== requiresRebuild) throw error;
-    return rebuildLocked(ctx, input, true);
+    return rebuildLocked(ctx, input, hiddenChanged);
   }
 }
 

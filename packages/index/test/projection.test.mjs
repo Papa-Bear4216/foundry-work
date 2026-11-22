@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempDisposableSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempDisposableSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
-import { openVaultReplay } from '../../vault/codec/dist/index.js';
+import { openVaultReplay, retireIndexKey } from '../../vault/codec/dist/index.js';
 import { applyIncremental, initializeSchema, openSqlDriver, rebuildIndex, search, searchIndex, updateIndex } from '../dist/index.js';
 import { ids, note, syntheticVault, systemEvent, tombstone } from './fixture.mjs';
 
@@ -191,4 +191,126 @@ test('a changed replay boundary discards partial work and an older vault is reje
   assert.equal(vault.unlock().keyring.keys.find(key => key.key_id === stale).state, 'destroyed');
   writeFileSync(vault.keyring, olderRing);
   assert.throws(() => searchIndex(options, 'needle'), { code: 'PROJECTION' });
+});
+
+test('projection authenticates and clears all frames after a deriver stops early', t => {
+  const { vault, temp, cleanup } = fixture(t);
+  const original = 'TEST ONLY frame '.repeat(100_000);
+  vault.write(writer => {
+    note(writer, 'visible', original);
+    writer.appendBatch([systemEvent('redaction.applied', { tombstone: tombstone(vault, 'TEST ONLY other bytes') })]);
+  });
+  const db = openSqlDriver(join(temp.path, 'frame.sqlite'), { key: scratchKey(), create: true });
+  cleanup.push(() => db.close());
+  initializeSchema(db);
+  const input = openVaultReplay(vault.directory, vault.credential);
+  const key = vault.tombstoneKey();
+  const streams = [];
+  const borrowed = [];
+  try {
+    applyIncremental(db, { ...input, *streamBlob(location) {
+      const frames = [];
+      streams.push(frames);
+      for (const frame of input.streamBlob(location)) {
+        assert.ok(frame.some(byte => byte !== 0));
+        frames.push(frame);
+        yield frame;
+      }
+    } }, { derive(_item, frames) {
+      for (const frame of frames) {
+        borrowed.push(frame);
+        break;
+      }
+      return ['TEST ONLY derived frame'];
+    } }, key);
+    assert.deepEqual(streams.map(frames => frames.length), [2, 2]);
+    assert.equal(borrowed[0], streams[1][0]);
+    assert.ok(streams.flat().every(frame => frame.every(byte => byte === 0)));
+    assert.equal(db.prepare('SELECT derived FROM items').get().derived, 1);
+    assert.equal(db.prepare('SELECT count(*) AS n FROM blob_locator').get().n, 1);
+  } finally {
+    key.fill(0);
+    input.close();
+  }
+});
+
+test('a swallowed frame error rolls back the item, its provisional chunks and locator', t => {
+  const { vault, temp, cleanup } = fixture(t);
+  vault.write(writer => note(writer, 'initial', 'TEST ONLY prior state'));
+  const db = openSqlDriver(join(temp.path, 'rollback.sqlite'), { key: scratchKey(), create: true });
+  cleanup.push(() => db.close());
+  initializeSchema(db);
+  const baseline = openVaultReplay(vault.directory, vault.credential);
+  try { applyIncremental(db, baseline); } finally { baseline.close(); }
+  const previous = canonical(db);
+  vault.write(writer => note(writer, 'new', 'TEST ONLY provisional frame'));
+  const input = openVaultReplay(vault.directory, vault.credential);
+  const failure = new Error('TEST ONLY stream failure');
+  const borrowed = [];
+  let swallowed;
+  try {
+    assert.throws(() => applyIncremental(db, { ...input, *streamBlob(location) {
+      yield* input.streamBlob(location);
+      throw failure;
+    } }, { *derive(_item, frames) {
+      try {
+        for (const frame of frames) {
+          borrowed.push(frame);
+          yield 'TEST ONLY provisional chunk';
+        }
+      } catch (error) {
+        swallowed = error;
+      }
+    } }), error => error === failure);
+    assert.equal(swallowed, failure);
+    assert.equal(borrowed.length, 1);
+    assert.ok(borrowed[0].every(byte => byte === 0));
+    assert.deepEqual(canonical(db), previous);
+  } finally {
+    input.close();
+  }
+});
+
+function interruptRebuild(options) {
+  assert.throws(() => rebuildIndex({ ...options, projection: { version: 1,
+    checkpoint() { throw new Error('TEST ONLY interrupted rebuild'); },
+  } }), /TEST ONLY interrupted rebuild/);
+  return catalog(options).staged;
+}
+
+test('an interrupted create resumes from a zero-byte staged generation', t => {
+  const { vault, options } = fixture(t);
+  vault.write(writer => note(writer, 'initial', 'TEST ONLY staged quartz'));
+  const staged = interruptRebuild(options);
+  writeFileSync(generation(options, staged), '');
+  assert.equal(updateIndex(options).lastEventSeq, 1);
+  assert.equal(catalog(options).active, staged);
+  assert.equal(searchIndex(options, 'quartz').length, 1);
+});
+
+test('update at the original deriver version recovers after interrupted stage abandonment', t => {
+  const { vault, options } = fixture(t);
+  vault.write(writer => note(writer, 'initial', 'TEST ONLY abandoned quartz'));
+  updateIndex(options);
+  const staged = interruptRebuild(options);
+  // Emulate an old v2 rebuild killed after retiring the v1 key and deleting its file.
+  retireIndexKey(vault.keyring, vault.vaultId, vault.credential, staged);
+  unlinkSync(generation(options, staged));
+  assert.equal(catalog(options).staged_version, 1);
+  assert.equal(catalog(options).staged, staged);
+  assert.equal(updateIndex(options).lastEventSeq, 1);
+  assert.equal(catalog(options).staged, null);
+  assert.notEqual(catalog(options).active, staged);
+  assert.equal(searchIndex(options, 'quartz').length, 1);
+});
+
+test('a deriver-version rebuild reports hiddenChanged false', t => {
+  const { vault, options } = fixture(t);
+  vault.write(writer => note(writer, 'initial', 'TEST ONLY version change'));
+  updateIndex(options);
+  const first = catalog(options).active;
+  const next = { ...options, projection: { version: 2, derive: () => ['TEST ONLY revised amber'] } };
+  assert.equal(updateIndex(next).hiddenChanged, false);
+  assert.notEqual(catalog(options).active, first);
+  assert.equal(searchIndex(next, 'amber').length, 1);
 });
