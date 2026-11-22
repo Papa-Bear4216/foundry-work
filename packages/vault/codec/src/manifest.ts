@@ -18,6 +18,7 @@ export function decodeVaultMetadata(raw: Buffer) {
   const { vault_id, created_at, signing_public_key } = data;
   hex(vault_id, 16);
   timestamp(created_at);
+  check(typeof signing_public_key === 'string');
   base64(signing_public_key, 32);
   return { format: 'foundry-vault/1' as const, vault_id, created_at, signing_public_key };
 }
@@ -110,25 +111,36 @@ export interface ChainPosition {
   lastEventSequence: number;
 }
 
+export function checkManifestLink(manifest: Manifest, vaultId: string, previous?: ChainPosition): void {
+  const lastEvent = previous?.lastEventSequence ?? 0;
+  check(manifest.vault_id === vaultId && manifest.segment === (previous?.segment ?? 0) + 1
+    && manifest.prev_manifest_sha256 === (previous?.hash ?? GENESIS_HASH)
+    && (manifest.first_event_seq === null || manifest.first_event_seq === lastEvent + 1), 'CHAIN');
+}
+
+export function streamOrdinal(name: string): number {
+  return Number(name.slice(name.indexOf('-') + 1, -4));
+}
+
+export function checkManifestRecords(manifest: Manifest, keyIds: Set<string>, first: number | null, last: number): void {
+  check(manifest.first_event_seq === first && (first === null || manifest.last_event_seq === last), 'SEQUENCE');
+  check(manifest.key_ids.join() === [...keyIds].sort().join(), 'KEY');
+}
+
 export function verifySegment(
   bytes: Buffer, signature: Buffer, publicKey: Buffer, vaultId: string,
   files: ReadonlyMap<string, Buffer>, previous?: ChainPosition,
 ) {
   const manifest = decodeManifest(bytes, signature, publicKey);
   const lastEvent = previous?.lastEventSequence ?? 0;
-  check(manifest.vault_id === vaultId && manifest.segment === (previous?.segment ?? 0) + 1
-    && manifest.prev_manifest_sha256 === (previous?.hash ?? GENESIS_HASH)
-    && (manifest.first_event_seq === null || manifest.first_event_seq === lastEvent + 1), 'CHAIN');
+  checkManifestLink(manifest, vaultId, previous);
   check(files.size === manifest.files.length, 'FILE');
 
   let eventSequence = lastEvent;
+  let first: number | null = null;
   const keyIds = new Set<string>();
   // Event stream filenames are traversed by numeric ordinal, including ordinals above 9999.
-  const ordered = [...manifest.files].sort((a, b) => {
-    const aNumber = Number(a.name.slice(a.name.indexOf('-') + 1, -4));
-    const bNumber = Number(b.name.slice(b.name.indexOf('-') + 1, -4));
-    return aNumber - bNumber;
-  });
+  const ordered = [...manifest.files].sort((a, b) => streamOrdinal(a.name) - streamOrdinal(b.name));
   for (const file of ordered) {
     const stream = files.get(file.name);
     check(stream && stream.length === file.bytes && sha256(stream) === file.sha256, 'FILE');
@@ -136,11 +148,13 @@ export function verifySegment(
     for (const record of scanRecords(stream)) {
       check(record.type === type, 'SCHEMA');
       keyIds.add(record.keyId);
-      if (record.type === 1) check(record.context === BigInt(++eventSequence), 'SEQUENCE');
+      if (record.type === 1) {
+        check(record.context === BigInt(++eventSequence), 'SEQUENCE');
+        first ??= eventSequence;
+      }
     }
   }
-  check(eventSequence === (manifest.last_event_seq ?? lastEvent), 'SEQUENCE');
-  check(manifest.key_ids.join() === [...keyIds].sort().join(), 'KEY');
+  checkManifestRecords(manifest, keyIds, first, eventSequence);
   const position: ChainPosition = {
     segment: manifest.segment, hash: sha256(bytes), lastEventSequence: eventSequence,
   };

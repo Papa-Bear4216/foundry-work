@@ -12,6 +12,7 @@ declare module 'node:buffer' {
 
   export const Buffer: {
     alloc(size: number): Buffer;
+    allocUnsafe(size: number): Buffer;
     from(value: string, encoding?: 'utf8' | 'hex' | 'base64'): Buffer;
     from(value: ArrayBuffer | Uint8Array | readonly number[]): Buffer;
     concat(values: readonly Uint8Array[]): Buffer;
@@ -60,4 +61,55 @@ declare module 'node:crypto' {
   export function createPublicKey(options: { key: Uint8Array; format: 'der'; type: 'spki' } | KeyObject): KeyObject;
   export function sign(algorithm: null, data: Uint8Array, key: KeyObject): Buffer;
   export function verify(algorithm: null, data: Uint8Array, key: KeyObject, signature: Uint8Array): boolean;
+}
+
+declare module 'node:fs' {
+  import type { Buffer } from 'node:buffer';
+
+  export function readFileSync(pathOrFd: string | number): Buffer;
+  interface Stats {
+    size: number;
+    mode: number;
+    isFile(): boolean;
+    isDirectory(): boolean;
+  }
+  interface Dirent {
+    name: string;
+    isFile(): boolean;
+    isDirectory(): boolean;
+  }
+  export function lstatSync(path: string): Stats;
+  export function fstatSync(fd: number): Stats;
+  export function readSync(fd: number, buffer: Buffer, offset: number, length: number, position: number | null): number;
+  export function readdirSync(path: string, options: { withFileTypes: true }): Dirent[];
+  export function openSync(path: string, flags: 'r' | 'r+'): number;
+  export function openSync(path: string, flags: 'wx', mode: number): number;
+  export function writeSync(fd: number, data: Uint8Array, offset: number, length: number, position: number): number;
+  export function writeFileSync(fd: number, data: Uint8Array): void;
+  export function ftruncateSync(fd: number, size: number): void;
+  export function mkdirSync(path: string, options?: { recursive?: boolean; mode?: number }): string | undefined;
+  export function chmodSync(path: string, mode: number): void;
+  export function fsyncSync(fd: number): void;
+  export function closeSync(fd: number): void;
+  export function renameSync(source: string, target: string): void;
+  export function unlinkSync(path: string): void;
+}
+
+declare module 'node:path' {
+  export function basename(path: string): string;
+  export function dirname(path: string): string;
+  export function join(...paths: string[]): string;
+  export function resolve(...paths: string[]): string;
+}
+
+declare module 'node:sqlite' {
+  export class DatabaseSync {
+    constructor(path: string, options: { timeout: number });
+    exec(sql: string): void;
+    close(): void;
+  }
+}
+
+declare module 'node:process' {
+  export const platform: string;
 }

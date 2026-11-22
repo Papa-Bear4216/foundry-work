@@ -47,11 +47,16 @@ interface KeyringInput {
   parallelism?: Kdf['p'];
 }
 export type Unlock = { passphrase: string } | { recoveryKey: Buffer };
+export type KdfParallelism = Kdf['p'];
+
+export function validateParallelism(value: unknown): asserts value is KdfParallelism {
+  check(value === 1 || value === 2, 'KDF');
+}
 
 function validateKdf(value: unknown): asserts value is Kdf {
   object(value, 'name N r p salt');
-  check(value.name === 'scrypt' && value.N === 131072 && value.r === 8
-    && (value.p === 1 || value.p === 2), 'KDF');
+  check(value.name === 'scrypt' && value.N === 131072 && value.r === 8, 'KDF');
+  validateParallelism(value.p);
   base64(value.salt, 32);
 }
 
@@ -101,12 +106,17 @@ function validateKeyring(value: unknown): asserts value is Keyring {
 }
 
 function passphraseKey(passphrase: string, kdf: Kdf): Buffer {
-  check(passphrase.isWellFormed(), 'KEY');
+  check(typeof passphrase === 'string' && passphrase.isWellFormed(), 'KEY');
   const { N, r, p, salt } = kdf;
-  return scryptSync(Buffer.from(passphrase), base64(salt, 32), 32, { N, r, p, maxmem: MAX_MEMORY });
+  const secret = Buffer.from(passphrase);
+  try {
+    return scryptSync(secret, base64(salt, 32), 32, { N, r, p, maxmem: MAX_MEMORY });
+  } finally {
+    secret.fill(0);
+  }
 }
 
-function vaultKey(key: Buffer, vaultId: string, label: string): Buffer {
+export function vaultKey(key: Buffer, vaultId: string, label: string): Buffer {
   return derive(key, label, Buffer.from(vaultId, 'hex'));
 }
 
@@ -135,8 +145,106 @@ function unwrap(key: Buffer, data: Buffer, wrapped: string): Buffer {
 }
 
 function mac(body: Omit<Keyring, 'mac'>, master: Buffer): Buffer {
-  return createHmac('sha256', vaultKey(master, body.vault_id, 'keyring-mac'))
-    .update(Buffer.from(canonical(body as unknown as Json))).digest();
+  const key = vaultKey(master, body.vault_id, 'keyring-mac');
+  try {
+    return createHmac('sha256', key).update(Buffer.from(canonical(body as unknown as Json))).digest();
+  } finally {
+    key.fill(0);
+  }
+}
+
+function encodeBody(body: Omit<Keyring, 'mac'>, masterKey: Buffer): Buffer {
+  const data = { ...body, mac: mac(body, masterKey).toString('base64') };
+  validateKeyring(data);
+  return Buffer.from(canonical(data as unknown as Json));
+}
+
+function newKdf(p: KdfParallelism, entropy: typeof randomBytes): Kdf {
+  const kdf: Kdf = { name: 'scrypt', N: 131072, r: 8, p, salt: entropy(32).toString('base64') };
+  validateKdf(kdf);
+  return kdf;
+}
+
+function passphraseWrap(
+  passphrase: string, kdf: Kdf, vaultId: string, masterKey: Buffer, entropy: typeof randomBytes,
+): string {
+  const key = passphraseKey(passphrase, kdf);
+  try {
+    return wrap(key, entropy(12), aad(vaultId, 'master', 'master', 'passphrase', kdf), masterKey);
+  } finally {
+    key.fill(0);
+  }
+}
+
+export function replacementParallelism(
+  current: KdfParallelism, requested = current,
+): KdfParallelism {
+  check(requested >= current, 'KDF');
+  return requested;
+}
+
+export function nextKeyringVersion(version: number): number {
+  integer(version + 1, 2);
+  return version + 1;
+}
+
+export function updateIndexEntry(
+  bytes: Buffer, vaultId: string, credential: Unlock, keyId: string, operation: 'stage' | 'retire',
+): { next?: Buffer; key?: Buffer } {
+  hex(keyId, 16);
+  const ring = readKeyring(bytes, vaultId);
+  const { mac: _mac, ...body } = ring;
+  const master = unlockMaster(ring, credential);
+  try {
+    const existing = body.keys.find(entry => entry.key_id === keyId);
+    const slot = aad(vaultId, keyId, 'index', 'master');
+    if (operation === 'stage' && existing) {
+      check(existing.kind === 'index' && existing.state === 'active', 'KEY');
+      return { key: unwrap(master, slot, existing.wrapped) };
+    }
+    const date = new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z');
+    if (operation === 'retire') {
+      check(existing?.kind === 'index', 'KEY');
+      if (existing.state === 'destroyed') return {};
+      const retired: Entry = { key_id: keyId, kind: 'index', parent: 'master', state: 'destroyed',
+        destroyed_at: date, wrapped: null };
+      const keys = body.keys.map(entry => entry === existing ? retired : entry);
+      return { next: encodeBody({ ...body, version: nextKeyringVersion(body.version), keys }, master) };
+    }
+    const key = randomBytes(32);
+    try {
+      const staged: Entry = { key_id: keyId, kind: 'index', parent: 'master', state: 'active',
+        created_at: date, wrapped: wrap(master, randomBytes(12), slot, key) };
+      const keys = [...body.keys, staged].sort((a, b) => a.key_id < b.key_id ? -1 : 1);
+      return { next: encodeBody({ ...body, version: nextKeyringVersion(body.version), keys }, master), key };
+    } catch (error) {
+      key.fill(0);
+      throw error;
+    }
+  } finally {
+    master.fill(0);
+  }
+}
+
+export function changeKeyringPassphrase(
+  bytes: Buffer, vaultId: string, current: string, replacement: string, parallelism?: KdfParallelism,
+): Buffer {
+  if (parallelism !== undefined) validateParallelism(parallelism);
+  const keyring = readKeyring(bytes, vaultId);
+  const version = nextKeyringVersion(keyring.version);
+  const kdf = newKdf(replacementParallelism(keyring.kdf.p, parallelism), randomBytes);
+  const masterKey = unlockMaster(keyring, { passphrase: current });
+  try {
+    return encodeBody({
+      format: FORMAT, vault_id: vaultId, version, kdf, keys: keyring.keys,
+      master: {
+        by_passphrase: passphraseWrap(replacement, kdf, vaultId, masterKey, randomBytes),
+        by_recovery: keyring.master.by_recovery,
+      },
+    }, masterKey);
+  } finally {
+    masterKey.fill(0);
+  }
 }
 
 /** The optional entropy source is for synthetic vectors and must never be reused in production. */
@@ -146,14 +254,17 @@ export function encodeKeyring(
   const { vaultId, version, masterKey, entries, parallelism = 1 } = input;
   hex(vaultId, 16);
   check(masterKey.length === 32, 'KEY');
-  const kdf: Kdf = { name: 'scrypt', N: 131072, r: 8, p: parallelism, salt: entropy(32).toString('base64') };
-  validateKdf(kdf);
-  const passKey = passphraseKey(passphrase, kdf);
+  const kdf = newKdf(parallelism, entropy);
   const recovery = vaultKey(recoveryKey, vaultId, 'recovery-wrap');
-  const master = {
-    by_passphrase: wrap(passKey, entropy(12), aad(vaultId, 'master', 'master', 'passphrase', kdf), masterKey),
-    by_recovery: wrap(recovery, entropy(12), aad(vaultId, 'master', 'master', 'recovery'), masterKey),
-  };
+  let master: Keyring['master'];
+  try {
+    master = {
+      by_passphrase: passphraseWrap(passphrase, kdf, vaultId, masterKey, entropy),
+      by_recovery: wrap(recovery, entropy(12), aad(vaultId, 'master', 'master', 'recovery'), masterKey),
+    };
+  } finally {
+    recovery.fill(0);
+  }
   const keysById = new Map(entries.flatMap(entry => entry.state === 'active' ? [[entry.key_id, entry.key]] : []));
   const keys: Entry[] = [...entries].sort((a, b) => a.key_id < b.key_id ? -1 : Number(a.key_id > b.key_id))
     .map(({ key_id, kind, parent, ...entry }) => {
@@ -165,57 +276,100 @@ export function encodeKeyring(
       const serialized: Entry = { ...identity, state: entry.state, created_at: entry.created_at, wrapped };
       if (kind === 'profile') {
         check(entry.label && entry.label.isWellFormed());
-        serialized.label_enc = wrap(vaultKey(masterKey, vaultId, 'profile-label'), entropy(12),
-          aad(vaultId, key_id, 'profile-label', parent), Buffer.from(entry.label));
+        const key = vaultKey(masterKey, vaultId, 'profile-label');
+        let label: Buffer | undefined;
+        try {
+          label = Buffer.from(entry.label);
+          serialized.label_enc = wrap(key, entropy(12), aad(vaultId, key_id, 'profile-label', parent), label);
+        } finally {
+          key.fill(0);
+          label?.fill(0);
+        }
       } else {
         check(entry.label === undefined);
       }
       return serialized;
     });
-  const body = { format: FORMAT, vault_id: vaultId, version, kdf, master, keys } as const;
-  const data = { ...body, mac: mac(body, masterKey).toString('base64') };
-  validateKeyring(data);
-  return Buffer.from(canonical(data as unknown as Json));
+  return encodeBody({ format: FORMAT, vault_id: vaultId, version, kdf, master, keys }, masterKey);
+}
+
+export function readKeyring(bytes: Buffer, expectedVaultId: string): Keyring {
+  const keyring: unknown = parseCanonical(bytes);
+  validateKeyring(keyring);
+  check(keyring.vault_id === expectedVaultId, 'KEY');
+  return keyring;
+}
+
+function unlockMaster(keyring: Keyring, credential: Unlock): Buffer {
+  const { mac: storedMac, ...body } = keyring;
+  const { vault_id: vaultId, kdf, master } = body;
+  const passphrase = 'passphrase' in credential;
+  check(passphrase !== ('recoveryKey' in credential), 'KEY');
+  const slot = passphrase ? 'passphrase' : 'recovery';
+  const wrappingKey = passphrase ? passphraseKey(credential.passphrase, kdf)
+    : vaultKey(credential.recoveryKey, vaultId, 'recovery-wrap');
+  let masterKey: Buffer;
+  try {
+    masterKey = unwrap(wrappingKey, aad(vaultId, 'master', 'master', slot, passphrase ? kdf : undefined),
+      passphrase ? master.by_passphrase : master.by_recovery);
+  } finally {
+    wrappingKey.fill(0);
+  }
+  try {
+    check(timingSafeEqual(base64(storedMac, 32), mac(body, masterKey)), 'MAC');
+    return masterKey;
+  } catch (error) {
+    masterKey.fill(0);
+    throw error;
+  }
 }
 
 export function decodeKeyring(bytes: Buffer, credential: Unlock, expectedVaultId: string) {
-  const keyring: unknown = parseCanonical(bytes);
-  validateKeyring(keyring);
-  const { mac: storedMac, ...body } = keyring;
-  const { vault_id: vaultId, kdf, master, keys } = body;
-  check(vaultId === expectedVaultId, 'KEY');
-  const masterKey = 'passphrase' in credential
-    ? unwrap(passphraseKey(credential.passphrase, kdf),
-      aad(vaultId, 'master', 'master', 'passphrase', kdf), master.by_passphrase)
-    : unwrap(vaultKey(credential.recoveryKey, vaultId, 'recovery-wrap'),
-      aad(vaultId, 'master', 'master', 'recovery'), master.by_recovery);
-  check(timingSafeEqual(base64(storedMac, 32), mac(body, masterKey)), 'MAC');
+  return unlockKeyring(readKeyring(bytes, expectedVaultId), credential);
+}
 
+export function unlockKeyring(keyring: Keyring, credential: Unlock) {
+  const { vault_id: vaultId, keys } = keyring;
+  const masterKey = unlockMaster(keyring, credential);
   const unwrapped = new Map<string, Buffer>();
   const labels = new Map<string, string>();
   const erased = new Map<string, string>();
-  for (const entry of [...keys.filter(key => key.kind !== 'collection'), ...keys.filter(key => key.kind === 'collection')]) {
-    const { key_id, kind, parent } = entry;
-    if (entry.state === 'destroyed') {
-      erased.set(key_id, entry.destroyed_at);
-      continue;
+  try {
+    for (const entry of [...keys.filter(key => key.kind !== 'collection'), ...keys.filter(key => key.kind === 'collection')]) {
+      const { key_id, kind, parent } = entry;
+      if (entry.state === 'destroyed') {
+        erased.set(key_id, entry.destroyed_at);
+        continue;
+      }
+      const wrappingKey = parent === 'master' ? masterKey : unwrapped.get(parent);
+      check(wrappingKey, 'KEY');
+      unwrapped.set(key_id, unwrap(wrappingKey, aad(vaultId, key_id, kind, parent), entry.wrapped));
+      if (kind === 'profile') {
+        const key = vaultKey(masterKey, vaultId, 'profile-label');
+        let label: Buffer | undefined;
+        try {
+          label = unwrap(key, aad(vaultId, key_id, 'profile-label', parent), entry.label_enc!);
+          check(isUtf8(label));
+          labels.set(key_id, label.toString());
+        } finally {
+          key.fill(0);
+          label?.fill(0);
+        }
+      }
     }
-    const wrappingKey = parent === 'master' ? masterKey : unwrapped.get(parent);
-    check(wrappingKey, 'KEY');
-    unwrapped.set(key_id, unwrap(wrappingKey, aad(vaultId, key_id, kind, parent), entry.wrapped));
-    if (kind === 'profile') {
-      const label = unwrap(vaultKey(masterKey, vaultId, 'profile-label'),
-        aad(vaultId, key_id, 'profile-label', parent), entry.label_enc!);
-      check(isUtf8(label));
-      labels.set(key_id, label.toString());
-    }
+  } catch (error) {
+    masterKey.fill(0);
+    for (const key of unwrapped.values()) key.fill(0);
+    throw error;
   }
   return {
     keyring, masterKey, keys: unwrapped, labels, erased,
     collectionEncryptionKey(keyId: string): Buffer {
-      check(!erased.has(keyId), 'ERASED');
+      const entry = keys.find(entry => entry.key_id === keyId && entry.kind === 'collection');
+      check(entry, 'KEY');
+      check(entry.state === 'active', 'ERASED');
       const key = unwrapped.get(keyId);
-      check(key && keys.some(entry => entry.key_id === keyId && entry.kind === 'collection'), 'KEY');
+      check(key, 'KEY');
       return vaultKey(key, vaultId, 'collection-encryption');
     },
   };

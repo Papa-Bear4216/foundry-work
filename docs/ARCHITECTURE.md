@@ -90,6 +90,9 @@ A parser improvement never touches the vault: bump the deriver version and re-de
 - Use the exact literal names shown above. Record stream names use lowercase ASCII.
   Segment directories use the decimal segment number, zero-padded to six digits for
   1 through 999,999 and written without leading zeros from 1,000,000 onward.
+- Root verification also allows the writer lock file `.writer.lock.sqlite` and its
+  SQLite `-journal`, `-wal`, and `-shm` side files. It accepts `HEAD.json.pending`
+  only for the interrupted head replacement described in section 4.6.
 - A record stream file rolls over at 64 MiB. A blob never spans two files; a blob larger
   than 64 MiB gets a file to itself. (**Decided:** segment soft cap 512 MiB.)
 - The cap is soft. A blob larger than the cap gets a segment to itself, and that segment is
@@ -252,12 +255,31 @@ and minutes and seconds 00 through 59.
 ### 4.6 Closing and crash safety
 
 - Appends go to `open/`. Each record is written with a single write call and fsynced at
-  the end of an import batch.
-- On start, a writer scans the tail of `open/`. A final record shorter than its
-  `total_len` is truncated away and reported.
-- Close: fsync files, write `MANIFEST.json` to a temp name, fsync, rename `open/` to
-  `segments/<n>/`, update `HEAD.json`. Closed segments are set read-only as a courtesy;
-  this is not a security control.
+  the end of an import batch. A short write fails the batch. A batch that crosses a
+  segment boundary syncs and seals its completed segment before continuing.
+- The writer holds the vault directory's SQLite writer lock until it releases the
+  session or exits. The lock database carries no vault content.
+- On start, a writer scans `open/`. A final record shorter than its header or
+  declared length is truncated away and reported. Both stream types can have a
+  short tail, each in its highest-ordinal file. A complete record with invalid
+  framing or a failed authentication check fails recovery.
+- Close: fsync files, write and sync the manifest and signature under temporary names,
+  rename them into place in `open/`, and prepare and sync a temporary head. Rename
+  `open/` to `segments/<n>/` before replacing `HEAD.json`. Sync affected directories
+  on POSIX. Closed files are set read-only as a courtesy.
+- The convenience head contains `segment` and `manifest_sha256` in canonical JSON,
+  with segment zero and the genesis hash before the first seal. On startup a writer
+  replaces a head that matches the verified predecessor only when the pending head
+  matches the verified last segment and `open/` is absent. Verification accepts that
+  interrupted state using the verified last segment as the head. If the segment
+  rename never happened, the writer discards the pending close files and preserves
+  the open records.
+- Public verification checks framing and sequence in `open/`, whose records have
+  no signed inventory until close. Deep verification authenticates active-key
+  records. For a collection key marked destroyed in a MAC-verified keyring, deep
+  verification, recovery and sealing check framing and sequence and hash the
+  record without decrypting it. If all integrity and authentication checks pass,
+  deep verification reports `ERASED` with the number of such records.
 - A segment closes when it reaches the soft cap, when a vault session starts, or on demand.
 
 ### 4.7 Reading the vault without Foundry
@@ -324,17 +346,24 @@ recovery key valid. Either change uses a fresh salt, re-wraps MK under the new
 passphrase-derived key, keeps `master.by_recovery` byte-identical, and recomputes the
 keyring MAC. The rewrite can use the current passphrase to unlock MK and needs no recovery key.
 
-- The text form carries a version character and a checksum, so a typing mistake is
-  reported as a mistake and not as a wrong key.
+- The printed text starts with the version character `1`. Encode the 32 recovery
+  bytes as 52 uppercase, unpadded RFC 4648 base32 characters. Append the first four
+  base32 characters of SHA-256 over the ASCII version character followed by those 52
+  characters. Print the resulting 56 characters in groups of four, with a hyphen
+  before each group. Check the text and checksum before attempting to unwrap MK.
 - The wizard warns before printing: "print to PDF" saves the key as a file, and network
   or cloud printers keep copies of what they print. Writing it down by hand is offered first.
 - The recovery key is useless without a keyring file. The restore drill proves the pair
   works using only what is on the second copy.
 - Changing the passphrase does not revoke an old one. Anyone who copied an earlier keyring
   and knows the earlier passphrase can still unwrap the keys that keyring held. After a
-  suspected passphrase leak the remedy is `foundry vault rekey --all`, not a passphrase change.
+  suspected passphrase leak, use `foundry vault rekey --all` with a fresh passphrase.
 - `foundry vault rekey --all` rotates MK and the profile, collection and index keys
-  for confidentiality. It preserves the vault signing key and printed anchor. If
+  for future writes. It issues a new recovery key, which is shown once. The new
+  keyring keeps historical collection keys wrapped under the new hierarchy so it
+  can read existing records by their original IDs. New writes use fresh collection
+  IDs, and the index must be rebuilt under the new index key. Sealed segments stay
+  byte-identical. It preserves the vault signing key and printed anchor. If
   the signing key may be compromised, create a new vault and import the old vault's
   contents. The new vault has its own vault ID, signing key and printed anchor.
 
@@ -362,6 +391,11 @@ must be kept in step across copies.
 - Use the canonical JSON and field encodings in section 4.5. The positive `version`
   starts at 1. Each rewrite increments it and uses a temp file, fsync and rename.
   `vault_id` must match the vault being opened.
+- A sibling SQLite database holds a writer lock that the OS releases when a process
+  exits. Under the lock, writers remove abandoned temp files for that keyring and
+  compare the published keyring to the authenticated input. They sync a uniquely
+  named temp file before renaming it over the keyring. POSIX writers also sync the
+  parent directory. Windows writers retry transient rename failures.
 - `keys` is sorted by ascending ASCII `key_id`. IDs are unique 16-byte identifiers.
   The kinds are `profile`, `collection`, `index` and `signing`. Profile, index and
   signing entries have parent `master`. A collection's parent is a profile entry ID,
@@ -491,6 +525,12 @@ tombstone key is derived from MK. The importer checks new items against the tomb
 re-importing the same archive does not restore a redacted item. The trade: the vault's
 owner can later confirm that a given file was once redacted. Erasing a whole profile
 records no per-item tombstones.
+
+The V-2 library rotates keys at the keyring boundary. Before enabling vault-wide
+rekey on a populated vault, the command must carry forward the ability to match
+existing tombstones across the MK change and recover the switch to the new write
+IDs and index generation. A later collection erasure must cover each historical
+ID for that collection as well as its current ID.
 
 **Items about more than one person.** A photo or a conversation is stored once, in the
 collection of the profile that imported it. A per-profile key cannot erase it for one

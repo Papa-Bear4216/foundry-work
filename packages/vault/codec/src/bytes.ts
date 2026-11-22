@@ -2,13 +2,14 @@ import { Buffer, isUtf8 } from 'node:buffer';
 import { createCipheriv, createDecipheriv, createHash, hkdfSync } from 'node:crypto';
 
 export type ErrorCode = 'VERSION' | 'SCHEMA' | 'CANONICAL' | 'LENGTH' | 'AUTH' | 'SIGNATURE'
-  | 'CHAIN' | 'FILE' | 'SEQUENCE' | 'KEY' | 'ERASED' | 'KDF' | 'MAC';
+  | 'CHAIN' | 'FILE' | 'SEQUENCE' | 'KEY' | 'ERASED' | 'KDF' | 'MAC'
+  | 'INVENTORY' | 'FILE_SIZE' | 'FILE_HASH' | 'HEAD' | 'ANCHOR';
 
 export class VaultFormatError extends Error {
   readonly code: ErrorCode;
 
-  constructor(code: ErrorCode) {
-    super(code);
+  constructor(code: ErrorCode, detail?: string) {
+    super(detail === undefined ? code : code + ': ' + detail);
     this.code = code;
     this.name = 'VaultFormatError';
   }
@@ -77,19 +78,49 @@ export function derive(key: Buffer, label: string, salt = Buffer.alloc(0)): Buff
   return Buffer.from(hkdfSync('sha256', key, salt, Buffer.from('foundry/' + label + '/v1'), 32));
 }
 
-export function seal(key: Buffer, nonce: Buffer, aad: Buffer, plaintext: Buffer): Buffer {
+function sealParts(key: Buffer, nonce: Buffer, aad: Buffer, plaintext: Buffer): Buffer[] {
   const cipher = createCipheriv('aes-256-gcm', key, nonce, { authTagLength: 16 });
   cipher.setAAD(aad);
-  return Buffer.concat([cipher.update(plaintext), cipher.final(), cipher.getAuthTag()]);
+  return [cipher.update(plaintext), cipher.final(), cipher.getAuthTag()];
+}
+
+export function seal(key: Buffer, nonce: Buffer, aad: Buffer, plaintext: Buffer): Buffer {
+  return Buffer.concat(sealParts(key, nonce, aad, plaintext));
+}
+
+export function sealInto(key: Buffer, nonce: Buffer, aad: Buffer, plaintext: Buffer, target: Buffer, offset: number): void {
+  for (const part of sealParts(key, nonce, aad, plaintext)) {
+    target.set(part, offset);
+    offset += part.length;
+    // Release each dedicated ciphertext allocation once it is in the record's write buffer.
+    if (part.length >= 64 * 1024 && part.byteOffset === 0 && part.length === part.buffer.byteLength) {
+      part.buffer.transfer(0);
+    }
+  }
+}
+
+/** Wipe an owned plaintext buffer and immediately release dedicated frame-sized allocations. */
+export function clearPlaintext(buffer: Buffer): void {
+  buffer.fill(0);
+  if (buffer.length >= 64 * 1024 && buffer.byteOffset === 0 && buffer.length === buffer.buffer.byteLength) {
+    buffer.buffer.transfer(0);
+  }
 }
 
 export function open(key: Buffer, nonce: Buffer, aad: Buffer, sealed: Buffer): Buffer {
   const decipher = createDecipheriv('aes-256-gcm', key, nonce, { authTagLength: 16 });
   decipher.setAAD(aad);
   decipher.setAuthTag(sealed.subarray(-16));
+  let plaintext: Buffer | undefined;
+  let tail: Buffer | undefined;
   try {
-    return Buffer.concat([decipher.update(sealed.subarray(0, -16)), decipher.final()]);
+    plaintext = decipher.update(sealed.subarray(0, -16));
+    tail = decipher.final();
+    return Buffer.concat([plaintext, tail]);
   } catch {
     throw new VaultFormatError('AUTH');
+  } finally {
+    if (plaintext) clearPlaintext(plaintext);
+    if (tail) clearPlaintext(tail);
   }
 }
