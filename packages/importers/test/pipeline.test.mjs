@@ -1043,7 +1043,24 @@ test('rejects concurrent importArchive calls sharing one writer with typed BUSY 
     assert.equal(rejected[0].reason.code, 'BUSY');
     assert.equal(fulfilled[0].value.totalItemsImported, 8);
 
-    // After the first call completes, the writer guard must be released so sequential re-import works and adds nothing.
+    // A failing import must also release the writer guard.
+    await assert.rejects(
+      () =>
+        importArchive({
+          archive: archiveB,
+          writer,
+          importers: DEFAULT_IMPORTERS,
+          resolveCollectionKeyId: () => {
+            throw new Error('INJECTED_KEY_LOOKUP_ERROR');
+          },
+          vaultDir,
+          unlocked,
+          readVaultRecord,
+        }),
+      /INJECTED_KEY_LOOKUP_ERROR/,
+    );
+
+    // After the first call completes (or fails), the writer guard must be released so sequential re-import works and adds nothing.
     const sequential = await importArchive({
       archive: archiveB,
       writer,

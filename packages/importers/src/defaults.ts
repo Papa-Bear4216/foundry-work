@@ -71,7 +71,7 @@ function parseTimezoneOffsetMinutes(tz: string | undefined): number | undefined 
   const trimmed = tz.trim();
   if (!trimmed) return 0;
   const lower = trimmed.toLowerCase();
-  if (lower in TZ_OFFSET_MINUTES) return TZ_OFFSET_MINUTES[lower]!;
+  if (Object.hasOwn(TZ_OFFSET_MINUTES, lower)) return TZ_OFFSET_MINUTES[lower]!;
   const m = /^([+-])(\d{2}):?(\d{2})$/.exec(trimmed);
   if (!m) return undefined;
   const sign = m[1] === '-' ? -1 : 1;
@@ -210,7 +210,8 @@ export function normalizeTimestamp(raw: string | undefined): string | undefined 
     );
   if (rfc5322) {
     const [, d, mon, y, hh, mm, ss, tz] = rfc5322;
-    const monthIdx = MONTH_INDEX[mon!.toLowerCase()];
+    const monKey = mon!.toLowerCase();
+    const monthIdx = Object.hasOwn(MONTH_INDEX, monKey) ? MONTH_INDEX[monKey] : undefined;
     const offset = parseTimezoneOffsetMinutes(tz);
     if (monthIdx !== undefined && offset !== undefined) {
       return buildValidatedUtcTimestamp(
@@ -234,7 +235,8 @@ export function normalizeTimestamp(raw: string | undefined): string | undefined 
   if (asctime) {
     const [, mon, d, hh, mm, ss, tzBefore, y, tzAfter] = asctime;
     if (tzBefore && tzAfter) return undefined;
-    const monthIdx = MONTH_INDEX[mon!.toLowerCase()];
+    const monKey = mon!.toLowerCase();
+    const monthIdx = Object.hasOwn(MONTH_INDEX, monKey) ? MONTH_INDEX[monKey] : undefined;
     const offset = parseTimezoneOffsetMinutes(tzBefore ?? tzAfter);
     if (monthIdx !== undefined && offset !== undefined) {
       return buildValidatedUtcTimestamp(

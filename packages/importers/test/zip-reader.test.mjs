@@ -858,6 +858,37 @@ test('accepts streamed ZIP64 bit-3 entries with 0xffffffff local sizes and zero 
     () => openArchive(badLfhSizePath),
     err => err instanceof ArchiveError && err.code === 'HEADER_MISMATCH',
   );
+
+  // 5. Classic 32-bit CD + classic EOCD with bit-3 LFH 0xffffffff sizes, [0n, 0n] ZIP64 extra, and signed ZIP64 descriptor
+  const z64ExtraZero = Buffer.alloc(20);
+  z64ExtraZero.writeUInt16LE(0x0001, 0);
+  z64ExtraZero.writeUInt16LE(16, 2);
+  z64ExtraZero.writeBigUInt64LE(0n, 4);
+  z64ExtraZero.writeBigUInt64LE(0n, 12);
+  const classicCdStreamedPath = join(dir, 'streamed-z64-classic-cd.zip');
+  writeFileSync(
+    classicCdStreamedPath,
+    buildRawZipBuffer([
+      {
+        path: 'Takeout/classic-cd-streamed.txt',
+        data: storedData,
+        flags: 0x0008,
+        versionNeeded: 45,
+        lfhCrc: 0,
+        lfhCompSize: 0xffffffff,
+        lfhUncompSize: 0xffffffff,
+        lfhExtra: z64ExtraZero,
+        zip64Descriptor: true,
+      },
+    ]),
+  );
+  const classicArch = await openArchive(classicCdStreamedPath);
+  try {
+    assert.equal(classicArch.entries.length, 1);
+    assert.ok((await streamToBuffer(classicArch.entries[0].open())).equals(storedData));
+  } finally {
+    await classicArch.close();
+  }
 });
 
 test('enforces Takeout part ordinal validation when opening a single file directly via openArchive (Round 2 Finding 3)', async t => {
