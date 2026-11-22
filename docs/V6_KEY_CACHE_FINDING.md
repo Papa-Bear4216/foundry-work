@@ -1,5 +1,10 @@
 # V-6 Key Cache Spike Finding
 
+> **Status: unverified spike notes.** Sections 1-7 are exploratory notes from a spike and have not been independently verified;
+> do not rely on their measurements, status labels or platform descriptions. The normative contract is `docs/DECISIONS.md` A-34,
+> and the MUST items in Section 8 are requirements, not evidence. Any package that builds an OS key cache must re-measure and
+> verify every claim it depends on, on the pinned runtime and supported hosts, before enabling a backend.
+
 Date: 2026-11-21
 Branch: `spike/v-6` (based on `main` @ `08baab9`; spike scripts recorded on branch `spike/v-6` at commit `3ba11ce`)
 Related specs & decisions: [ARCHITECTURE.md](ARCHITECTURE.md) sections 5.1–5.4, 5.6, 5.7, 9, 10; [ROADMAP.md](ROADMAP.md) row V-6; [DECISIONS.md](DECISIONS.md) A-26, A-31, A-32, A-34; [V0_MEASUREMENT_REPORT.md](V0_MEASUREMENT_REPORT.md).
