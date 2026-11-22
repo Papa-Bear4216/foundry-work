@@ -30,6 +30,110 @@ function makeTempDir(t, prefix) {
   return dir;
 }
 
+/** Builds a raw ZIP buffer with customizable per-entry flags, descriptors, and raw filename bytes. */
+function buildRawZipBuffer(entries, options = {}) {
+  const parts = [];
+  const cdParts = [];
+  let offset = 0;
+
+  for (const spec of entries) {
+    const lfhName = Buffer.isBuffer(spec.lfhName) ? spec.lfhName : Buffer.from(spec.lfhName ?? spec.path, 'utf8');
+    const cdName = Buffer.isBuffer(spec.cdName) ? spec.cdName : Buffer.from(spec.cdName ?? spec.path, 'utf8');
+    const raw = spec.data;
+    const method = spec.compression === 'deflate' ? 8 : 0;
+    const payload = spec.rawPayload ?? (method === 8 ? deflateRawSync(raw, { level: spec.deflateLevel ?? 1 }) : raw);
+    const entryCrc = spec.crc ?? (crc32(raw) >>> 0);
+    const compSize = spec.compSize ?? payload.length;
+    const uncompSize = spec.uncompSize ?? raw.length;
+    const flags = spec.flags ?? 0x0800;
+    const lfhFlags = spec.lfhFlags ?? flags;
+    const lfhOffset = offset;
+    const bit3 = (flags & 0x0008) !== 0;
+
+    const lfhExtra = spec.lfhExtra ?? Buffer.alloc(0);
+    const lfh = Buffer.alloc(30);
+    lfh.writeUInt32LE(0x04034b50, 0);
+    lfh.writeUInt16LE(spec.versionNeeded ?? (spec.zip64Descriptor ? 45 : 20), 4);
+    lfh.writeUInt16LE(lfhFlags, 6);
+    lfh.writeUInt16LE(spec.lfhMethod ?? method, 8);
+    lfh.writeUInt16LE(0, 10);
+    lfh.writeUInt16LE(0x5821, 12);
+    lfh.writeUInt32LE(spec.lfhCrc ?? (bit3 ? 0 : entryCrc), 14);
+    lfh.writeUInt32LE(spec.lfhCompSize ?? (bit3 ? 0 : compSize), 18);
+    lfh.writeUInt32LE(spec.lfhUncompSize ?? (bit3 ? 0 : uncompSize), 22);
+    lfh.writeUInt16LE(lfhName.length, 26);
+    lfh.writeUInt16LE(lfhExtra.length, 28);
+
+    parts.push(lfh, lfhName, lfhExtra, payload);
+    offset += lfh.length + lfhName.length + lfhExtra.length + payload.length;
+
+    if (bit3 && !spec.omitDescriptor) {
+      const withSig = spec.descriptorWithSig !== false;
+      const isZ64 = Boolean(spec.zip64Descriptor);
+      const desc = Buffer.alloc((withSig ? 4 : 0) + (isZ64 ? 20 : 12));
+      let p = 0;
+      if (withSig) {
+        desc.writeUInt32LE(0x08074b50, p);
+        p += 4;
+      }
+      desc.writeUInt32LE(spec.descriptorCrc ?? entryCrc, p);
+      if (isZ64) {
+        desc.writeBigUInt64LE(BigInt(spec.descriptorCompSize ?? compSize), p + 4);
+        desc.writeBigUInt64LE(BigInt(spec.descriptorUncompSize ?? uncompSize), p + 12);
+      } else {
+        desc.writeUInt32LE(spec.descriptorCompSize ?? compSize, p + 4);
+        desc.writeUInt32LE(spec.descriptorUncompSize ?? uncompSize, p + 8);
+      }
+      parts.push(desc);
+      offset += desc.length;
+    }
+
+    const cdExtra = spec.cdExtra ?? Buffer.alloc(0);
+    const cd = Buffer.alloc(46);
+    cd.writeUInt32LE(0x02014b50, 0);
+    cd.writeUInt16LE(spec.versionNeeded ?? (spec.zip64Descriptor ? 45 : 20), 4);
+    cd.writeUInt16LE(spec.versionNeeded ?? (spec.zip64Descriptor ? 45 : 20), 6);
+    cd.writeUInt16LE(flags, 8);
+    cd.writeUInt16LE(method, 10);
+    cd.writeUInt16LE(0, 12);
+    cd.writeUInt16LE(0x5821, 14);
+    cd.writeUInt32LE(entryCrc, 16);
+    cd.writeUInt32LE(compSize, 20);
+    cd.writeUInt32LE(uncompSize, 24);
+    cd.writeUInt16LE(cdName.length, 28);
+    cd.writeUInt16LE(cdExtra.length, 30);
+    cd.writeUInt16LE(0, 32);
+    cd.writeUInt16LE(0, 34);
+    cd.writeUInt16LE(0, 36);
+    cd.writeUInt32LE(0, 38);
+    cd.writeUInt32LE(spec.cdLfhOffset ?? lfhOffset, 42);
+    cdParts.push(cd, cdName, cdExtra);
+  }
+
+  const cdOffset = offset;
+  const cdBuf = Buffer.concat(cdParts);
+  parts.push(cdBuf);
+  offset += cdBuf.length;
+
+  if (options.gapAfterCd) {
+    parts.push(options.gapAfterCd);
+    offset += options.gapAfterCd.length;
+  }
+
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(0, 4);
+  eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(options.eocdEntriesDisk ?? entries.length, 8);
+  eocd.writeUInt16LE(options.eocdTotalEntries ?? entries.length, 10);
+  eocd.writeUInt32LE(options.eocdCdSize ?? cdBuf.length, 12);
+  eocd.writeUInt32LE(options.eocdCdOffset ?? cdOffset, 16);
+  eocd.writeUInt16LE(0, 20);
+  parts.push(eocd);
+
+  return Buffer.concat(parts);
+}
+
 test('reads stored and deflate entries from standard zip and forced zip64 archives', async t => {
   const dir = makeTempDir(t, 'foundry-zip-std-');
   const storedPayload = Buffer.from('TEST ONLY stored payload 0123456789\n', 'utf8');
@@ -258,7 +362,6 @@ test('rejects malformed archives with typed errors and never writes outside memo
   ]);
   const validBytes = readFileSync(validPath);
   const truncCd = Buffer.from(validBytes);
-  // Corrupt CD size in EOCD to declare more bytes than exist before EOCD
   truncCd.writeUInt32LE(truncCd.length + 100, truncCd.length - 10);
   const truncPath = join(dir, 'trunc-cd.zip');
   writeFileSync(truncPath, truncCd);
@@ -278,29 +381,56 @@ test('rejects malformed archives with typed errors and never writes outside memo
     err => err instanceof ArchiveError && err.code === 'BAD_OFFSET',
   );
 
-  // 5. Overlapping entries (point entry #2's localHeaderOffset at entry #1's offset 0)
-  const overlapBuf = Buffer.from(validBytes);
-  const cd1 = overlapBuf.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
-  const cd2 = overlapBuf.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]), cd1 + 4);
-  overlapBuf.writeUInt32LE(0, cd2 + 42);
+  // 5. Overlapping entries (point entry #2's localHeaderOffset at entry #1's offset 0, matching LFH fields)
+  const overlapBuf = buildRawZipBuffer([
+    { path: 'Takeout/one.txt', data: Buffer.from('one-payload') },
+    { path: 'Takeout/one.txt', cdName: Buffer.from('Takeout/two.txt'), data: Buffer.from('two-payload') },
+  ]);
+  // Better: construct two entries with identical name bytes at same offset? No, duplicate name fails first;
+  // instead point entry #2's LFH offset inside entry #1's payload with a fake LFH header embedded inside entry #1's payload!
+  const fakeName = Buffer.from('Takeout/two.txt', 'utf8');
+  const fakePayload = Buffer.from('two');
+  const fakeCrc = crc32(fakePayload) >>> 0;
+  const embeddedLfh = Buffer.alloc(30);
+  embeddedLfh.writeUInt32LE(0x04034b50, 0);
+  embeddedLfh.writeUInt16LE(20, 4);
+  embeddedLfh.writeUInt16LE(0x0800, 6);
+  embeddedLfh.writeUInt16LE(0, 8);
+  embeddedLfh.writeUInt32LE(fakeCrc, 14);
+  embeddedLfh.writeUInt32LE(fakePayload.length, 18);
+  embeddedLfh.writeUInt32LE(fakePayload.length, 22);
+  embeddedLfh.writeUInt16LE(fakeName.length, 26);
+  embeddedLfh.writeUInt16LE(0, 28);
+  const hostPayload = Buffer.concat([Buffer.from('prefix'), embeddedLfh, fakeName, fakePayload]);
+  const entry1Name = Buffer.from('Takeout/one.txt', 'utf8');
+  const embeddedOffset = 30 + entry1Name.length + 6;
+  const trueOverlapBuf = buildRawZipBuffer([
+    { path: 'Takeout/one.txt', data: hostPayload },
+    { path: 'Takeout/two.txt', data: fakePayload, cdLfhOffset: embeddedOffset },
+  ]);
+  assert.ok(overlapBuf.length > 0);
   const overlapPath = join(dir, 'overlap.zip');
-  writeFileSync(overlapPath, overlapBuf);
+  writeFileSync(overlapPath, trueOverlapBuf);
   await assert.rejects(
     () => openZipFile(overlapPath),
     err => err instanceof ArchiveError && err.code === 'OVERLAPPING_ENTRIES',
   );
 
-  // 6. Undeclared entry bomb (CD claims 100 bytes uncompressed, actual deflate stream outputs 2 MiB)
+  // 6. Undeclared entry bomb (both LFH and CD lie: declare 100 bytes uncompressed while deflate stream outputs 2 MiB)
   const real2MiB = Buffer.alloc(2 * 1024 * 1024, 0x41);
   const deflated2MiB = deflateRawSync(real2MiB, { level: 9 });
-  const bombPath = join(dir, 'lying-bomb.zip');
-  await writeZipArchive(bombPath, [{ path: 'Takeout/bomb.txt', data: real2MiB, compression: 'deflate', deflateLevel: 9 }]);
-  const bombBuf = readFileSync(bombPath);
-  const bombCd = bombBuf.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
-  // Lie in CD: declare uncompressedSize = 100 while compressed payload actually inflates to 2 MiB.
-  bombBuf.writeUInt32LE(100, bombCd + 24);
-  const lyingBombPath = join(dir, 'lying-bomb-edited.zip');
-  writeFileSync(lyingBombPath, bombBuf);
+  const lyingBombBuf = buildRawZipBuffer([
+    {
+      path: 'Takeout/bomb.txt',
+      data: real2MiB,
+      compression: 'deflate',
+      rawPayload: deflated2MiB,
+      compSize: deflated2MiB.length,
+      uncompSize: 100,
+    },
+  ]);
+  const lyingBombPath = join(dir, 'lying-bomb.zip');
+  writeFileSync(lyingBombPath, lyingBombBuf);
   const lyingArchive = await openZipFile(lyingBombPath);
   try {
     await assert.rejects(
@@ -312,12 +442,13 @@ test('rejects malformed archives with typed errors and never writes outside memo
   }
   assert.ok(deflated2MiB.length < 10_000);
 
-  // 7. CRC mismatch
-  const crcBuf = Buffer.from(validBytes);
-  const crcCd = crcBuf.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
-  crcBuf.writeUInt32LE((crcBuf.readUInt32LE(crcCd + 16) ^ 0xffffffff) >>> 0, crcCd + 16);
+  // 7. Streaming CRC mismatch (LFH and CD agree on wrong CRC; streaming payload detects CRC_MISMATCH)
+  const payload7 = Buffer.from('TEST ONLY payload with bad crc');
+  const badCrcBuf = buildRawZipBuffer([
+    { path: 'Takeout/badcrc.txt', data: payload7, crc: ((crc32(payload7) ^ 0xffffffff) >>> 0) },
+  ]);
   const crcPath = join(dir, 'bad-crc.zip');
-  writeFileSync(crcPath, crcBuf);
+  writeFileSync(crcPath, badCrcBuf);
   const crcArchive = await openZipFile(crcPath);
   try {
     await assert.rejects(
@@ -343,4 +474,309 @@ test('rejects malformed archives with typed errors and never writes outside memo
     () => openArchive(emptyDir),
     err => err instanceof ArchiveError && err.code === 'EMPTY_ARCHIVE_DIR',
   );
+});
+
+test('rejects local and central header mismatches (filename, flags, CRC/sizes) and validates bit-3 descriptors (Ruling 2)', async t => {
+  const dir = makeTempDir(t, 'foundry-ruling2-');
+
+  // Name mismatch between local header and central directory
+  const nameMismatchPath = join(dir, 'name-mismatch.zip');
+  writeFileSync(
+    nameMismatchPath,
+    buildRawZipBuffer([
+      {
+        path: 'Takeout/central.txt',
+        lfhName: Buffer.from('Takeout/local.txt', 'utf8'),
+        cdName: Buffer.from('Takeout/central.txt', 'utf8'),
+        data: Buffer.from('TEST ONLY mismatch'),
+      },
+    ]),
+  );
+  await assert.rejects(
+    () => openZipFile(nameMismatchPath),
+    err => err instanceof ArchiveError && err.code === 'HEADER_MISMATCH',
+  );
+
+  // Flags mismatch
+  const flagsMismatchPath = join(dir, 'flags-mismatch.zip');
+  writeFileSync(
+    flagsMismatchPath,
+    buildRawZipBuffer([
+      {
+        path: 'Takeout/flags.txt',
+        data: Buffer.from('TEST ONLY flags'),
+        flags: 0x0800,
+        lfhFlags: 0x0000,
+      },
+    ]),
+  );
+  await assert.rejects(
+    () => openZipFile(flagsMismatchPath),
+    err => err instanceof ArchiveError && err.code === 'HEADER_MISMATCH',
+  );
+
+  // Missing data descriptor when bit 3 is set
+  const missingDescPath = join(dir, 'missing-desc.zip');
+  writeFileSync(
+    missingDescPath,
+    buildRawZipBuffer([
+      {
+        path: 'Takeout/bit3-missing.txt',
+        data: Buffer.from('TEST ONLY bit3 without descriptor'),
+        flags: 0x0808,
+        omitDescriptor: true,
+      },
+    ]),
+  );
+  await assert.rejects(
+    () => openZipFile(missingDescPath),
+    err => err instanceof ArchiveError && err.code === 'INVALID_DATA_DESCRIPTOR',
+  );
+
+  // Corrupt CRC inside data descriptor -> INVALID_DATA_DESCRIPTOR
+  const badDescCrcPath = join(dir, 'bad-desc-crc.zip');
+  writeFileSync(
+    badDescCrcPath,
+    buildRawZipBuffer([
+      {
+        path: 'Takeout/first.txt',
+        data: Buffer.from('TEST ONLY bit3 bad descriptor crc'),
+        flags: 0x0808,
+        descriptorWithSig: true,
+        descriptorCrc: 0x12345678,
+      },
+    ]),
+  );
+  await assert.rejects(
+    () => openZipFile(badDescCrcPath),
+    err => err instanceof ArchiveError && err.code === 'INVALID_DATA_DESCRIPTOR',
+  );
+
+  // Valid ZIP32 (signed + unsigned) and ZIP64 (signed + unsigned) data descriptors succeed
+  const validDescPath = join(dir, 'valid-desc.zip');
+  const p1 = Buffer.from('TEST ONLY zip32 signed descriptor');
+  const p2 = Buffer.from('TEST ONLY zip32 unsigned descriptor');
+  const p3 = Buffer.from('TEST ONLY zip64 signed descriptor');
+  const p4 = Buffer.from('TEST ONLY zip64 unsigned descriptor');
+  writeFileSync(
+    validDescPath,
+    buildRawZipBuffer([
+      { path: 'Takeout/d1.txt', data: p1, flags: 0x0808, descriptorWithSig: true, zip64Descriptor: false },
+      { path: 'Takeout/d2.txt', data: p2, flags: 0x0808, descriptorWithSig: false, zip64Descriptor: false },
+      { path: 'Takeout/d3.txt', data: p3, flags: 0x0808, descriptorWithSig: true, zip64Descriptor: true },
+      { path: 'Takeout/d4.txt', data: p4, flags: 0x0808, descriptorWithSig: false, zip64Descriptor: true },
+    ]),
+  );
+  const descArchive = await openZipFile(validDescPath);
+  try {
+    assert.equal(descArchive.entries.length, 4);
+    assert.ok((await streamToBuffer(descArchive.entries[0].open())).equals(p1));
+    assert.ok((await streamToBuffer(descArchive.entries[1].open())).equals(p2));
+    assert.ok((await streamToBuffer(descArchive.entries[2].open())).equals(p3));
+    assert.ok((await streamToBuffer(descArchive.entries[3].open())).equals(p4));
+  } finally {
+    await descArchive.close();
+  }
+});
+
+test('rejects unexplained gaps after central directory, zeroed counts with retained directory, and inconsistent ZIP64 end records (Ruling 3)', async t => {
+  const dir = makeTempDir(t, 'foundry-ruling3-');
+
+  // 1. Zeroed classic EOCD counts and CD size while retaining the directory offset -> must NOT open as empty archive!
+  const validPath = join(dir, 'valid.zip');
+  await writeZipArchive(validPath, [{ path: 'Takeout/retained.txt', data: Buffer.from('TEST ONLY kept') }]);
+  const zeroedBuf = Buffer.from(readFileSync(validPath));
+  const eocdStart = zeroedBuf.length - 22;
+  zeroedBuf.writeUInt16LE(0, eocdStart + 8);  // entries on disk = 0
+  zeroedBuf.writeUInt16LE(0, eocdStart + 10); // total entries = 0
+  zeroedBuf.writeUInt32LE(0, eocdStart + 12); // cdSize = 0 (cdOffset retained!)
+  const zeroedPath = join(dir, 'zeroed-counts.zip');
+  writeFileSync(zeroedPath, zeroedBuf);
+  await assert.rejects(
+    () => openZipFile(zeroedPath),
+    err => err instanceof ArchiveError && err.code === 'INVALID_FORMAT',
+  );
+
+  // 2. Unexplained gap bytes between central directory and EOCD
+  const gapPath = join(dir, 'cd-gap.zip');
+  writeFileSync(
+    gapPath,
+    buildRawZipBuffer(
+      [{ path: 'Takeout/item.txt', data: Buffer.from('TEST ONLY gap') }],
+      { gapAfterCd: Buffer.alloc(16, 0xaa) },
+    ),
+  );
+  await assert.rejects(
+    () => openZipFile(gapPath),
+    err => err instanceof ArchiveError && err.code === 'INVALID_FORMAT',
+  );
+
+  // 3. Inconsistent classic EOCD vs ZIP64 EOCD entry count
+  const z64Path = join(dir, 'z64-valid.zip');
+  await writeZipArchive(
+    z64Path,
+    [
+      { path: 'Takeout/a.txt', data: Buffer.from('a') },
+      { path: 'Takeout/b.txt', data: Buffer.from('b') },
+    ],
+    { forceZip64: true },
+  );
+  const inconsistentZ64 = Buffer.from(readFileSync(z64Path));
+  const z64EocdPos = inconsistentZ64.length - 22;
+  // Classic EOCD claims 1 entry while ZIP64 EOCD has 2 entries
+  inconsistentZ64.writeUInt16LE(1, z64EocdPos + 8);
+  inconsistentZ64.writeUInt16LE(1, z64EocdPos + 10);
+  const inconsistentPath = join(dir, 'z64-inconsistent.zip');
+  writeFileSync(inconsistentPath, inconsistentZ64);
+  await assert.rejects(
+    () => openZipFile(inconsistentPath),
+    err => err instanceof ArchiveError && err.code === 'INVALID_FORMAT',
+  );
+});
+
+test('requires deflate inflater to consume exact compressed size and enforces ratio on consumed bytes (Ruling 4)', async t => {
+  const dir = makeTempDir(t, 'foundry-ruling4-');
+
+  // 1. Valid small deflate stream + trailing garbage bytes -> SIZE_MISMATCH
+  const smallOrig = Buffer.from('TEST ONLY deflate with trailing bytes', 'utf8');
+  const smallDeflated = deflateRawSync(smallOrig, { level: 6 });
+  const paddedSmall = Buffer.concat([smallDeflated, Buffer.alloc(64, 0x00)]);
+  const trailingPath = join(dir, 'deflate-trailing.zip');
+  writeFileSync(
+    trailingPath,
+    buildRawZipBuffer([
+      {
+        path: 'Takeout/trailing.txt',
+        data: smallOrig,
+        compression: 'deflate',
+        rawPayload: paddedSmall,
+        compSize: paddedSmall.length,
+        uncompSize: smallOrig.length,
+      },
+    ]),
+  );
+  const trailingArchive = await openZipFile(trailingPath);
+  try {
+    await assert.rejects(
+      () => streamToBuffer(trailingArchive.entries[0].open()),
+      err => err instanceof ArchiveError && err.code === 'SIZE_MISMATCH',
+    );
+  } finally {
+    await trailingArchive.close();
+  }
+
+  // 1b. Valid deflate stream + >64 KiB trailing garbage bytes (multi-chunk) -> SIZE_MISMATCH
+  const paddedMultiChunk = Buffer.concat([smallDeflated, Buffer.alloc(128 * 1024, 0x00)]);
+  const trailingMultiPath = join(dir, 'deflate-trailing-multi.zip');
+  writeFileSync(
+    trailingMultiPath,
+    buildRawZipBuffer([
+      {
+        path: 'Takeout/trailing-multi.txt',
+        data: smallOrig,
+        compression: 'deflate',
+        rawPayload: paddedMultiChunk,
+        compSize: paddedMultiChunk.length,
+        uncompSize: smallOrig.length,
+      },
+    ]),
+  );
+  const trailingMultiArchive = await openZipFile(trailingMultiPath);
+  try {
+    await assert.rejects(
+      () => streamToBuffer(trailingMultiArchive.entries[0].open()),
+      err => err instanceof ArchiveError && err.code === 'SIZE_MISMATCH',
+    );
+  } finally {
+    await trailingMultiArchive.close();
+  }
+
+  // 2. Padded bomb: 2 MiB of 'A' deflates to ~2 KiB (>1000:1), padded with 30 KiB trailing bytes
+  // so declared ratio looks like ~65:1 (<100:1), but consumed-byte ratio is >1000:1 -> ENTRY_BOMB!
+  const bombOrig = Buffer.alloc(2 * 1024 * 1024, 0x41);
+  const bombDeflated = deflateRawSync(bombOrig, { level: 9 });
+  const paddedBomb = Buffer.concat([bombDeflated, Buffer.alloc(30 * 1024, 0x00)]);
+  const paddedBombPath = join(dir, 'padded-bomb.zip');
+  writeFileSync(
+    paddedBombPath,
+    buildRawZipBuffer([
+      {
+        path: 'Takeout/padded-bomb.txt',
+        data: bombOrig,
+        compression: 'deflate',
+        rawPayload: paddedBomb,
+        compSize: paddedBomb.length,
+        uncompSize: bombOrig.length,
+      },
+    ]),
+  );
+  const paddedArchive = await openZipFile(paddedBombPath);
+  try {
+    await assert.rejects(
+      () => streamToBuffer(paddedArchive.entries[0].open()),
+      err => err instanceof ArchiveError && err.code === 'ENTRY_BOMB',
+    );
+  } finally {
+    await paddedArchive.close();
+  }
+});
+
+test('rejects missing parts, mixed export prefixes, and duplicate ordinals in multi-part folders (Ruling 5)', async t => {
+  // 1. Missing middle part (001 and 003 without 002)
+  const missingMid = makeTempDir(t, 'foundry-missing-mid-');
+  await writeZipArchive(join(missingMid, 'takeout-20261121T000000Z-001.zip'), [{ path: 'Takeout/a.txt', data: Buffer.from('a') }]);
+  await writeZipArchive(join(missingMid, 'takeout-20261121T000000Z-003.zip'), [{ path: 'Takeout/c.txt', data: Buffer.from('c') }]);
+  await assert.rejects(
+    () => openArchive(missingMid),
+    err => err instanceof ArchiveError && err.code === 'INVALID_MULTIPART',
+  );
+
+  // 2. Missing leading part (002 alone)
+  const missingFirst = makeTempDir(t, 'foundry-missing-first-');
+  await writeZipArchive(join(missingFirst, 'takeout-20261121T000000Z-002.zip'), [{ path: 'Takeout/b.txt', data: Buffer.from('b') }]);
+  await assert.rejects(
+    () => openArchive(missingFirst),
+    err => err instanceof ArchiveError && err.code === 'INVALID_MULTIPART',
+  );
+
+  // 3. Mixed prefixes
+  const mixedDir = makeTempDir(t, 'foundry-mixed-prefix-');
+  await writeZipArchive(join(mixedDir, 'takeout-20261121T000000Z-001.zip'), [{ path: 'Takeout/a.txt', data: Buffer.from('a') }]);
+  await writeZipArchive(join(mixedDir, 'takeout-20261122T000000Z-002.zip'), [{ path: 'Takeout/b.txt', data: Buffer.from('b') }]);
+  await assert.rejects(
+    () => openArchive(mixedDir),
+    err => err instanceof ArchiveError && err.code === 'INVALID_MULTIPART',
+  );
+
+  // 4. Duplicate ordinals (-1.zip and -001.zip)
+  const dupOrdDir = makeTempDir(t, 'foundry-dup-ord-');
+  await writeZipArchive(join(dupOrdDir, 'takeout-20261121T000000Z-1.zip'), [{ path: 'Takeout/a.txt', data: Buffer.from('a') }]);
+  await writeZipArchive(join(dupOrdDir, 'takeout-20261121T000000Z-001.zip'), [{ path: 'Takeout/b.txt', data: Buffer.from('b') }]);
+  await assert.rejects(
+    () => openArchive(dupOrdDir),
+    err => err instanceof ArchiveError && err.code === 'INVALID_MULTIPART',
+  );
+});
+
+test('compares raw name bytes for duplicate detection so distinct legacy non-UTF-8 entries do not collide (Ruling 13 / Finding 15)', async t => {
+  const dir = makeTempDir(t, 'foundry-raw-dedup-');
+  const rawName1 = Buffer.concat([Buffer.from('Takeout/item_', 'ascii'), Buffer.from([0xe8]), Buffer.from('.txt', 'ascii')]);
+  const rawName2 = Buffer.concat([Buffer.from('Takeout/item_', 'ascii'), Buffer.from([0xe9]), Buffer.from('.txt', 'ascii')]);
+  const zipPath = join(dir, 'legacy-names.zip');
+  writeFileSync(
+    zipPath,
+    buildRawZipBuffer([
+      { lfhName: rawName1, cdName: rawName1, flags: 0x0000, data: Buffer.from('first') },
+      { lfhName: rawName2, cdName: rawName2, flags: 0x0000, data: Buffer.from('second') },
+    ]),
+  );
+
+  const archive = await openZipFile(zipPath);
+  try {
+    assert.equal(archive.entries.length, 2);
+    assert.ok((await streamToBuffer(archive.entries[0].open())).equals(Buffer.from('first')));
+    assert.ok((await streamToBuffer(archive.entries[1].open())).equals(Buffer.from('second')));
+  } finally {
+    await archive.close();
+  }
 });

@@ -4,6 +4,31 @@ import type { Readable } from 'node:stream';
 /** Sensitivity tiers defined by Product Spec section 9. */
 export type SensitivityTier = 'public' | 'personal' | 'private' | 'secret' | 'clinical' | 'child';
 
+/** Typed per-item skip / validation error codes reported without aborting valid items. */
+export type ItemErrorCode =
+  | 'ITEM_TOO_LARGE'
+  | 'VCARD_NESTED_BEGIN'
+  | 'VCARD_UNFINISHED';
+
+/** Structured record of a single skipped or malformed item encountered during import. */
+export interface ItemErrorInfo {
+  readonly code: ItemErrorCode;
+  readonly source: string;
+  readonly entryPath: string;
+  readonly itemPath: string;
+  readonly message: string;
+  readonly limitBytes?: number;
+  readonly observedBytes?: number;
+}
+
+/** Optional controls passed to an Importer's split stage. */
+export interface SplitOptions {
+  /** Maximum per-item plaintext byte cap enforced before buffering past it. Default: 64 MiB. */
+  maxItemBytes?: number;
+  /** Callback invoked for typed per-item errors so the caller can count, report, and continue. */
+  onItemError?: (error: ItemErrorInfo) => void;
+}
+
 /** Single readable entry inside a zip or multi-part archive tree (Architecture 7). */
 export interface ArchiveEntry {
   readonly path: string;
@@ -35,7 +60,7 @@ export interface RawItem {
 export interface Importer {
   readonly id: string;
   matches(entry: ArchiveEntry): boolean;
-  split(entry: ArchiveEntry): AsyncIterable<RawItem>;
+  split(entry: ArchiveEntry, options?: SplitOptions): AsyncIterable<RawItem>;
 }
 
 /** Metadata of a stored vault item passed into a Deriver (Architecture 7). */
@@ -143,16 +168,21 @@ export interface ImportCheckpointInfo {
 export interface SourceImportCounts {
   itemsImported: number;
   itemsSkipped: number;
+  itemsErrored: number;
   blobsWritten: number;
   blobsDeduplicated: number;
   bytesStored: number;
 }
 
 export interface ImportResult {
+  partsCount: number;
+  parts: string[];
   countsBySource: Record<string, SourceImportCounts>;
   unrecognisedEntries: string[];
+  itemErrors: ItemErrorInfo[];
   totalItemsImported: number;
   totalItemsSkipped: number;
+  totalItemsErrored: number;
   totalBlobsWritten: number;
   totalBlobsDeduplicated: number;
   totalEventsWritten: number;

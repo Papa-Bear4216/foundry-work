@@ -168,8 +168,12 @@ declare module 'node:zlib' {
     chunkSize?: number;
   }
 
-  export function createInflateRaw(options?: ZlibOptions): Transform;
-  export function createDeflateRaw(options?: ZlibOptions): Transform;
+  export interface ZlibTransform extends Transform {
+    readonly bytesWritten: number;
+  }
+
+  export function createInflateRaw(options?: ZlibOptions): ZlibTransform;
+  export function createDeflateRaw(options?: ZlibOptions): ZlibTransform;
   export function deflateRawSync(buf: Uint8Array, options?: ZlibOptions): Buffer;
   export function crc32(data: Uint8Array | string, value?: number): number;
 }

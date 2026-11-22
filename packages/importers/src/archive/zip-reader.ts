@@ -7,6 +7,7 @@ import type { Archive, ArchiveEntry } from '../types.js';
 import { ArchiveError } from './errors.js';
 
 const SIG_LFH = 0x04034b50;
+const SIG_DATA_DESC = 0x08074b50;
 const SIG_CD = 0x02014b50;
 const SIG_EOCD = 0x06054b50;
 const SIG_ZIP64_EOCD = 0x06064b50;
@@ -20,6 +21,24 @@ const DEFAULT_MAX_COMPRESSION_RATIO = 100;
 const DEFAULT_RATIO_CHECK_MIN_BYTES = 1024 * 1024;
 const DEFAULT_MAX_UNCOMPRESSED_ENTRY_BYTES = 64n * 1024n * 1024n * 1024n;
 const DEFAULT_MAX_CD_BYTES = 64 * 1024 * 1024;
+
+/** Maps each ArchiveEntry produced by this reader to its normalized raw-byte dedup key. */
+const entryRawDedupKeys = new WeakMap<ArchiveEntry, string>();
+
+/** Returns the raw-byte dedup key for an entry (falling back to entry.path for synthetic entries). */
+export function getEntryDedupKey(entry: ArchiveEntry): string {
+  return entryRawDedupKeys.get(entry) ?? entry.path;
+}
+
+function rawNameDedupKey(rawNameBuf: Buffer): string {
+  // Normalize backslashes (0x5c) to forward slashes (0x2f) at the raw byte level so
+  // duplicate detection compares raw name bytes without UTF-8 replacement-char collisions.
+  const copy = Buffer.from(rawNameBuf);
+  for (let i = 0; i < copy.length; i++) {
+    if (copy[i] === 0x5c) copy[i] = 0x2f;
+  }
+  return copy.toString('hex');
+}
 
 export interface RandomAccessReader {
   readonly size: bigint;
@@ -42,6 +61,7 @@ export interface ZipOpenOptions {
 
 interface ParsedEntryMeta {
   path: string;
+  rawDedupKey: string;
   isDirectory: boolean;
   compressionMethod: number;
   crc32: number;
@@ -50,6 +70,8 @@ interface ParsedEntryMeta {
   localHeaderOffset: bigint;
   dataStart: bigint;
   dataEnd: bigint;
+  /** End of entry record including any trailing data descriptor (for range/overlap checks). */
+  recordEnd: bigint;
   mtime?: Date;
 }
 
@@ -127,6 +149,23 @@ export function validateArchivePath(rawName: string): { path: string; isDirector
   return { path: isDirectory ? `${stripped}/` : stripped, isDirectory };
 }
 
+function findZip64ExtraData(extra: Buffer): Buffer | undefined {
+  let pos = 0;
+  while (pos + 4 <= extra.length) {
+    const headerId = extra.readUInt16LE(pos);
+    const dataSize = extra.readUInt16LE(pos + 2);
+    pos += 4;
+    if (pos + dataSize > extra.length) {
+      throw new ArchiveError('TRUNCATED_CENTRAL_DIRECTORY', 'Truncated extra field in ZIP header.');
+    }
+    if (headerId === 0x0001) {
+      return extra.subarray(pos, pos + dataSize);
+    }
+    pos += dataSize;
+  }
+  return undefined;
+}
+
 function parseZip64ExtraField(
   extra: Buffer,
   needUncomp: boolean,
@@ -134,43 +173,158 @@ function parseZip64ExtraField(
   needLfhOffset: boolean,
   needDiskStart: boolean,
 ): { uncompressedSize?: bigint; compressedSize?: bigint; localHeaderOffset?: bigint; diskStart?: number } {
-  let pos = 0;
-  while (pos + 4 <= extra.length) {
-    const headerId = extra.readUInt16LE(pos);
-    const dataSize = extra.readUInt16LE(pos + 2);
-    pos += 4;
-    if (pos + dataSize > extra.length) {
-      throw new ArchiveError('TRUNCATED_CENTRAL_DIRECTORY', 'Truncated extra field in central directory.');
-    }
-    if (headerId === 0x0001) {
-      let cursor = pos;
-      const limit = pos + dataSize;
-      const out: { uncompressedSize?: bigint; compressedSize?: bigint; localHeaderOffset?: bigint; diskStart?: number } = {};
-      if (needUncomp) {
-        if (cursor + 8 > limit) throw new ArchiveError('TRUNCATED_CENTRAL_DIRECTORY', 'ZIP64 extra field missing uncompressed size.');
-        out.uncompressedSize = extra.readBigUInt64LE(cursor);
-        cursor += 8;
-      }
-      if (needComp) {
-        if (cursor + 8 > limit) throw new ArchiveError('TRUNCATED_CENTRAL_DIRECTORY', 'ZIP64 extra field missing compressed size.');
-        out.compressedSize = extra.readBigUInt64LE(cursor);
-        cursor += 8;
-      }
-      if (needLfhOffset) {
-        if (cursor + 8 > limit) throw new ArchiveError('TRUNCATED_CENTRAL_DIRECTORY', 'ZIP64 extra field missing local header offset.');
-        out.localHeaderOffset = extra.readBigUInt64LE(cursor);
-        cursor += 8;
-      }
-      if (needDiskStart) {
-        if (cursor + 4 > limit) throw new ArchiveError('TRUNCATED_CENTRAL_DIRECTORY', 'ZIP64 extra field missing disk start.');
-        out.diskStart = extra.readUInt32LE(cursor);
-        cursor += 4;
-      }
-      return out;
-    }
-    pos += dataSize;
+  const data = findZip64ExtraData(extra);
+  if (!data) {
+    throw new ArchiveError('TRUNCATED_CENTRAL_DIRECTORY', 'ZIP64 sentinel present without ZIP64 extended information extra field.');
   }
-  throw new ArchiveError('TRUNCATED_CENTRAL_DIRECTORY', 'ZIP64 sentinel present without ZIP64 extended information extra field.');
+  let cursor = 0;
+  const limit = data.length;
+  const out: { uncompressedSize?: bigint; compressedSize?: bigint; localHeaderOffset?: bigint; diskStart?: number } = {};
+  if (needUncomp) {
+    if (cursor + 8 > limit) throw new ArchiveError('TRUNCATED_CENTRAL_DIRECTORY', 'ZIP64 extra field missing uncompressed size.');
+    out.uncompressedSize = data.readBigUInt64LE(cursor);
+    cursor += 8;
+  }
+  if (needComp) {
+    if (cursor + 8 > limit) throw new ArchiveError('TRUNCATED_CENTRAL_DIRECTORY', 'ZIP64 extra field missing compressed size.');
+    out.compressedSize = data.readBigUInt64LE(cursor);
+    cursor += 8;
+  }
+  if (needLfhOffset) {
+    if (cursor + 8 > limit) throw new ArchiveError('TRUNCATED_CENTRAL_DIRECTORY', 'ZIP64 extra field missing local header offset.');
+    out.localHeaderOffset = data.readBigUInt64LE(cursor);
+    cursor += 8;
+  }
+  if (needDiskStart) {
+    if (cursor + 4 > limit) throw new ArchiveError('TRUNCATED_CENTRAL_DIRECTORY', 'ZIP64 extra field missing disk start.');
+    out.diskStart = data.readUInt32LE(cursor);
+    cursor += 4;
+  }
+  return out;
+}
+
+function parseLocalHeaderSizes(
+  lfhRawCompSize: number,
+  lfhRawUncompSize: number,
+  lfhExtra: Buffer,
+  entryPath: string,
+): { compSize: bigint; uncompSize: bigint; hasZip64Extra: boolean } {
+  const z64Data = findZip64ExtraData(lfhExtra);
+  const needUncomp = lfhRawUncompSize === SENTINEL_U32;
+  const needComp = lfhRawCompSize === SENTINEL_U32;
+
+  if (!needUncomp && !needComp) {
+    return {
+      compSize: BigInt(lfhRawCompSize),
+      uncompSize: BigInt(lfhRawUncompSize),
+      hasZip64Extra: z64Data !== undefined,
+    };
+  }
+  if (!z64Data) {
+    throw new ArchiveError('HEADER_MISMATCH', `Local file header for ${entryPath} has ZIP64 sentinel without ZIP64 extra field.`);
+  }
+  if (needUncomp && needComp) {
+    if (z64Data.length < 16) {
+      throw new ArchiveError('HEADER_MISMATCH', `Local file header ZIP64 extra field truncated for ${entryPath}.`);
+    }
+    return {
+      uncompSize: z64Data.readBigUInt64LE(0),
+      compSize: z64Data.readBigUInt64LE(8),
+      hasZip64Extra: true,
+    };
+  }
+  // APPNOTE 4.5.3 specifies both sizes in LFH ZIP64 extra; accept either 16 bytes (checking non-sentinel) or 8 bytes.
+  if (z64Data.length >= 16) {
+    const uncomp = z64Data.readBigUInt64LE(0);
+    const comp = z64Data.readBigUInt64LE(8);
+    if (!needUncomp && uncomp !== BigInt(lfhRawUncompSize)) {
+      throw new ArchiveError('HEADER_MISMATCH', `Local header 32-bit and ZIP64 uncompressed sizes disagree for ${entryPath}.`);
+    }
+    if (!needComp && comp !== BigInt(lfhRawCompSize)) {
+      throw new ArchiveError('HEADER_MISMATCH', `Local header 32-bit and ZIP64 compressed sizes disagree for ${entryPath}.`);
+    }
+    return { compSize: comp, uncompSize: uncomp, hasZip64Extra: true };
+  }
+  if (z64Data.length >= 8) {
+    return {
+      uncompSize: needUncomp ? z64Data.readBigUInt64LE(0) : BigInt(lfhRawUncompSize),
+      compSize: needComp ? z64Data.readBigUInt64LE(0) : BigInt(lfhRawCompSize),
+      hasZip64Extra: true,
+    };
+  }
+  throw new ArchiveError('HEADER_MISMATCH', `Local file header ZIP64 extra field too short for ${entryPath}.`);
+}
+
+function matchDataDescriptor(
+  buf: Buffer,
+  expectedCrc: number,
+  expectedComp: bigint,
+  expectedUncomp: bigint,
+  requiresZip64: boolean,
+  allowsZip64: boolean,
+): number {
+  const tryCandidate = (withSig: boolean, isZip64: boolean): number => {
+    const len = (withSig ? 4 : 0) + (isZip64 ? 20 : 12);
+    if (buf.length < len) return 0;
+    if (withSig && buf.readUInt32LE(0) !== SIG_DATA_DESC) return 0;
+    const off = withSig ? 4 : 0;
+    const crc = buf.readUInt32LE(off);
+    if ((crc >>> 0) !== (expectedCrc >>> 0)) return 0;
+    if (isZip64) {
+      const comp = buf.readBigUInt64LE(off + 4);
+      const uncomp = buf.readBigUInt64LE(off + 12);
+      return comp === expectedComp && uncomp === expectedUncomp ? len : 0;
+    }
+    if (requiresZip64) return 0;
+    const comp = BigInt(buf.readUInt32LE(off + 4));
+    const uncomp = BigInt(buf.readUInt32LE(off + 8));
+    return comp === expectedComp && uncomp === expectedUncomp ? len : 0;
+  };
+
+  const candidates: Array<[boolean, boolean]> = requiresZip64
+    ? [
+        [true, true],
+        [false, true],
+      ]
+    : allowsZip64
+      ? [
+          [true, true],
+          [true, false],
+          [false, true],
+          [false, false],
+        ]
+      : [
+          [true, false],
+          [false, false],
+        ];
+
+  for (const [withSig, isZip64] of candidates) {
+    const matchedLen = tryCandidate(withSig, isZip64);
+    if (matchedLen > 0) return matchedLen;
+  }
+  return 0;
+}
+
+function checkClassicVsZip64Field(
+  classic: number,
+  sentinel: number,
+  z64Value: bigint,
+  fieldName: string,
+): void {
+  const sentinelBig = BigInt(sentinel);
+  if (z64Value >= sentinelBig) {
+    if (classic !== sentinel) {
+      throw new ArchiveError(
+        'INVALID_FORMAT',
+        `Inconsistent classic EOCD and ZIP64 EOCD ${fieldName}: classic=${classic}, expected sentinel ${sentinel} for ${z64Value}.`,
+      );
+    }
+  } else if (classic !== sentinel && BigInt(classic) !== z64Value) {
+    throw new ArchiveError(
+      'INVALID_FORMAT',
+      `Inconsistent classic EOCD and ZIP64 EOCD ${fieldName}: classic=${classic}, zip64=${z64Value}.`,
+    );
+  }
 }
 
 function createRangeReadable(reader: RandomAccessReader, start: bigint, end: bigint): Readable {
@@ -205,7 +359,7 @@ function createRangeReadable(reader: RandomAccessReader, start: bigint, end: big
 
 function checkBombLimits(
   bytesOut: bigint,
-  compressedSize: bigint,
+  consumedIn: bigint,
   compressionMethod: number,
   maxRatio: number,
   ratioCheckMinBytes: bigint,
@@ -216,10 +370,10 @@ function checkBombLimits(
     throw new ArchiveError('ENTRY_BOMB', `Entry ${entryPath} exceeds maximum allowed uncompressed size.`);
   }
   if (compressionMethod === 8 && Number.isFinite(maxRatio) && bytesOut > ratioCheckMinBytes) {
-    if (compressedSize === 0n) {
+    if (consumedIn === 0n) {
       throw new ArchiveError('ENTRY_BOMB', `Entry ${entryPath} inflates from zero compressed bytes.`);
     }
-    const maxAllowed = compressedSize * BigInt(Math.max(1, Math.floor(maxRatio)));
+    const maxAllowed = consumedIn * BigInt(Math.max(1, Math.floor(maxRatio)));
     if (bytesOut > maxAllowed) {
       throw new ArchiveError('ENTRY_BOMB', `Entry ${entryPath} exceeds compression ratio limit (${maxRatio}:1).`);
     }
@@ -237,6 +391,8 @@ function openEntryStream(
   let actualOut = 0n;
   let runningCrc = 0;
 
+  const inflater = meta.compressionMethod === 8 ? createInflateRaw({ chunkSize: STREAM_CHUNK_BYTES }) : null;
+
   const verifier = new Transform({
     highWaterMark: STREAM_CHUNK_BYTES,
     transform(chunk: Buffer, _encoding: string, callback) {
@@ -245,10 +401,11 @@ function openEntryStream(
         callback(new ArchiveError('ENTRY_BOMB', `Entry ${meta.path} expanded past declared size ${meta.uncompressedSize}.`));
         return;
       }
+      const consumedIn = inflater ? BigInt(inflater.bytesWritten) : actualOut;
       try {
         checkBombLimits(
           actualOut,
-          meta.compressedSize,
+          consumedIn,
           meta.compressionMethod,
           maxRatio,
           ratioCheckMinBytes,
@@ -263,6 +420,32 @@ function openEntryStream(
       callback(null, chunk);
     },
     flush(callback) {
+      if (inflater) {
+        const consumedIn = BigInt(inflater.bytesWritten);
+        try {
+          checkBombLimits(
+            actualOut,
+            consumedIn,
+            meta.compressionMethod,
+            maxRatio,
+            ratioCheckMinBytes,
+            maxEntryBytes,
+            meta.path,
+          );
+        } catch (error) {
+          callback(error instanceof Error ? error : new Error(String(error)));
+          return;
+        }
+        if (consumedIn !== meta.compressedSize) {
+          callback(
+            new ArchiveError(
+              'SIZE_MISMATCH',
+              `Entry ${meta.path} deflate stream consumed ${consumedIn} bytes, expected ${meta.compressedSize} compressed bytes.`,
+            ),
+          );
+          return;
+        }
+      }
       if (actualOut !== meta.uncompressedSize) {
         callback(
           new ArchiveError(
@@ -285,12 +468,12 @@ function openEntryStream(
     },
   });
 
-  if (meta.compressionMethod === 0) {
+  if (!inflater) {
     rawStream.on('error', err => verifier.destroy(err));
+    verifier.on('error', () => rawStream.destroy());
     return rawStream.pipe(verifier);
   }
 
-  const inflater = createInflateRaw({ chunkSize: STREAM_CHUNK_BYTES });
   rawStream.on('error', err => {
     inflater.destroy(err);
     verifier.destroy(err);
@@ -308,8 +491,8 @@ function openEntryStream(
 
 /**
  * Opens a zip or zip64 archive through a RandomAccessReader without unpacking to disk.
- * Validates EOCD, ZIP64 end records and extra fields, local headers, entry bounds,
- * overlapping intervals, path traversal, and compression bomb limits.
+ * Validates EOCD, ZIP64 end records and extra fields, local/central header agreement,
+ * data descriptors, entry bounds, overlapping intervals, path traversal, and compression bomb limits.
  */
 export async function openZipReader(reader: RandomAccessReader, options: ZipOpenOptions = {}): Promise<Archive> {
   const maxRatio = options.maxCompressionRatio ?? DEFAULT_MAX_COMPRESSION_RATIO;
@@ -369,13 +552,14 @@ export async function openZipReader(reader: RandomAccessReader, options: ZipOpen
   }
 
   if (hasZip64Locator && locatorBuf) {
+    const locatorOffset = eocdOffset - 20n;
     const locatorDisk = locatorBuf.readUInt32LE(4);
     const zip64EocdOffset = locatorBuf.readBigUInt64LE(8);
     const totalDisks = locatorBuf.readUInt32LE(16);
     if (locatorDisk !== 0 || (totalDisks !== 1 && totalDisks !== 0)) {
       throw new ArchiveError('INVALID_FORMAT', 'Spanned multi-disk ZIP volumes are not supported; use independent multi-part zips.');
     }
-    if (zip64EocdOffset + 56n > eocdOffset - 20n) {
+    if (zip64EocdOffset + 56n > locatorOffset) {
       throw new ArchiveError('BAD_OFFSET', 'ZIP64 EOCD offset is out of archive bounds.');
     }
     const z64 = await reader.readAt(zip64EocdOffset, 56);
@@ -383,8 +567,14 @@ export async function openZipReader(reader: RandomAccessReader, options: ZipOpen
       throw new ArchiveError('INVALID_FORMAT', 'Invalid ZIP64 EOCD signature.');
     }
     const recordSize = z64.readBigUInt64LE(4);
-    if (recordSize < 44n || zip64EocdOffset + 12n + recordSize > eocdOffset - 20n) {
+    if (recordSize < 44n || zip64EocdOffset + 12n + recordSize > locatorOffset) {
       throw new ArchiveError('TRUNCATED_CENTRAL_DIRECTORY', 'ZIP64 EOCD record size is invalid or truncated.');
+    }
+    if (zip64EocdOffset + 12n + recordSize !== locatorOffset) {
+      throw new ArchiveError(
+        'INVALID_FORMAT',
+        `Unexplained gap between ZIP64 EOCD (ends at ${zip64EocdOffset + 12n + recordSize}) and ZIP64 Locator (${locatorOffset}).`,
+      );
     }
     const z64Disk = z64.readUInt32LE(16);
     const z64CdDisk = z64.readUInt32LE(20);
@@ -399,6 +589,17 @@ export async function openZipReader(reader: RandomAccessReader, options: ZipOpen
     cdSize = z64.readBigUInt64LE(40);
     cdOffset = z64.readBigUInt64LE(48);
     cdEndLimit = zip64EocdOffset;
+
+    // Cross-check classic EOCD fields against ZIP64 EOCD fields.
+    if (eocdEntriesDisk !== eocdTotalEntries) {
+      throw new ArchiveError('INVALID_FORMAT', 'Classic EOCD entry counts on disk and total disagree.');
+    }
+    checkClassicVsZip64Field(eocdDisk, SENTINEL_U16, BigInt(z64Disk), 'disk number');
+    checkClassicVsZip64Field(eocdCdDisk, SENTINEL_U16, BigInt(z64CdDisk), 'CD start disk');
+    checkClassicVsZip64Field(eocdEntriesDisk, SENTINEL_U16, entriesOnDisk, 'entries on disk');
+    checkClassicVsZip64Field(eocdTotalEntries, SENTINEL_U16, totalEntries, 'total entries');
+    checkClassicVsZip64Field(eocdCdSize, SENTINEL_U32, cdSize, 'CD size');
+    checkClassicVsZip64Field(eocdCdOffset, SENTINEL_U32, cdOffset, 'CD offset');
   } else {
     if (needsZip64) {
       throw new ArchiveError('TRUNCATED_CENTRAL_DIRECTORY', 'ZIP64 sentinels found in EOCD without a ZIP64 EOCD Locator.');
@@ -418,6 +619,18 @@ export async function openZipReader(reader: RandomAccessReader, options: ZipOpen
   if (cdOffset > cdEndLimit || cdOffset + cdSize > cdEndLimit) {
     throw new ArchiveError('TRUNCATED_CENTRAL_DIRECTORY', 'Central directory extends beyond archive end record.');
   }
+  if (cdOffset + cdSize !== cdEndLimit) {
+    throw new ArchiveError(
+      'INVALID_FORMAT',
+      `Unexplained gap between central directory (ends at ${cdOffset + cdSize}) and end record (${cdEndLimit}).`,
+    );
+  }
+  if (totalEntries === 0n && (cdSize !== 0n || cdOffset !== 0n)) {
+    throw new ArchiveError(
+      'INVALID_FORMAT',
+      `Empty ZIP archive declares zero entries with non-zero central directory offset (${cdOffset}) or size (${cdSize}).`,
+    );
+  }
   if (totalEntries * 46n > cdSize) {
     throw new ArchiveError('TRUNCATED_CENTRAL_DIRECTORY', 'Central directory too small for declared entry count.');
   }
@@ -427,13 +640,14 @@ export async function openZipReader(reader: RandomAccessReader, options: ZipOpen
 
   const cdBuf = await reader.readAt(cdOffset, Number(cdSize));
   const parsed: ParsedEntryMeta[] = [];
-  const seenPaths = new Set<string>();
+  const seenRawNames = new Set<string>();
   let pos = 0;
 
   for (let i = 0n; i < totalEntries; i++) {
     if (pos + 46 > cdBuf.length || cdBuf.readUInt32LE(pos) !== SIG_CD) {
       throw new ArchiveError('TRUNCATED_CENTRAL_DIRECTORY', `Truncated or invalid central directory header at entry ${i}.`);
     }
+    const versionNeeded = cdBuf.readUInt16LE(pos + 6);
     const flags = cdBuf.readUInt16LE(pos + 8);
     if ((flags & 0x0001) !== 0) {
       throw new ArchiveError('ENCRYPTED_ENTRY', 'Encrypted ZIP entries are not supported.');
@@ -459,16 +673,18 @@ export async function openZipReader(reader: RandomAccessReader, options: ZipOpen
       throw new ArchiveError('TRUNCATED_CENTRAL_DIRECTORY', `Central directory variable fields truncated at entry ${i}.`);
     }
 
-    const rawName = cdBuf.subarray(varStart, varStart + nameLen).toString('utf8');
+    const rawNameBuf = cdBuf.subarray(varStart, varStart + nameLen);
+    const rawName = rawNameBuf.toString('utf8');
     const extraBuf = cdBuf.subarray(varStart + nameLen, varStart + nameLen + extraLen);
     pos = nextPos;
 
     const { path, isDirectory } = validateArchivePath(rawName);
+    const dedupKey = rawNameDedupKey(rawNameBuf);
     if (!isDirectory) {
-      if (seenPaths.has(path)) {
+      if (seenRawNames.has(dedupKey)) {
         throw new ArchiveError('DUPLICATE_ENTRY', `Duplicate entry path in zip archive: ${path}`);
       }
-      seenPaths.add(path);
+      seenRawNames.add(dedupKey);
     }
 
     let compressedSize = BigInt(rawCompSize);
@@ -480,6 +696,7 @@ export async function openZipReader(reader: RandomAccessReader, options: ZipOpen
     const needComp = rawCompSize === SENTINEL_U32;
     const needLfhOffset = rawLfhOffset === SENTINEL_U32;
     const needDiskStart = rawDiskStart === SENTINEL_U16;
+    const hasCdZip64Extra = findZip64ExtraData(extraBuf) !== undefined;
     if (needUncomp || needComp || needLfhOffset || needDiskStart) {
       const z64Extra = parseZip64ExtraField(extraBuf, needUncomp, needComp, needLfhOffset, needDiskStart);
       if (needUncomp) uncompressedSize = z64Extra.uncompressedSize!;
@@ -503,10 +720,17 @@ export async function openZipReader(reader: RandomAccessReader, options: ZipOpen
     if (lfh.readUInt32LE(0) !== SIG_LFH) {
       throw new ArchiveError('BAD_OFFSET', `Invalid local file header signature for ${path}.`);
     }
+    const lfhFlags = lfh.readUInt16LE(6);
+    if (lfhFlags !== flags) {
+      throw new ArchiveError('HEADER_MISMATCH', `Local and central header flags disagree for ${path}.`);
+    }
     const lfhMethod = lfh.readUInt16LE(8);
     if (lfhMethod !== compressionMethod) {
-      throw new ArchiveError('INVALID_FORMAT', `Local and central header compression methods disagree for ${path}.`);
+      throw new ArchiveError('HEADER_MISMATCH', `Local and central header compression methods disagree for ${path}.`);
     }
+    const lfhCrc = lfh.readUInt32LE(14);
+    const lfhRawCompSize = lfh.readUInt32LE(18);
+    const lfhRawUncompSize = lfh.readUInt32LE(22);
     const lfhNameLen = lfh.readUInt16LE(26);
     const lfhExtraLen = lfh.readUInt16LE(28);
     const dataStart = localHeaderOffset + 30n + BigInt(lfhNameLen) + BigInt(lfhExtraLen);
@@ -515,8 +739,62 @@ export async function openZipReader(reader: RandomAccessReader, options: ZipOpen
       throw new ArchiveError('BAD_OFFSET', `Entry data range for ${path} extends into central directory.`);
     }
 
+    const lfhVar = await reader.readAt(localHeaderOffset + 30n, lfhNameLen + lfhExtraLen);
+    const lfhNameBuf = lfhVar.subarray(0, lfhNameLen);
+    const lfhExtraBuf = lfhVar.subarray(lfhNameLen);
+    if (lfhNameLen !== nameLen || !lfhNameBuf.equals(rawNameBuf)) {
+      throw new ArchiveError('HEADER_MISMATCH', `Local and central header filenames disagree for ${path}.`);
+    }
+
+    const hasDataDescriptor = (flags & 0x0008) !== 0;
+    let recordEnd = dataEnd;
+
+    if (!hasDataDescriptor) {
+      if ((lfhCrc >>> 0) !== (entryCrc >>> 0)) {
+        throw new ArchiveError('HEADER_MISMATCH', `Local and central header CRC-32 disagree for ${path}.`);
+      }
+      const lfhSizes = parseLocalHeaderSizes(lfhRawCompSize, lfhRawUncompSize, lfhExtraBuf, path);
+      if (lfhSizes.compSize !== compressedSize || lfhSizes.uncompSize !== uncompressedSize) {
+        throw new ArchiveError('HEADER_MISMATCH', `Local and central header sizes disagree for ${path}.`);
+      }
+    } else {
+      // Bit 3 set: LFH CRC/sizes must be 0 (or agree with CD if populated), and a valid ZIP32/ZIP64 data descriptor must follow dataEnd.
+      if (lfhCrc !== 0 && (lfhCrc >>> 0) !== (entryCrc >>> 0)) {
+        throw new ArchiveError('HEADER_MISMATCH', `Local header CRC-32 disagrees with central directory for bit-3 entry ${path}.`);
+      }
+      const lfhHasZ64Extra = findZip64ExtraData(lfhExtraBuf) !== undefined;
+      if (lfhRawCompSize !== 0 || lfhRawUncompSize !== 0) {
+        const lfhSizes = parseLocalHeaderSizes(lfhRawCompSize, lfhRawUncompSize, lfhExtraBuf, path);
+        if (lfhRawCompSize !== 0 && lfhSizes.compSize !== compressedSize) {
+          throw new ArchiveError('HEADER_MISMATCH', `Local header compressed size disagrees with central directory for bit-3 entry ${path}.`);
+        }
+        if (lfhRawUncompSize !== 0 && lfhSizes.uncompSize !== uncompressedSize) {
+          throw new ArchiveError('HEADER_MISMATCH', `Local header uncompressed size disagrees with central directory for bit-3 entry ${path}.`);
+        }
+      }
+      const availAfterData = cdOffset - dataEnd;
+      const peekLen = Number(availAfterData < 24n ? availAfterData : 24n);
+      const descBuf = peekLen > 0 ? await reader.readAt(dataEnd, peekLen) : Buffer.alloc(0);
+      const requiresZip64Desc =
+        compressedSize >= BigInt(SENTINEL_U32) || uncompressedSize >= BigInt(SENTINEL_U32) || lfhHasZ64Extra;
+      const allowsZip64Desc = requiresZip64Desc || hasCdZip64Extra || versionNeeded >= 45;
+      const descLen = matchDataDescriptor(
+        descBuf,
+        entryCrc,
+        compressedSize,
+        uncompressedSize,
+        requiresZip64Desc,
+        allowsZip64Desc,
+      );
+      if (descLen === 0) {
+        throw new ArchiveError('INVALID_DATA_DESCRIPTOR', `Missing or invalid ZIP data descriptor for ${path}.`);
+      }
+      recordEnd = dataEnd + BigInt(descLen);
+    }
+
     parsed.push({
       path,
+      rawDedupKey: dedupKey,
       isDirectory,
       compressionMethod,
       crc32: entryCrc,
@@ -525,6 +803,7 @@ export async function openZipReader(reader: RandomAccessReader, options: ZipOpen
       localHeaderOffset,
       dataStart,
       dataEnd,
+      recordEnd,
       mtime: decodeDosDateTime(dosTime, dosDate),
     });
   }
@@ -533,17 +812,17 @@ export async function openZipReader(reader: RandomAccessReader, options: ZipOpen
     throw new ArchiveError('TRUNCATED_CENTRAL_DIRECTORY', 'Trailing bytes found in central directory.');
   }
 
-  // Reject overlapping entry ranges (defends against zip-overlap and shared-payload bombs).
+  // Reject overlapping entry ranges (including local header, payload, and data descriptors).
   const byOffset = [...parsed].sort((a, b) =>
     a.localHeaderOffset < b.localHeaderOffset ? -1 : a.localHeaderOffset > b.localHeaderOffset ? 1 : 0,
   );
   for (let i = 1; i < byOffset.length; i++) {
     const prev = byOffset[i - 1]!;
     const curr = byOffset[i]!;
-    if (curr.localHeaderOffset < prev.dataEnd) {
+    if (curr.localHeaderOffset < prev.recordEnd) {
       throw new ArchiveError(
         'OVERLAPPING_ENTRIES',
-        `Entry ${curr.path} at ${curr.localHeaderOffset} overlaps ${prev.path} ending at ${prev.dataEnd}.`,
+        `Entry ${curr.path} at ${curr.localHeaderOffset} overlaps ${prev.path} ending at ${prev.recordEnd}.`,
       );
     }
   }
@@ -554,14 +833,16 @@ export async function openZipReader(reader: RandomAccessReader, options: ZipOpen
     if (meta.uncompressedSize > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new ArchiveError('ENTRY_BOMB', `Entry ${meta.path} exceeds safe integer size.`);
     }
-    entries.push({
+    const entry: ArchiveEntry = {
       path: meta.path,
       size: Number(meta.uncompressedSize),
       compressedSize: Number(meta.compressedSize),
       part: options.partName,
       mtime: meta.mtime,
       open: () => openEntryStream(reader, meta, maxRatio, ratioCheckMinBytes, maxEntryBytes),
-    });
+    };
+    entryRawDedupKeys.set(entry, meta.rawDedupKey);
+    entries.push(entry);
   }
 
   return {

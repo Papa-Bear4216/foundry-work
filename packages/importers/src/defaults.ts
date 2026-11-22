@@ -4,6 +4,9 @@ import type { SensitivityTier } from './types.js';
 /** Default profile before P-1 introduces multi-profile configuration (DECISIONS.md A-36). */
 export const DEFAULT_PROFILE = 'me';
 
+/** Per-item plaintext byte cap enforced before buffering past it (DECISIONS.md A-36). */
+export const DEFAULT_MAX_ITEM_BYTES = 64 * 1024 * 1024;
+
 /**
  * Fixed default sensitivity tier per importer source before P-1 rules arrive (DECISIONS.md A-36).
  * Matches Architecture 4.3 (`"sensitivity": "personal"`).
@@ -33,32 +36,214 @@ export function formatUtcTimestamp(date: Date): string {
   return iso.replace(/\.\d{3}Z$/u, 'Z');
 }
 
-/** Parses an ISO-8601, iCalendar/vCard compact, or RFC 5322 date string into canonical UTC `YYYY-MM-DDTHH:MM:SSZ`. */
+const MONTH_INDEX: Readonly<Record<string, number>> = Object.freeze({
+  jan: 0,
+  feb: 1,
+  mar: 2,
+  apr: 3,
+  may: 4,
+  jun: 5,
+  jul: 6,
+  aug: 7,
+  sep: 8,
+  oct: 9,
+  nov: 10,
+  dec: 11,
+});
+
+const TZ_OFFSET_MINUTES: Readonly<Record<string, number>> = Object.freeze({
+  utc: 0,
+  gmt: 0,
+  ut: 0,
+  z: 0,
+  edt: -240,
+  est: -300,
+  cdt: -300,
+  cst: -360,
+  mdt: -360,
+  mst: -420,
+  pdt: -420,
+  pst: -480,
+});
+
+function parseTimezoneOffsetMinutes(tz: string | undefined): number | undefined {
+  if (!tz) return 0; // Zone-less timestamps are always interpreted as UTC (DECISIONS.md A-36).
+  const trimmed = tz.trim();
+  if (!trimmed) return 0;
+  const lower = trimmed.toLowerCase();
+  if (lower in TZ_OFFSET_MINUTES) return TZ_OFFSET_MINUTES[lower]!;
+  const m = /^([+-])(\d{2}):?(\d{2})$/.exec(trimmed);
+  if (!m) return undefined;
+  const sign = m[1] === '-' ? -1 : 1;
+  const hours = Number.parseInt(m[2]!, 10);
+  const mins = Number.parseInt(m[3]!, 10);
+  if (hours > 23 || mins > 59) return undefined;
+  return sign * (hours * 60 + mins);
+}
+
+function buildValidatedUtcTimestamp(
+  year: number,
+  monthZeroBased: number,
+  day: number,
+  hour: number,
+  minute: number,
+  second: number,
+  offsetMinutes: number,
+): string | undefined {
+  if (
+    year < 1 ||
+    year > 9999 ||
+    monthZeroBased < 0 ||
+    monthZeroBased > 11 ||
+    day < 1 ||
+    day > 31 ||
+    hour < 0 ||
+    hour > 23 ||
+    minute < 0 ||
+    minute > 59 ||
+    second < 0 ||
+    second > 59
+  ) {
+    return undefined;
+  }
+  const baseMs = Date.UTC(year, monthZeroBased, day, hour, minute, second);
+  const check = new Date(baseMs);
+  if (
+    check.getUTCFullYear() !== year ||
+    check.getUTCMonth() !== monthZeroBased ||
+    check.getUTCDate() !== day
+  ) {
+    return undefined;
+  }
+  const utcMs = baseMs - offsetMinutes * 60_000;
+  const utcDate = new Date(utcMs);
+  const finalYear = utcDate.getUTCFullYear();
+  if (!Number.isFinite(utcMs) || finalYear < 1 || finalYear > 9999) return undefined;
+  return formatUtcTimestamp(utcDate);
+}
+
+/**
+ * Parses an ISO-8601, iCalendar/vCard compact, or RFC 5322 date string into canonical UTC
+ * `YYYY-MM-DDTHH:MM:SSZ`. Zone-less date-times are ALWAYS interpreted as UTC regardless of
+ * host time zone (DECISIONS.md A-36).
+ */
 export function normalizeTimestamp(raw: string | undefined): string | undefined {
   if (!raw) return undefined;
   const trimmed = raw.trim();
   if (!trimmed) return undefined;
 
-  // Compact iCalendar / vCard UTC or local forms: YYYYMMDDTHHMMSSZ or YYYYMMDDTHHMMSS or YYYYMMDD
-  const compactDateTime = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z?)$/i.exec(trimmed);
+  // 1. Compact iCalendar / vCard date-time: YYYYMMDDTHHMMSS[Z|±HHMM|±HH:MM]
+  const compactDateTime = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z|[+-]\d{2}:?\d{2})?$/i.exec(trimmed);
   if (compactDateTime) {
-    const [, y, m, d, hh, mm, ss] = compactDateTime;
-    const candidate = `${y}-${m}-${d}T${hh}:${mm}:${ss}Z`;
-    const parsed = Date.parse(candidate);
-    if (Number.isFinite(parsed)) return formatUtcTimestamp(new Date(parsed));
-    return undefined;
+    const [, y, m, d, hh, mm, ss, tz] = compactDateTime;
+    const offset = parseTimezoneOffsetMinutes(tz);
+    if (offset === undefined) return undefined;
+    return buildValidatedUtcTimestamp(
+      Number.parseInt(y!, 10),
+      Number.parseInt(m!, 10) - 1,
+      Number.parseInt(d!, 10),
+      Number.parseInt(hh!, 10),
+      Number.parseInt(mm!, 10),
+      Number.parseInt(ss!, 10),
+      offset,
+    );
   }
 
+  // 2. Compact date-only: YYYYMMDD
   const compactDate = /^(\d{4})(\d{2})(\d{2})$/.exec(trimmed);
   if (compactDate) {
     const [, y, m, d] = compactDate;
-    const candidate = `${y}-${m}-${d}T00:00:00Z`;
-    const parsed = Date.parse(candidate);
-    if (Number.isFinite(parsed)) return formatUtcTimestamp(new Date(parsed));
-    return undefined;
+    return buildValidatedUtcTimestamp(
+      Number.parseInt(y!, 10),
+      Number.parseInt(m!, 10) - 1,
+      Number.parseInt(d!, 10),
+      0,
+      0,
+      0,
+      0,
+    );
   }
 
-  const parsed = Date.parse(trimmed);
+  // 3. ISO-8601 date-only: YYYY-MM-DD
+  const isoDate = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed);
+  if (isoDate) {
+    const [, y, m, d] = isoDate;
+    return buildValidatedUtcTimestamp(
+      Number.parseInt(y!, 10),
+      Number.parseInt(m!, 10) - 1,
+      Number.parseInt(d!, 10),
+      0,
+      0,
+      0,
+      0,
+    );
+  }
+
+  // 4. ISO-8601 date-time (zone-less defaults strictly to UTC): YYYY-MM-DD[T ]HH:MM[:SS[.fff]][Z|±HH:MM|±HHMM]
+  const isoDateTime =
+    /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?:\s*(Z|[+-]\d{2}:?\d{2}))?$/i.exec(trimmed);
+  if (isoDateTime) {
+    const [, y, m, d, hh, mm, ss, tz] = isoDateTime;
+    const offset = parseTimezoneOffsetMinutes(tz);
+    if (offset === undefined) return undefined;
+    return buildValidatedUtcTimestamp(
+      Number.parseInt(y!, 10),
+      Number.parseInt(m!, 10) - 1,
+      Number.parseInt(d!, 10),
+      Number.parseInt(hh!, 10),
+      Number.parseInt(mm!, 10),
+      ss ? Number.parseInt(ss, 10) : 0,
+      offset,
+    );
+  }
+
+  // 5. RFC 5322 email date (zone-less defaults strictly to UTC): [Day,] DD Mon YYYY HH:MM[:SS] [TZ] [(comment)]
+  const rfc5322 =
+    /^(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+)?(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s+(\d{2}):(\d{2})(?::(\d{2}))?(?:\s+([+-]\d{4}|[A-Za-z]{1,5}))?(?:\s+\([^)]*\))?$/i.exec(
+      trimmed,
+    );
+  if (rfc5322) {
+    const [, d, mon, y, hh, mm, ss, tz] = rfc5322;
+    const monthIdx = MONTH_INDEX[mon!.toLowerCase()];
+    const offset = parseTimezoneOffsetMinutes(tz);
+    if (monthIdx !== undefined && offset !== undefined) {
+      return buildValidatedUtcTimestamp(
+        Number.parseInt(y!, 10),
+        monthIdx,
+        Number.parseInt(d!, 10),
+        Number.parseInt(hh!, 10),
+        Number.parseInt(mm!, 10),
+        ss ? Number.parseInt(ss, 10) : 0,
+        offset,
+      );
+    }
+  }
+
+  // 6. Asctime / mbox date (zone-less defaults strictly to UTC): Day Mon DD HH:MM:SS [TZ] YYYY [TZ]
+  const asctime =
+    /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})(?:\s+([+-]\d{4}|[A-Za-z]{1,5}))?\s+(\d{4})(?:\s+([+-]\d{4}))?$/i.exec(
+      trimmed,
+    );
+  if (asctime) {
+    const [, mon, d, hh, mm, ss, tzBefore, y, tzAfter] = asctime;
+    const monthIdx = MONTH_INDEX[mon!.toLowerCase()];
+    const offset = parseTimezoneOffsetMinutes(tzBefore ?? tzAfter);
+    if (monthIdx !== undefined && offset !== undefined) {
+      return buildValidatedUtcTimestamp(
+        Number.parseInt(y!, 10),
+        monthIdx,
+        Number.parseInt(d!, 10),
+        Number.parseInt(hh!, 10),
+        Number.parseInt(mm!, 10),
+        Number.parseInt(ss!, 10),
+        offset,
+      );
+    }
+  }
+
+  // 7. Fallback: NEVER let Date.parse interpret a zone-less string in host local time.
+  const hasExplicitZone = /(?:Z|GMT|UTC|UT|[ECMP][DS]T|[+-]\d{2}:?\d{2})\s*(?:\([^)]*\))?$/i.test(trimmed);
+  const parsed = Date.parse(hasExplicitZone ? trimmed : `${trimmed} UTC`);
   if (!Number.isFinite(parsed)) return undefined;
   const date = new Date(parsed);
   const year = date.getUTCFullYear();

@@ -42,15 +42,13 @@ export function isMboxSeparatorLine(line: Buffer): boolean {
 function parseSeparatorTimestamp(separatorLine: string): string | undefined {
   // Format: `From <addr> Mon Jan 01 12:34:56 +0000 2024` or `From <addr> Mon Jan  1 12:34:56 2024`
   const m =
-    /^From \S+ (?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}:\d{2}:\d{2})(?:\s+([+-]\d{4}))?\s+(\d{4})(?:\s+([+-]\d{4}))?$/.exec(
+    /^From \S+ ((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(?:\s+(?:[+-]\d{4}|[A-Za-z]{2,5}))?\s+\d{4}(?:\s+[+-]\d{4})?)$/.exec(
       separatorLine,
     );
   if (m) {
-    const [, mon, day, time, tzBefore, year, tzAfter] = m;
-    const tz = tzBefore ?? tzAfter ?? '+0000';
-    return normalizeTimestamp(`${day} ${mon} ${year} ${time} ${tz}`);
+    return normalizeTimestamp(m[1]);
   }
-  const iso = /^From \S+ (\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\S*)$/.exec(separatorLine);
+  const iso = /^From \S+ (\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:\s*(?:Z|[+-]\d{2}:?\d{2}))?)$/i.exec(separatorLine);
   if (iso) return normalizeTimestamp(iso[1]);
   return undefined;
 }

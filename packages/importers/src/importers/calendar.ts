@@ -5,8 +5,10 @@
 
 import { Buffer } from 'node:buffer';
 import { Readable } from 'node:stream';
-import type { ArchiveEntry, Derived, Deriver, Importer, RawItem, StoredItem } from '../types.js';
-import { formatUtcTimestamp, normalizeTimestamp, uniqueSorted } from '../defaults.js';
+import type { ArchiveEntry, Derived, Deriver, Importer, ItemErrorInfo, RawItem, SplitOptions, StoredItem } from '../types.js';
+import { DEFAULT_MAX_ITEM_BYTES, formatUtcTimestamp, normalizeTimestamp, uniqueSorted } from '../defaults.js';
+import { getParamValue, parseContentLine } from './content-line.js';
+import { ItemSkipError } from './errors.js';
 
 export const CALENDAR_SOURCE_ID = 'google-takeout/calendar';
 
@@ -36,13 +38,6 @@ function unescapeIcalText(value: string): string {
     if (esc === 'n' || esc === 'N') return '\n';
     return esc;
   });
-}
-
-function parseParam(params: string, name: string): string | undefined {
-  const re = new RegExp(`(?:^|;)${name}=(?:"([^"]*)"|([^;:]*))`, 'i');
-  const m = re.exec(params);
-  if (!m) return undefined;
-  return (m[1] ?? m[2] ?? '').trim() || undefined;
 }
 
 function cleanMailto(value: string): string {
@@ -77,11 +72,11 @@ export function parseIcalendar(icsText: string): ParsedCalendar {
       continue;
     }
 
-    const match = /^([A-Za-z0-9-]+)((?:;[^:]*)*):(.*)$/.exec(line);
-    if (!match) continue;
-    const prop = match[1]!.toUpperCase();
-    const params = match[2] ?? '';
-    const rawVal = match[3]!.trim();
+    const parsedLine = parseContentLine(line);
+    if (!parsedLine) continue;
+    const prop = parsedLine.name;
+    const params = parsedLine.params;
+    const rawVal = parsedLine.value.trim();
 
     if (!inEvent) {
       if (prop === 'X-WR-CALNAME' && !calendarName && rawVal) {
@@ -122,7 +117,7 @@ export function parseIcalendar(icsText: string): ParsedCalendar {
       case 'ORGANIZER': {
         const address = cleanMailto(rawVal);
         if (address) {
-          current.organizer = { address, name: parseParam(params, 'CN') };
+          current.organizer = { address, name: getParamValue(params, 'CN') };
         }
         break;
       }
@@ -131,8 +126,8 @@ export function parseIcalendar(icsText: string): ParsedCalendar {
         if (address) {
           current.attendees.push({
             address,
-            name: parseParam(params, 'CN'),
-            partstat: parseParam(params, 'PARTSTAT'),
+            name: getParamValue(params, 'CN'),
+            partstat: getParamValue(params, 'PARTSTAT'),
           });
         }
         break;
@@ -196,8 +191,31 @@ async function readStreamToBuffer(stream: Readable): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-function extractCalendarTimestamp(icsText: string, mtime?: Date): string | undefined {
-  const parsed = parseIcalendar(icsText);
+async function readStreamBounded(
+  stream: Readable,
+  maxBytes: number,
+): Promise<{ buffer: Buffer; exceeded: false } | { exceeded: true; observedBytes: number }> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  let exceeded = false;
+
+  for await (const rawChunk of stream) {
+    const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk as Uint8Array);
+    total += chunk.length;
+    if (exceeded) continue;
+    if (total > maxBytes) {
+      chunks.length = 0;
+      exceeded = true;
+      continue;
+    }
+    chunks.push(chunk);
+  }
+
+  if (exceeded) return { exceeded: true, observedBytes: total };
+  return { buffer: chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks), exceeded: false };
+}
+
+function extractCalendarTimestamp(parsed: ParsedCalendar, mtime?: Date): string | undefined {
   let earliest: string | undefined;
   for (const ev of parsed.events) {
     const ts = ev.dtstart ?? ev.dtstamp;
@@ -213,12 +231,47 @@ export const calendarImporter: Importer = {
     const lower = entry.path.toLowerCase();
     return lower.endsWith('.ics') || lower.endsWith('.ical');
   },
-  async *split(entry: ArchiveEntry): AsyncIterable<RawItem> {
+  async *split(entry: ArchiveEntry, options?: SplitOptions): AsyncIterable<RawItem> {
+    const maxItemBytes = options?.maxItemBytes ?? DEFAULT_MAX_ITEM_BYTES;
+    const reportError = (info: ItemErrorInfo): void => {
+      if (options?.onItemError) {
+        options.onItemError(info);
+        return;
+      }
+      throw new ItemSkipError(info);
+    };
+
+    if (entry.size > maxItemBytes) {
+      reportError({
+        code: 'ITEM_TOO_LARGE',
+        source: CALENDAR_SOURCE_ID,
+        entryPath: entry.path,
+        itemPath: entry.path,
+        message: `Calendar file ${entry.path} (${entry.size} bytes) exceeds per-item limit (${maxItemBytes} bytes).`,
+        limitBytes: maxItemBytes,
+        observedBytes: entry.size,
+      });
+      return;
+    }
+
     // Architecture 7: lossless original calendar file stored as one item (preserves VTIMEZONE and VCALENDAR metadata).
-    const raw = await readStreamToBuffer(entry.open());
-    const text = raw.toString('utf8');
-    const sourceTs = extractCalendarTimestamp(text, entry.mtime);
-    const parsed = parseIcalendar(text);
+    const read = await readStreamBounded(entry.open(), maxItemBytes);
+    if (read.exceeded) {
+      reportError({
+        code: 'ITEM_TOO_LARGE',
+        source: CALENDAR_SOURCE_ID,
+        entryPath: entry.path,
+        itemPath: entry.path,
+        message: `Calendar file ${entry.path} (${read.observedBytes} bytes) exceeds per-item limit (${maxItemBytes} bytes).`,
+        limitBytes: maxItemBytes,
+        observedBytes: read.observedBytes,
+      });
+      return;
+    }
+
+    const raw = read.buffer;
+    const parsed = parseIcalendar(raw.toString('utf8'));
+    const sourceTs = extractCalendarTimestamp(parsed, entry.mtime);
     const tags = ['calendar'];
     if (parsed.calendarName) tags.push(parsed.calendarName.toLowerCase());
     yield {

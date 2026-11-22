@@ -7,9 +7,12 @@ export type {
   ImportCrashPoint,
   Importer,
   ImportResult,
+  ItemErrorCode,
+  ItemErrorInfo,
   RawItem,
   SensitivityTier,
   SourceImportCounts,
+  SplitOptions,
   StoredItem,
   UnlockedKeyringLike,
   VaultAppend,
@@ -20,6 +23,7 @@ export type {
 
 export {
   computeItemKey,
+  DEFAULT_MAX_ITEM_BYTES,
   DEFAULT_PROFILE,
   DEFAULT_SENSITIVITY_BY_SOURCE,
   defaultCollectionName,
@@ -34,6 +38,10 @@ export type { ArchiveErrorCode } from './archive/errors.js';
 export { openZipFile, openZipReader, validateArchivePath } from './archive/zip-reader.js';
 export type { RandomAccessReader, ZipOpenOptions } from './archive/zip-reader.js';
 export { comparePartNames, openArchive } from './archive/multipart.js';
+
+export { ItemSkipError } from './importers/errors.js';
+export { getParamValue, parseContentLine } from './importers/content-line.js';
+export type { ContentLineParam, ParsedContentLine } from './importers/content-line.js';
 
 export {
   CONTACTS_SOURCE_ID,

@@ -8,10 +8,15 @@
 
 import { Buffer } from 'node:buffer';
 import { Readable } from 'node:stream';
-import type { ArchiveEntry, Derived, Deriver, Importer, RawItem, StoredItem } from '../types.js';
-import { normalizeTimestamp, uniqueSorted } from '../defaults.js';
+import type { ArchiveEntry, Derived, Deriver, Importer, ItemErrorInfo, RawItem, SplitOptions, StoredItem } from '../types.js';
+import { DEFAULT_MAX_ITEM_BYTES, normalizeTimestamp, uniqueSorted } from '../defaults.js';
+import { getParamValue, parseContentLine } from './content-line.js';
+import type { ContentLineParam } from './content-line.js';
+import { ItemSkipError } from './errors.js';
 
 export const CONTACTS_SOURCE_ID = 'google-takeout/contacts';
+
+const LOGICAL_MARKER_MAX_CHARS = 32;
 
 export interface ParsedContact {
   name: string;
@@ -53,15 +58,22 @@ function unescapeVcardValue(value: string): string {
   });
 }
 
-function extractParamType(params: string): string | undefined {
-  const match = /(?:^|;)TYPE=([^;:]+)/i.exec(params);
-  if (match) return match[1]!.replace(/^"|"$/g, '').trim() || undefined;
+function extractParamType(params: readonly ContentLineParam[]): string | undefined {
+  const explicit = getParamValue(params, 'TYPE');
+  if (explicit) return explicit;
   // vCard 2.1 bare type parameters such as ;CELL or ;HOME;VOICE
   const bare = params
-    .split(';')
-    .map(p => p.trim())
-    .filter(p => p.length > 0 && !p.includes('='));
+    .filter(p => p.name === '' && p.value.length > 0 && p.value.toUpperCase() !== 'QUOTED-PRINTABLE')
+    .map(p => p.value);
   return bare.length > 0 ? bare.join(',') : undefined;
+}
+
+function isQuotedPrintableParams(params: readonly ContentLineParam[]): boolean {
+  for (const p of params) {
+    if (p.name === 'ENCODING' && p.value.toUpperCase() === 'QUOTED-PRINTABLE') return true;
+    if (p.name === '' && p.value.toUpperCase() === 'QUOTED-PRINTABLE') return true;
+  }
+  return false;
 }
 
 /** Parses a single vCard (RFC 2425/2426/6350) into a structured contact record. */
@@ -87,14 +99,14 @@ export function parseVcard(cardText: string): ParsedContact | null {
   for (const rawLine of unfolded.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) continue;
-    const match = /^(?:[\w-]+\.)?([A-Za-z0-9-]+)((?:;[^:]*)*):(.*)$/.exec(line);
-    if (!match) continue;
+    const parsedLine = parseContentLine(line, { allowGroup: true });
+    if (!parsedLine) continue;
 
-    const prop = match[1]!.toUpperCase();
-    const params = match[2] ?? '';
-    let value = match[3]!.trim();
+    const prop = parsedLine.name;
+    const params = parsedLine.params;
+    let value = parsedLine.value.trim();
 
-    if (/ENCODING=QUOTED-PRINTABLE/i.test(params) || /(?:^|;)QUOTED-PRINTABLE(?:;|$)/i.test(params)) {
+    if (isQuotedPrintableParams(params)) {
       value = decodeQuotedPrintable(value);
     }
 
@@ -214,9 +226,17 @@ function entryTags(entryPath: string): string[] {
 }
 
 function extractRevFromCard(cardBytes: Buffer): string | undefined {
-  const text = cardBytes.toString('utf8');
-  const match = /(?:^|\r?\n)REV(?:;[^:]*)?:([^\r\n]+)/i.exec(text);
-  return match ? normalizeTimestamp(match[1]!.trim()) : undefined;
+  const text = cardBytes.toString('utf8').replace(/^\ufeff/, '').replace(/\r?\n[ \t]/g, '');
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const parsed = parseContentLine(line, { allowGroup: true });
+    if (parsed && parsed.name === 'REV') {
+      const normalized = normalizeTimestamp(parsed.value.trim());
+      if (normalized) return normalized;
+    }
+  }
+  return undefined;
 }
 
 async function readStreamToBuffer(stream: Readable): Promise<Buffer> {
@@ -228,74 +248,352 @@ async function readStreamToBuffer(stream: Readable): Promise<Buffer> {
 }
 
 /**
- * Splits a vCard stream into lossless per-contact RawItems, preserving original bytes
- * for every BEGIN:VCARD ... END:VCARD block.
+ * Splits a vCard stream into lossless per-contact RawItems, preserving exact physical bytes
+ * for every BEGIN:VCARD ... END:VCARD block. Recognises BEGIN/END markers only on complete
+ * unfolded RFC logical lines, bounds every card and unterminated line to maxItemBytes before
+ * accumulating past it, and reports nested BEGIN or unfinished final cards as typed errors.
  */
-async function* splitVcardStream(entry: ArchiveEntry): AsyncIterable<RawItem> {
+async function* splitVcardStream(entry: ArchiveEntry, options?: SplitOptions): AsyncIterable<RawItem> {
+  const maxItemBytes = options?.maxItemBytes ?? DEFAULT_MAX_ITEM_BYTES;
   const baseTags = entryTags(entry.path);
   const source = entry.open();
-  let carry = Buffer.alloc(0);
-  let cardChunks: Buffer[] = [];
-  let inCard = false;
-  let cardIndex = 0;
 
-  const emitLine = (lineBuf: Buffer): Buffer | null => {
-    const trimmed = lineBuf.toString('utf8').replace(/^\ufeff/, '').trim().toUpperCase();
-    if (trimmed === 'BEGIN:VCARD') {
+  const reportError = (info: ItemErrorInfo): void => {
+    if (options?.onItemError) {
+      options.onItemError(info);
+      return;
+    }
+    throw new ItemSkipError(info);
+  };
+
+  let carryChunks: Buffer[] = [];
+  let carryBytes = 0;
+  let skippingOversizedPhysLine = false;
+  let isFirstPhysLine = true;
+
+  // Pending unfolded logical line (physical buffers kept verbatim; prefix capped for marker checks).
+  let hasPending = false;
+  let pendingPhys: Buffer[] = [];
+  let pendingBytes = 0;
+  let pendingHasContent = false;
+  let pendingLogicalPrefix = '';
+  let pendingLogicalOverflow = false;
+  let pendingOversized = false;
+
+  // Current card accumulator.
+  let inCard = false;
+  let cardOrdinal = 0;
+  let cardChunks: Buffer[] = [];
+  let cardBytes = 0;
+  let oversizedCard = false;
+
+  const appendLogicalText = (slice: Buffer): void => {
+    if (pendingLogicalOverflow || slice.length === 0) return;
+    const needed = LOGICAL_MARKER_MAX_CHARS - pendingLogicalPrefix.length;
+    if (slice.length > needed) {
+      pendingLogicalOverflow = true;
+      return;
+    }
+    pendingLogicalPrefix += slice.toString('utf8');
+    if (pendingLogicalPrefix.length > LOGICAL_MARKER_MAX_CHARS) {
+      pendingLogicalOverflow = true;
+    }
+  };
+
+  const markCurrentCardOversized = (observedBytes: number): void => {
+    const alreadyReported = oversizedCard;
+    cardChunks = [];
+    cardBytes = 0;
+    oversizedCard = true;
+    if (!alreadyReported) {
+      reportError({
+        code: 'ITEM_TOO_LARGE',
+        source: CONTACTS_SOURCE_ID,
+        entryPath: entry.path,
+        itemPath: inCard ? `${entry.path}#${cardOrdinal}` : entry.path,
+        message: `vCard item exceeds per-item limit (${maxItemBytes} bytes).`,
+        limitBytes: maxItemBytes,
+        observedBytes,
+      });
+    }
+  };
+
+  const flushPendingLogicalLine = (): { card: Buffer; ordinal: number } | null => {
+    if (!hasPending) return null;
+
+    const phys = pendingPhys;
+    const physLen = pendingBytes;
+    const logicalKey = pendingLogicalOverflow || pendingOversized ? '' : pendingLogicalPrefix.toUpperCase();
+
+    hasPending = false;
+    pendingPhys = [];
+    pendingBytes = 0;
+    pendingHasContent = false;
+    pendingLogicalPrefix = '';
+    pendingLogicalOverflow = false;
+    pendingOversized = false;
+
+    if (logicalKey === 'BEGIN:VCARD') {
+      if (inCard) {
+        if (!oversizedCard) {
+          reportError({
+            code: 'VCARD_NESTED_BEGIN',
+            source: CONTACTS_SOURCE_ID,
+            entryPath: entry.path,
+            itemPath: `${entry.path}#${cardOrdinal}`,
+            message: `Nested BEGIN:VCARD encountered before END:VCARD in ${entry.path}#${cardOrdinal}.`,
+          });
+        }
+        cardChunks = [];
+        cardBytes = 0;
+        oversizedCard = false;
+      }
+      cardOrdinal++;
       inCard = true;
-      cardChunks = [lineBuf];
+      if (physLen > maxItemBytes) {
+        markCurrentCardOversized(physLen);
+        return null;
+      }
+      cardChunks = phys;
+      cardBytes = physLen;
       return null;
     }
-    if (inCard) {
-      cardChunks.push(lineBuf);
-      if (trimmed === 'END:VCARD') {
-        const fullCard = Buffer.concat(cardChunks);
-        cardChunks = [];
+
+    if (logicalKey === 'END:VCARD') {
+      if (!inCard) return null;
+      if (oversizedCard) {
         inCard = false;
-        return fullCard;
+        oversizedCard = false;
+        cardChunks = [];
+        cardBytes = 0;
+        return null;
+      }
+      if (cardBytes + physLen > maxItemBytes) {
+        const observed = cardBytes + physLen;
+        markCurrentCardOversized(observed);
+        inCard = false;
+        oversizedCard = false;
+        return null;
+      }
+      for (const b of phys) cardChunks.push(b);
+      const fullCard = Buffer.concat(cardChunks);
+      const completedOrdinal = cardOrdinal;
+      inCard = false;
+      oversizedCard = false;
+      cardChunks = [];
+      cardBytes = 0;
+      return { card: fullCard, ordinal: completedOrdinal };
+    }
+
+    if (inCard && !oversizedCard) {
+      if (cardBytes + physLen > maxItemBytes) {
+        markCurrentCardOversized(cardBytes + physLen);
+      } else {
+        for (const b of phys) cardChunks.push(b);
+        cardBytes += physLen;
       }
     }
     return null;
   };
 
+  const onPhysicalLine = (lineBuf: Buffer, wasOversized: boolean): { card: Buffer; ordinal: number } | null => {
+    let contentStart = 0;
+    let contentEnd = lineBuf.length;
+
+    if (isFirstPhysLine) {
+      isFirstPhysLine = false;
+      if (!wasOversized && lineBuf.length >= 3 && lineBuf[0] === 0xef && lineBuf[1] === 0xbb && lineBuf[2] === 0xbf) {
+        contentStart = 3;
+      }
+    }
+    if (contentEnd > contentStart && lineBuf[contentEnd - 1] === 0x0a) contentEnd--;
+    if (contentEnd > contentStart && lineBuf[contentEnd - 1] === 0x0d) contentEnd--;
+
+    const isContinuation =
+      !wasOversized &&
+      hasPending &&
+      pendingHasContent &&
+      contentEnd > contentStart &&
+      (lineBuf[contentStart] === 0x20 || lineBuf[contentStart] === 0x09);
+
+    if (isContinuation) {
+      if (pendingOversized || oversizedCard) return null;
+      const projectedPending = pendingBytes + lineBuf.length;
+      const projectedCard = inCard ? cardBytes + projectedPending : projectedPending;
+      if (projectedPending > maxItemBytes || projectedCard > maxItemBytes) {
+        pendingPhys = [];
+        pendingBytes = 0;
+        pendingOversized = true;
+        if (inCard) {
+          markCurrentCardOversized(projectedCard);
+        } else {
+          reportError({
+            code: 'ITEM_TOO_LARGE',
+            source: CONTACTS_SOURCE_ID,
+            entryPath: entry.path,
+            itemPath: entry.path,
+            message: `Folded vCard line exceeds per-item limit (${maxItemBytes} bytes).`,
+            limitBytes: maxItemBytes,
+            observedBytes: projectedPending,
+          });
+        }
+        return null;
+      }
+      pendingPhys.push(lineBuf);
+      pendingBytes = projectedPending;
+      appendLogicalText(lineBuf.subarray(contentStart + 1, contentEnd));
+      return null;
+    }
+
+    const completed = flushPendingLogicalLine();
+
+    if (wasOversized) {
+      hasPending = true;
+      pendingPhys = [];
+      pendingBytes = 0;
+      pendingHasContent = true;
+      pendingLogicalPrefix = '';
+      pendingLogicalOverflow = true;
+      pendingOversized = true;
+      if (inCard && !oversizedCard) {
+        markCurrentCardOversized(maxItemBytes + 1);
+      }
+      return completed;
+    }
+
+    hasPending = true;
+    pendingHasContent = contentEnd > contentStart;
+    pendingLogicalPrefix = '';
+    pendingLogicalOverflow = false;
+    pendingOversized = false;
+    appendLogicalText(lineBuf.subarray(contentStart, contentEnd));
+
+    // Bound combined in-flight buffers before holding cardChunks + pendingPhys past maxItemBytes.
+    if (inCard && !oversizedCard && pendingLogicalOverflow && cardBytes + lineBuf.length > maxItemBytes) {
+      pendingPhys = [];
+      pendingBytes = 0;
+      pendingOversized = true;
+      markCurrentCardOversized(cardBytes + lineBuf.length);
+    } else if (inCard && !oversizedCard) {
+      pendingPhys = [lineBuf];
+      pendingBytes = lineBuf.length;
+    } else if (!inCard && !pendingLogicalOverflow) {
+      // Outside a card we only need to retain potential BEGIN:VCARD physical bytes.
+      pendingPhys = [lineBuf];
+      pendingBytes = lineBuf.length;
+    } else {
+      pendingPhys = [];
+      pendingBytes = 0;
+    }
+
+    return completed;
+  };
+
+  const makeRawItem = (completed: { card: Buffer; ordinal: number }): RawItem => {
+    const sourceTs = extractRevFromCard(completed.card);
+    return {
+      bytes: Readable.from([completed.card]),
+      path: `${entry.path}#${completed.ordinal}`,
+      mime: 'text/vcard',
+      sourceTs,
+      tags: baseTags,
+    };
+  };
+
   for await (const rawChunk of source) {
     const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk as Uint8Array);
-    const data = carry.length > 0 ? Buffer.concat([carry, chunk]) : chunk;
     let start = 0;
-    while (start < data.length) {
-      const nl = data.indexOf(0x0a, start);
-      if (nl === -1) break;
-      const lineBuf = data.subarray(start, nl + 1);
-      const completed = emitLine(Buffer.from(lineBuf));
-      if (completed) {
-        cardIndex++;
-        const sourceTs = extractRevFromCard(completed);
-        yield {
-          bytes: Readable.from([completed]),
-          path: `${entry.path}#${cardIndex}`,
-          mime: 'text/vcard',
-          sourceTs,
-          tags: baseTags,
-        };
+
+    while (start < chunk.length) {
+      const nl = chunk.indexOf(0x0a, start);
+      if (skippingOversizedPhysLine) {
+        if (nl === -1) {
+          start = chunk.length;
+        } else {
+          skippingOversizedPhysLine = false;
+          const completed = onPhysicalLine(Buffer.alloc(0), true);
+          if (completed) yield makeRawItem(completed);
+          start = nl + 1;
+        }
+        continue;
       }
-      start = nl + 1;
+
+      const sliceEnd = nl === -1 ? chunk.length : nl + 1;
+      const sliceLen = sliceEnd - start;
+
+      const lineTooLong = carryBytes + sliceLen > maxItemBytes;
+      const cardTooLargeMidLine =
+        inCard &&
+        !oversizedCard &&
+        carryBytes + sliceLen > LOGICAL_MARKER_MAX_CHARS &&
+        cardBytes + pendingBytes + carryBytes + sliceLen > maxItemBytes;
+
+      if (lineTooLong || cardTooLargeMidLine) {
+        const observed = lineTooLong ? carryBytes + sliceLen : cardBytes + pendingBytes + carryBytes + sliceLen;
+        carryChunks = [];
+        carryBytes = 0;
+        if (inCard) {
+          markCurrentCardOversized(observed);
+        } else {
+          reportError({
+            code: 'ITEM_TOO_LARGE',
+            source: CONTACTS_SOURCE_ID,
+            entryPath: entry.path,
+            itemPath: entry.path,
+            message: `Unterminated vCard line exceeds per-item limit (${maxItemBytes} bytes).`,
+            limitBytes: maxItemBytes,
+            observedBytes: observed,
+          });
+        }
+        if (nl === -1) {
+          skippingOversizedPhysLine = true;
+          start = chunk.length;
+        } else {
+          const completed = onPhysicalLine(Buffer.alloc(0), true);
+          if (completed) yield makeRawItem(completed);
+          start = nl + 1;
+        }
+        continue;
+      }
+
+      const piece = Buffer.from(chunk.subarray(start, sliceEnd));
+      if (nl === -1) {
+        carryChunks.push(piece);
+        carryBytes += piece.length;
+        start = chunk.length;
+      } else {
+        const lineBuf = carryChunks.length === 0 ? piece : Buffer.concat([...carryChunks, piece]);
+        carryChunks = [];
+        carryBytes = 0;
+        const completed = onPhysicalLine(lineBuf, false);
+        if (completed) yield makeRawItem(completed);
+        start = nl + 1;
+      }
     }
-    carry = start < data.length ? Buffer.from(data.subarray(start)) : Buffer.alloc(0);
   }
 
-  if (carry.length > 0) {
-    const completed = emitLine(carry);
-    if (completed) {
-      cardIndex++;
-      const sourceTs = extractRevFromCard(completed);
-      yield {
-        bytes: Readable.from([completed]),
-        path: `${entry.path}#${cardIndex}`,
-        mime: 'text/vcard',
-        sourceTs,
-        tags: baseTags,
-      };
-    }
+  if (skippingOversizedPhysLine) {
+    const completed = onPhysicalLine(Buffer.alloc(0), true);
+    if (completed) yield makeRawItem(completed);
+  } else if (carryChunks.length > 0) {
+    const lineBuf = carryChunks.length === 1 ? carryChunks[0]! : Buffer.concat(carryChunks);
+    carryChunks = [];
+    carryBytes = 0;
+    const completed = onPhysicalLine(lineBuf, false);
+    if (completed) yield makeRawItem(completed);
+  }
+
+  const finalCompleted = flushPendingLogicalLine();
+  if (finalCompleted) yield makeRawItem(finalCompleted);
+
+  if (inCard && !oversizedCard) {
+    reportError({
+      code: 'VCARD_UNFINISHED',
+      source: CONTACTS_SOURCE_ID,
+      entryPath: entry.path,
+      itemPath: `${entry.path}#${cardOrdinal}`,
+      message: `Unfinished vCard reached EOF without END:VCARD in ${entry.path}#${cardOrdinal}.`,
+    });
   }
 }
 
@@ -305,8 +603,8 @@ export const contactsImporter: Importer = {
     const lower = entry.path.toLowerCase();
     return lower.endsWith('.vcf') || lower.endsWith('.vcard');
   },
-  split(entry: ArchiveEntry): AsyncIterable<RawItem> {
-    return splitVcardStream(entry);
+  split(entry: ArchiveEntry, options?: SplitOptions): AsyncIterable<RawItem> {
+    return splitVcardStream(entry, options);
   },
 };
 

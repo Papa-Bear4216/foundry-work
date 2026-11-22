@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { Readable } from 'node:stream';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -14,8 +15,13 @@ import {
   generateSyntheticMbox,
   generateSyntheticVcards,
   isMboxSeparatorLine,
+  ItemSkipError,
   mailDeriver,
   mailImporter,
+  normalizeTimestamp,
+  parseContentLine,
+  parseIcalendar,
+  parseVcard,
   syntheticEmail,
 } from '../dist/index.js';
 
@@ -251,6 +257,168 @@ test('mail importer splits mbox streaming byte-for-byte across tiny chunks and d
   assert.ok(text2);
   assert.ok(text2.tags.includes('synthetic label'));
   assert.deepEqual(text2.structured.attachments, [{ filename: 'report.bin', mime: 'application/octet-stream' }]);
+});
+
+test('contacts splitter handles folded END:VCARD continuation, unfinished final card, and nested BEGIN (Ruling 10)', async () => {
+  // 1. Folded END:VCARD continuation inside a NOTE must NOT terminate the card early
+  const email = syntheticEmail('folded-end');
+  const foldedCard = Buffer.from(
+    [
+      'BEGIN:VCARD',
+      'VERSION:3.0',
+      'FN:Folded Continuation Contact',
+      'NOTE:First line',
+      ' END:VCARD',
+      `EMAIL;TYPE=HOME:${email}`,
+      'END:VCARD',
+      '',
+    ].join('\r\n'),
+    'utf8',
+  );
+  const foldedErrors = [];
+  const foldedItems = [];
+  for await (const rawItem of contactsImporter.split(
+    entryFromBuffer('Takeout/Contacts/folded.vcf', foldedCard, 13),
+    { onItemError: err => foldedErrors.push(err) },
+  )) {
+    foldedItems.push(await streamToBuffer(rawItem.bytes));
+  }
+  assert.equal(foldedErrors.length, 0);
+  assert.equal(foldedItems.length, 1);
+  assert.ok(foldedItems[0].equals(foldedCard), 'folded card physical bytes must be preserved verbatim');
+  const parsedFolded = parseVcard(foldedItems[0].toString('utf8'));
+  assert.ok(parsedFolded);
+  assert.equal(parsedFolded.emails[0]?.address, email);
+  assert.ok(parsedFolded.notes?.includes('END:VCARD'));
+
+  // 2. Unfinished final card -> typed VCARD_UNFINISHED error (reported via callback, or throws ItemSkipError without callback)
+  const unfinishedBuf = Buffer.from(
+    [
+      'BEGIN:VCARD',
+      'VERSION:3.0',
+      'FN:Complete First',
+      'END:VCARD',
+      'BEGIN:VCARD',
+      'VERSION:3.0',
+      'FN:Unfinished Second',
+      '',
+    ].join('\r\n'),
+    'utf8',
+  );
+  const unfinishedErrors = [];
+  const unfinishedCards = [];
+  for await (const rawItem of contactsImporter.split(
+    entryFromBuffer('Takeout/Contacts/unfinished.vcf', unfinishedBuf, 19),
+    { onItemError: err => unfinishedErrors.push(err) },
+  )) {
+    unfinishedCards.push(await streamToBuffer(rawItem.bytes));
+  }
+  assert.equal(unfinishedCards.length, 1);
+  assert.equal(unfinishedErrors.length, 1);
+  assert.equal(unfinishedErrors[0].code, 'VCARD_UNFINISHED');
+
+  await assert.rejects(
+    async () => {
+      for await (const rawItem of contactsImporter.split(entryFromBuffer('Takeout/Contacts/unfinished.vcf', unfinishedBuf))) {
+        await streamToBuffer(rawItem.bytes);
+      }
+    },
+    err => err instanceof ItemSkipError && err.code === 'VCARD_UNFINISHED',
+  );
+
+  // 3. Nested BEGIN:VCARD -> typed VCARD_NESTED_BEGIN error, while subsequent complete card still yields
+  const nestedBuf = Buffer.from(
+    [
+      'BEGIN:VCARD',
+      'VERSION:3.0',
+      'FN:Outer Incomplete',
+      'BEGIN:VCARD',
+      'VERSION:3.0',
+      'FN:Inner Complete',
+      'END:VCARD',
+      '',
+    ].join('\r\n'),
+    'utf8',
+  );
+  const nestedErrors = [];
+  const nestedCards = [];
+  for await (const rawItem of contactsImporter.split(
+    entryFromBuffer('Takeout/Contacts/nested.vcf', nestedBuf, 11),
+    { onItemError: err => nestedErrors.push(err) },
+  )) {
+    nestedCards.push(await streamToBuffer(rawItem.bytes));
+  }
+  assert.equal(nestedErrors.length, 1);
+  assert.equal(nestedErrors[0].code, 'VCARD_NESTED_BEGIN');
+  assert.equal(nestedCards.length, 1);
+  assert.equal(parseVcard(nestedCards[0].toString('utf8'))?.name, 'Inner Complete');
+});
+
+test('calendar and contacts property-parameter scanners reject 100 KB of semicolons without colon in under 1 s (Ruling 11)', () => {
+  const pathological = 'X' + ';'.repeat(100 * 1024);
+
+  const t0 = performance.now();
+  const parsedLine = parseContentLine(pathological, { allowGroup: true });
+  const cal = parseIcalendar(`BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\n${pathological}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n`);
+  const card = parseVcard(`BEGIN:VCARD\r\nVERSION:3.0\r\n${pathological}\r\nEND:VCARD\r\n`);
+  const elapsedMs = performance.now() - t0;
+
+  assert.equal(parsedLine, null);
+  assert.equal(cal.events.length, 1);
+  assert.equal(cal.events[0].summary, undefined);
+  assert.equal(card, null);
+  assert.ok(elapsedMs < 1000, `100 KB semicolon scan took ${elapsedMs.toFixed(1)} ms (limit 1000 ms)`);
+});
+
+test('calendar and contacts importers enforce per-item size cap before buffering and skip over-limit items (Ruling 6)', async () => {
+  const limit = 4096;
+
+  // Over-limit calendar entry
+  const bigIcs = Buffer.concat([
+    Buffer.from('BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nSUMMARY:'),
+    Buffer.alloc(limit + 2048, 0x41),
+    Buffer.from('\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n'),
+  ]);
+  const calErrors = [];
+  const calItems = [];
+  for await (const item of calendarImporter.split(entryFromBuffer('Takeout/Calendar/big.ics', bigIcs, 512), {
+    maxItemBytes: limit,
+    onItemError: e => calErrors.push(e),
+  })) {
+    calItems.push(item);
+  }
+  assert.equal(calItems.length, 0);
+  assert.equal(calErrors.length, 1);
+  assert.equal(calErrors[0].code, 'ITEM_TOO_LARGE');
+
+  // Over-limit vCard followed by a valid vCard + unterminated over-limit line
+  const vcfMix = Buffer.concat([
+    Buffer.from('BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Too Large\r\nNOTE:'),
+    Buffer.alloc(limit + 1024, 0x42),
+    Buffer.from('\r\nEND:VCARD\r\n'),
+    Buffer.from('BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Small Valid\r\nEND:VCARD\r\n'),
+  ]);
+  const vcfErrors = [];
+  const vcfItems = [];
+  for await (const item of contactsImporter.split(entryFromBuffer('Takeout/Contacts/mix.vcf', vcfMix, 512), {
+    maxItemBytes: limit,
+    onItemError: e => vcfErrors.push(e),
+  })) {
+    vcfItems.push(await streamToBuffer(item.bytes));
+  }
+  assert.equal(vcfErrors.length, 1);
+  assert.equal(vcfErrors[0].code, 'ITEM_TOO_LARGE');
+  assert.equal(vcfItems.length, 1);
+  assert.equal(parseVcard(vcfItems[0].toString('utf8'))?.name, 'Small Valid');
+});
+
+test('normalizeTimestamp interprets zone-less date-times as UTC deterministically (Ruling 12)', () => {
+  assert.equal(normalizeTimestamp('2024-12-31T23:30:00'), '2024-12-31T23:30:00Z');
+  assert.equal(normalizeTimestamp('2024-12-31 23:30:00'), '2024-12-31T23:30:00Z');
+  assert.equal(normalizeTimestamp('20241231T233000'), '2024-12-31T23:30:00Z');
+  assert.equal(normalizeTimestamp('Tue, 31 Dec 2024 23:30:00'), '2024-12-31T23:30:00Z');
+  assert.equal(normalizeTimestamp('Tue Dec 31 23:30:00 2024'), '2024-12-31T23:30:00Z');
+  assert.equal(normalizeTimestamp('2024-12-31T23:30:00-05:00'), '2025-01-01T04:30:00Z');
 });
 
 test('importers and derivers never import network modules or invoke fetch (Product 6.3 rule 4)', () => {

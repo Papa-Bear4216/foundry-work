@@ -20,17 +20,16 @@ const CEILING_MIB = 256;
 const TARGET_BYTES = 1024 * 1024 * 1024; // 1 GiB synthetic mbox
 
 function cleanup(dir) {
-  const segments = join(dir, 'vault', 'segments');
-  if (existsSync(segments)) {
-    for (const seg of readdirSync(segments, { withFileTypes: true })) {
-      const segPath = join(segments, seg.name);
-      if (!seg.isDirectory()) continue;
-      chmodSync(segPath, 0o700);
-      for (const f of readdirSync(segPath, { withFileTypes: true })) {
-        if (f.isFile()) chmodSync(join(segPath, f.name), 0o600);
-      }
+  if (!existsSync(dir)) return;
+  const makeWritable = target => {
+    chmodSync(target, 0o700);
+    for (const entry of readdirSync(target, { withFileTypes: true })) {
+      const full = join(target, entry.name);
+      if (entry.isDirectory()) makeWritable(full);
+      else if (entry.isFile()) chmodSync(full, 0o600);
     }
-  }
+  };
+  makeWritable(dir);
   rmSync(dir, { recursive: true, force: true });
 }
 
