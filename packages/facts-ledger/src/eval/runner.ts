@@ -165,9 +165,95 @@ interface FixtureIntegritySnapshot {
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8');
-const STRUCTURED_ANSWER_RE = /^ANSWER:\s*(.+?)\s+\[(fact|asserted):([0-9a-f]{12}\.\d{1,4})\]$/;
+const ANSWER_PREFIX = 'ANSWER:';
+const MIN_CITATION_LEN = 21; // "[fact:000000000000.0]"
+const MAX_CITATION_LEN = 28; // "[asserted:000000000000.0000]"
 const OPEN_READ_NONBLOCK =
   fsConstants.O_RDONLY | (typeof fsConstants.O_NONBLOCK === 'number' ? fsConstants.O_NONBLOCK : 0);
+
+function isHorizontalWhitespace(code: number): boolean {
+  return code === 0x20 || code === 0x09;
+}
+
+function trimHorizontalWhitespace(text: string): string {
+  let start = 0;
+  let end = text.length;
+  while (start < end && isHorizontalWhitespace(text.charCodeAt(start))) start++;
+  while (end > start && isHorizontalWhitespace(text.charCodeAt(end - 1))) end--;
+  return start === 0 && end === text.length ? text : text.slice(start, end);
+}
+
+function isValidFactId(id: string): boolean {
+  if (id.length < 14 || id.length > 17) return false;
+  for (let i = 0; i < 12; i++) {
+    const code = id.charCodeAt(i);
+    const isDigit = code >= 0x30 && code <= 0x39;
+    const isHexLower = code >= 0x61 && code <= 0x66;
+    if (!isDigit && !isHexLower) return false;
+  }
+  if (id.charCodeAt(12) !== 0x2e /* . */) return false;
+  for (let i = 13; i < id.length; i++) {
+    const code = id.charCodeAt(i);
+    if (code < 0x30 || code > 0x39) return false;
+  }
+  return true;
+}
+
+/**
+ * Linear-time structured answer parser (R6-r5 findings 3 & 4).
+ * Locates and validates the fixed `[fact:<id>]` / `[asserted:<id>]` suffix first in O(1),
+ * then validates the `ANSWER:` prefix, horizontal-whitespace-only separator (space or TAB),
+ * and non-empty value in O(N) with no regex backtracking.
+ */
+export function parseStructuredAnswer(
+  line: string,
+): { readonly kind: 'fact' | 'asserted'; readonly id: string; readonly normalizedValue: string } | null {
+  const len = line.length;
+  if (len < ANSWER_PREFIX.length + 2 + MIN_CITATION_LEN) return null;
+  if (line.charCodeAt(len - 1) !== 0x5d /* ] */) return null;
+  if (!line.startsWith(ANSWER_PREFIX)) return null;
+
+  const searchStart = Math.max(ANSWER_PREFIX.length, len - MAX_CITATION_LEN);
+  const citeOpen = line.lastIndexOf('[', len - 2);
+  if (citeOpen < searchStart) return null;
+
+  const citeBody = line.slice(citeOpen + 1, len - 1);
+  let kind: 'fact' | 'asserted';
+  let id: string;
+  if (citeBody.startsWith('fact:')) {
+    kind = 'fact';
+    id = citeBody.slice('fact:'.length);
+  } else if (citeBody.startsWith('asserted:')) {
+    kind = 'asserted';
+    id = citeBody.slice('asserted:'.length);
+  } else {
+    return null;
+  }
+  if (!isValidFactId(id)) return null;
+
+  let valueEnd = citeOpen;
+  while (valueEnd > ANSWER_PREFIX.length && isHorizontalWhitespace(line.charCodeAt(valueEnd - 1))) {
+    valueEnd--;
+  }
+  // Require at least one horizontal whitespace character (space or TAB) between value and citation.
+  if (valueEnd === citeOpen) return null;
+
+  let valueStart = ANSWER_PREFIX.length;
+  while (valueStart < valueEnd && isHorizontalWhitespace(line.charCodeAt(valueStart))) {
+    valueStart++;
+  }
+  if (valueStart >= valueEnd) return null;
+
+  const rawValue = line.slice(valueStart, valueEnd);
+  // Reject non-horizontal Unicode whitespace (e.g. NBSP, CR, line separators) bordering the value.
+  if (rawValue.trim() !== rawValue) return null;
+
+  return {
+    kind,
+    id,
+    normalizedValue: normalizeEvalValue(rawValue),
+  };
+}
 
 /** Deterministic token estimator: UTF-8 byte length / 4, rounded up (A-29). */
 export function estimateTokens(text: string): number {
@@ -755,7 +841,7 @@ function createEvalAnswerScorer(evalCase: EvalCase): EvalStreamingScorer {
 
     if (nonBlankLines === 1) {
       if (kind === 'abstain') {
-        const payload = (line ?? '').slice('ABSTAIN:'.length).replace(/^[ \t\r]+|[ \t\r]+$/g, '');
+        const payload = trimHorizontalWhitespace((line ?? '').slice('ABSTAIN:'.length));
         firstLine = {
           kind: 'abstain',
           lineNo,
@@ -766,14 +852,7 @@ function createEvalAnswerScorer(evalCase: EvalCase): EvalStreamingScorer {
       const lineCitations = citations ?? [];
       let structured: FirstStatementLine['structured'] = null;
       if (lineCitations.length === 1 && line !== undefined) {
-        const match = STRUCTURED_ANSWER_RE.exec(line);
-        if (match) {
-          structured = {
-            kind: match[2] as 'fact' | 'asserted',
-            id: match[3] as string,
-            normalizedValue: normalizeEvalValue(match[1] as string),
-          };
-        }
+        structured = parseStructuredAnswer(line);
       }
       firstLine = {
         kind: 'statement',

@@ -18,18 +18,25 @@ export const MAX_STORED_PROBLEMS = 20;
 
 const CITATION_RE = /\[(fact|asserted):([^\]\s]*)\]/g;
 const FACT_ID_RE = /^[0-9a-f]{12}\.\d{1,4}$/;
-const ABSTAIN_RE = /^ABSTAIN:[ \t\r]*\S/;
+const ABSTAIN_RE = /^ABSTAIN:[ \t]*\S/;
 
-function isRealWhitespace(code: number): boolean {
-  return code === 0x20 || code === 0x09 || code === 0x0d || code === 0x0a;
+/** Horizontal whitespace only: ASCII space (0x20) or TAB (0x09). */
+function isHorizontalWhitespace(code: number): boolean {
+  return code === 0x20 || code === 0x09;
 }
 
-/** Reject U+0000-U+001F (except tab/CR/LF) and U+007F anywhere on a line before scoring. */
+/**
+ * Reject embedded/bare CR, C0 controls other than TAB (0x09), DEL (0x7F), C1 controls
+ * (U+0080-U+009F incl. U+0085), and Unicode line/paragraph separators (U+2028, U+2029)
+ * anywhere on a line span (after stripping a single trailing CR-in-CRLF).
+ */
 function hasDisallowedControlChar(text: string, start: number, end: number): boolean {
   for (let i = start; i < end; i++) {
     const code = text.charCodeAt(i);
-    if ((code < 0x20 && code !== 0x09 && code !== 0x0d && code !== 0x0a) || code === 0x7f) {
-      return true;
+    if (code < 0x20) {
+      if (code !== 0x09) return true;
+    } else if (code >= 0x7f) {
+      if (code <= 0x9f || code === 0x2028 || code === 0x2029) return true;
     }
   }
   return false;
@@ -183,20 +190,27 @@ export function createAnswerScanner(
     );
   };
 
-  const processSpan = (text: string, start: number, end: number, nextBracket: number): number => {
-    if (hasDisallowedControlChar(text, start, end)) {
+  const processSpan = (
+    text: string,
+    start: number,
+    end: number,
+    nextBracket: number,
+    endedWithLf: boolean,
+  ): number => {
+    const lineEnd = endedWithLf && end > start && text.charCodeAt(end - 1) === 0x0d ? end - 1 : end;
+    if (hasDisallowedControlChar(text, start, lineEnd)) {
       hasNonBlankLine = true;
       let s = start;
-      while (s < end && isRealWhitespace(text.charCodeAt(s))) s++;
+      while (s < lineEnd && isHorizontalWhitespace(text.charCodeAt(s))) s++;
       const kind = text.startsWith('ABSTAIN:', s) ? 'abstain' : 'statement';
       recordProblem(lineNo, 'line contains disallowed control character');
       onNonBlankLine?.(lineNo, kind, false);
       return nextBracket;
     }
     let s = start;
-    let e = end;
-    while (s < e && isRealWhitespace(text.charCodeAt(s))) s++;
-    while (e > s && isRealWhitespace(text.charCodeAt(e - 1))) e--;
+    let e = lineEnd;
+    while (s < e && isHorizontalWhitespace(text.charCodeAt(s))) s++;
+    while (e > s && isHorizontalWhitespace(text.charCodeAt(e - 1))) e--;
     if (s === e) return nextBracket;
     hasNonBlankLine = true;
 
@@ -238,7 +252,7 @@ export function createAnswerScanner(
       const combined = carry + chunk.slice(pos, nl);
       carry = '';
       lineNo++;
-      processSpan(combined, 0, combined.length, -2);
+      processSpan(combined, 0, combined.length, -2, true);
       pos = nl + 1;
       if (pos >= chunk.length) return;
     }
@@ -251,7 +265,7 @@ export function createAnswerScanner(
         break;
       }
       lineNo++;
-      nextBracket = processSpan(chunk, pos, nl, nextBracket);
+      nextBracket = processSpan(chunk, pos, nl, nextBracket, true);
       pos = nl + 1;
     }
   };
@@ -263,7 +277,7 @@ export function createAnswerScanner(
       const remaining = carry;
       carry = '';
       lineNo++;
-      processSpan(remaining, 0, remaining.length, -2);
+      processSpan(remaining, 0, remaining.length, -2, false);
     }
   };
 

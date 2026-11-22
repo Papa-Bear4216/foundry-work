@@ -207,13 +207,17 @@ function parseRenderedPromptEvidence(prompt) {
           freshness: hdr[4],
           id: hdr[5],
           claim: hdr[6],
+          lines: [line],
           note: null,
           rule: null,
         };
-      } else if (cur && line.startsWith('  note: ')) {
-        cur.note = line.slice('  note: '.length);
-      } else if (cur && line.startsWith('  rule: ')) {
-        cur.rule = line.slice('  rule: '.length);
+      } else if (cur) {
+        cur.lines.push(line);
+        if (line.startsWith('  note: ')) {
+          cur.note = line.slice('  note: '.length);
+        } else if (line.startsWith('  rule: ')) {
+          cur.rule = line.slice('  rule: '.length);
+        }
       }
     }
     if (cur) lookupRows.push(cur);
@@ -314,15 +318,17 @@ function validateRenderedPromptEvidence(evalCase, prompt) {
     for (const subject of subjects) {
       const needle = subject.normalize('NFKC').toLowerCase();
       for (const df of digestLines) {
-        if (df.claim.normalize('NFKC').toLowerCase().includes(needle)) {
+        // Search the FULL rendered citable line (prefix + claim + rendered fact ID + any other text).
+        if (df.line.normalize('NFKC').toLowerCase().includes(needle)) {
           problems.push(
             `${evalCase.id}: abstain-only subject "${subject}" appears in citable digest line (${df.id})`,
           );
         }
       }
       for (const row of citableLookupRows) {
-        const text = (row.note ? `${row.claim} ${row.note}` : row.claim).normalize('NFKC').toLowerCase();
-        if (text.includes(needle)) {
+        // Search the FULL rendered citable lookup entry (header incl. ID + claim + note + rule + any other lines).
+        const rendered = row.lines.join('\n').normalize('NFKC').toLowerCase();
+        if (rendered.includes(needle)) {
           problems.push(
             `${evalCase.id}: abstain-only subject "${subject}" appears in citable lookup row (${row.id})`,
           );
@@ -627,6 +633,61 @@ test('facts eval (R5-r4 abstain-only self-check): injecting a citable V line for
   assert.ok(
     lookupProblems.some((p) => p.includes('D02') && p.includes('src/old-sync.ts') && p.includes('a90000000009.0')),
     `expected D02 self-check to fail on injected citable lookup row, got: ${JSON.stringify(lookupProblems)}`,
+  );
+});
+
+test('facts eval (R6-r5 finding 2 abstain self-check): rendered V line whose declared subject appears only in the fact ID fails C05', async () => {
+  const c05 = CASES.find((c) => c.id === 'C05');
+  assert.ok(c05);
+  assert.deepEqual(c05.abstainSubjects, ['ffffffffffff.0']);
+
+  const dry = await runEvalDryRun(['C05']);
+  const basePrompt = dry.cases[0].prompt;
+  assert.deepEqual(validateRenderedPromptEvidence(c05, basePrompt), []);
+
+  // Subject "ffffffffffff.0" appears ONLY in the rendered fact ID, never in the claim text.
+  const injectedLine = 'V repo "gate": file "src/schema.ts" contains "SCHEMA_VERSION = 7" (ffffffffffff.0)';
+
+  // 1) Inject into ## Recently verified section with C05's empty lookup.
+  const injectedRecent = basePrompt.replace(
+    '## Recently verified\n',
+    `## Recently verified\n${injectedLine}\n`,
+  );
+  assert.notEqual(injectedRecent, basePrompt);
+  const recentProblems = validateRenderedPromptEvidence(c05, injectedRecent);
+  assert.ok(
+    recentProblems.some((p) => p.includes('C05') && p.includes('ffffffffffff.0') && p.includes('citable digest line')),
+    `expected C05 self-check to fail when subject appears only in digest ID (Recently verified), got: ${JSON.stringify(recentProblems)}`,
+  );
+
+  // 2) Inject into ## Pinned section with C05's empty lookup.
+  const injectedPinned = basePrompt.replace(
+    '## Recent decisions\n',
+    `## Pinned\n${injectedLine}\n## Recent decisions\n`,
+  );
+  assert.notEqual(injectedPinned, basePrompt);
+  const pinnedProblems = validateRenderedPromptEvidence(c05, injectedPinned);
+  assert.ok(
+    pinnedProblems.some((p) => p.includes('C05') && p.includes('ffffffffffff.0') && p.includes('citable digest line')),
+    `expected C05 self-check to fail when subject appears only in digest ID (Pinned), got: ${JSON.stringify(pinnedProblems)}`,
+  );
+
+  // 3) Inject as a citable lookup row where subject appears only in the rendered ID.
+  const injectedLookupRow = [
+    BEGIN_FENCE,
+    '[VERIFIED] [match/exact] [supported] (ffffffffffff.0) repo "gate": file "src/schema.ts" contains "SCHEMA_VERSION = 7"',
+    '  rule: May be cited as fact.',
+    END_FENCE,
+  ].join('\n');
+  const injectedLookup = basePrompt.replace(
+    '=== Lookup Results ===\n',
+    `=== Lookup Results ===\n${injectedLookupRow}\n`,
+  );
+  assert.notEqual(injectedLookup, basePrompt);
+  const lookupProblems = validateRenderedPromptEvidence(c05, injectedLookup);
+  assert.ok(
+    lookupProblems.some((p) => p.includes('C05') && p.includes('ffffffffffff.0') && p.includes('citable lookup row')),
+    `expected C05 self-check to fail when subject appears only in lookup row ID, got: ${JSON.stringify(lookupProblems)}`,
   );
 });
 
@@ -2363,4 +2424,191 @@ catch (err) { console.log(err.message); }`,
   assert.equal(fxRes.status, 0, fxRes.stderr);
   assert.match(fxRes.stdout, /timed out/);
   assert.ok(fxElapsed < 5_000, `expected fixture git SIGKILL within 5s, took ${fxElapsed} ms`);
+});
+
+test('facts eval (R6-r5 finding 3 streaming control chars & line separators): rejects bare CR, C1 controls, U+2028/U+2029, and non-horizontal whitespace while preserving CRLF', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'facts-eval-r6-ctrl-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
+
+  // Streaming fake model that writes exact UTF-8 payloads (optionally split across small chunks)
+  // straight to stdout without modifying line endings or control characters.
+  const streamModel = writeFakeModel(
+    dir,
+    'stream-payload-model.mjs',
+    [
+      "import { createHash } from 'node:crypto';",
+      "import { readFileSync } from 'node:fs';",
+      'const spec = JSON.parse(readFileSync(process.argv[2], "utf8"));',
+      'const prompt = readFileSync(0, "utf8");',
+      'const m = /=== Question ===\\r?\\n([^\\r\\n]+)/.exec(prompt);',
+      'const key = m ? createHash("sha256").update(m[1].trim()).digest("hex") : "";',
+      'const payload = spec[key];',
+      'if (typeof payload !== "string") process.exit(2);',
+      'const buf = Buffer.from(payload, "utf8");',
+      'for (let i = 0; i < buf.length; i += 7) {',
+      '  process.stdout.write(buf.subarray(i, Math.min(buf.length, i + 7)));',
+      '}',
+    ].join('\n'),
+  );
+
+  const runStreamingPair = async (label, a01Payload, d02Payload) => {
+    const answersPath = join(dir, `answers-${label}.json`);
+    writeFileSync(
+      answersPath,
+      JSON.stringify(
+        buildQuestionAnswerMap({
+          A01: a01Payload,
+          D02: d02Payload,
+        }),
+      ),
+      'utf8',
+    );
+    return runEval({
+      modelCmd: process.execPath,
+      modelArgs: [streamModel, answersPath],
+      modelName: `r6-ctrl-${label}`,
+      caseIds: ['A01', 'D02'],
+      logPath: join(dir, `ledger-${label}.jsonl`),
+      project: 'foundry',
+      agent: 'eval-tester',
+    });
+  };
+
+  // 1) All malformed control / line-separator payloads on D02 and A01 via streaming path:
+  //    NONE may score `correct` or `abstained_correctly`.
+  const badD02Payloads = [
+    ['bare-cr-inline', 'ABSTAIN: unknown\rsrc/old-sync.ts exists.'],
+    ['bare-cr-with-lf', 'ABSTAIN: unknown\rsrc/old-sync.ts exists.\n'],
+    ['bare-cr-eof', 'ABSTAIN: unknown.\r'],
+    ['double-cr-lf', 'ABSTAIN: unknown.\r\r\n'],
+    ['nel-u0085', 'ABSTAIN: unknown\u0085src/old-sync.ts exists.\n'],
+    ['ls-u2028', 'ABSTAIN: unknown\u2028src/old-sync.ts exists.\n'],
+    ['ps-u2029', 'ABSTAIN: unknown\u2029src/old-sync.ts exists.\n'],
+    ['csi-u009b', 'ABSTAIN: unknown\u009bsrc/old-sync.ts exists.\n'],
+    ['c1-u0080', 'ABSTAIN: unknown\u0080.\n'],
+  ];
+  const badA01Payloads = [
+    ['bare-cr-between', 'ANSWER: 7\r[fact:a10000000001.0]\n'],
+    ['bare-cr-eof', 'ANSWER: 7 [fact:a10000000001.0]\r'],
+    ['double-cr-lf', 'ANSWER: 7 [fact:a10000000001.0]\r\r\n'],
+    ['nel-u0085', 'ANSWER: 7\u0085[fact:a10000000001.0]\n'],
+    ['ls-u2028', 'ANSWER: 7\u2028[fact:a10000000001.0]\n'],
+    ['ps-u2029', 'ANSWER: 7\u2029[fact:a10000000001.0]\n'],
+    ['csi-u009b', 'ANSWER: 7\u009b [fact:a10000000001.0]\n'],
+    ['nbsp-between', 'ANSWER: 7\u00a0[fact:a10000000001.0]\n'],
+    ['nbsp-padded', 'ANSWER: 7 \u00a0 [fact:a10000000001.0]\n'],
+  ];
+
+  for (let i = 0; i < badD02Payloads.length; i++) {
+    const [dLabel, dPayload] = badD02Payloads[i];
+    const [aLabel, aPayload] = badA01Payloads[i];
+    const res = await runStreamingPair(`bad-${i}-${aLabel}-${dLabel}`, aPayload, dPayload);
+    const aCase = res.cases.find((c) => c.id === 'A01');
+    const dCase = res.cases.find((c) => c.id === 'D02');
+    assert.ok(aCase && dCase);
+    assert.notEqual(aCase.outcome, 'correct', `A01 (${aLabel}) must not score correct`);
+    assert.notEqual(aCase.outcome, 'abstained_correctly', `A01 (${aLabel}) must not score abstained_correctly`);
+    assert.notEqual(dCase.outcome, 'correct', `D02 (${dLabel}) must not score correct`);
+    assert.notEqual(dCase.outcome, 'abstained_correctly', `D02 (${dLabel}) must not score abstained_correctly`);
+    assert.equal(dCase.outcome, 'unsupported', `D02 (${dLabel}) must be rejected as unsupported`);
+    if (aLabel.startsWith('nbsp')) {
+      assert.equal(aCase.outcome, 'wrong', `A01 (${aLabel}) non-horizontal whitespace must fail structured match`);
+    } else {
+      assert.equal(aCase.outcome, 'unsupported', `A01 (${aLabel}) control/separator char must be rejected as unsupported`);
+    }
+    assert.equal(res.counts.correct, 0);
+    assert.equal(res.counts.abstained_correctly, 0);
+    assert.ok(res.unsupported_claims >= 2);
+  }
+
+  // 2) Ordinary CRLF answers (including TAB horizontal whitespace and split `\r` / `\n` chunks) still score as before.
+  const crlfRes = await runStreamingPair(
+    'ok-crlf',
+    'ANSWER: 7 [fact:a10000000001.0]\r\n',
+    'ABSTAIN: no current citable fact answers this question.\r\n',
+  );
+  assert.equal(crlfRes.counts.correct, 1);
+  assert.equal(crlfRes.counts.abstained_correctly, 1);
+  assert.equal(crlfRes.unsupported_claims, 0);
+
+  const tabCrlfRes = await runStreamingPair(
+    'ok-tab-crlf',
+    'ANSWER:\t7\t[fact:a10000000001.0]\r\n\t \r\n',
+    '\tABSTAIN:\tunknown.\r\n\r\n',
+  );
+  assert.equal(tabCrlfRes.counts.correct, 1);
+  assert.equal(tabCrlfRes.counts.abstained_correctly, 1);
+  assert.equal(tabCrlfRes.unsupported_claims, 0);
+});
+
+test('facts eval (R6-r5 finding 4 linear-time structured parser): 250 KiB spaces + trailing x after citation grades malformed/wrong in under 1 s', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'facts-eval-r6-redos-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
+
+  const pad250k = ' '.repeat(250 * 1024);
+  const trailingXPayload = `ANSWER:${pad250k}[fact:a10000000001.0]x\n`;
+  const emptyValuePayload = `ANSWER:${pad250k}[fact:a10000000001.0]\n`;
+  const longAbstainPayload = `ABSTAIN: a${pad250k}b\n`;
+  assert.ok(Buffer.byteLength(trailingXPayload, 'utf8') < MAX_ANSWER_BYTES);
+  assert.ok(Buffer.byteLength(emptyValuePayload, 'utf8') < MAX_ANSWER_BYTES);
+  assert.ok(Buffer.byteLength(longAbstainPayload, 'utf8') < MAX_ANSWER_BYTES);
+
+  // 1) Direct checkAnswer + scoreEvalAnswer timing check (strict < 1 s deadline per payload).
+  const fx = buildEvalFixture(join(dir, 'fx'));
+  rebuildIndex(fx.logPath, fx.indexPath);
+  const repos = loadRepoMap(fx.reposPath);
+  const a01 = CASES.find((c) => c.id === 'A01');
+  const d02 = CASES.find((c) => c.id === 'D02');
+  assert.ok(a01 && d02);
+
+  for (const [label, evalCase, payload] of [
+    ['250k-spaces-trailing-x', a01, trailingXPayload],
+    ['250k-spaces-empty-value', a01, emptyValuePayload],
+    ['250k-spaces-abstain', d02, longAbstainPayload],
+  ]) {
+    const startMs = performance.now();
+    const checked = await checkAnswer(payload, {
+      logPath: fx.logPath,
+      indexPath: fx.indexPath,
+      repos,
+      nowMs: NOW_MS,
+      readOnlyIndex: true,
+    });
+    const scored = scoreEvalAnswer(evalCase, payload, checked);
+    const elapsedMs = performance.now() - startMs;
+    assert.ok(elapsedMs < 1_000, `${label} must be graded in under 1 s, took ${elapsedMs.toFixed(1)} ms`);
+    assert.equal(scored.outcome, 'wrong', `${label} must be graded malformed/wrong`);
+    assert.equal(scored.offTargetStatements, 1);
+    assert.equal(scored.unsupportedProblems, 1);
+  }
+
+  // 2) Streaming `runEval` path with the exact ~250 KiB backtracking regression payload on A01.
+  const redosModel = writeFakeModel(
+    dir,
+    'redos-model.mjs',
+    [
+      "import { readFileSync } from 'node:fs';",
+      'readFileSync(0, "utf8");',
+      'process.stdout.write("ANSWER:" + " ".repeat(250 * 1024) + "[fact:a10000000001.0]x\\n");',
+    ].join('\n'),
+  );
+  const evalStartMs = performance.now();
+  const evalRes = await runEval({
+    modelCmd: process.execPath,
+    modelArgs: [redosModel],
+    modelName: 'redos-model',
+    caseIds: ['A01'],
+    logPath: join(dir, 'eval-ledger.jsonl'),
+    project: 'foundry',
+    agent: 'eval-tester',
+  });
+  const evalElapsedMs = performance.now() - evalStartMs;
+  // Assert the streaming eval case itself (excluding fixture build overhead) isn't stalled;
+  // direct grading above enforces strict < 1 s on grading, and even full runEval stays fast.
+  assert.equal(evalRes.counts.wrong, 1);
+  assert.equal(evalRes.counts.correct, 0);
+  assert.equal(evalRes.counts.error, 0);
+  assert.equal(evalRes.off_target_statements, 1);
+  assert.equal(evalRes.unsupported_claims, 1);
+  assert.ok(evalElapsedMs < 15_000, `streaming runEval on 250 KiB spaces payload unexpectedly slow: ${evalElapsedMs.toFixed(1)} ms`);
 });
