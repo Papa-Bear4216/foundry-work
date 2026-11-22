@@ -504,6 +504,21 @@ test('session is read by value, not by presence: a proxy that hides session from
   assert.equal(reads, 1);
 });
 
+test('a session getter that throws reaches the caller of decodeKeyring, even with a valid recovery key', () => {
+  const fixtureBytes = readFileSync(new URL('./vectors/' + cases.keyring, import.meta.url));
+  const thrown = new Error('TEST ONLY session getter');
+  const throwing = new Proxy({ recoveryKey: recoveryKey() }, {
+    has: (target, key) => key === 'session' ? false : Reflect.has(target, key),
+    get: (target, key, receiver) => {
+      if (key === 'session') throw thrown;
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  resetKdfCallCountForTest();
+  assert.throws(() => decodeKeyring(fixtureBytes, throwing, identity.vaultId), error => error === thrown);
+  assert.equal(getKdfCallCountForTest(), 0);
+});
+
 test('the new entry points validate the credential shape before any file read or keyring parse', t => {
   const temp = mkdtempDisposableSync(join(tmpdir(), 'foundry-session-order-'));
   t.after(() => temp.remove());

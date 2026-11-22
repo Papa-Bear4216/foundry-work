@@ -399,6 +399,7 @@ test('a running read closed by one getter fails KEY when a later getter throws; 
 });
 
 test('close, return, next fails KEY on a never-started iterator; the other close and return orders keep their results', t => {
+  // A repeated return() after close() keeps an already-ended iterator done; only a never-started one fails KEY.
   const vault = setup(t);
   const payload = Buffer.alloc(FRAME_BYTES + 1, 0x42);
   vault.write(writer => writer.appendBatch([event('TEST ONLY close return order'), blob(payload)]));
@@ -415,27 +416,37 @@ test('close, return, next fails KEY on a never-started iterator; the other close
     streamBlob: source => source.streamBlob(location),
   };
   const orders = [
-    { name: 'never started: close, return, next', start: false, closeFirst: true, expectKey: true },
-    { name: 'never started: return, close, next', start: false, closeFirst: false, expectKey: false },
-    { name: 'started: close, return, next', start: true, closeFirst: true, expectKey: true },
-    { name: 'started: return, close, next', start: true, closeFirst: false, expectKey: false },
+    { name: 'never started: close, return, next', steps: ['close', 'return'], expectKey: true },
+    { name: 'never started: return, close, next', steps: ['return', 'close'], expectKey: false },
+    { name: 'started: close, return, next', steps: ['start', 'close', 'return'], expectKey: true },
+    { name: 'started: return, close, next', steps: ['start', 'return', 'close'], expectKey: false },
+    { name: 'never started: return, close, return, next', steps: ['return', 'close', 'return'], expectKey: false },
+    { name: 'started: return, close, return, next', steps: ['start', 'return', 'close', 'return'], expectKey: false },
+    { name: 'read to its end: close, return, next', steps: ['end', 'close', 'return'], expectKey: false },
+    { name: 'never started: close, return, return, next', steps: ['close', 'return', 'return'], expectKey: true },
   ];
   for (const [kind, create] of Object.entries(kinds)) {
     for (const order of orders) {
       const source = openVaultReplay(vault.directory, credential());
       t.after(() => source.close());
       const iterator = create(source);
-      if (order.start) {
-        const first = iterator.next();
-        assert.equal(first.done, false, `${kind} ${order.name}`);
-        if (Buffer.isBuffer(first.value)) first.value.fill(0);
-      }
-      if (order.closeFirst) {
-        source.close();
-        iterator.return();
-      } else {
-        iterator.return();
-        source.close();
+      for (const step of order.steps) {
+        if (step === 'start') {
+          const first = iterator.next();
+          assert.equal(first.done, false, `${kind} ${order.name}`);
+          if (Buffer.isBuffer(first.value)) first.value.fill(0);
+        } else if (step === 'end') {
+          let result = iterator.next();
+          assert.equal(result.done, false, `${kind} ${order.name}`);
+          while (!result.done) {
+            if (Buffer.isBuffer(result.value)) result.value.fill(0);
+            result = iterator.next();
+          }
+        } else if (step === 'close') {
+          source.close();
+        } else {
+          iterator.return();
+        }
       }
       if (order.expectKey) {
         assert.throws(() => iterator.next(), isKey, `${kind} ${order.name}`);

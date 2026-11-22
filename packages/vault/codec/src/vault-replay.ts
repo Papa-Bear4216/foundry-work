@@ -193,8 +193,9 @@ export function openVaultReplay(directory: string, credential: Unlock, { anchor 
       iterator.return = (value: R) => {
         // On a running generator this call throws "already running" before any flag below changes; keep that order.
         const result = generator.return(value);
-        // Ended after close(): a later next() fails KEY, as it did before lazy tracking. Never joins `active`.
-        if (closed) endedByClose = true;
+        // Only a never-started iterator returned after close() is marked, so its later next() fails KEY. A started one
+        // was already marked by close() itself if it was still active; an ended one stays done. Never joins `active`.
+        if (closed && !started) endedByClose = true;
         started = true;
         finished = true;
         active.delete(closeIterator);
