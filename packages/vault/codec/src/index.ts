@@ -21,3 +21,5 @@ export type { UnlockedKeyring } from './record-file.ts';
 export { openVaultReplay } from './vault-replay.ts';
 export type { ReplayLocation, ReplayOptions, VaultReplayItem } from './vault-replay.ts';
 export { retireIndexKey, stageIndexKey } from './index-keys.ts';
+export { collectionKeyId, ensureCollectionKeys } from './collection-keys.ts';
+export type { EnsureCollectionKeysResult } from './collection-keys.ts';

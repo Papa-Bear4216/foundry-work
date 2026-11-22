@@ -15,7 +15,10 @@ import {
   signingPublicKey,
   VaultWriter,
 } from '../../vault/codec/dist/index.js';
-import { generateSyntheticMbox, importArchive, loadExistingItemKeys, mailImporter, openArchive, writeZipArchive } from '../dist/index.js';
+import {
+  CONTACTS_SOURCE_ID, contactsImporter, generateSyntheticMbox, generateSyntheticVcards, importArchive, loadExistingItemKeys,
+  mailImporter, openArchive, writeZipArchive,
+} from '../dist/index.js';
 
 /** Number of item events durably in the vault, sealed or open segment (read-only vault scan). */
 function storedCount({ vaultDir, unlock }) {
@@ -111,8 +114,8 @@ async function runImport({ zipPath, vaultDir, collectionKeyId, unlock }, extra) 
     return await importArchive({
       archive,
       writer: extra.wrapWriter ? extra.wrapWriter(writer) : writer,
-      importers: [mailImporter],
-      resolveCollectionKeyId: () => collectionKeyId,
+      importers: extra.importers ?? [mailImporter],
+      resolveCollectionKeyId: extra.resolveCollectionKeyId ?? (() => collectionKeyId),
       vaultDir,
       unlocked,
       readVaultRecord: extra.readVaultRecord ?? readVaultRecord,
@@ -211,4 +214,69 @@ test('in the checkpoint path a batch that fails after some events adds no key fr
   // Batch 1 (4 events) and the first event of batch 2 are stored; only batch 1's keys are recorded.
   assert.equal(storedCount(ctx), BATCH + 1);
   assert.equal(lookup.added.length, BATCH);
+});
+
+// V-7a (A-41): a resolver may return undefined ("no key for this collection yet"); such items are deferred.
+const CONTACTS = 3;
+
+function storedKeys({ vaultDir, unlock }) {
+  const unlocked = unlock();
+  try {
+    return loadExistingItemKeys(vaultDir, unlocked, readVaultRecord);
+  } finally {
+    unlocked.masterKey.fill(0);
+    for (const key of unlocked.keys.values()) key.fill(0);
+  }
+}
+
+test('a resolver returning undefined defers that collection; a second run with a key imports exactly the deferred items', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'foundry-v7a-deferred-'));
+  t.after(() => removeTree(root));
+  const zipPath = join(root, 'takeout.zip');
+  const vaultDir = join(root, 'vault');
+  await writeZipArchive(zipPath, [
+    { path: 'Takeout/Mail/All mail.mbox', data: generateSyntheticMbox(MESSAGES, 717), compression: 'deflate' },
+    { path: 'Takeout/Contacts/contacts.vcf', data: generateSyntheticVcards(CONTACTS, 1717), compression: 'deflate' },
+  ]);
+  const ctx = { zipPath, vaultDir, ...createVault(vaultDir) };
+  const importers = [mailImporter, contactsImporter];
+  const lookup = recordingLookup();
+  const asked = [];
+  // The ten synthetic messages all fall in one year, so many deferred items share one collection name.
+  const isContacts = name => name.startsWith(CONTACTS_SOURCE_ID + '/');
+
+  const first = await runImport(ctx, {
+    importers, itemKeys: lookup,
+    resolveCollectionKeyId: name => {
+      asked.push(name);
+      return isContacts(name) ? ctx.collectionKeyId : undefined;
+    },
+  });
+  const mailNames = asked.filter(name => !isContacts(name));
+  assert.equal(mailNames.length, MESSAGES);
+  assert.equal(new Set(mailNames).size, 1);
+  assert.deepEqual(first.missingCollections, [mailNames[0]], 'the deferred collection is listed once');
+  assert.equal(first.totalItemsDeferred, MESSAGES);
+  assert.equal(first.totalItemsImported, CONTACTS);
+  assert.equal(first.totalItemsSkipped, 0);
+  assert.equal(first.totalItemsErrored, 0);
+  assert.equal(first.totalEventsWritten, CONTACTS);
+  assert.equal(first.totalBlobsWritten, CONTACTS);
+  assert.equal(lookup.added.length, CONTACTS);
+  assert.deepEqual(storedKeys(ctx), new Set(lookup.added), 'only stored items reach itemKeys; no deferred key does');
+
+  const second = await runImport(ctx, { importers, itemKeys: lookup });
+  assert.equal(second.totalItemsDeferred, 0);
+  assert.deepEqual(second.missingCollections, []);
+  assert.equal(second.totalItemsImported, MESSAGES, 'exactly the deferred items');
+  assert.equal(second.totalItemsSkipped, CONTACTS, 'nothing twice');
+  assert.equal(second.totalEventsWritten, MESSAGES);
+  assert.equal(lookup.added.length, MESSAGES + CONTACTS);
+  assert.equal(new Set(lookup.added).size, MESSAGES + CONTACTS);
+  assert.deepEqual(storedKeys(ctx), new Set(lookup.added));
+
+  const third = await runImport(ctx, { importers, itemKeys: lookup });
+  assert.equal(third.totalItemsImported, 0);
+  assert.equal(third.totalItemsDeferred, 0);
+  assert.equal(storedCount(ctx), MESSAGES + CONTACTS);
 });

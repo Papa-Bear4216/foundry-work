@@ -31,6 +31,7 @@ import {
   defaultCollectionName,
   defaultSensitivityForSource,
   formatUtcTimestamp,
+  uniqueSorted,
 } from './defaults.js';
 import { computeBlobId, deriveCollectionIdKey, loadExistingItemKeys } from './vault-state.js';
 import type { ReadVaultRecordFn } from './vault-state.js';
@@ -59,9 +60,11 @@ export interface ImportArchiveOptions {
   importers: readonly Importer[];
   /**
    * Maps a logical collection name (e.g. `google-takeout/mail/2024`) to an active
-   * 32-hex collection key ID in the vault keyring.
+   * 32-hex collection key ID in the vault keyring. `undefined` means "no key for this collection yet"
+   * (A-41): the item is not stored, not an error, counted in `totalItemsDeferred`, and its collection
+   * name is reported in `missingCollections`.
    */
-  resolveCollectionKeyId: (collection: string) => string;
+  resolveCollectionKeyId: (collection: string) => string | undefined;
   /** Vault directory used to derive durable item identity state from persisted events. */
   vaultDir: string;
   /** Unlocked vault keyring used to compute collection-keyed blob IDs and read persisted events. */
@@ -245,6 +248,8 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
   let totalItemsImported = 0;
   let totalItemsSkipped = 0;
   let totalItemsErrored = 0;
+  let totalItemsDeferred = 0;
+  const missingCollections = new Set<string>();
   let totalBlobsWritten = 0;
   let totalBlobsDeduplicated = 0;
   let totalEventsWritten = 0;
@@ -440,6 +445,13 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
         const plaintext = read.buffer;
         const collection = defaultCollectionName(importer.id, rawItem.sourceTs);
         const keyId = options.resolveCollectionKeyId(collection);
+        if (keyId === undefined) {
+          // A-41: no key for this collection yet. Not stored, not an error; the caller creates the key and imports again.
+          plaintext.fill(0);
+          totalItemsDeferred++;
+          missingCollections.add(collection);
+          continue;
+        }
         const sensitivity = resolveSensitivity(importer.id, rawItem.path);
         const idKey = getIdKey(keyId);
         const blobId = computeBlobId(idKey, plaintext);
@@ -508,6 +520,8 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
     totalItemsImported,
     totalItemsSkipped,
     totalItemsErrored,
+    totalItemsDeferred,
+    missingCollections: uniqueSorted(missingCollections),
     totalBlobsWritten,
     totalBlobsDeduplicated,
     totalEventsWritten,

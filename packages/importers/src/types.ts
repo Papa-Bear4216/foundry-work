@@ -192,6 +192,10 @@ export interface ImportResult {
   totalItemsImported: number;
   totalItemsSkipped: number;
   totalItemsErrored: number;
+  /** Items not stored because the collection resolver returned `undefined` (A-41). */
+  totalItemsDeferred: number;
+  /** Collection names the resolver had no key for, unique and sorted (A-41). */
+  missingCollections: string[];
   totalBlobsWritten: number;
   totalBlobsDeduplicated: number;
   totalEventsWritten: number;

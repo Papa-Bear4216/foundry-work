@@ -272,6 +272,59 @@ export function updateIndexEntry(
   }
 }
 
+/** A new active profile or collection entry for appendKeyringEntries (A-41). */
+export interface KeyringAddition {
+  key_id: string;
+  kind: 'profile' | 'collection';
+  parent: string;
+  key: Buffer;
+  label?: string;
+}
+
+/**
+ * A-41: encode an authenticated keyring with new active entries appended, the next version and a MAC under the same
+ * master key. Existing entries, both master wraps and the KDF block are reused unchanged, so they serialize to the same
+ * bytes. A profile is wrapped under the master key with an encrypted label; a collection is wrapped under its parent's
+ * raw profile key, taken from `parentKeys` or from a profile added in the same call. The caller owns every key buffer.
+ */
+export function appendKeyringEntries(
+  ring: Keyring, masterKey: Buffer, parentKeys: ReadonlyMap<string, Buffer>, additions: readonly KeyringAddition[],
+): Buffer {
+  const { mac: _mac, ...body } = ring;
+  const vaultId = body.vault_id;
+  const createdAt = new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z');
+  const ids = new Set(body.keys.map(entry => entry.key_id));
+  const wrappingKeys = new Map(parentKeys);
+  for (const addition of additions) if (addition.kind === 'profile') wrappingKeys.set(addition.key_id, addition.key);
+  const added = additions.map(({ key_id, kind, parent, key, label }): Entry => {
+    hex(key_id, 16);
+    check(!ids.has(key_id), 'KEY');
+    ids.add(key_id);
+    check(kind === 'profile' ? parent === 'master' : kind === 'collection' && parent !== 'master', 'KEY');
+    const wrappingKey = parent === 'master' ? masterKey : wrappingKeys.get(parent);
+    check(wrappingKey && key.length === 32, 'KEY');
+    const entry: Entry = { key_id, kind, parent, state: 'active', created_at: createdAt,
+      wrapped: wrap(wrappingKey, randomBytes(12), aad(vaultId, key_id, kind, parent), key) };
+    if (kind === 'profile') {
+      check(typeof label === 'string' && label.length > 0 && label.isWellFormed(), 'KEY');
+      const labelKey = vaultKey(masterKey, vaultId, 'profile-label');
+      let plaintext: Buffer | undefined;
+      try {
+        plaintext = Buffer.from(label);
+        entry.label_enc = wrap(labelKey, randomBytes(12), aad(vaultId, key_id, 'profile-label', parent), plaintext);
+      } finally {
+        labelKey.fill(0);
+        plaintext?.fill(0);
+      }
+    } else {
+      check(label === undefined, 'KEY');
+    }
+    return entry;
+  });
+  const keys = [...body.keys, ...added].sort((a, b) => a.key_id < b.key_id ? -1 : 1);
+  return encodeBody({ ...body, version: nextKeyringVersion(body.version), keys }, masterKey);
+}
+
 export function changeKeyringPassphrase(
   bytes: Buffer, vaultId: string, current: string, replacement: string, parallelism?: KdfParallelism,
 ): Buffer {
