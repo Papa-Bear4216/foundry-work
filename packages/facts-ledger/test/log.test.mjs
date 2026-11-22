@@ -239,3 +239,62 @@ test('appendBlock enforces optional expectedLog precondition under the writer lo
   );
   assert.equal(readFileSync(emptyPath).length, 0);
 });
+
+test('appendBlock backward parent lookup matches forward scan across 64 KiB chunks, oversized lines, and unterminated tails', (t) => {
+  const path = logPath(t);
+  const mkLine = (id, project, pad = '') =>
+    JSON.stringify({
+      id,
+      ts: '2026-11-21T00:00:00+00:00',
+      agent: 'tester',
+      project,
+      parent: null,
+      trace_id: id,
+      status: 'done',
+      intent: 'test',
+      reasoning: pad || 'ok',
+      actions: [],
+      verification: null,
+      touches: [],
+      supersedes: null,
+      schema: 2,
+    });
+
+  // Alpha block at offset 0, followed by >70 KiB of beta blocks, an oversized >64 KiB alpha line
+  // (must be skipped like scanFdRange), blank lines, corrupt JSON, and an unterminated gamma tail.
+  const lines = [
+    mkLine('000000000001', 'alpha'),
+    mkLine('000000000002', 'beta', 'b'.repeat(40_000)),
+    mkLine('000000000003', 'beta', 'c'.repeat(40_000)),
+    mkLine('000000000004', 'alpha', 'x'.repeat(MAX_LINE_BYTES + 100)),
+    '',
+    '{corrupt json line',
+    mkLine('000000000005', 'gamma'),
+  ];
+  // Omit trailing LF on the last gamma block to verify unterminated-tail parent recovery.
+  writeFileSync(path, lines.join('\n'), 'utf8');
+
+  const gammaNext = appendBlock(path, {
+    agent: 'tester',
+    project: 'gamma',
+    intent: 'after unterminated',
+    reasoning: 'ok',
+  });
+  assert.equal(gammaNext.parent, '000000000005');
+
+  const alphaNext = appendBlock(path, {
+    agent: 'tester',
+    project: 'alpha',
+    intent: 'skips oversized alpha and crosses 64 KiB chunk boundary',
+    reasoning: 'ok',
+  });
+  assert.equal(alphaNext.parent, '000000000001');
+
+  const unseenNext = appendBlock(path, {
+    agent: 'tester',
+    project: 'unseen-project',
+    intent: 'no prior block for project',
+    reasoning: 'ok',
+  });
+  assert.equal(unseenNext.parent, null);
+});

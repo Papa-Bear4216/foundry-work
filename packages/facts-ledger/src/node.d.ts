@@ -65,6 +65,12 @@ declare class URL {
 declare function setTimeout(callback: () => void, ms: number): unknown;
 declare function clearTimeout(handle: unknown): void;
 
+declare module 'node:buffer' {
+  export const Buffer: {
+    byteLength(text: string, encoding?: 'utf8'): number;
+  };
+}
+
 declare module 'node:child_process' {
   export interface ChildReadable {
     on(event: 'data', listener: (chunk: string | Uint8Array) => void): this;

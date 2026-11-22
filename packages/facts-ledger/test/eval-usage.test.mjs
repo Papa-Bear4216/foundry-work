@@ -14,7 +14,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { MAX_ANSWER_BYTES, MAX_STORED_PROBLEMS, checkAnswer } from '../dist/check-answer.js';
+import { MAX_ANSWER_BYTES, MAX_STORED_PROBLEMS, checkAnswer, createAnswerScanner } from '../dist/check-answer.js';
 import { CASES, normalizeEvalValue } from '../dist/eval/cases.js';
 import { NOW_MS, buildGateFixture, gateFactCatalog } from '../dist/eval/fixture.js';
 import { AGENT_RULES_TEXT, answerTypeHint } from '../dist/eval/prompt.js';
@@ -1191,6 +1191,87 @@ test('facts eval (F7): maximum short invalid lines keeps at most 20 problems per
   assert.ok(res.block_id);
   const raw = readFileSync(logPath, 'utf8');
   assert.ok(Buffer.byteLength(raw, 'utf8') < MAX_LINE_BYTES, 'appended block must stay under 64 KiB');
+});
+
+test('facts eval (C1 streaming): incremental UTF-8 and line scanning matches checkAnswer across chunk boundaries and rejects invalid UTF-8', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'facts-eval-stream-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
+
+  const fx = buildGateFixture(dir);
+  const repos = loadRepoMap(fx.reposPath);
+
+  // Feed a multi-line BOM + CRLF + unicode answer 1 code unit at a time into createAnswerScanner
+  // and verify it matches checkAnswer byte-for-byte.
+  const sample = '\ufeff\r\nANSWER: \uff17. [fact:a10000000001.0]\r\nuncited line\r\nABSTAIN: ok\r\n';
+  const expected = await checkAnswer(sample, {
+    logPath: fx.logPath,
+    indexPath: fx.indexPath,
+    repos,
+    nowMs: NOW_MS,
+  });
+  const scanner = createAnswerScanner(MAX_STORED_PROBLEMS);
+  for (let i = 0; i < sample.length; i++) {
+    scanner.feedChunk(sample[i]);
+  }
+  const streamed = await scanner.finalize({
+    logPath: fx.logPath,
+    indexPath: fx.indexPath,
+    repos,
+    nowMs: NOW_MS,
+  });
+  assert.deepEqual(streamed, expected);
+
+  // Fake model writing UTF-8 BOM + full-width '7' (EF BC 97) + CRLF across separate writes.
+  const splitUtf8Model = writeFakeModel(
+    dir,
+    'split-utf8.mjs',
+    [
+      "import { readFileSync } from 'node:fs';",
+      'readFileSync(0, "utf8");',
+      'const bytes = Buffer.from("\\ufeffANSWER: \\uff17. [fact:a10000000001.0]\\r\\n", "utf8");',
+      'let i = 0;',
+      'const send = () => {',
+      '  if (i >= bytes.length) return;',
+      '  process.stdout.write(bytes.subarray(i, i + 1));',
+      '  i++;',
+      '  setImmediate(send);',
+      '};',
+      'send();',
+    ].join('\n'),
+  );
+  const splitRes = await runEval({
+    modelCmd: process.execPath,
+    modelArgs: [splitUtf8Model],
+    modelName: 'split-utf8',
+    caseIds: ['A01'],
+    logPath: join(dir, 'split-ledger.jsonl'),
+    project: 'foundry',
+    agent: 'eval-tester',
+  });
+  assert.equal(splitRes.counts.correct, 1);
+  assert.equal(splitRes.unsupported_claims, 0);
+
+  // Fake model writing truncated UTF-8 at EOF -> recorded as error ("not valid UTF-8").
+  const badUtf8Model = writeFakeModel(
+    dir,
+    'bad-utf8.mjs',
+    [
+      "import { readFileSync } from 'node:fs';",
+      'readFileSync(0, "utf8");',
+      'process.stdout.write(Buffer.from([0x41, 0xef, 0xbc]));',
+    ].join('\n'),
+  );
+  const badUtf8Res = await runEval({
+    modelCmd: process.execPath,
+    modelArgs: [badUtf8Model],
+    modelName: 'bad-utf8',
+    caseIds: ['A01'],
+    logPath: join(dir, 'bad-utf8-ledger.jsonl'),
+    project: 'foundry',
+    agent: 'eval-tester',
+  });
+  assert.equal(badUtf8Res.counts.error, 1);
+  assert.match(badUtf8Res.cases[0].error ?? '', /not valid UTF-8/);
 });
 
 test('facts eval (F8): passing all 50 IDs via --cases is still a selection run (passes_bar=false, reason=selection, no block appended)', async (t) => {

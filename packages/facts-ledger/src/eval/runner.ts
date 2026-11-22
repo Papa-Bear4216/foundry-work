@@ -3,6 +3,7 @@
 // judges structured answers with `checkAnswer` plus declared exact values, chains fixture
 // integrity snapshots across cases, enforces result-log preconditions under the append lock,
 // and appends one summary block on full non-selection runs.
+import { Buffer } from 'node:buffer';
 import { execFile, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
@@ -22,13 +23,14 @@ import { validateTokenUsage } from '../add.js';
 import {
   MAX_ANSWER_BYTES,
   MAX_STORED_PROBLEMS,
-  checkAnswer,
+  createAnswerScanner,
   type AnswerProblem,
   type CheckAnswerResult,
+  type NonBlankLineCallback,
+  type PendingCitation,
 } from '../check-answer.js';
 import { generateDigest } from '../digest.js';
 import { FreshnessChecker } from '../freshness.js';
-import { collectGarbage } from '../gc.js';
 import { resolveGitExecutable } from '../git.js';
 import { appendBlock, type ExpectedLogPrecondition } from '../log.js';
 import { formatQueryText, queryFacts, sanitizeInlineText } from '../query.js';
@@ -122,6 +124,8 @@ export interface EvalOptions {
 export interface ModelCommandOptions {
   readonly cwd?: string;
   readonly env?: Record<string, string | undefined>;
+  /** Optional streaming UTF-8 chunk consumer; when set, stdout is streamed instead of buffered in `output`. */
+  readonly onTextChunk?: (chunk: string) => void;
 }
 
 export interface ModelCommandResult {
@@ -156,17 +160,13 @@ interface FixtureIntegritySnapshot {
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8');
-const fatalUtf8 = new TextDecoder('utf-8', { fatal: true });
-const CITATION_RE = /\[(fact|asserted):([^\]\s]*)\]/g;
-const FACT_ID_RE = /^[0-9a-f]{12}\.\d{1,4}$/;
-const ABSTAIN_RE = /^ABSTAIN:\s*\S/;
 const STRUCTURED_ANSWER_RE = /^ANSWER:\s*(.+?)\s+\[(fact|asserted):([0-9a-f]{12}\.\d{1,4})\]$/;
 const OPEN_READ_NONBLOCK =
   fsConstants.O_RDONLY | (typeof fsConstants.O_NONBLOCK === 'number' ? fsConstants.O_NONBLOCK : 0);
 
 /** Deterministic token estimator: UTF-8 byte length / 4, rounded up (A-29). */
 export function estimateTokens(text: string): number {
-  return estimateTokensFromBytes(encoder.encode(text).length);
+  return estimateTokensFromBytes(Buffer.byteLength(text, 'utf8'));
 }
 
 export function estimateTokensFromBytes(byteCount: number): number {
@@ -501,20 +501,11 @@ async function terminateProcessTree(
   }
 }
 
-function concatBytes(chunks: readonly Uint8Array[], totalBytes: number): Uint8Array {
-  const merged = new Uint8Array(totalBytes);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return merged;
-}
-
 /**
  * Spawn the model executable directly (`shell: false`), write `prompt` to stdin and require
- * `stdin.end` to complete without error (including EPIPE, F5), collect stdout capped at
- * `MAX_ANSWER_BYTES`, catch synchronous spawn failures (F4), and enforce `timeoutMs` (<= 2^31 - 1).
+ * `stdin.end` to complete without error (including EPIPE, F5), stream/decode stdout capped at
+ * `MAX_ANSWER_BYTES` without double-buffering chunks, catch synchronous spawn failures (F4),
+ * and enforce `timeoutMs` (<= 2^31 - 1).
  */
 export function runModelCommand(
   executablePath: string,
@@ -548,8 +539,11 @@ export function runModelCommand(
       return;
     }
 
-    const stdoutChunks: Uint8Array[] = [];
+    const onTextChunk = options.onTextChunk;
+    const streamDecoder = new TextDecoder('utf-8', { fatal: true });
+    const textParts: string[] | null = onTextChunk ? null : [];
     let stdoutBytes = 0;
+    let utf8Failed = false;
     let settled = false;
     let terminating = false;
     let stdinFinished = false;
@@ -569,6 +563,7 @@ export function runModelCommand(
     const terminateAndFail = (message: string): void => {
       if (settled || terminating) return;
       terminating = true;
+      if (textParts) textParts.length = 0;
       clearTimeout(timer);
       void terminateProcessTree(child, childExited).finally(() => {
         if (settled) return;
@@ -612,7 +607,21 @@ export function runModelCommand(
         terminateAndFail(`Model stdout exceeded ${MAX_ANSWER_BYTES} bytes`);
         return;
       }
-      stdoutChunks.push(bytes);
+      if (!utf8Failed) {
+        try {
+          const decoded = streamDecoder.decode(bytes, { stream: true });
+          if (decoded.length > 0) {
+            if (onTextChunk) {
+              onTextChunk(decoded);
+            } else if (textParts) {
+              textParts.push(decoded);
+            }
+          }
+        } catch {
+          utf8Failed = true;
+          if (textParts) textParts.length = 0;
+        }
+      }
     });
 
     // Drain stderr so a noisy model cannot block on pipe backpressure.
@@ -638,13 +647,32 @@ export function runModelCommand(
           terminateAndFail('Model did not read the whole prompt');
           return;
         }
-        let output: string;
+        if (utf8Failed) {
+          terminateAndFail('Model stdout is not valid UTF-8');
+          return;
+        }
         try {
-          output = fatalUtf8.decode(concatBytes(stdoutChunks, stdoutBytes));
+          const tail = streamDecoder.decode();
+          if (tail.length > 0) {
+            if (onTextChunk) {
+              onTextChunk(tail);
+            } else if (textParts) {
+              textParts.push(tail);
+            }
+          }
         } catch {
           terminateAndFail('Model stdout is not valid UTF-8');
           return;
         }
+        const output =
+          textParts === null
+            ? ''
+            : textParts.length === 0
+              ? ''
+              : textParts.length === 1
+                ? (textParts[0] as string)
+                : textParts.join('');
+        if (textParts) textParts.length = 0;
         const finishOk = (): void => {
           if (settled) return;
           settled = true;
@@ -686,6 +714,236 @@ function compareProblems(a: AnswerProblem, b: AnswerProblem): number {
   return a.line - b.line || (a.problem < b.problem ? -1 : a.problem > b.problem ? 1 : 0);
 }
 
+interface FirstAbstainLine {
+  readonly kind: 'abstain';
+  readonly lineNo: number;
+  readonly payloadOverLimit: boolean;
+}
+
+interface FirstStatementLine {
+  readonly kind: 'statement';
+  readonly lineNo: number;
+  readonly citations: readonly PendingCitation[];
+  readonly structured: {
+    readonly kind: 'fact' | 'asserted';
+    readonly id: string;
+    readonly normalizedValue: string;
+  } | null;
+}
+
+interface EvalStreamingScorer {
+  readonly onNonBlankLine: NonBlankLineCallback;
+  finalize(check: CheckAnswerResult): EvalScoreResult;
+}
+
+/**
+ * Incremental structured-answer scorer paired with `createAnswerScanner`. Retains only the
+ * first syntactically-clean line's parsed structure plus bounded extra-line diagnostics,
+ * avoiding buffering full answer strings during eval runs.
+ */
+function createEvalAnswerScorer(evalCase: EvalCase): EvalStreamingScorer {
+  let nonBlankLines = 0;
+  let firstLine: FirstAbstainLine | FirstStatementLine | null = null;
+  let extraAbstainCount = 0;
+  const extraAbstainDiagnostics: AnswerProblem[] = [];
+  const extraStatementLines: Array<{
+    readonly lineNo: number;
+    readonly citations: readonly PendingCitation[];
+  }> = [];
+
+  const onNonBlankLine: NonBlankLineCallback = (lineNo, kind, syntaxClean, line, citations) => {
+    nonBlankLines++;
+    if (!syntaxClean) return;
+
+    if (nonBlankLines === 1) {
+      if (kind === 'abstain') {
+        const payload = (line ?? '').slice('ABSTAIN:'.length).trim();
+        firstLine = {
+          kind: 'abstain',
+          lineNo,
+          payloadOverLimit: Buffer.byteLength(payload, 'utf8') > MAX_ABSTAIN_PAYLOAD_BYTES,
+        };
+        return;
+      }
+      const lineCitations = citations ?? [];
+      let structured: FirstStatementLine['structured'] = null;
+      if (lineCitations.length === 1 && line !== undefined) {
+        const match = STRUCTURED_ANSWER_RE.exec(line);
+        if (match) {
+          structured = {
+            kind: match[2] as 'fact' | 'asserted',
+            id: match[3] as string,
+            normalizedValue: normalizeEvalValue(match[1] as string),
+          };
+        }
+      }
+      firstLine = {
+        kind: 'statement',
+        lineNo,
+        citations: lineCitations,
+        structured,
+      };
+      return;
+    }
+
+    if (kind === 'abstain') {
+      extraAbstainCount++;
+      if (extraAbstainDiagnostics.length < MAX_EVAL_CASE_PROBLEMS) {
+        extraAbstainDiagnostics.push({
+          line: lineNo,
+          problem: 'extra line: answer must be exactly one non-blank line',
+        });
+      }
+      return;
+    }
+    extraStatementLines.push({ lineNo, citations: citations ?? [] });
+  };
+
+  const finalize = (check: CheckAnswerResult): EvalScoreResult => {
+    const checkerProblems = check.problemCount;
+    const keptProblems: AnswerProblem[] = check.problems.slice(0, MAX_EVAL_CASE_PROBLEMS);
+    const recordDiagnostic = (line: number, problem: string): void => {
+      if (keptProblems.length < MAX_EVAL_CASE_PROBLEMS) {
+        keptProblems.push({ line, problem });
+        if (keptProblems.length === MAX_EVAL_CASE_PROBLEMS) keptProblems.sort(compareProblems);
+        return;
+      }
+      const worst = keptProblems[keptProblems.length - 1] as AnswerProblem;
+      if (line > worst.line || (line === worst.line && problem >= worst.problem)) return;
+      keptProblems[keptProblems.length - 1] = { line, problem };
+      keptProblems.sort(compareProblems);
+    };
+
+    // Global checkAnswer failure (empty answer, >500 distinct citations, etc.): no line-level off-target scan.
+    if (check.problems.some((p) => p.line === 0)) {
+      keptProblems.sort(compareProblems);
+      return {
+        outcome: 'unsupported',
+        checkerProblems,
+        offTargetStatements: 0,
+        unsupportedProblems: checkerProblems,
+        problems: keptProblems,
+      };
+    }
+
+    const invalidSet = new Set(check.invalidCitations);
+    const acceptedValuesByCite = new Map<string, Set<string>>();
+    for (const opt of evalCase.expect.accept ?? []) {
+      const key = `${opt.as}:${opt.id}`;
+      let set = acceptedValuesByCite.get(key);
+      if (!set) {
+        set = new Set<string>();
+        acceptedValuesByCite.set(key, set);
+      }
+      for (const v of opt.values) {
+        set.add(normalizeEvalValue(v));
+      }
+    }
+
+    let offTargetStatements = 0;
+    let validAbstain = false;
+    let matchedAccept = false;
+
+    if (firstLine !== null) {
+      if (firstLine.kind === 'abstain') {
+        if (firstLine.payloadOverLimit) {
+          offTargetStatements++;
+          recordDiagnostic(firstLine.lineNo, `ABSTAIN payload exceeds ${MAX_ABSTAIN_PAYLOAD_BYTES} bytes`);
+        } else {
+          validAbstain = true;
+        }
+      } else {
+        let hasCheckerIssue = false;
+        for (const c of firstLine.citations) {
+          if (invalidSet.has(`${c.kind}:${c.id}`)) {
+            hasCheckerIssue = true;
+            break;
+          }
+        }
+        if (!hasCheckerIssue) {
+          if (firstLine.citations.length !== 1) {
+            offTargetStatements++;
+            recordDiagnostic(
+              firstLine.lineNo,
+              'off-target statement: ANSWER line must carry exactly one citation',
+            );
+          } else if (!firstLine.structured) {
+            offTargetStatements++;
+            recordDiagnostic(
+              firstLine.lineNo,
+              'off-target statement: line must match "ANSWER: <value> [fact:<id>]" or "ANSWER: <value> [asserted:<id>]" with no extra text',
+            );
+          } else {
+            const acceptedValues = acceptedValuesByCite.get(
+              `${firstLine.structured.kind}:${firstLine.structured.id}`,
+            );
+            if (!acceptedValues) {
+              offTargetStatements++;
+              recordDiagnostic(
+                firstLine.lineNo,
+                'off-target statement: citation is not accepted for this case',
+              );
+            } else if (!acceptedValues.has(firstLine.structured.normalizedValue)) {
+              offTargetStatements++;
+              recordDiagnostic(
+                firstLine.lineNo,
+                'off-target statement: answer value is not in accepted set',
+              );
+            } else {
+              matchedAccept = true;
+            }
+          }
+        }
+      }
+    }
+
+    offTargetStatements += extraAbstainCount;
+    for (const diag of extraAbstainDiagnostics) {
+      recordDiagnostic(diag.line, diag.problem);
+    }
+
+    for (const extra of extraStatementLines) {
+      let hasCheckerIssue = false;
+      for (const c of extra.citations) {
+        if (invalidSet.has(`${c.kind}:${c.id}`)) {
+          hasCheckerIssue = true;
+          break;
+        }
+      }
+      if (!hasCheckerIssue) {
+        offTargetStatements++;
+        recordDiagnostic(extra.lineNo, 'extra line: answer must be exactly one non-blank line');
+      }
+    }
+
+    keptProblems.sort(compareProblems);
+    const unsupportedProblems = checkerProblems + offTargetStatements;
+
+    let outcome: EvalOutcome;
+    if (!check.ok) {
+      outcome = 'unsupported';
+    } else if (offTargetStatements > 0) {
+      outcome = 'wrong';
+    } else if (matchedAccept) {
+      outcome = 'correct';
+    } else if (validAbstain) {
+      outcome = evalCase.expect.abstain ? 'abstained_correctly' : 'abstained_wrongly';
+    } else {
+      outcome = 'wrong';
+    }
+
+    return {
+      outcome,
+      checkerProblems,
+      offTargetStatements,
+      unsupportedProblems,
+      problems: keptProblems,
+    };
+  };
+
+  return { onNonBlankLine, finalize };
+}
+
 /**
  * Deterministic structured-answer scoring against a case's declared acceptance set (R1, F7, L1, A-29).
  * Requires exactly ONE non-blank line: either `ANSWER: <value> [fact:<id>]` /
@@ -699,185 +957,11 @@ export function scoreEvalAnswer(
   answerText: string,
   check: CheckAnswerResult,
 ): EvalScoreResult {
-  const checkerProblems = check.problemCount;
-  const keptProblems: AnswerProblem[] = check.problems.slice(0, MAX_EVAL_CASE_PROBLEMS);
-  const recordDiagnostic = (line: number, problem: string): void => {
-    if (keptProblems.length < MAX_EVAL_CASE_PROBLEMS) {
-      keptProblems.push({ line, problem });
-      if (keptProblems.length === MAX_EVAL_CASE_PROBLEMS) keptProblems.sort(compareProblems);
-      return;
-    }
-    const worst = keptProblems[keptProblems.length - 1] as AnswerProblem;
-    if (line > worst.line || (line === worst.line && problem >= worst.problem)) return;
-    keptProblems[keptProblems.length - 1] = { line, problem };
-    keptProblems.sort(compareProblems);
-  };
-
-  // Global checkAnswer failure (empty answer, >500 distinct citations, etc.): no line-level off-target scan.
-  if (check.problems.some((p) => p.line === 0)) {
-    keptProblems.sort(compareProblems);
-    return {
-      outcome: 'unsupported',
-      checkerProblems,
-      offTargetStatements: 0,
-      unsupportedProblems: checkerProblems,
-      problems: keptProblems,
-    };
-  }
-
-  const invalidSet = new Set(check.invalidCitations);
-  const acceptedValuesByCite = new Map<string, Set<string>>();
-  for (const opt of evalCase.expect.accept ?? []) {
-    const key = `${opt.as}:${opt.id}`;
-    let set = acceptedValuesByCite.get(key);
-    if (!set) {
-      set = new Set<string>();
-      acceptedValuesByCite.set(key, set);
-    }
-    for (const v of opt.values) {
-      set.add(normalizeEvalValue(v));
-    }
-  }
-
-  let offTargetStatements = 0;
-  let nonBlankLines = 0;
-  let validAbstain = false;
-  let matchedAccept = false;
-
-  // Iterate line by line without allocating substrings for ordinary uncited lines (F7).
-  const startOffset = answerText.startsWith('\ufeff') ? 1 : 0;
-  let pos = startOffset;
-  let lineNo = 0;
-  let nextBracket = answerText.indexOf('[', startOffset);
-  while (pos <= answerText.length) {
-    lineNo++;
-    const nl = answerText.indexOf('\n', pos);
-    const end = nl === -1 ? answerText.length : nl;
-    let s = pos;
-    let e = end > pos && answerText.charCodeAt(end - 1) === 13 ? end - 1 : end;
-    pos = nl === -1 ? answerText.length + 1 : nl + 1;
-
-    while (s < e && answerText.charCodeAt(s) <= 32) s++;
-    while (e > s && answerText.charCodeAt(e - 1) <= 32) e--;
-    if (s === e) continue;
-
-    // Fast path: non-ABSTAIN lines without '[' already failed checkAnswer as uncited (O(1) amortized).
-    const hasNonAsciiEdge = answerText.charCodeAt(s) > 127 || answerText.charCodeAt(e - 1) > 127;
-    if (!hasNonAsciiEdge && !answerText.startsWith('ABSTAIN:', s)) {
-      if (nextBracket !== -1 && nextBracket < s) {
-        nextBracket = answerText.indexOf('[', s);
-      }
-      if (nextBracket === -1 || nextBracket >= e) {
-        nonBlankLines++;
-        continue;
-      }
-    }
-
-    const line = hasNonAsciiEdge ? answerText.slice(s, e).trim() : answerText.slice(s, e);
-    if (line.length === 0) continue;
-    nonBlankLines++;
-
-    if (line.startsWith('ABSTAIN:')) {
-      // Lines that already failed checkAnswer are counted in checkerProblems, not double-counted.
-      if (!ABSTAIN_RE.test(line) || /\[(fact|asserted):/.test(line)) {
-        continue;
-      }
-      if (nonBlankLines > 1) {
-        offTargetStatements++;
-        recordDiagnostic(lineNo, 'extra line: answer must be exactly one non-blank line');
-        continue;
-      }
-      const payload = line.slice('ABSTAIN:'.length).trim();
-      if (encoder.encode(payload).length > MAX_ABSTAIN_PAYLOAD_BYTES) {
-        offTargetStatements++;
-        recordDiagnostic(lineNo, `ABSTAIN payload exceeds ${MAX_ABSTAIN_PAYLOAD_BYTES} bytes`);
-      } else {
-        validAbstain = true;
-      }
-      continue;
-    }
-
-    // Statement line: skip if checkAnswer already flagged this line.
-    if (!line.includes('[fact') && !line.includes('[asserted')) {
-      continue;
-    }
-    const found = [...line.matchAll(CITATION_RE)];
-    const loose = (line.match(/\[(fact|asserted)\b/g) ?? []).length;
-    if (found.length === 0 || loose !== found.length) {
-      continue;
-    }
-    let hasCheckerIssue = false;
-    for (const m of found) {
-      const kind = m[1] as 'fact' | 'asserted';
-      const id = m[2] ?? '';
-      if (!FACT_ID_RE.test(id) || invalidSet.has(`${kind}:${id}`)) {
-        hasCheckerIssue = true;
-        break;
-      }
-    }
-    if (hasCheckerIssue) continue;
-
-    // Checker-clean statement line: enforce single-line, single-citation structured ANSWER format.
-    if (nonBlankLines > 1) {
-      offTargetStatements++;
-      recordDiagnostic(lineNo, 'extra line: answer must be exactly one non-blank line');
-      continue;
-    }
-    if (found.length !== 1) {
-      offTargetStatements++;
-      recordDiagnostic(lineNo, 'off-target statement: ANSWER line must carry exactly one citation');
-      continue;
-    }
-    const match = STRUCTURED_ANSWER_RE.exec(line);
-    if (!match) {
-      offTargetStatements++;
-      recordDiagnostic(
-        lineNo,
-        'off-target statement: line must match "ANSWER: <value> [fact:<id>]" or "ANSWER: <value> [asserted:<id>]" with no extra text',
-      );
-      continue;
-    }
-    const rawValue = match[1] as string;
-    const kind = match[2] as 'fact' | 'asserted';
-    const id = match[3] as string;
-    const acceptedValues = acceptedValuesByCite.get(`${kind}:${id}`);
-    if (!acceptedValues) {
-      offTargetStatements++;
-      recordDiagnostic(lineNo, 'off-target statement: citation is not accepted for this case');
-      continue;
-    }
-    const normalized = normalizeEvalValue(rawValue);
-    if (!acceptedValues.has(normalized)) {
-      offTargetStatements++;
-      recordDiagnostic(lineNo, 'off-target statement: answer value is not in accepted set');
-      continue;
-    }
-    matchedAccept = true;
-  }
-
-  keptProblems.sort(compareProblems);
-  const unsupportedProblems = checkerProblems + offTargetStatements;
-
-  let outcome: EvalOutcome;
-  if (!check.ok) {
-    outcome = 'unsupported';
-  } else if (offTargetStatements > 0) {
-    outcome = 'wrong';
-  } else if (matchedAccept) {
-    outcome = 'correct';
-  } else if (validAbstain) {
-    outcome = evalCase.expect.abstain ? 'abstained_correctly' : 'abstained_wrongly';
-  } else {
-    outcome = 'wrong';
-  }
-
-  return {
-    outcome,
-    checkerProblems,
-    offTargetStatements,
-    unsupportedProblems,
-    problems: keptProblems,
-  };
+  const scorer = createEvalAnswerScorer(evalCase);
+  const scanner = createAnswerScanner(0, scorer.onNonBlankLine);
+  scanner.feedChunk(answerText);
+  scanner.finish();
+  return scorer.finalize(check);
 }
 
 /** Build prompts for the selected cases without running any model or appending to any log. */
@@ -1012,13 +1096,7 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
 
     // R2: keep one running snapshot chained across all cases.
     let lastSnapshot = snapshotFixtureIntegrity(fx);
-    let lastOutputLarge = false;
     for (const c of cases) {
-      if (lastOutputLarge) {
-        collectGarbage();
-        lastOutputLarge = false;
-      }
-
       // Verify fixture is unchanged since the end of the previous case (or initial build).
       const beforeQuery = snapshotFixtureIntegrity(fx);
       const betweenDiffs = diffFixtureIntegrity(lastSnapshot, beforeQuery);
@@ -1056,9 +1134,14 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
       }
       lastSnapshot = afterQuery;
 
+      // Stream stdout chunks directly into the incremental line scanner/scorer so a 256 KiB
+      // answer is never buffered as raw chunks + concatenated bytes + decoded full string.
+      const scorer = createEvalAnswerScorer(c);
+      const scanner = createAnswerScanner(MAX_EVAL_CASE_PROBLEMS, scorer.onNonBlankLine);
       const modelRun = await runModelCommand(options.modelCmd, modelArgs, prompt, caseTimeoutMs, {
         cwd: modelCwd,
         env: childEnv,
+        onTextChunk: scanner.feedChunk,
       });
 
       const afterModel = snapshotFixtureIntegrity(fx);
@@ -1089,7 +1172,7 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
       } else {
         let check: CheckAnswerResult;
         try {
-          check = await checkAnswer(modelRun.output, {
+          check = await scanner.finalize({
             logPath: fx.logPath,
             indexPath: fx.indexPath,
             repos,
@@ -1119,7 +1202,7 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
           );
         }
 
-        const scored = scoreEvalAnswer(c, modelRun.output, check);
+        const scored = scorer.finalize(check);
         counts[scored.outcome]++;
         totalCheckerProblems += scored.checkerProblems;
         totalOffTargetStatements += scored.offTargetStatements;
@@ -1140,9 +1223,6 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
       caseResults.push(caseResult);
       if (options.onCaseComplete) {
         await options.onCaseComplete(caseResult);
-      }
-      if (modelRun.outputBytes >= 65_536) {
-        lastOutputLarge = true;
       }
     }
 

@@ -2059,10 +2059,14 @@ test('command embedder terminates descendant process tree on timeout and stdout 
     'utf8',
   );
 
+  // Pre-build the SQLite index so subtest 3 measures the semantic query deadline against
+  // the hanging command embedder rather than cold index creation on a slow CI runner.
+  rebuildIndex(logPath);
+
   // 1) Direct createCommandEmbedder timeout kills descendant process before settling.
   const hangPidFile = join(dir, 'hang.pid');
   await assert.rejects(
-    () => createCommandEmbedder(process.execPath, [wrapperPath, hangPidFile, 'hang'], 'cmd', 600).embed(['probe']),
+    () => createCommandEmbedder(process.execPath, [wrapperPath, hangPidFile, 'hang'], 'cmd', 2_000).embed(['probe']),
     /timed out/,
   );
   assert.equal(existsSync(hangPidFile), true);
@@ -2088,8 +2092,8 @@ test('command embedder terminates descendant process tree on timeout and stdout 
       queryFacts({
         logPath,
         text: 'unrelated semantic trigger',
-        embedder: createCommandEmbedder(process.execPath, [wrapperPath, queryPidFile, 'hang'], 'cmd', 10_000),
-        semanticTimeoutMs: 600,
+        embedder: createCommandEmbedder(process.execPath, [wrapperPath, queryPidFile, 'hang'], 'cmd', 20_000),
+        semanticTimeoutMs: 2_000,
         nowMs,
       }),
     /timed out/,
