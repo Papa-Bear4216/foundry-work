@@ -141,3 +141,34 @@ jobs:
         env:
           FOUNDRY_V0_REQUIRE_BUILT: "1"
         run: node benchmarks/v0/run-all.mjs
+
+  importers:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          package-manager-cache: false
+      - name: Install workspace
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Build vault codec and importers
+        shell: pwsh
+        run: |
+          npm --prefix packages/vault/codec run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run build --workspace importers
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --input-type=module -e "await import('importers')"
+      - name: Importer test suites (serial)
+        run: npm test --workspace importers
+      - name: Importer 1 GiB mbox peak RSS budget (pinned runtime)
+        if: ${{ !cancelled() }}
+        run: npm run budgets --workspace importers
