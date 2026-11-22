@@ -107,11 +107,14 @@ export class StreamScanner {
     inspect: (record: DiskRecord) => void, unlocked?: UnlockedKeyring,
   ) {
     const hash = createHash('sha256');
+    const destroyedCollections = new Set(unlocked?.keyring.keys
+      .filter(entry => entry.kind === 'collection' && entry.state === 'destroyed')
+      .map(entry => entry.key_id));
     let erased = 0;
     const { shortAt } = this.walk(fd, size, record => {
       check(record.type === type, 'SCHEMA');
       inspect(record);
-      if (unlocked && !unlocked.erased.has(record.keyId)) {
+      if (unlocked && !destroyedCollections.has(record.keyId)) {
         this.authenticate(fd, record, unlocked, hash);
       } else {
         this.frames(fd, record, hash);

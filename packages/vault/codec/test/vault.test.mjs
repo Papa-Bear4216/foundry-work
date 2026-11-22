@@ -162,19 +162,68 @@ test('blob candidate indexing visits each sealed blob header once per writer ses
 function setCollectionState(directory, unlocked, destroyed) {
   const collection = cases.ids.erased;
   const date = identity.createdAt;
-  const entries = unlocked.keyring.keys.map(({ key_id, kind, parent, state, created_at, destroyed_at }) => {
+  const entries = fixtureKeyEntries(unlocked).map(entry => {
+    if (entry.key_id !== collection) return entry;
+    const { key_id, kind, parent } = entry;
+    return destroyed ? { key_id, kind, parent, state: 'destroyed', destroyed_at: date }
+      : { key_id, kind, parent, state: 'active', created_at: date, key: Buffer.alloc(32, 0x42) };
+  });
+  return writeFixtureKeyring(directory, unlocked, entries, destroyed ? 2 : 1);
+}
+
+function fixtureKeyEntries(unlocked) {
+  return unlocked.keyring.keys.map(({ key_id, kind, parent, state, created_at, destroyed_at }) => {
     const entry = { key_id, kind, parent };
-    if (key_id === collection) {
-      return destroyed ? { ...entry, state: 'destroyed', destroyed_at: date }
-        : { ...entry, state: 'active', created_at: date, key: Buffer.alloc(32, 0x42) };
-    }
     if (state === 'destroyed') return { ...entry, state, destroyed_at };
     return { ...entry, state, created_at, key: unlocked.keys.get(key_id), label: unlocked.labels.get(key_id) };
   });
+}
+
+function writeFixtureKeyring(directory, unlocked, entries, version) {
   writeFileSync(keyringPath(directory), encodeKeyring({
-    vaultId: identity.vaultId, masterKey: unlocked.masterKey, version: destroyed ? 2 : 1, entries,
+    vaultId: identity.vaultId, masterKey: unlocked.masterKey, version, entries,
   }, cases.passphrase, Buffer.from(cases.recovery_key, 'hex')));
   return unlockFixture(directory);
+}
+
+for (const [kind, destroyedId] of [['index', cases.ids.index], ['profile', '06'.repeat(16)]]) {
+  test(`vault rejects records with a destroyed ${kind} key ID after rekey`, t => {
+    const { directory, unlocked } = makeVault(t);
+    if (kind === 'profile') {
+      writeFixtureKeyring(directory, unlocked, [...fixtureKeyEntries(unlocked), {
+        key_id: destroyedId, kind, parent: 'master', state: 'destroyed', destroyed_at: identity.createdAt,
+      }], 1);
+    }
+    const { recoveryKey } = rekeyAll(keyringPath(directory), identity.vaultId, {
+      recoveryKey: formatRecoveryKey(Buffer.from(cases.recovery_key, 'hex')),
+    }, { passphrase: 'TEST ONLY rotate the vault', currentCollectionIds: [keyId], historicalCollectionIds: [] });
+    const rotated = unlockByRecovery(keyringPath(directory), identity.vaultId, recoveryKey);
+    const entry = rotated.keyring.keys.find(item => item.key_id === destroyedId);
+    assert.equal(entry.kind, kind);
+    assert.equal(entry.state, 'destroyed');
+
+    const item = blob('TEST ONLY record payload');
+    const invalid = encodeRecord({ type: 2, keyId: destroyedId, context: 0n }, item.plaintext,
+      identity.vaultId, Buffer.alloc(32));
+    const { location, original, openPath } = withWriter(directory, rotated, writer => {
+      const [{ location }] = writer.appendBatch([item]);
+      const openPath = join(directory, 'open', location.stream);
+      const original = readFileSync(openPath);
+      writeFileSync(openPath, invalid);
+      assert.throws(() => writer.closeSegment(), { code: 'KEY' });
+      return { location, original, openPath };
+    });
+    assert.throws(() => withWriter(directory, rotated, () => {}), { code: 'KEY' });
+    assert.equal(verifyVault(directory).position.segment, 0);
+    assert.deepEqual(readFileSync(openPath), invalid);
+
+    writeFileSync(openPath, original);
+    withWriter(directory, rotated, writer => assert.equal(writer.closeSegment().segment, 1));
+    writable(directory);
+    writeFileSync(join(segment(directory, 1), location.stream), invalid);
+    assert.throws(() => verifyVaultDeep(directory, rotated), { code: 'KEY' });
+    assert.throws(() => readVaultRecord(directory, location, rotated), { code: 'KEY' });
+  });
 }
 
 test('deep verification reports erased counts only after checking later integrity and authentication', t => {
