@@ -49,7 +49,9 @@ export {
 
 export {
   INDEX_SCHEMA_VERSION,
+  ReadOnlyIndexError,
   defaultIndexPath,
+  openIndexReadOnlyStrict,
   openSyncedIndexForQuery,
   rebuildIndex,
   syncIndex,
@@ -100,10 +102,13 @@ export {
   type UsageReport,
 } from './usage.js';
 export {
+  EVAL_TAKEOUT_FACT_ID,
   NOW_MS,
   PROJECT as GATE_PROJECT,
   REPO as GATE_REPO,
+  buildEvalFixture,
   buildGateFixture,
+  evalFactCatalog,
   gateFactCatalog,
   type DeclaredFactState,
   type GateFactCatalogEntry,

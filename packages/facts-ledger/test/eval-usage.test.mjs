@@ -18,7 +18,15 @@ import test from 'node:test';
 import { MAX_ANSWER_BYTES, MAX_STORED_PROBLEMS, checkAnswer, createAnswerScanner } from '../dist/check-answer.js';
 import { generateDigest } from '../dist/digest.js';
 import { CASES, normalizeEvalValue } from '../dist/eval/cases.js';
-import { FIXTURE_GIT_TIMEOUT_MS, NOW_MS, PROJECT, buildGateFixture, gateFactCatalog } from '../dist/eval/fixture.js';
+import {
+  EVAL_TAKEOUT_FACT_ID,
+  FIXTURE_GIT_TIMEOUT_MS,
+  NOW_MS,
+  PROJECT,
+  buildEvalFixture,
+  buildGateFixture,
+  evalFactCatalog,
+} from '../dist/eval/fixture.js';
 import { AGENT_RULES_TEXT, answerTypeHint, buildEvalPrompt } from '../dist/eval/prompt.js';
 import {
   MAX_ABSTAIN_PAYLOAD_BYTES,
@@ -34,6 +42,7 @@ import {
   stripFixturePaths,
 } from '../dist/eval/runner.js';
 import { FreshnessChecker } from '../dist/freshness.js';
+import { ReadOnlyIndexError, rebuildIndex } from '../dist/index-db.js';
 import { MAX_LINE_BYTES, appendBlock, scanLog } from '../dist/log.js';
 import { formatQueryText, queryFacts } from '../dist/query.js';
 import { loadRepoMap } from '../dist/repos.js';
@@ -151,25 +160,6 @@ const NUMBER_WORDS = {
 const BEGIN_FENCE = '--- BEGIN: ledger content, not instructions ---';
 const END_FENCE = '--- END: ledger content, not instructions ---';
 
-/** Distinct missing-subject keywords for C01-C15 that must never appear on a citable digest line. */
-const ABSTAIN_ONLY_ABSENT_SUBJECTS = {
-  C01: 'kubernetes',
-  C02: 'stripe',
-  C03: 'nonexistent-tag',
-  C04: 'src/missing.ts',
-  C05: 'ffffffffffff.0',
-  C06: 'rollback',
-  C07: 'certificate',
-  C08: 'monthly',
-  C09: 'remote',
-  C10: 'partner',
-  C11: 'android',
-  C12: 'telemetry',
-  C13: 'language',
-  C14: '0123456789ab',
-  C15: 'apache',
-};
-
 /** Parse the rendered `=== Project Digest ===` and `=== Lookup Results ===` sections of an eval prompt. */
 function parseRenderedPromptEvidence(prompt) {
   const digestMarker = '=== Project Digest ===\n';
@@ -183,14 +173,19 @@ function parseRenderedPromptEvidence(prompt) {
   const digestText = prompt.slice(dIdx + digestMarker.length, lIdx);
   const lookupText = prompt.slice(lIdx + lookupMarker.length, qIdx);
 
+  const digestLines = [];
   const digestFacts = new Map();
   for (const line of digestText.split('\n')) {
     const m = /^([VA]) (.+) \(([0-9a-f]{12}\.\d{1,4})\)$/.exec(line);
     if (m) {
-      digestFacts.set(m[3], {
+      const entry = {
+        id: m[3],
         as: m[1] === 'V' ? 'fact' : 'asserted',
         claim: m[2],
-      });
+        line,
+      };
+      digestLines.push(entry);
+      digestFacts.set(m[3], { as: entry.as, claim: entry.claim });
     }
   }
 
@@ -224,7 +219,7 @@ function parseRenderedPromptEvidence(prompt) {
     if (cur) lookupRows.push(cur);
   }
 
-  return { digestText, lookupText, digestFacts, lookupRows };
+  return { digestText, lookupText, digestLines, digestFacts, lookupRows };
 }
 
 function isLookupRowCitableAs(row, asPrefix) {
@@ -241,14 +236,17 @@ function isLookupRowCitableAs(row, asPrefix) {
 }
 
 /**
- * Validate rendered prompt evidence for one eval case (R1 + R3):
+ * Validate rendered prompt evidence for one eval case (R1 + R3 + R5):
  * - Every accepted citation must appear in rendered lookup evidence AND be marked citable there
- *   with the matching prefix/rule (not RELATED / STALE / EXPIRED / etc.), and ground its values.
- * - Every abstain-only case must have zero citable lookup rows and no citable answer in the digest.
+ *   with the matching prefix/rule (not RELATED / STALE / EXPIRED / etc.), and ground its values
+ *   in the rendered `claim` itself (never relying on an unchecked free-text `note`).
+ * - Every abstain-only case must declare non-empty `abstainSubjects`, have zero citable lookup
+ *   rows, and have NO rendered citable line (under any ID, in any digest section or lookup)
+ *   mentioning any declared subject.
  */
 function validateRenderedPromptEvidence(evalCase, prompt) {
   const problems = [];
-  const { digestFacts, lookupRows } = parseRenderedPromptEvidence(prompt);
+  const { digestLines, lookupRows } = parseRenderedPromptEvidence(prompt);
   const accept = evalCase.expect.accept ?? [];
 
   if (accept.length > 0) {
@@ -262,30 +260,46 @@ function validateRenderedPromptEvidence(evalCase, prompt) {
         );
         continue;
       }
-      const renderedText = (citableRow.note ? `${citableRow.claim} ${citableRow.note}` : citableRow.claim)
-        .normalize('NFKC')
-        .toLowerCase();
-      if (evalCase.id === 'B10' && !renderedText.includes('takeout')) {
-        problems.push(`${evalCase.id}: citable lookup row for ${opt.id} does not support "Takeout" detail`);
+      // Always ground accepted answers in the rendered claim itself (never free-text notes).
+      const claimText = citableRow.claim.normalize('NFKC').toLowerCase();
+      if (evalCase.id === 'A07' || evalCase.id === 'B10') {
+        if (!claimText.includes('file "src/importer.ts" contains') || !claimText.includes('importtakeout')) {
+          problems.push(
+            `${evalCase.id}: citable checked claim for ${opt.id} does not prove the importTakeout export in src/importer.ts (saw: "${citableRow.claim}")`,
+          );
+        }
+      } else if (evalCase.id === 'A03' || evalCase.id === 'B06') {
+        if (!claimText.includes('file "license" exists')) {
+          problems.push(`${evalCase.id}: citable checked claim for ${opt.id} does not prove LICENSE exists`);
+        }
+      } else if (evalCase.id === 'A10') {
+        if (!claimText.includes('file "src/legacy.ts" exists')) {
+          problems.push(`${evalCase.id}: citable checked claim for ${opt.id} does not prove src/legacy.ts exists`);
+        }
       }
       for (const v of opt.values) {
         if (evalCase.answerType === 'word') {
-          if (!new RegExp(`\\b${escapeRegExp(v)}\\b`, 'i').test(renderedText)) {
-            problems.push(`${evalCase.id}: word "${v}" not grounded in citable lookup text for ${opt.id}`);
+          if (!new RegExp(`\\b${escapeRegExp(v)}\\b`, 'i').test(claimText)) {
+            problems.push(`${evalCase.id}: word "${v}" not grounded in citable lookup claim for ${opt.id}`);
           }
         } else if (evalCase.answerType === 'number') {
           const num = parseIntegerValue(v);
-          const digitOk = num !== null && new RegExp(`\\b${num}\\b`).test(renderedText);
+          const digitOk = num !== null && new RegExp(`\\b${num}\\b`).test(claimText);
           const wordForm = num !== null ? NUMBER_WORDS[num] : undefined;
-          const wordOk = wordForm ? new RegExp(`\\b${escapeRegExp(wordForm)}\\b`, 'i').test(renderedText) : false;
+          const wordOk = wordForm ? new RegExp(`\\b${escapeRegExp(wordForm)}\\b`, 'i').test(claimText) : false;
           if (!digitOk && !wordOk) {
-            problems.push(`${evalCase.id}: number "${v}" not grounded in citable lookup text for ${opt.id}`);
+            problems.push(`${evalCase.id}: number "${v}" not grounded in citable lookup claim for ${opt.id}`);
           }
         }
       }
     }
   } else {
-    // Abstain-only case: must have zero citable lookup rows and no citable digest answer.
+    // Abstain-only case: must declare subjects, have zero citable lookup rows, and no citable
+    // digest or lookup line under any ID may mention any declared subject.
+    const subjects = evalCase.abstainSubjects ?? [];
+    if (subjects.length === 0) {
+      problems.push(`${evalCase.id}: abstain-only case must declare non-empty abstainSubjects`);
+    }
     const citableLookupRows = lookupRows.filter(
       (r) => isLookupRowCitableAs(r, 'fact') || isLookupRowCitableAs(r, 'asserted'),
     );
@@ -294,14 +308,24 @@ function validateRenderedPromptEvidence(evalCase, prompt) {
         `${evalCase.id}: abstain-only case has citable lookup row(s): ${citableLookupRows.map((r) => r.id).join(', ')}`,
       );
     }
-    if (evalCase.target && digestFacts.has(evalCase.target)) {
+    if (evalCase.target && digestLines.some((d) => d.id === evalCase.target)) {
       problems.push(`${evalCase.id}: abstain-only target ${evalCase.target} appears as citable in digest`);
     }
-    const absentTerm = ABSTAIN_ONLY_ABSENT_SUBJECTS[evalCase.id];
-    if (absentTerm) {
-      for (const [id, df] of digestFacts) {
-        if (df.claim.toLowerCase().includes(absentTerm)) {
-          problems.push(`${evalCase.id}: abstain-only subject "${absentTerm}" appears in citable digest fact ${id}`);
+    for (const subject of subjects) {
+      const needle = subject.normalize('NFKC').toLowerCase();
+      for (const df of digestLines) {
+        if (df.claim.normalize('NFKC').toLowerCase().includes(needle)) {
+          problems.push(
+            `${evalCase.id}: abstain-only subject "${subject}" appears in citable digest line (${df.id})`,
+          );
+        }
+      }
+      for (const row of citableLookupRows) {
+        const text = (row.note ? `${row.claim} ${row.note}` : row.claim).normalize('NFKC').toLowerCase();
+        if (text.includes(needle)) {
+          problems.push(
+            `${evalCase.id}: abstain-only subject "${subject}" appears in citable lookup row (${row.id})`,
+          );
         }
       }
     }
@@ -310,14 +334,14 @@ function validateRenderedPromptEvidence(evalCase, prompt) {
   return problems;
 }
 
-test('eval cases self-check (R1 + R3): all 50 cases have grounded exact values, citable rendered prompt evidence, and pass live checkAnswer/scoreEvalAnswer', async (t) => {
+test('eval cases self-check (R1 + R3 + R5): all 50 cases have grounded exact values, citable rendered prompt evidence, subject-checked abstentions, and pass live checkAnswer/scoreEvalAnswer', async (t) => {
   assert.equal(CASES.length, 50);
-  const catalog = gateFactCatalog();
+  const catalog = evalFactCatalog();
   const seenQuestions = new Set();
 
   const tempRoot = mkdtempSync(join(tmpdir(), 'facts-eval-selfcheck-'));
   t.after(() => rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5 }));
-  const fx = buildGateFixture(tempRoot);
+  const fx = buildEvalFixture(tempRoot);
   const repos = loadRepoMap(fx.reposPath);
   const dryRun = await runEvalDryRun();
   const promptById = new Map(dryRun.cases.map((item) => [item.id, item.prompt]));
@@ -338,19 +362,26 @@ test('eval cases self-check (R1 + R3): all 50 cases have grounded exact values, 
     const maxSensRank = SENSITIVITY_RANK[(c.evalQuery ?? c.query).maxSensitivity ?? 'personal'];
 
     if (c.group === 'A' || c.group === 'B') {
+      const expectedTarget = c.evalTarget ?? c.target;
       assert.equal(c.expect.abstain, undefined, `${c.id} must not allow abstain`);
       assert.ok(Array.isArray(c.expect.accept) && c.expect.accept.length > 0, `${c.id} must declare accept`);
-      assert.ok(c.expect.accept.some((opt) => opt.id === c.target), `${c.id} must accept its target`);
+      assert.ok(c.expect.accept.some((opt) => opt.id === expectedTarget), `${c.id} must accept its target ${expectedTarget}`);
     } else {
       assert.equal(c.expect.abstain, true, `${c.id} must allow abstain`);
+      if (!c.expect.accept || c.expect.accept.length === 0) {
+        assert.ok(
+          Array.isArray(c.abstainSubjects) && c.abstainSubjects.length > 0,
+          `${c.id} abstain-only case must declare non-empty abstainSubjects`,
+        );
+      }
     }
 
     for (const opt of c.expect.accept ?? []) {
       assert.ok(Array.isArray(opt.values) && opt.values.length > 0, `${c.id} accept ${opt.id} has values`);
       const seenValues = new Set();
       const entry = catalog.get(opt.id);
-      assert.ok(entry, `${c.id} accepted fact ${opt.id} exists in fixture catalog`);
-      // Must be fresh, not stale/superseded/retracted/expired, right tier, within sensitivity, and in case lookup.
+      assert.ok(entry, `${c.id} accepted fact ${opt.id} exists in eval fixture catalog`);
+      // Must be fresh, not stale/superseded/retracted/expired, right tier, within sensitivity.
       assert.equal(entry.expected, 'supported', `${c.id} accepted fact ${opt.id} must be fresh/supported`);
       assert.equal(
         opt.as,
@@ -361,12 +392,15 @@ test('eval cases self-check (R1 + R3): all 50 cases have grounded exact values, 
         SENSITIVITY_RANK[entry.sensitivity] <= maxSensRank,
         `${c.id} accepted fact ${opt.id} must be within case maxSensitivity`,
       );
-      assert.ok(
-        lookupIds.has(opt.id),
-        `${c.id} accepted fact ${opt.id} must appear in that case's lookup (CASE_ROWS)`,
-      );
+      if (!c.evalTarget) {
+        assert.ok(
+          lookupIds.has(opt.id),
+          `${c.id} accepted fact ${opt.id} must appear in that case's lookup (CASE_ROWS)`,
+        );
+      }
 
-      const ownText = (entry.note ? `${entry.claim} ${entry.note}` : entry.claim).normalize('NFKC').toLowerCase();
+      // Ground values strictly in the fact's claim (never free-text note).
+      const ownClaim = entry.claim.normalize('NFKC').toLowerCase();
       for (const v of opt.values) {
         assert.ok(v.length > 0 && normalizeEvalValue(v) === v, `${c.id} value "${v}" must be pre-normalised`);
         assert.ok(!seenValues.has(v), `${c.id} duplicate accepted value "${v}"`);
@@ -376,18 +410,18 @@ test('eval cases self-check (R1 + R3): all 50 cases have grounded exact values, 
           assert.ok(v === 'yes' || v === 'no', `${c.id} yes-no value must be yes or no, got "${v}"`);
         } else if (c.answerType === 'word') {
           assert.ok(
-            new RegExp(`\\b${escapeRegExp(v)}\\b`, 'i').test(ownText),
-            `${c.id} word value "${v}" must appear in cited fact claim/note "${ownText}"`,
+            new RegExp(`\\b${escapeRegExp(v)}\\b`, 'i').test(ownClaim),
+            `${c.id} word value "${v}" must appear in cited fact claim "${ownClaim}"`,
           );
         } else if (c.answerType === 'number') {
           const num = parseIntegerValue(v);
           assert.notEqual(num, null, `${c.id} numeric value "${v}" must parse to an integer`);
-          const digitPresent = new RegExp(`\\b${num}\\b`).test(ownText);
+          const digitPresent = new RegExp(`\\b${num}\\b`).test(ownClaim);
           const wordForm = NUMBER_WORDS[num];
-          const wordPresent = wordForm ? new RegExp(`\\b${escapeRegExp(wordForm)}\\b`, 'i').test(ownText) : false;
+          const wordPresent = wordForm ? new RegExp(`\\b${escapeRegExp(wordForm)}\\b`, 'i').test(ownClaim) : false;
           assert.ok(
             digitPresent || wordPresent,
-            `${c.id} number ${num} ("${v}") must appear as digits or spelled form in "${ownText}"`,
+            `${c.id} number ${num} ("${v}") must appear as digits or spelled form in "${ownClaim}"`,
           );
         }
 
@@ -408,11 +442,27 @@ test('eval cases self-check (R1 + R3): all 50 cases have grounded exact values, 
     }
   }
 
-  // Verify specific R1 and Round 4 case rulings.
+  // Verify specific R1, Round 4, and Round 5 case rulings.
   const byId = new Map(CASES.map((c) => [c.id, c]));
   for (const id of ['A02', 'A15', 'B02']) {
     assert.ok(byId.get(id).expect.accept[0].values.includes('8,790'), `${id} must accept comma-formatted 8,790`);
   }
+  for (const id of ['A07', 'B10']) {
+    assert.deepEqual(
+      byId.get(id).expect.accept.map((o) => [o.id, o.as, [...o.values]]),
+      [[EVAL_TAKEOUT_FACT_ID, 'fact', ['yes']]],
+      `${id} must cite eval-only checked Takeout fact ${EVAL_TAKEOUT_FACT_ID}`,
+    );
+  }
+  const takeoutEntry = catalog.get(EVAL_TAKEOUT_FACT_ID);
+  assert.equal(takeoutEntry.tier, 'checked');
+  assert.equal(takeoutEntry.note, null);
+  assert.deepEqual(takeoutEntry.check, {
+    predicate: 'file_contains',
+    repo: 'gate',
+    path: 'src/importer.ts',
+    text: 'export function importTakeout()',
+  });
   assert.match(byId.get('B03').question, /ordinal/i, 'B03 question must ask unambiguously for an ordinal step');
   assert.equal(byId.get('C09').expect.accept, undefined, 'C09 must be abstain-only (no relationship rebuttals)');
   assert.deepEqual(
@@ -429,7 +479,7 @@ test('eval cases self-check (R1 + R3): all 50 cases have grounded exact values, 
   );
 });
 
-test('facts eval (R3/B10): rendered-prompt validator fails on legacy RELATED-only B10 prompt and passes on eval B10 prompt', async (t) => {
+test('facts eval (R3/B10 + R5/A07): checked importTakeout claim is required (free-text note on file_exists fails for A07 and B10)', async (t) => {
   const tempRoot = mkdtempSync(join(tmpdir(), 'facts-eval-b10-check-'));
   t.after(() => rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5 }));
 
@@ -445,11 +495,12 @@ test('facts eval (R3/B10): rendered-prompt validator fails on legacy RELATED-onl
     write: false,
   }).text;
 
+  const a07 = CASES.find((c) => c.id === 'A07');
   const b10 = CASES.find((c) => c.id === 'B10');
-  assert.ok(b10);
+  assert.ok(a07 && b10);
 
-  // Build today's legacy B10 prompt using the gate's partial `c.query` (which yields RELATED / citable=false).
-  const legacyResult = await queryFacts({
+  // 1) Legacy RELATED-only B10 prompt using the gate's partial `c.query` must fail.
+  const legacyB10Result = await queryFacts({
     logPath: fx.logPath,
     indexPath: fx.indexPath,
     ...b10.query,
@@ -457,21 +508,126 @@ test('facts eval (R3/B10): rendered-prompt validator fails on legacy RELATED-onl
     freshnessResolver: checker.resolver(),
     freshnessPrefetch: checker.prefetcher(),
   });
-  const legacyPrompt = buildEvalPrompt(b10, digestText, formatQueryText(legacyResult));
-  const legacyProblems = validateRenderedPromptEvidence(b10, legacyPrompt);
-  assert.ok(
-    legacyProblems.length > 0 && legacyProblems.some((p) => /not marked citable.*RELATED/.test(p)),
-    `expected legacy B10 prompt to fail citability check, got: ${JSON.stringify(legacyProblems)}`,
+  const legacyB10Prompt = buildEvalPrompt(b10, digestText, formatQueryText(legacyB10Result));
+  const legacyB10Problems = validateRenderedPromptEvidence(
+    { ...b10, expect: { accept: [{ id: 'a10000000001.6', as: 'fact', values: ['yes'] }] } },
+    legacyB10Prompt,
   );
-  // Confirm the digest line for a10000000001.6 alone does not contain "Takeout" either.
-  const { digestFacts } = parseRenderedPromptEvidence(legacyPrompt);
-  assert.equal(digestFacts.get('a10000000001.6')?.claim.toLowerCase().includes('takeout'), false);
+  assert.ok(
+    legacyB10Problems.length > 0 && legacyB10Problems.some((p) => /not marked citable.*RELATED/.test(p)),
+    `expected legacy B10 prompt to fail citability check, got: ${JSON.stringify(legacyB10Problems)}`,
+  );
 
-  // Now verify the actual eval B10 prompt (using `evalQuery`) passes with a citable VERIFIED row containing Takeout.
-  const evalDry = await runEvalDryRun(['B10']);
-  assert.deepEqual(validateRenderedPromptEvidence(b10, evalDry.cases[0].prompt), []);
-  assert.match(evalDry.cases[0].prompt, /\[VERIFIED\] \[match\/lexical\] \[supported\] \(a10000000001\.6\)/);
-  assert.match(evalDry.cases[0].prompt, /note: A Takeout importer module exists\./);
+  // 2) Even when `a10000000001.6` (file_exists + free-text Takeout note) is rendered as VERIFIED
+  //    match, the validator MUST reject it for BOTH A07 and B10 because its checked claim only
+  //    proves `src/importer.ts` exists and does not prove the `importTakeout` export.
+  const noteOnlyResult = await queryFacts({
+    logPath: fx.logPath,
+    indexPath: fx.indexPath,
+    text: 'takeout importer module',
+    nowMs: NOW_MS,
+    freshnessResolver: checker.resolver(),
+    freshnessPrefetch: checker.prefetcher(),
+  });
+  const noteOnlyLookup = formatQueryText(noteOnlyResult);
+  assert.match(noteOnlyLookup, /\[VERIFIED\] \[match\/lexical\] \[supported\] \(a10000000001\.6\)/);
+  assert.match(noteOnlyLookup, /note: A Takeout importer module exists\./);
+  for (const c of [a07, b10]) {
+    const noteOnlyCase = {
+      ...c,
+      expect: { accept: [{ id: 'a10000000001.6', as: 'fact', values: ['yes'] }] },
+    };
+    const noteOnlyPrompt = buildEvalPrompt(noteOnlyCase, digestText, noteOnlyLookup);
+    const problems = validateRenderedPromptEvidence(noteOnlyCase, noteOnlyPrompt);
+    assert.ok(
+      problems.some((p) => p.includes('does not prove the importTakeout export')),
+      `expected note-only file_exists prompt to fail for ${c.id}, got: ${JSON.stringify(problems)}`,
+    );
+  }
+
+  // 3) Live eval prompts for A07 and B10 cite `EVAL_TAKEOUT_FACT_ID` whose checked claim itself
+  //    proves `export function importTakeout()` in `src/importer.ts` with no free-text note.
+  const evalDry = await runEvalDryRun(['A07', 'B10']);
+  for (const [idx, c] of [a07, b10].entries()) {
+    const prompt = evalDry.cases[idx].prompt;
+    assert.deepEqual(validateRenderedPromptEvidence(c, prompt), []);
+    assert.match(
+      prompt,
+      new RegExp(`\\[VERIFIED\\] \\[match/lexical\\] \\[supported\\] \\(${escapeRegExp(EVAL_TAKEOUT_FACT_ID)}\\) repo "gate": file "src/importer\\.ts" contains "export function importTakeout\\(\\)"`),
+    );
+    assert.ok(
+      prompt.includes(`V repo "gate": file "src/importer.ts" contains "export function importTakeout()" (${EVAL_TAKEOUT_FACT_ID})`),
+      `${c.id}: digest must also carry the checked importTakeout claim`,
+    );
+    assert.ok(!prompt.includes('note: A Takeout importer module exists.'), `${c.id}: eval lookup must not rely on free-text note`);
+  }
+
+  // 4) Scoring accepts `EVAL_TAKEOUT_FACT_ID` and rejects `a10000000001.6` for both A07 and B10.
+  const evalFx = buildEvalFixture(join(tempRoot, 'eval-fx'));
+  const evalRepos = loadRepoMap(evalFx.reposPath);
+  for (const c of [a07, b10]) {
+    const okAns = `ANSWER: yes [fact:${EVAL_TAKEOUT_FACT_ID}]\n`;
+    const okChk = await checkAnswer(okAns, { logPath: evalFx.logPath, indexPath: evalFx.indexPath, repos: evalRepos, nowMs: NOW_MS });
+    assert.equal(okChk.ok, true);
+    assert.equal(scoreEvalAnswer(c, okAns, okChk).outcome, 'correct');
+
+    const oldAns = 'ANSWER: yes [fact:a10000000001.6]\n';
+    const oldChk = await checkAnswer(oldAns, { logPath: evalFx.logPath, indexPath: evalFx.indexPath, repos: evalRepos, nowMs: NOW_MS });
+    assert.equal(oldChk.ok, true);
+    const oldScored = scoreEvalAnswer(c, oldAns, oldChk);
+    assert.equal(oldScored.outcome, 'wrong');
+    assert.equal(oldScored.offTargetStatements, 1);
+  }
+});
+
+test('facts eval (R5-r4 abstain-only self-check): injecting a citable V line for src/old-sync.ts under a new ID fails D02', async () => {
+  const d02 = CASES.find((c) => c.id === 'D02');
+  assert.ok(d02);
+  const dry = await runEvalDryRun(['D02']);
+  const basePrompt = dry.cases[0].prompt;
+  assert.deepEqual(validateRenderedPromptEvidence(d02, basePrompt), []);
+
+  const injectedLine = 'V repo "gate": file "src/old-sync.ts" is absent (a90000000009.0)';
+
+  // Inject into ## Recently verified section under a brand-new fact ID.
+  const injectedRecent = basePrompt.replace(
+    '## Recently verified\n',
+    `## Recently verified\n${injectedLine}\n`,
+  );
+  assert.notEqual(injectedRecent, basePrompt);
+  const recentProblems = validateRenderedPromptEvidence(d02, injectedRecent);
+  assert.ok(
+    recentProblems.some((p) => p.includes('D02') && p.includes('src/old-sync.ts') && p.includes('a90000000009.0')),
+    `expected D02 self-check to fail on injected Recently verified V line, got: ${JSON.stringify(recentProblems)}`,
+  );
+
+  // Inject into ## Pinned section under a brand-new fact ID.
+  const injectedPinned = basePrompt.replace(
+    '## Recent decisions\n',
+    `## Pinned\n${injectedLine}\n## Recent decisions\n`,
+  );
+  assert.notEqual(injectedPinned, basePrompt);
+  const pinnedProblems = validateRenderedPromptEvidence(d02, injectedPinned);
+  assert.ok(
+    pinnedProblems.some((p) => p.includes('D02') && p.includes('src/old-sync.ts') && p.includes('a90000000009.0')),
+    `expected D02 self-check to fail on injected Pinned V line, got: ${JSON.stringify(pinnedProblems)}`,
+  );
+
+  // Inject a citable VERIFIED lookup row under a brand-new fact ID.
+  const injectedLookupRow = [
+    '[VERIFIED] [match/exact] [supported] (a90000000009.0) repo "gate": file "src/old-sync.ts" is absent tags:[oldsync]',
+    '  rule: May be cited as fact.',
+  ].join('\n');
+  const injectedLookup = basePrompt.replace(
+    `${END_FENCE}\n`,
+    `${injectedLookupRow}\n${END_FENCE}\n`,
+  );
+  assert.notEqual(injectedLookup, basePrompt);
+  const lookupProblems = validateRenderedPromptEvidence(d02, injectedLookup);
+  assert.ok(
+    lookupProblems.some((p) => p.includes('D02') && p.includes('src/old-sync.ts') && p.includes('a90000000009.0')),
+    `expected D02 self-check to fail on injected citable lookup row, got: ${JSON.stringify(lookupProblems)}`,
+  );
 });
 
 test('facts eval --dry-run (R1/F2/F6): deterministic prompts require single-line ANSWER/ABSTAIN, state value type, and omit case IDs/fixture paths', async () => {
@@ -1929,7 +2085,7 @@ test('facts check-answer & eval (R4-r3 control chars): trims only real whitespac
   assert.equal(evalRes.unsupported_claims, 2);
 });
 
-test('facts eval (R5-r3 index/WAL immutability): modifying fixture index or WAL during the query window invalidates the run instead of re-baselining', async (t) => {
+test('facts eval (R5-r3 + R5-r4 index/WAL immutability & read-only fail-closed): deleting or corrupting index before query open aborts without rebuilding or spawning the model', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'facts-eval-r5-idx-'));
   const sandboxTmp = join(dir, 'sandbox-tmp');
   mkdirSync(sandboxTmp, { recursive: true });
@@ -1945,20 +2101,25 @@ test('facts eval (R5-r3 index/WAL immutability): modifying fixture index or WAL 
     rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
   });
 
-  // Helper waits for goFile, then modifies either `ledger.index.sqlite` or `ledger.index.sqlite-wal`
+  // Helper waits for goFile, then performs mode ('delete' | 'corrupt' | 'append') on targetName
   // inside the active temp fixture directory and writes doneFile.
   const helperScript = writeFakeModel(
     dir,
     'query-window-helper.mjs',
     [
-      "import { appendFileSync, existsSync, readdirSync, writeFileSync } from 'node:fs';",
+      "import { appendFileSync, existsSync, readdirSync, rmSync, writeFileSync } from 'node:fs';",
       "import { join } from 'node:path';",
-      'const [tmp, targetName, goPath, donePath] = process.argv.slice(2);',
+      'const [tmp, targetName, mode, goPath, donePath] = process.argv.slice(2);',
       'const deadline = Date.now() + 10000;',
       'const tick = () => {',
       '  if (existsSync(goPath)) {',
       '    const fxDir = readdirSync(tmp).find((n) => n.startsWith("facts-eval-") && !n.startsWith("facts-eval-cwd-"));',
-      '    if (fxDir) appendFileSync(join(tmp, fxDir, targetName), "tampered-during-query\\n");',
+      '    if (fxDir) {',
+      '      const target = join(tmp, fxDir, targetName);',
+      '      if (mode === "delete") rmSync(target, { force: true });',
+      '      else if (mode === "corrupt") writeFileSync(target, "NOT-A-VALID-SQLITE-INDEX-HEADER\\n");',
+      '      else appendFileSync(target, "tampered-during-query\\n");',
+      '    }',
       '    writeFileSync(donePath, "done\\n");',
       '    process.exit(0);',
       '  }',
@@ -1969,9 +2130,66 @@ test('facts eval (R5-r3 index/WAL immutability): modifying fixture index or WAL 
     ].join('\n'),
   );
 
-  for (const [label, targetName, expectedPattern] of [
-    ['index', 'ledger.index.sqlite', /Fixture integrity check failed during case A02 query.*fixture index changed/],
-    ['wal', 'ledger.index.sqlite-wal', /Fixture integrity check failed during case A02 query.*fixture index WAL changed/],
+  // Part 1 (R5-r4): delete and separately corrupt the index BEFORE it is opened in case A01's
+  // query phase. Eval must fail closed immediately without rebuilding and NEVER spawn the model.
+  const countingModel = writeFakeModel(
+    dir,
+    'counting-model.mjs',
+    [
+      "import { appendFileSync, readFileSync } from 'node:fs';",
+      'readFileSync(0, "utf8");',
+      'appendFileSync(process.argv[2], "spawned\\n");',
+      'process.stdout.write("ANSWER: 7 [fact:a10000000001.0]\\n");',
+    ].join('\n'),
+  );
+  for (const [label, mode, expectedPattern] of [
+    ['pre-query-delete-a01', 'delete', /Fixture integrity check failed during case A01 query.*index file is missing/],
+    ['pre-query-corrupt-a01', 'corrupt', /Fixture integrity check failed during case A01 query.*index is corrupt/],
+  ]) {
+    const goFile = join(dir, `go-${label}`);
+    const doneFile = join(dir, `done-${label}`);
+    const countFile = join(dir, `count-${label}.txt`);
+    const logPath = join(dir, `ledger-${label}.jsonl`);
+    const helper = spawn(
+      process.execPath,
+      [helperScript, sandboxTmp, 'ledger.index.sqlite', mode, goFile, doneFile],
+      { detached: true, stdio: 'ignore', windowsHide: true },
+    );
+    helper.unref();
+
+    await assert.rejects(
+      runEval({
+        modelCmd: process.execPath,
+        modelArgs: [countingModel, countFile],
+        modelName: label,
+        logPath,
+        project: 'foundry',
+        agent: 'eval-tester',
+        onBeforeQuery: async (caseId) => {
+          if (caseId === 'A01') {
+            writeFileSync(goFile, 'go\n');
+            const deadline = Date.now() + 5000;
+            while (!existsSync(doneFile) && Date.now() < deadline) {
+              await new Promise((r) => setTimeout(r, 10));
+            }
+            assert.equal(existsSync(doneFile), true, `helper (${label}) must finish before query opens index`);
+          }
+        },
+      }),
+      expectedPattern,
+    );
+
+    assert.equal(existsSync(countFile), false, `model command must never be spawned (${label})`);
+    assert.equal(existsSync(logPath), false, `must not append block (${label})`);
+  }
+
+  // Part 2 (R5-r3 + R5-r4): detached helper spawned by case A01 deletes or corrupts the index
+  // BEFORE case A02's query opens it, and separately tampers index/WAL after query finishes.
+  for (const [label, targetName, mode, phase, expectedPattern] of [
+    ['pre-query-delete-a02', 'ledger.index.sqlite', 'delete', 'before', /Fixture integrity check failed during case A02 query.*index file is missing/],
+    ['pre-query-corrupt-a02', 'ledger.index.sqlite', 'corrupt', 'before', /Fixture integrity check failed during case A02 query.*index is corrupt/],
+    ['post-query-index-a02', 'ledger.index.sqlite', 'append', 'after', /Fixture integrity check failed during case A02 query.*fixture index changed/],
+    ['post-query-wal-a02', 'ledger.index.sqlite-wal', 'append', 'after', /Fixture integrity check failed during case A02 query.*fixture index WAL changed/],
   ]) {
     const goFile = join(dir, `go-${label}`);
     const doneFile = join(dir, `done-${label}`);
@@ -1984,39 +2202,99 @@ test('facts eval (R5-r3 index/WAL immutability): modifying fixture index or WAL 
         "import { spawn } from 'node:child_process';",
         "import { appendFileSync, readFileSync } from 'node:fs';",
         'readFileSync(0, "utf8");',
-        'const [helper, tmp, target, goPath, donePath, countPath] = process.argv.slice(2);',
+        'const [helper, tmp, target, modeArg, goPath, donePath, countPath] = process.argv.slice(2);',
         'appendFileSync(countPath, "1\\n");',
-        'const child = spawn(process.execPath, [helper, tmp, target, goPath, donePath], { detached: true, stdio: "ignore", windowsHide: true });',
+        'const child = spawn(process.execPath, [helper, tmp, target, modeArg, goPath, donePath], { detached: true, stdio: "ignore", windowsHide: true });',
         'child.unref();',
         'process.stdout.write("ANSWER: 7 [fact:a10000000001.0]\\n");',
       ].join('\n'),
     );
 
+    const triggerHelper = async (caseId) => {
+      if (caseId === 'A02') {
+        writeFileSync(goFile, 'go\n');
+        const deadline = Date.now() + 5000;
+        while (!existsSync(doneFile) && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        assert.equal(existsSync(doneFile), true, `helper (${label}) must finish before next check`);
+      }
+    };
+
     await assert.rejects(
       runEval({
         modelCmd: process.execPath,
-        modelArgs: [spawnerModel, helperScript, sandboxTmp, targetName, goFile, doneFile, countFile],
+        modelArgs: [spawnerModel, helperScript, sandboxTmp, targetName, mode, goFile, doneFile, countFile],
         modelName: `query-window-${label}`,
         logPath,
         project: 'foundry',
         agent: 'eval-tester',
-        onAfterQuery: async (caseId) => {
-          if (caseId === 'A02') {
-            writeFileSync(goFile, 'go\n');
-            const deadline = Date.now() + 5000;
-            while (!existsSync(doneFile) && Date.now() < deadline) {
-              await new Promise((r) => setTimeout(r, 10));
-            }
-            assert.equal(existsSync(doneFile), true, `query-window helper (${label}) must finish before afterQuery`);
-          }
-        },
+        ...(phase === 'before' ? { onBeforeQuery: triggerHelper } : { onAfterQuery: triggerHelper }),
       }),
       expectedPattern,
     );
 
     assert.equal(readFileSync(countFile, 'utf8').trim().split('\n').length, 1, `case A02 must never invoke model (${label})`);
-    assert.equal(existsSync(logPath), false, `must not append block after query-window ${label} tamper`);
+    assert.equal(existsSync(logPath), false, `must not append block after ${label}`);
   }
+});
+
+test('facts eval (R5-r4 strict read-only opener): queryFacts, generateDigest, and checkAnswer fail closed without rebuilding on missing, corrupt, trailing-tampered, or WAL-mutated index', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'facts-eval-r5-ro-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
+
+  const fx = buildEvalFixture(dir);
+  const repos = loadRepoMap(fx.reposPath);
+  rebuildIndex(fx.logPath, fx.indexPath);
+
+  // Sanity: all three phases succeed with readOnlyIndex: true on the clean pre-built index.
+  const qOk = await queryFacts({ logPath: fx.logPath, indexPath: fx.indexPath, id: 'a10000000001.0', nowMs: NOW_MS, readOnlyIndex: true });
+  assert.equal(qOk.results.length, 1);
+  const dOk = generateDigest({ logPath: fx.logPath, indexPath: fx.indexPath, project: PROJECT, repos, nowMs: NOW_MS, write: false, readOnlyIndex: true });
+  assert.ok(dOk.text.includes(EVAL_TAKEOUT_FACT_ID));
+  const cOk = await checkAnswer(`ANSWER: 7 [fact:a10000000001.0]\n`, { logPath: fx.logPath, indexPath: fx.indexPath, repos, nowMs: NOW_MS, readOnlyIndex: true });
+  assert.equal(cOk.ok, true);
+
+  const assertAllThreeFailClosed = async (why) => {
+    await assert.rejects(
+      queryFacts({ logPath: fx.logPath, indexPath: fx.indexPath, id: 'a10000000001.0', nowMs: NOW_MS, readOnlyIndex: true }),
+      (err) => err instanceof ReadOnlyIndexError,
+      `queryFacts must throw ReadOnlyIndexError (${why})`,
+    );
+    assert.throws(
+      () => generateDigest({ logPath: fx.logPath, indexPath: fx.indexPath, project: PROJECT, repos, nowMs: NOW_MS, write: false, readOnlyIndex: true }),
+      (err) => err instanceof ReadOnlyIndexError,
+      `generateDigest must throw ReadOnlyIndexError (${why})`,
+    );
+    await assert.rejects(
+      checkAnswer('ANSWER: 7 [fact:a10000000001.0]\n', { logPath: fx.logPath, indexPath: fx.indexPath, repos, nowMs: NOW_MS, readOnlyIndex: true }),
+      (err) => err instanceof ReadOnlyIndexError,
+      `checkAnswer must throw ReadOnlyIndexError (${why})`,
+    );
+  };
+
+  // 1) Deleted index: all three fail closed AND index remains deleted (never rebuilt).
+  rmSync(fx.indexPath, { force: true });
+  await assertAllThreeFailClosed('deleted index');
+  assert.equal(existsSync(fx.indexPath), false, 'deleted index must NOT be rebuilt');
+
+  // 2) Corrupt header bytes: all three fail closed AND corrupt bytes stay untouched.
+  const corruptPayload = 'corrupt-sqlite-bytes\n';
+  writeFileSync(fx.indexPath, corruptPayload, 'utf8');
+  await assertAllThreeFailClosed('corrupt index');
+  assert.equal(readFileSync(fx.indexPath, 'utf8'), corruptPayload, 'corrupt index must NOT be rebuilt');
+
+  // 3) Trailing appended bytes on an otherwise readable SQLite file: fail closed without rebuilding.
+  rebuildIndex(fx.logPath, fx.indexPath);
+  const appendedBefore = readFileSync(fx.indexPath);
+  writeFileSync(fx.indexPath, Buffer.concat([appendedBefore, Buffer.from('trailing-tamper\n')]));
+  await assertAllThreeFailClosed('trailing bytes');
+  assert.equal(readFileSync(fx.indexPath).length, appendedBefore.length + 16, 'trailing-tampered index must NOT be rebuilt');
+
+  // 4) Spurious WAL sidecar file beside a clean index: fail closed.
+  rebuildIndex(fx.logPath, fx.indexPath);
+  writeFileSync(`${fx.indexPath}-wal`, 'tampered-wal\n', 'utf8');
+  await assertAllThreeFailClosed('unexpected WAL');
 });
 
 test('facts eval (R6-r3 POSIX): SIGTERM-ignoring git wrapper is killed with SIGKILL within timeout for snapshots and fixture creation', {

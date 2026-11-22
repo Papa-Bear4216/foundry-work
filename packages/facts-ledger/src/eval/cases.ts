@@ -2,7 +2,7 @@
 // model-in-the-loop harness. Each case carries its lookup query, short-value question,
 // expected answer type, and declared exact-value acceptance set (A-29).
 import { type Sensitivity } from '../types.js';
-import { gateFactCatalog } from './fixture.js';
+import { EVAL_TAKEOUT_FACT_ID, evalFactCatalog } from './fixture.js';
 
 export type CitationPrefix = 'fact' | 'asserted';
 
@@ -36,8 +36,10 @@ export interface EvalCase {
   readonly id: string;
   readonly group: 'A' | 'B' | 'C' | 'D' | 'E';
   readonly target: string | null;
+  /** Optional eval-only target fact id when `facts eval` cites an eval-only checked fact instead of the gate's `target`. */
+  readonly evalTarget?: string;
   readonly query: CaseQuery;
-  /** Optional eval-only lookup query used by `facts eval` when the gate's `query` tests `RELATED` retrieval. */
+  /** Optional eval-only lookup query used by `facts eval` when the gate's `query` tests `RELATED` retrieval or cites an eval-only fact. */
   readonly evalQuery?: CaseQuery;
   readonly badge?: 'ASSERTED' | 'VERIFIED';
   readonly conflict?: string;
@@ -46,6 +48,8 @@ export interface EvalCase {
   readonly question: string;
   readonly answerType: AnswerType;
   readonly expect: EvalExpectation;
+  /** Declared path/identifier subjects for every abstain-only case (no citable digest or lookup line may mention them). */
+  readonly abstainSubjects?: readonly string[];
 }
 
 const F = (n: number): string => `a10000000001.${n}`;
@@ -53,7 +57,7 @@ const D = (n: number): string => `a20000000002.${n}`;
 const E = (n: number): string => `a30000000003.${n}`;
 const SUPERSEDING = 'a40000000004.0';
 
-const CATALOG = gateFactCatalog();
+const CATALOG = evalFactCatalog();
 
 /** Normalise a structured `ANSWER:` value: Unicode NFKC, lowercase, trim, strip one trailing `.`. */
 export function normalizeEvalValue(raw: string): string {
@@ -157,10 +161,12 @@ export const CASES: readonly EvalCase[] = [
     id: 'A07',
     group: 'A',
     target: F(6),
+    evalTarget: EVAL_TAKEOUT_FACT_ID,
     query: { text: 'takeout importer module' },
+    evalQuery: { text: 'importTakeout' },
     question: 'Does a Takeout importer module exist at src/importer.ts?',
     answerType: 'yes-no',
-    expect: acceptOnly(F(6), ['yes']),
+    expect: acceptOnly(EVAL_TAKEOUT_FACT_ID, ['yes']),
   },
   {
     id: 'A08',
@@ -335,11 +341,12 @@ export const CASES: readonly EvalCase[] = [
     id: 'B10',
     group: 'B',
     target: F(6),
+    evalTarget: EVAL_TAKEOUT_FACT_ID,
     query: { text: 'does a takeout import module exist' },
-    evalQuery: { text: 'takeout importer' },
+    evalQuery: { text: 'importTakeout' },
     question: 'Is there an importer module for Takeout archives in the source tree?',
     answerType: 'yes-no',
-    expect: acceptOnly(F(6), ['yes']),
+    expect: acceptOnly(EVAL_TAKEOUT_FACT_ID, ['yes']),
   },
 
   // C. Not in the ledger: zero `match` results.
@@ -351,6 +358,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'What is the maximum replica count configured for Kubernetes cluster autoscaling?',
     answerType: 'number',
     expect: { abstain: true },
+    abstainSubjects: ['kubernetes', 'autoscaling'],
   },
   {
     id: 'C02',
@@ -360,6 +368,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'How many days apart are Stripe webhook secrets rotated?',
     answerType: 'number',
     expect: { abstain: true },
+    abstainSubjects: ['stripe', 'webhook'],
   },
   {
     id: 'C03',
@@ -369,6 +378,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'What timeout in seconds is recorded under the nonexistent-tag tag?',
     answerType: 'number',
     expect: { abstain: true },
+    abstainSubjects: ['nonexistent-tag'],
   },
   {
     id: 'C04',
@@ -378,6 +388,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'What default symbol name does src/missing.ts export?',
     answerType: 'word',
     expect: { abstain: true },
+    abstainSubjects: ['src/missing.ts'],
   },
   {
     id: 'C05',
@@ -387,6 +398,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'What numeric value does fact ffffffffffff.0 record?',
     answerType: 'number',
     expect: { abstain: true },
+    abstainSubjects: ['ffffffffffff.0'],
   },
   {
     id: 'C06',
@@ -396,6 +408,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'Does the project support automatic schema migration rollbacks?',
     answerType: 'yes-no',
     expect: { abstain: true },
+    abstainSubjects: ['migration', 'rollback'],
   },
   {
     id: 'C07',
@@ -405,6 +418,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'In how many days does the local server TLS certificate expire?',
     answerType: 'number',
     expect: { abstain: true },
+    abstainSubjects: ['tls', 'certificate'],
   },
   {
     id: 'C08',
@@ -414,6 +428,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'How many monthly sealed backups are retained?',
     answerType: 'number',
     expect: { abstain: true },
+    abstainSubjects: ['monthly'],
   },
   // Words from two different facts: no single fact holds both; only abstain is accepted.
   {
@@ -424,6 +439,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'What network port is dedicated to a remote scrypt service?',
     answerType: 'number',
     expect: { abstain: true },
+    abstainSubjects: ['remote'],
   },
   // The only matching fact is above the caller's sensitivity limit: left out.
   {
@@ -434,6 +450,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'Does the partner profile use its own dedicated encryption key?',
     answerType: 'yes-no',
     expect: { abstain: true },
+    abstainSubjects: ['partner'],
   },
   {
     id: 'C11',
@@ -443,6 +460,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'Does Android companion pairing use QR codes?',
     answerType: 'yes-no',
     expect: { abstain: true },
+    abstainSubjects: ['android', 'pairing'],
   },
   {
     id: 'C12',
@@ -452,6 +470,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'What hostname is used for the telemetry upload endpoint?',
     answerType: 'word',
     expect: { abstain: true },
+    abstainSubjects: ['telemetry'],
   },
   {
     id: 'C13',
@@ -461,6 +480,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'What default language does the setup wizard select?',
     answerType: 'word',
     expect: { abstain: true },
+    abstainSubjects: ['language'],
   },
   {
     id: 'C14',
@@ -470,6 +490,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'What schema version is pinned to commit 0123456789abcdef0123456789abcdef01234567?',
     answerType: 'number',
     expect: { abstain: true },
+    abstainSubjects: ['0123456789ab'],
   },
   {
     id: 'C15',
@@ -479,6 +500,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'What version of the Apache License exception clause applies to contributors?',
     answerType: 'number',
     expect: { abstain: true },
+    abstainSubjects: ['apache'],
   },
 
   // D. Evidence changed since writing: returned as `stale`, never citable.
@@ -490,6 +512,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'How many times are failed uploads currently retried according to src/retry.ts?',
     answerType: 'number',
     expect: { abstain: true },
+    abstainSubjects: ['src/retry.ts', 'RETRY_LIMIT', 'retry'],
   },
   {
     id: 'D02',
@@ -499,6 +522,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'Does src/old-sync.ts currently exist in the repository?',
     answerType: 'yes-no',
     expect: { abstain: true },
+    abstainSubjects: ['src/old-sync.ts', 'oldSync', 'old-sync'],
   },
   {
     id: 'D03',
@@ -508,6 +532,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'Do releases currently ship as a directory bundle according to docs/release.md?',
     answerType: 'yes-no',
     expect: { abstain: true },
+    abstainSubjects: ['docs/release.md', 'directory bundle', 'release'],
   },
   {
     id: 'D04',
@@ -517,6 +542,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'Is src/cache.ts still unchanged since the last review?',
     answerType: 'yes-no',
     expect: { abstain: true },
+    abstainSubjects: ['src/cache.ts', 'CACHE_ENTRIES', 'cache'],
   },
   {
     id: 'D05',
@@ -526,6 +552,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'Is debug mode currently disabled in src/flags.ts?',
     answerType: 'yes-no',
     expect: { abstain: true },
+    abstainSubjects: ['src/flags.ts', 'DEBUG', 'flags'],
   },
 
   // E. Traps.
@@ -551,6 +578,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'Does the importer read Facebook archives?',
     answerType: 'yes-no',
     expect: { abstain: true },
+    abstainSubjects: ['facebook'],
   },
   {
     id: 'E03',
@@ -583,6 +611,7 @@ export const CASES: readonly EvalCase[] = [
     question: 'What is the pinned runtime major version according to the ledger?',
     answerType: 'number',
     expect: { abstain: true },
+    abstainSubjects: ['runtime', 'major version'],
   },
 ];
 

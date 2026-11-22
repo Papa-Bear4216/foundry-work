@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { FreshnessChecker } from './freshness.js';
-import { defaultIndexPath, openSyncedIndexForQuery } from './index-db.js';
+import { defaultIndexPath, openIndexReadOnlyStrict, openSyncedIndexForQuery } from './index-db.js';
 import { classifyPresentation, lookupFactsByIds } from './query.js';
 import { type RepoMap } from './repos.js';
 import { type Sensitivity } from './types.js';
@@ -77,6 +77,8 @@ export interface CheckAnswerOptions {
   readonly maxSensitivity?: Exclude<Sensitivity, 'secret'>;
   readonly nowMs?: number;
   readonly maxProblems?: number;
+  /** Open the pre-built index strictly read-only and fail closed without rebuilding on failure. */
+  readonly readOnlyIndex?: boolean;
 }
 
 interface CitationVerdict {
@@ -275,7 +277,10 @@ export function createAnswerScanner(
     const checker = new FreshnessChecker({ repos: options.repos });
     const resolver = checker.resolver();
     // One index open, one batched lookup and one git prefetch for every cited id.
-    const { db } = openSyncedIndexForQuery(options.logPath, options.indexPath ?? defaultIndexPath(options.logPath), false);
+    const indexPath = options.indexPath ?? defaultIndexPath(options.logPath);
+    const { db } = options.readOnlyIndex
+      ? openIndexReadOnlyStrict(options.logPath, indexPath)
+      : openSyncedIndexForQuery(options.logPath, indexPath, false);
     let facts;
     try {
       facts = lookupFactsByIds(db, distinct, options.maxSensitivity);

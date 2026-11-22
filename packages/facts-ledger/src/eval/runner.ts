@@ -32,13 +32,13 @@ import {
 import { generateDigest } from '../digest.js';
 import { FreshnessChecker } from '../freshness.js';
 import { resolveGitExecutable } from '../git.js';
-import { rebuildIndex } from '../index-db.js';
+import { ReadOnlyIndexError, rebuildIndex } from '../index-db.js';
 import { appendBlock, type ExpectedLogPrecondition } from '../log.js';
 import { formatQueryText, queryFacts, sanitizeInlineText } from '../query.js';
 import { loadRepoMap } from '../repos.js';
 import { type Block, type Sensitivity, type TokenUsage } from '../types.js';
 import { CASES, normalizeEvalValue, type EvalCase } from './cases.js';
-import { NOW_MS, PROJECT, buildGateFixture, type GateFixture } from './fixture.js';
+import { NOW_MS, PROJECT, buildEvalFixture, type GateFixture } from './fixture.js';
 import { buildEvalPrompt } from './prompt.js';
 
 export const DEFAULT_CASE_TIMEOUT_MS = 120_000;
@@ -118,6 +118,8 @@ export interface EvalOptions {
   readonly logPath: string;
   readonly project: string;
   readonly agent: string;
+  /** Optional hook firing after the pre-query integrity snapshot and right before query/digest open the index. */
+  readonly onBeforeQuery?: (caseId: string) => void | Promise<void>;
   /** Optional hook firing after prompt/query build and before the post-query integrity check. */
   readonly onAfterQuery?: (caseId: string) => void | Promise<void>;
   /** Optional per-case completion hook (fires after scoring a case, before the next case). */
@@ -965,7 +967,7 @@ export async function runEvalDryRun(caseIds?: readonly string[]): Promise<EvalDr
   const { cases, subset } = selectEvalCases(caseIds);
   const tempRoot = mkdtempSync(join(tmpdir(), 'facts-eval-'));
   try {
-    const fx = buildGateFixture(tempRoot);
+    const fx = buildEvalFixture(tempRoot);
     rebuildIndex(fx.logPath, fx.indexPath);
     const fixturePaths = [tempRoot, fx.repoDir, fx.logPath, fx.indexPath, fx.reposPath];
     const repos = loadRepoMap(fx.reposPath);
@@ -982,6 +984,7 @@ export async function runEvalDryRun(caseIds?: readonly string[]): Promise<EvalDr
           repos,
           nowMs: NOW_MS,
           write: false,
+          readOnlyIndex: true,
           ...(maxSensitivity ? { maxSensitivity } : {}),
         }).text;
         digestCache.set(key, cached);
@@ -999,6 +1002,7 @@ export async function runEvalDryRun(caseIds?: readonly string[]): Promise<EvalDr
         ...(text ? { text } : {}),
         ...rest,
         nowMs: NOW_MS,
+        readOnlyIndex: true,
         freshnessResolver: checker.resolver(),
         freshnessPrefetch: checker.prefetcher(),
       });
@@ -1069,9 +1073,9 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
   const tempRoot = mkdtempSync(join(tmpdir(), 'facts-eval-'));
   const modelCwd = mkdtempSync(join(tmpdir(), 'facts-eval-cwd-'));
   try {
-    const fx = buildGateFixture(tempRoot);
-    // Build and sync the fixture index BEFORE running any model so index + WAL stay byte-identical
-    // across query, digest generation, model execution, and grading for every case.
+    const fx = buildEvalFixture(tempRoot);
+    // Build and sync the fixture index BEFORE running any model; every subsequent query, digest,
+    // and grading open uses `readOnlyIndex: true` (strict read-only, fail-closed, never rebuilds).
     rebuildIndex(fx.logPath, fx.indexPath);
     const fixturePaths = [tempRoot, fx.repoDir, fx.logPath, fx.indexPath, fx.reposPath];
     const repos = loadRepoMap(fx.reposPath);
@@ -1088,6 +1092,7 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
           repos,
           nowMs: NOW_MS,
           write: false,
+          readOnlyIndex: true,
           ...(maxSensitivity ? { maxSensitivity } : {}),
         }).text;
         digestCache.set(key, cached);
@@ -1109,21 +1114,36 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
         );
       }
 
+      if (options.onBeforeQuery) {
+        await options.onBeforeQuery(c.id);
+      }
+
       const evalQuery = c.evalQuery ?? c.query;
       const { text, ...rest } = evalQuery;
-      const queryResult = await queryFacts({
-        logPath: fx.logPath,
-        indexPath: fx.indexPath,
-        ...(text ? { text } : {}),
-        ...rest,
-        nowMs: NOW_MS,
-        freshnessResolver: checker.resolver(),
-        freshnessPrefetch: checker.prefetcher(),
-      });
-      const prompt = stripFixturePaths(
-        buildEvalPrompt(c, digestFor(evalQuery.maxSensitivity), formatQueryText(queryResult)),
-        fixturePaths,
-      );
+      let prompt: string;
+      try {
+        const queryResult = await queryFacts({
+          logPath: fx.logPath,
+          indexPath: fx.indexPath,
+          ...(text ? { text } : {}),
+          ...rest,
+          nowMs: NOW_MS,
+          readOnlyIndex: true,
+          freshnessResolver: checker.resolver(),
+          freshnessPrefetch: checker.prefetcher(),
+        });
+        prompt = stripFixturePaths(
+          buildEvalPrompt(c, digestFor(evalQuery.maxSensitivity), formatQueryText(queryResult)),
+          fixturePaths,
+        );
+      } catch (err) {
+        if (err instanceof ReadOnlyIndexError) {
+          throw new Error(
+            `Fixture integrity check failed during case ${c.id} query (${err.message}); aborting eval without appending a block`,
+          );
+        }
+        throw err;
+      }
       const inputTokens = estimateTokens(prompt);
       totalInputTokens += inputTokens;
 
@@ -1185,10 +1205,17 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
             repos,
             nowMs: NOW_MS,
             maxProblems: MAX_EVAL_CASE_PROBLEMS,
+            readOnlyIndex: true,
             ...(evalQuery.maxSensitivity ? { maxSensitivity: evalQuery.maxSensitivity } : {}),
           });
         } catch (err) {
-          const msg = sanitizeInlineText((err as Error).message);
+          if (err instanceof ReadOnlyIndexError || !(err instanceof Error) || !err.message.includes('distinct facts')) {
+            const detail = err instanceof Error ? sanitizeInlineText(err.message) : 'read-only index error';
+            throw new Error(
+              `Fixture integrity check failed during case ${c.id} grading (${detail}); aborting eval without appending a block`,
+            );
+          }
+          const msg = sanitizeInlineText(err.message);
           check = {
             ok: false,
             statements: 0,

@@ -20,6 +20,8 @@ import {
 
 export const REPO = 'gate';
 export const PROJECT = 'gate';
+/** Eval-only checked fact proving `src/importer.ts` exports `importTakeout` (outside the gate oracle). */
+export const EVAL_TAKEOUT_FACT_ID = 'a50000000005.0';
 /** The gate and eval harness fixed clock. */
 export const NOW_MS = Date.parse('2026-11-20T12:00:00Z');
 /** Timeout for synchronous git commands during fixture creation (with hard SIGKILL). */
@@ -162,12 +164,9 @@ function iso(ms: number): string {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, '+00:00');
 }
 
-/**
- * Build the fixture under `root`: `root/gate` (git repository), `root/repos.json`
- * (repo map, outside the repository) and `root/ledger.jsonl`.
- */
-export function buildGateFixture(
+function buildFixtureInternal(
   root: string,
+  includeEvalFacts: boolean,
   options?: { readonly gitTimeoutMs?: number },
 ): GateFixture {
   const gitTimeoutMs = options?.gitTimeoutMs ?? FIXTURE_GIT_TIMEOUT_MS;
@@ -190,7 +189,7 @@ export function buildGateFixture(
   git(repoDir, ['commit', '--quiet', '--no-verify', '-m', 'c2'], '2026-11-02T00:00:00+00:00', gitTimeoutMs);
   const c2 = git(repoDir, ['rev-parse', 'HEAD'], undefined, gitTimeoutMs);
 
-  const blocks = gateBlocks(c1, c1Blobs);
+  const blocks = gateBlocks(c1, c1Blobs, includeEvalFacts);
 
   const logPath = join(root, 'ledger.jsonl');
   writeFileSync(logPath, encoder.encode(`${blocks.map((b) => JSON.stringify(b)).join('\n')}\n`));
@@ -202,10 +201,32 @@ export function buildGateFixture(
 }
 
 /**
- * The fixture's blocks. Claims, notes, tags and retraction reasons do not depend on the commit
- * ids, so `gateFactCatalog()` can read them without building the repository (A-28 item 11).
+ * Build the deterministic gate fixture under `root`: `root/gate` (git repository), `root/repos.json`
+ * (repo map, outside the repository) and `root/ledger.jsonl`.
  */
-function gateBlocks(c1: string, c1Blobs: Record<string, string>): Block[] {
+export function buildGateFixture(
+  root: string,
+  options?: { readonly gitTimeoutMs?: number },
+): GateFixture {
+  return buildFixtureInternal(root, false, options);
+}
+
+/**
+ * Build the `facts eval` fixture under `root`: identical git repository and gate blocks, plus
+ * eval-only checked facts (such as `EVAL_TAKEOUT_FACT_ID`) without changing the gate oracle.
+ */
+export function buildEvalFixture(
+  root: string,
+  options?: { readonly gitTimeoutMs?: number },
+): GateFixture {
+  return buildFixtureInternal(root, true, options);
+}
+
+/**
+ * The fixture's blocks. Claims, notes, tags and retraction reasons do not depend on the commit
+ * ids, so `gateFactCatalog()` / `evalFactCatalog()` can read them without building the repository (A-28 item 11).
+ */
+function gateBlocks(c1: string, c1Blobs: Record<string, string>, includeEvalFacts = false): Block[] {
   const fileEv = (path: string, quote?: string): FileEvidence => ({
     type: 'file',
     repo: REPO,
@@ -218,7 +239,7 @@ function gateBlocks(c1: string, c1Blobs: Record<string, string>): Block[] {
   const checked = (
     fact_id: string,
     check: CheckedPredicate & { readonly path: string },
-    note: string,
+    note: string | null,
     tags: readonly string[],
     extra: Partial<FactInput> = {},
   ): FactInput => ({
@@ -341,7 +362,7 @@ function gateBlocks(c1: string, c1Blobs: Record<string, string>): Block[] {
     ...extra,
   });
 
-  return [
+  const out: Block[] = [
     block(b1, 1, null, b1Facts),
     block(b2, 2, b1, b2Facts),
     block(b3, 3, b2, b3Facts),
@@ -349,6 +370,23 @@ function gateBlocks(c1: string, c1Blobs: Record<string, string>): Block[] {
       retracted_facts: [{ fact_id: `${b3}.1`, reason: 'The importer reads Google Takeout only.' }],
     }),
   ];
+
+  if (includeEvalFacts) {
+    // Eval-only checked fact proving the `importTakeout` export in `src/importer.ts` without
+    // relying on free-text notes or altering the deterministic gate fixture.
+    const b5 = 'a50000000005';
+    const b5Facts = [
+      checked(
+        EVAL_TAKEOUT_FACT_ID,
+        { predicate: 'file_contains', path: 'src/importer.ts', text: 'export function importTakeout()' },
+        null,
+        ['importer', 'takeout'],
+      ),
+    ].map(fix);
+    out.push(block(b5, 5, b4, b5Facts));
+  }
+
+  return out;
 }
 
 /**
@@ -372,16 +410,14 @@ const EXPECTED_STATE: Record<string, DeclaredFactState> = {
   'a30000000003.0': 'superseded', 'a30000000003.1': 'retracted',
   'a30000000003.2': 'supported', 'a30000000003.3': 'expired', 'a30000000003.4': 'supported',
   'a40000000004.0': 'supported',
+  // Block 5 (eval-only): src/importer.ts is unchanged in commit 2, so file_contains holds.
+  [EVAL_TAKEOUT_FACT_ID]: 'supported',
 };
 
 /** The only contradicting pair the fixture builds: src/legacy.ts "exists" against "is absent". */
 const CONFLICT_PAIRS: ReadonlyArray<readonly [string, string]> = [['a10000000001.9', 'a10000000001.10']];
 
-/**
- * fact_id -> { tier, sensitivity, check, claim, note, tags, retractionReason, expected, conflictsWith }
- * for every fixture fact, defined here, not by the renderer.
- */
-export function gateFactCatalog(): Map<string, GateFactCatalogEntry> {
+function buildFactCatalog(includeEvalFacts: boolean): Map<string, GateFactCatalogEntry> {
   // Blob ids are content hashes (SHA-1 object format), so they are computed here without git.
   const blobId = (text: string): string => {
     const body = encoder.encode(text);
@@ -390,7 +426,7 @@ export function gateFactCatalog(): Map<string, GateFactCatalogEntry> {
   const c1Blobs: Record<string, string> = Object.fromEntries(
     Object.entries(C1_FILES).map(([path, text]) => [path, blobId(text)]),
   );
-  const blocks = gateBlocks('0'.repeat(40), c1Blobs);
+  const blocks = gateBlocks('0'.repeat(40), c1Blobs, includeEvalFacts);
   const retracted = new Map<string, string>();
   for (const b of blocks) {
     for (const r of b.retracted_facts ?? []) retracted.set(r.fact_id, r.reason);
@@ -416,4 +452,19 @@ export function gateFactCatalog(): Map<string, GateFactCatalogEntry> {
     }
   }
   return catalog;
+}
+
+/**
+ * fact_id -> { tier, sensitivity, check, claim, note, tags, retractionReason, expected, conflictsWith }
+ * for every deterministic gate fixture fact, defined here, not by the renderer.
+ */
+export function gateFactCatalog(): Map<string, GateFactCatalogEntry> {
+  return buildFactCatalog(false);
+}
+
+/**
+ * fact_id -> catalog entry for every `facts eval` fixture fact (gate facts plus eval-only checked facts).
+ */
+export function evalFactCatalog(): Map<string, GateFactCatalogEntry> {
+  return buildFactCatalog(true);
 }
