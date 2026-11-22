@@ -274,3 +274,4 @@ Report back: commits, the commands you ran and their output, each "Done when" li
 |---|---|
 | 2026-11-19 | First version. Every roadmap package assigned. Nothing dispatched, nothing built. |
 | 2026-11-19 | Expanded for D-20 and D-21: added Phase 4 (`E-1`..`E-6`) and Phase 5 (`W-1`..`W-5`) full public Sovereign Exocortex assignments and phase exits; renumbered Predecessor Adoption to Phase 6. |
+| 2026-11-22 | D-24 (owner): for the 2026-11-22 session the Claude builder subagent is a third builder. V-3c final fix round, A-40 and V-7 are written by it and reviewed blind by Codex. The roster table in section 2 is otherwise unchanged. |
