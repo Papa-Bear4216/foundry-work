@@ -1,0 +1,17 @@
+{
+  "name": "importers",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": "24.22.3"
+  },
+  "exports": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test --test-concurrency=1 test/zip-reader.test.mjs test/importers.test.mjs test/pipeline.test.mjs",
+    "budgets": "npm run build && node test/budget/import-budget.mjs"
+  }
+}

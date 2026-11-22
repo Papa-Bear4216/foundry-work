@@ -679,13 +679,18 @@ interface Deriver {
 
 - **Two stages on purpose.** `split` only cuts an archive into original items (one email,
   one contact card, one calendar file). `derive` produces text and structure for the
-  index. Only stage one writes to the vault.
+  index (`calendar` yields each `VEVENT`, `GEO` place and participant graph evidence during
+  `derive` while keeping `VTIMEZONE` intact in the stored `.ics` blob). Only stage one
+  writes to the vault.
 - **Archive reader.** Zip with zip64, entries opened as streams through the central
   directory, multi-part archives presented as one tree. The archive is never unpacked to
-  disk. One vetted zip dependency is acceptable here; it is recorded in `DEPENDENCIES.md`.
+  disk. Implemented in `packages/importers` with Node built-ins only (`node:fs`,
+  `node:stream`, `node:zlib`), adding zero external runtime dependencies (one vetted zip
+  dependency remains permitted if ever needed, recorded in `DEPENDENCIES.md`).
 - **Mail.** The mbox is split on message boundaries into individual messages while
-  streaming. Memory stays flat regardless of mbox size. The separator line is kept in the
-  event so the original file can be reproduced byte for byte.
+  streaming. Memory stays flat regardless of mbox size. Each stored message keeps its
+  leading `From ` separator line (and the event records `body.mbox_separator`), so
+  concatenating stored messages reproduces the original file byte for byte.
 - **Location history.** The predecessor's parser covers the older Takeout formats
   (`Records.json`, Semantic Location History). Newer accounts keep Timeline on the phone
   and export a different file from device settings. The location importer must handle
