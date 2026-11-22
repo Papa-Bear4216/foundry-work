@@ -106,26 +106,32 @@ function buildValidatedUtcTimestamp(
   ) {
     return undefined;
   }
-  const baseMs = Date.UTC(year, monthZeroBased, day, hour, minute, second);
-  const check = new Date(baseMs);
+  const baseDate = new Date(0);
+  baseDate.setUTCFullYear(year, monthZeroBased, day);
+  baseDate.setUTCHours(hour, minute, second, 0);
   if (
-    check.getUTCFullYear() !== year ||
-    check.getUTCMonth() !== monthZeroBased ||
-    check.getUTCDate() !== day
+    baseDate.getUTCFullYear() !== year ||
+    baseDate.getUTCMonth() !== monthZeroBased ||
+    baseDate.getUTCDate() !== day ||
+    baseDate.getUTCHours() !== hour ||
+    baseDate.getUTCMinutes() !== minute ||
+    baseDate.getUTCSeconds() !== second
   ) {
     return undefined;
   }
-  const utcMs = baseMs - offsetMinutes * 60_000;
+  const utcMs = baseDate.getTime() - offsetMinutes * 60_000;
+  if (!Number.isFinite(utcMs)) return undefined;
   const utcDate = new Date(utcMs);
   const finalYear = utcDate.getUTCFullYear();
-  if (!Number.isFinite(utcMs) || finalYear < 1 || finalYear > 9999) return undefined;
+  if (finalYear < 1 || finalYear > 9999) return undefined;
   return formatUtcTimestamp(utcDate);
 }
 
 /**
- * Parses an ISO-8601, iCalendar/vCard compact, or RFC 5322 date string into canonical UTC
- * `YYYY-MM-DDTHH:MM:SSZ`. Zone-less date-times are ALWAYS interpreted as UTC regardless of
- * host time zone (DECISIONS.md A-36).
+ * Parses an ISO-8601, iCalendar/vCard compact, RFC 5322, or asctime date string into canonical UTC
+ * `YYYY-MM-DDTHH:MM:SSZ` using explicit grammars that identify the zone field. Zone-less date-times
+ * are ALWAYS interpreted as UTC regardless of host time zone; unsupported forms return `undefined`
+ * deterministically (never delegates to `Date.parse`, per DECISIONS.md A-36).
  */
 export function normalizeTimestamp(raw: string | undefined): string | undefined {
   if (!raw) return undefined;
@@ -197,9 +203,9 @@ export function normalizeTimestamp(raw: string | undefined): string | undefined 
     );
   }
 
-  // 5. RFC 5322 email date (zone-less defaults strictly to UTC): [Day,] DD Mon YYYY HH:MM[:SS] [TZ] [(comment)]
+  // 5. RFC 5322 email date (zone-less defaults strictly to UTC): [Day,] DD Mon YYYY H(H):MM[:SS] [TZ] [(comment)]
   const rfc5322 =
-    /^(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+)?(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s+(\d{2}):(\d{2})(?::(\d{2}))?(?:\s+([+-]\d{4}|[A-Za-z]{1,5}))?(?:\s+\([^)]*\))?$/i.exec(
+    /^(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+)?(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s+([+-]\d{2}:?\d{2}|[A-Za-z]{1,5}))?(?:\s+\([^)]*\))?$/i.exec(
       trimmed,
     );
   if (rfc5322) {
@@ -217,6 +223,7 @@ export function normalizeTimestamp(raw: string | undefined): string | undefined 
         offset,
       );
     }
+    return undefined;
   }
 
   // 6. Asctime / mbox date (zone-less defaults strictly to UTC): Day Mon DD HH:MM:SS [TZ] YYYY [TZ]
@@ -226,6 +233,7 @@ export function normalizeTimestamp(raw: string | undefined): string | undefined 
     );
   if (asctime) {
     const [, mon, d, hh, mm, ss, tzBefore, y, tzAfter] = asctime;
+    if (tzBefore && tzAfter) return undefined;
     const monthIdx = MONTH_INDEX[mon!.toLowerCase()];
     const offset = parseTimezoneOffsetMinutes(tzBefore ?? tzAfter);
     if (monthIdx !== undefined && offset !== undefined) {
@@ -239,16 +247,11 @@ export function normalizeTimestamp(raw: string | undefined): string | undefined 
         offset,
       );
     }
+    return undefined;
   }
 
-  // 7. Fallback: NEVER let Date.parse interpret a zone-less string in host local time.
-  const hasExplicitZone = /(?:Z|GMT|UTC|UT|[ECMP][DS]T|[+-]\d{2}:?\d{2})\s*(?:\([^)]*\))?$/i.test(trimmed);
-  const parsed = Date.parse(hasExplicitZone ? trimmed : `${trimmed} UTC`);
-  if (!Number.isFinite(parsed)) return undefined;
-  const date = new Date(parsed);
-  const year = date.getUTCFullYear();
-  if (year < 1 || year > 9999) return undefined;
-  return formatUtcTimestamp(date);
+  // Any format not accepted by the explicit grammars above maps deterministically to undated.
+  return undefined;
 }
 
 /** Bytewise ASCII/UTF-16 deduplicated sort (Architecture 11 deterministic ordering). */

@@ -11,6 +11,7 @@ import {
   calendarImporter,
   contactsDeriver,
   contactsImporter,
+  defaultCollectionName,
   generateSyntheticIcalendar,
   generateSyntheticMbox,
   generateSyntheticVcards,
@@ -412,13 +413,56 @@ test('calendar and contacts importers enforce per-item size cap before buffering
   assert.equal(parseVcard(vcfItems[0].toString('utf8'))?.name, 'Small Valid');
 });
 
-test('normalizeTimestamp interprets zone-less date-times as UTC deterministically (Ruling 12)', () => {
+test('normalizeTimestamp uses explicit zone-aware UTC grammars without Date.parse and preserves years 0001-9999 (Ruling 12 & Round 2 Findings 9-10)', async () => {
+  // Zone-less accepted forms -> UTC
   assert.equal(normalizeTimestamp('2024-12-31T23:30:00'), '2024-12-31T23:30:00Z');
   assert.equal(normalizeTimestamp('2024-12-31 23:30:00'), '2024-12-31T23:30:00Z');
   assert.equal(normalizeTimestamp('20241231T233000'), '2024-12-31T23:30:00Z');
   assert.equal(normalizeTimestamp('Tue, 31 Dec 2024 23:30:00'), '2024-12-31T23:30:00Z');
   assert.equal(normalizeTimestamp('Tue Dec 31 23:30:00 2024'), '2024-12-31T23:30:00Z');
   assert.equal(normalizeTimestamp('2024-12-31T23:30:00-05:00'), '2025-01-01T04:30:00Z');
+
+  // Round 2 Finding 9: unsupported formats (including time-first Jan-01-2024) deterministically yield undefined (undated)
+  assert.equal(normalizeTimestamp('00:30:00 Jan-01-2024'), undefined);
+  assert.equal(defaultCollectionName('google-takeout/mail', normalizeTimestamp('00:30:00 Jan-01-2024')), 'google-takeout/mail/undated');
+  assert.equal(normalizeTimestamp('Mon Jan 01 00:30:00 +0000 2024 +0500'), undefined);
+  assert.equal(normalizeTimestamp('Mon, 01 Jan 2024 00:30:00 UNKNOWN'), undefined);
+
+  // Round 2 Finding 10: two-digit / sub-1000 years are preserved via setUTCFullYear (never shifted to 19xx)
+  assert.equal(normalizeTimestamp('00990101T003000Z'), '0099-01-01T00:30:00Z');
+  assert.equal(defaultCollectionName('google-takeout/contacts', normalizeTimestamp('00990101T003000Z')), 'google-takeout/contacts/0099');
+  assert.equal(normalizeTimestamp('0001-01-01T00:00:00Z'), '0001-01-01T00:00:00Z');
+  assert.equal(normalizeTimestamp('00960229T003000Z'), '0096-02-29T00:30:00Z');
+  assert.equal(normalizeTimestamp('00990229T003000Z'), undefined); // 0099 is not a leap year
+  assert.equal(normalizeTimestamp('00000101T003000Z'), undefined); // year 0000 out of range
+  assert.equal(normalizeTimestamp('0001-01-01T00:30:00+02:00'), undefined); // offset shifts before year 0001
+
+  // vCard splitter preserves year 0099 REV without shifting to 1999 or dropping to undated
+  const ancientCard = Buffer.from(
+    ['BEGIN:VCARD', 'VERSION:3.0', 'FN:Year 99 Contact', 'REV:00990101T003000Z', 'END:VCARD', ''].join('\r\n'),
+    'utf8',
+  );
+  const splitCards = [];
+  for await (const rawItem of contactsImporter.split(entryFromBuffer('Takeout/Contacts/ancient.vcf', ancientCard))) {
+    await streamToBuffer(rawItem.bytes);
+    splitCards.push(rawItem);
+  }
+  assert.equal(splitCards.length, 1);
+  assert.equal(splitCards[0].sourceTs, '0099-01-01T00:30:00Z');
+
+  // Verify no Date.parse call remains in compiled dist/
+  const distRoot = fileURLToPath(new URL('../dist', import.meta.url));
+  const checkNoDateParse = dir => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) checkNoDateParse(full);
+      else if (entry.isFile() && entry.name.endsWith('.js')) {
+        const src = readFileSync(full, 'utf8');
+        assert.equal(/\bDate\.parse\s*\(/.test(src), false, `Forbidden Date.parse call in ${full}`);
+      }
+    }
+  };
+  checkNoDateParse(distRoot);
 });
 
 test('importers and derivers never import network modules or invoke fetch (Product 6.3 rule 4)', () => {

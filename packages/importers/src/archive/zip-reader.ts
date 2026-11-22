@@ -758,17 +758,20 @@ export async function openZipReader(reader: RandomAccessReader, options: ZipOpen
         throw new ArchiveError('HEADER_MISMATCH', `Local and central header sizes disagree for ${path}.`);
       }
     } else {
-      // Bit 3 set: LFH CRC/sizes must be 0 (or agree with CD if populated), and a valid ZIP32/ZIP64 data descriptor must follow dataEnd.
+      // Bit 3 set: LFH CRC/sizes must be 0 or ZIP64 zero-placeholders (or agree with CD if populated),
+      // and a valid ZIP32/ZIP64 data descriptor matching CD CRC and sizes must follow dataEnd.
       if (lfhCrc !== 0 && (lfhCrc >>> 0) !== (entryCrc >>> 0)) {
         throw new ArchiveError('HEADER_MISMATCH', `Local header CRC-32 disagrees with central directory for bit-3 entry ${path}.`);
       }
       const lfhHasZ64Extra = findZip64ExtraData(lfhExtraBuf) !== undefined;
       if (lfhRawCompSize !== 0 || lfhRawUncompSize !== 0) {
         const lfhSizes = parseLocalHeaderSizes(lfhRawCompSize, lfhRawUncompSize, lfhExtraBuf, path);
-        if (lfhRawCompSize !== 0 && lfhSizes.compSize !== compressedSize) {
+        // Treat resolved zero sizes (including 0xffffffff with 0n ZIP64-extra placeholders) as bit-3 placeholders;
+        // cross-check any non-zero populated size against the central directory.
+        if (lfhSizes.compSize !== 0n && lfhSizes.compSize !== compressedSize) {
           throw new ArchiveError('HEADER_MISMATCH', `Local header compressed size disagrees with central directory for bit-3 entry ${path}.`);
         }
-        if (lfhRawUncompSize !== 0 && lfhSizes.uncompSize !== uncompressedSize) {
+        if (lfhSizes.uncompSize !== 0n && lfhSizes.uncompSize !== uncompressedSize) {
           throw new ArchiveError('HEADER_MISMATCH', `Local header uncompressed size disagrees with central directory for bit-3 entry ${path}.`);
         }
       }

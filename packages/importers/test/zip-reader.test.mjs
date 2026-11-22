@@ -13,6 +13,7 @@ import {
   openZipReader,
   validateArchivePath,
   writeMultiPartTakeoutFolder,
+  writeStreamedZip64Archive,
   writeZipArchive,
 } from '../dist/index.js';
 
@@ -778,5 +779,121 @@ test('compares raw name bytes for duplicate detection so distinct legacy non-UTF
     assert.ok((await streamToBuffer(archive.entries[1].open())).equals(Buffer.from('second')));
   } finally {
     await archive.close();
+  }
+});
+
+test('accepts streamed ZIP64 bit-3 entries with 0xffffffff local sizes and zero ZIP64-extra placeholders, and rejects descriptor mismatches (Round 2 Finding 1)', async t => {
+  const dir = makeTempDir(t, 'foundry-r2-f1-');
+  const storedData = Buffer.from('TEST ONLY streamed ZIP64 stored payload\n', 'utf8');
+  const deflateData = Buffer.from('TEST ONLY streamed ZIP64 deflate payload '.repeat(200), 'utf8');
+
+  // 1. Valid Python zipfile force_zip64=True non-seekable layout -> reads cleanly
+  const validPath = join(dir, 'streamed-z64-valid.zip');
+  await writeStreamedZip64Archive(validPath, [
+    { path: 'Takeout/stored.txt', data: storedData, compression: 'store' },
+    { path: 'Takeout/deflated.txt', data: deflateData, compression: 'deflate' },
+  ]);
+  const archive = await openArchive(validPath);
+  try {
+    assert.equal(archive.entries.length, 2);
+    assert.ok((await streamToBuffer(archive.entries[0].open())).equals(storedData));
+    assert.ok((await streamToBuffer(archive.entries[1].open())).equals(deflateData));
+  } finally {
+    await archive.close();
+  }
+
+  // 2. Same layout with descriptor CRC mismatch -> INVALID_DATA_DESCRIPTOR
+  const badCrcPath = join(dir, 'streamed-z64-bad-crc.zip');
+  await writeStreamedZip64Archive(badCrcPath, [
+    {
+      path: 'Takeout/deflated.txt',
+      data: deflateData,
+      compression: 'deflate',
+      descriptorCrc: ((crc32(deflateData) ^ 0xffffffff) >>> 0),
+    },
+  ]);
+  await assert.rejects(
+    () => openArchive(badCrcPath),
+    err => err instanceof ArchiveError && err.code === 'INVALID_DATA_DESCRIPTOR',
+  );
+
+  // 3. Same layout with descriptor uncompressed size mismatch -> INVALID_DATA_DESCRIPTOR
+  const badSizePath = join(dir, 'streamed-z64-bad-size.zip');
+  await writeStreamedZip64Archive(badSizePath, [
+    {
+      path: 'Takeout/stored.txt',
+      data: storedData,
+      compression: 'store',
+      descriptorUncompressedSize: BigInt(storedData.length + 1),
+    },
+  ]);
+  await assert.rejects(
+    () => openArchive(badSizePath),
+    err => err instanceof ArchiveError && err.code === 'INVALID_DATA_DESCRIPTOR',
+  );
+
+  // 4. Bit-3 entry with populated non-zero LFH ZIP64 size that disagrees with CD -> HEADER_MISMATCH
+  const z64ExtraPopulated = Buffer.alloc(20);
+  z64ExtraPopulated.writeUInt16LE(0x0001, 0);
+  z64ExtraPopulated.writeUInt16LE(16, 2);
+  z64ExtraPopulated.writeBigUInt64LE(BigInt(storedData.length + 7), 4);
+  z64ExtraPopulated.writeBigUInt64LE(BigInt(storedData.length), 12);
+  const badLfhSizePath = join(dir, 'streamed-z64-bad-lfh.zip');
+  writeFileSync(
+    badLfhSizePath,
+    buildRawZipBuffer([
+      {
+        path: 'Takeout/populated-mismatch.txt',
+        data: storedData,
+        flags: 0x0808,
+        versionNeeded: 45,
+        lfhCompSize: 0xffffffff,
+        lfhUncompSize: 0xffffffff,
+        lfhExtra: z64ExtraPopulated,
+        zip64Descriptor: true,
+      },
+    ]),
+  );
+  await assert.rejects(
+    () => openArchive(badLfhSizePath),
+    err => err instanceof ArchiveError && err.code === 'HEADER_MISMATCH',
+  );
+});
+
+test('enforces Takeout part ordinal validation when opening a single file directly via openArchive (Round 2 Finding 3)', async t => {
+  const dir = makeTempDir(t, 'foundry-r2-f3-');
+
+  const part2 = join(dir, 'takeout-20261121T000000Z-002.zip');
+  await writeZipArchive(part2, [{ path: 'Takeout/b.txt', data: Buffer.from('part 2 only') }]);
+  await assert.rejects(
+    () => openArchive(part2),
+    err => err instanceof ArchiveError && err.code === 'INVALID_MULTIPART' && /part 1/i.test(err.message),
+  );
+
+  const part0 = join(dir, 'takeout-20261121T000000Z-000.zip');
+  await writeZipArchive(part0, [{ path: 'Takeout/z.txt', data: Buffer.from('part 0 invalid') }]);
+  await assert.rejects(
+    () => openArchive(part0),
+    err => err instanceof ArchiveError && err.code === 'INVALID_MULTIPART',
+  );
+
+  // Part 001 opened directly is allowed (missing final part is deferred per A-36)
+  const part1 = join(dir, 'takeout-20261121T000000Z-001.zip');
+  await writeZipArchive(part1, [{ path: 'Takeout/a.txt', data: Buffer.from('part 1') }]);
+  const arch1 = await openArchive(part1);
+  try {
+    assert.equal(arch1.entries.length, 1);
+  } finally {
+    await arch1.close();
+  }
+
+  // Non-part archive filename still opens as a single archive
+  const single = join(dir, 'single-export.zip');
+  await writeZipArchive(single, [{ path: 'Takeout/single.txt', data: Buffer.from('single') }]);
+  const archSingle = await openArchive(single);
+  try {
+    assert.equal(archSingle.entries.length, 1);
+  } finally {
+    await archSingle.close();
   }
 });

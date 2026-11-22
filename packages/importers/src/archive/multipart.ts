@@ -103,7 +103,9 @@ function validateAndOrderPartNames(zipNames: readonly string[]): string[] {
 export async function openArchive(pathOrDir: string, options: ZipOpenOptions = {}): Promise<Archive> {
   const info = await lstat(pathOrDir, { bigint: true });
   if (info.isFile()) {
-    return openZipFile(pathOrDir, { ...options, partName: basename(pathOrDir) });
+    const fileName = basename(pathOrDir);
+    validateAndOrderPartNames([fileName]);
+    return openZipFile(pathOrDir, { ...options, partName: fileName });
   }
   if (!info.isDirectory()) {
     throw new ArchiveError('INVALID_FORMAT', `Archive path is neither a regular file nor a directory: ${pathOrDir}`);

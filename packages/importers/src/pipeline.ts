@@ -37,6 +37,21 @@ import type { ReadVaultRecordFn } from './vault-state.js';
 const DEFAULT_BATCH_MAX_ITEMS = 16;
 const DEFAULT_BATCH_MAX_BYTES = 4 * 1024 * 1024;
 
+export type ImportErrorCode = 'BUSY';
+
+export class ImportError extends Error {
+  readonly code: ImportErrorCode;
+
+  constructor(code: ImportErrorCode, message: string) {
+    super(`${code}: ${message}`);
+    this.name = 'ImportError';
+    this.code = code;
+  }
+}
+
+/** Per-writer in-process concurrency guard held from entry (before identity scan) through the final write. */
+const activeWriters = new WeakSet<VaultWriterLike>();
+
 export interface ImportArchiveOptions {
   archive: Archive;
   writer: VaultWriterLike;
@@ -132,6 +147,9 @@ interface PendingItem {
  * index, and never calls any network service or model.
  */
 export async function importArchive(options: ImportArchiveOptions): Promise<ImportResult> {
+  if (!options.writer || typeof options.writer !== 'object') {
+    throw new TypeError('importArchive requires an open VaultWriter.');
+  }
   if (!options.vaultDir || typeof options.vaultDir !== 'string') {
     throw new TypeError('importArchive requires vaultDir to derive durable item identity state.');
   }
@@ -141,6 +159,23 @@ export async function importArchive(options: ImportArchiveOptions): Promise<Impo
   if (typeof options.readVaultRecord !== 'function') {
     throw new TypeError('importArchive requires readVaultRecord to derive durable item identity state.');
   }
+
+  // Round 2 Finding 8: Reject concurrent imports sharing one VaultWriter instance.
+  // Acquired synchronously before the first await (before pre-validation and identity scan)
+  // and held until after the final write / closeSegmentOnFinish completes.
+  if (activeWriters.has(options.writer)) {
+    throw new ImportError('BUSY', 'Another importArchive call is already active on this VaultWriter.');
+  }
+  activeWriters.add(options.writer);
+
+  try {
+    return await runImportArchive(options);
+  } finally {
+    activeWriters.delete(options.writer);
+  }
+}
+
+async function runImportArchive(options: ImportArchiveOptions): Promise<ImportResult> {
 
   const profile = options.profile ?? DEFAULT_PROFILE;
   const resolveSensitivity = options.resolveSensitivity ?? (source => defaultSensitivityForSource(source));

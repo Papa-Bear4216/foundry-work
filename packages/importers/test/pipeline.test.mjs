@@ -23,13 +23,17 @@ import {
   DEFAULT_DERIVERS,
   DEFAULT_IMPORTERS,
   generateSyntheticMbox,
+  generateSyntheticVcards,
   importArchive,
+  ImportError,
   mailImporter,
   openArchive,
   syntheticEmail,
   writeMultiPartTakeoutFolder,
+  writeStreamedZip64Archive,
   writeZipArchive,
 } from '../dist/index.js';
+import { crc32 } from 'node:zlib';
 import { measurePeakRss } from './budget/peak-rss.mjs';
 
 /** Recursively restores write permissions on all subdirectories (including nested vault/segments) before rmSync on POSIX. */
@@ -622,12 +626,12 @@ test('counts and reports unfinished and nested vCard errors in ImportResult whil
   assert.equal(verifyVaultDeep(vaultDir, unlocked).position.lastEventSequence, 1);
 });
 
-test('resolves identical UTC collections across different TZ environments and re-import adds nothing (Ruling 12)', async t => {
+test('resolves identical UTC collections across TZ environments (including 00:30:00 Jan-01-2024 under UTC vs Pacific/Auckland) and re-import adds nothing (Ruling 12 & Round 2 Finding 9)', async t => {
   const root = mkdtempSync(join(tmpdir(), 'foundry-v5-tz-'));
   t.after(() => makeWritableAndRemove(root));
   const zipPath = join(root, 'zoneless.zip');
-  const vaultA = join(root, 'vault-ny');
-  const vaultB = join(root, 'vault-tokyo');
+  const vaultA = join(root, 'vault-utc');
+  const vaultB = join(root, 'vault-auckland');
   const passphrase = 'TEST ONLY v5 tz passphrase';
 
   // Boundary timestamps near New Year WITHOUT time zones — host TZ would shift these across 2024/2025!
@@ -648,6 +652,20 @@ test('resolves identical UTC collections across different TZ environments and re
       'Content-Type: text/plain; charset="utf-8"',
       '',
       'RFC 5322 body.\r\n',
+    ].join('\r\n'),
+    'utf8',
+  );
+  // Round 2 Finding 9: unsupported `00:30:00 Jan-01-2024` Date header without mbox separator must
+  // deterministically resolve to undated under both TZ=UTC and TZ=Pacific/Auckland.
+  const unsupportedDateMbox = Buffer.from(
+    [
+      `From: <${syntheticEmail('tz-sender')}>`,
+      `To: <${syntheticEmail('tz-recipient')}>`,
+      'Date: 00:30:00 Jan-01-2024',
+      'Subject: TEST ONLY unsupported date format must be undated',
+      'Content-Type: text/plain; charset="utf-8"',
+      '',
+      'Unsupported date body.\r\n',
     ].join('\r\n'),
     'utf8',
   );
@@ -679,6 +697,7 @@ test('resolves identical UTC collections across different TZ environments and re
 
   await writeZipArchive(zipPath, [
     { path: 'Takeout/Mail/Zoneless.mbox', data: zonelessMbox },
+    { path: 'Takeout/Mail/UnsupportedDate.mbox', data: unsupportedDateMbox },
     { path: 'Takeout/Contacts/Zoneless.vcf', data: zonelessVcf },
     { path: 'Takeout/Calendar/Zoneless.ics', data: zonelessIcs },
   ]);
@@ -703,23 +722,30 @@ test('resolves identical UTC collections across different TZ environments and re
     return JSON.parse(r.stdout);
   };
 
-  const nyRun = runInTz('America/New_York', vaultA, vA);
-  const tokyoRun = runInTz('Asia/Tokyo', vaultB, vB);
+  const utcRun = runInTz('UTC', vaultA, vA);
+  const aucklandRun = runInTz('Pacific/Auckland', vaultB, vB);
 
-  assert.equal(nyRun.summary.totalItemsImported, 4);
-  assert.equal(tokyoRun.summary.totalItemsImported, 4);
-  assert.deepEqual(nyRun.collections, tokyoRun.collections, 'collections and UTC timestamps must be identical across TZ values');
-  for (const item of nyRun.collections) {
+  assert.equal(utcRun.summary.totalItemsImported, 5);
+  assert.equal(aucklandRun.summary.totalItemsImported, 5);
+  assert.deepEqual(utcRun.collections, aucklandRun.collections, 'collections and UTC timestamps must be identical under TZ=UTC and TZ=Pacific/Auckland');
+
+  const unsupportedItem = utcRun.collections.find(c => c.path === 'Takeout/Mail/UnsupportedDate.mbox#1');
+  assert.ok(unsupportedItem);
+  assert.equal(unsupportedItem.collection, 'google-takeout/mail/undated');
+  assert.equal(unsupportedItem.sourceTs, undefined);
+
+  for (const item of utcRun.collections) {
+    if (item.path === 'Takeout/Mail/UnsupportedDate.mbox#1') continue;
     assert.ok(item.collection.endsWith('/2024'), `expected 2024 UTC collection, got ${item.collection}`);
   }
 
-  // Re-import the SAME archive into vaultA under the SECOND timezone (Asia/Tokyo) -> adds nothing!
+  // Re-import the SAME archive into vaultA under TZ=Pacific/Auckland -> adds nothing!
   const bytesBeforeReimport = vaultByteSize(vaultA);
-  const crossTzReimport = runInTz('Asia/Tokyo', vaultA, vA);
+  const crossTzReimport = runInTz('Pacific/Auckland', vaultA, vA);
   assert.equal(crossTzReimport.summary.totalItemsImported, 0);
   assert.equal(crossTzReimport.summary.totalBlobsWritten, 0);
   assert.equal(crossTzReimport.summary.totalEventsWritten, 0);
-  assert.equal(crossTzReimport.summary.totalItemsSkipped, 4);
+  assert.equal(crossTzReimport.summary.totalItemsSkipped, 5);
   assert.equal(vaultByteSize(vaultA), bytesBeforeReimport);
 });
 
@@ -848,4 +874,239 @@ test('resumes cleanly after a child process terminates abruptly halfway through 
     if (events[i].json.source === 'google-takeout/mail') mailBlobs.push(blobs[i].plaintext);
   }
   assert.ok(Buffer.concat(mailBlobs).equals(fixture.rawMail));
+});
+
+test('imports valid streamed ZIP64 archive (Python zipfile force_zip64 layout) and rejects descriptor CRC mismatch with zero vault writes (Round 2 Finding 1)', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'foundry-v5-r2-f1-'));
+  t.after(() => makeWritableAndRemove(root));
+  const validZip = join(root, 'streamed-zip64.zip');
+  const corruptZip = join(root, 'streamed-zip64-bad-desc.zip');
+  const vaultGood = join(root, 'vault-good');
+  const vaultBad = join(root, 'vault-bad');
+  const passphrase = 'TEST ONLY v5 r2 f1 passphrase';
+
+  const vcfBytes = generateSyntheticVcards(3, 1201);
+  const mboxBytes = generateSyntheticMbox(4, 1202);
+
+  await writeStreamedZip64Archive(validZip, [
+    { path: 'Takeout/Contacts/All Contacts.vcf', data: vcfBytes, compression: 'deflate' },
+    { path: 'Takeout/Mail/All mail.mbox', data: mboxBytes, compression: 'deflate' },
+  ]);
+  await writeStreamedZip64Archive(corruptZip, [
+    { path: 'Takeout/Contacts/All Contacts.vcf', data: vcfBytes, compression: 'deflate' },
+    {
+      path: 'Takeout/Mail/All mail.mbox',
+      data: mboxBytes,
+      compression: 'deflate',
+      descriptorCrc: ((crc32(mboxBytes) ^ 0xffffffff) >>> 0),
+    },
+  ]);
+
+  // 1. Valid streamed ZIP64 archive imports cleanly
+  const goodMeta = createTestVaultWithCollections(vaultGood, passphrase);
+  const goodUnlocked = unlockByPassphrase(join(vaultGood, 'keyring', 'keyring.json'), goodMeta.vaultId, passphrase);
+  const goodArchive = await openArchive(validZip);
+  const goodWriter = VaultWriter.open(vaultGood, goodUnlocked);
+  try {
+    const res = await importArchive({
+      archive: goodArchive,
+      writer: goodWriter,
+      importers: DEFAULT_IMPORTERS,
+      resolveCollectionKeyId: () => goodMeta.collectionKeyId,
+      vaultDir: vaultGood,
+      unlocked: goodUnlocked,
+      readVaultRecord,
+      closeSegmentOnFinish: true,
+    });
+    assert.equal(res.totalItemsImported, 7);
+    assert.equal(res.totalEventsWritten, 7);
+  } finally {
+    goodWriter.release();
+    await goodArchive.close();
+  }
+  assert.equal(verifyVaultDeep(vaultGood, goodUnlocked).position.lastEventSequence, 7);
+
+  // 2. Descriptor CRC mismatch -> typed ArchiveError, zero vault writes
+  const badMeta = createTestVaultWithCollections(vaultBad, passphrase);
+  const badUnlocked = unlockByPassphrase(join(vaultBad, 'keyring', 'keyring.json'), badMeta.vaultId, passphrase);
+  await assert.rejects(
+    async () => {
+      const badArchive = await openArchive(corruptZip);
+      const badWriter = VaultWriter.open(vaultBad, badUnlocked);
+      try {
+        await importArchive({
+          archive: badArchive,
+          writer: badWriter,
+          importers: DEFAULT_IMPORTERS,
+          resolveCollectionKeyId: () => badMeta.collectionKeyId,
+          vaultDir: vaultBad,
+          unlocked: badUnlocked,
+          readVaultRecord,
+        });
+      } finally {
+        badWriter.release();
+        await badArchive.close();
+      }
+    },
+    err => err instanceof ArchiveError && err.code === 'INVALID_DATA_DESCRIPTOR',
+  );
+  const badRecords = readAllVaultRecords(vaultBad, badUnlocked);
+  assert.equal(badRecords.events.length, 0);
+  assert.equal(badRecords.blobs.length, 0);
+  assert.equal(verifyVault(vaultBad).position.lastEventSequence, 0);
+});
+
+test('rejects direct import of Takeout part 002 with zero writes while non-part single archive imports normally (Round 2 Finding 3)', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'foundry-v5-r2-f3-'));
+  t.after(() => makeWritableAndRemove(root));
+  const part2Path = join(root, 'takeout-20261121T000000Z-002.zip');
+  const singlePath = join(root, 'personal-export.zip');
+  const vaultDir = join(root, 'vault');
+  const passphrase = 'TEST ONLY v5 r2 f3 passphrase';
+
+  const vcf = generateSyntheticVcards(2, 1301);
+  await writeZipArchive(part2Path, [{ path: 'Takeout/Contacts/contacts.vcf', data: vcf, compression: 'deflate' }]);
+  await writeZipArchive(singlePath, [{ path: 'Takeout/Contacts/contacts.vcf', data: vcf, compression: 'deflate' }]);
+
+  const { vaultId, collectionKeyId } = createTestVaultWithCollections(vaultDir, passphrase);
+  const unlocked = unlockByPassphrase(join(vaultDir, 'keyring', 'keyring.json'), vaultId, passphrase);
+
+  await assert.rejects(
+    () => openArchive(part2Path),
+    err => err instanceof ArchiveError && err.code === 'INVALID_MULTIPART' && /part 1/i.test(err.message),
+  );
+  assert.equal(readAllVaultRecords(vaultDir, unlocked).events.length, 0);
+
+  const archive = await openArchive(singlePath);
+  const writer = VaultWriter.open(vaultDir, unlocked);
+  try {
+    const res = await importArchive({
+      archive,
+      writer,
+      importers: DEFAULT_IMPORTERS,
+      resolveCollectionKeyId: () => collectionKeyId,
+      vaultDir,
+      unlocked,
+      readVaultRecord,
+      closeSegmentOnFinish: true,
+    });
+    assert.equal(res.totalItemsImported, 2);
+  } finally {
+    writer.release();
+    await archive.close();
+  }
+  assert.equal(verifyVaultDeep(vaultDir, unlocked).position.lastEventSequence, 2);
+});
+
+test('rejects concurrent importArchive calls sharing one writer with typed BUSY error and zero duplicates (Round 2 Finding 8)', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'foundry-v5-r2-f8-'));
+  t.after(() => makeWritableAndRemove(root));
+  const zipPath = join(root, 'concurrent.zip');
+  const vaultDir = join(root, 'vault');
+  const passphrase = 'TEST ONLY v5 r2 f8 passphrase';
+
+  const rawMbox = generateSyntheticMbox(8, 1801);
+  await writeZipArchive(zipPath, [{ path: 'Takeout/Mail/All mail.mbox', data: rawMbox, compression: 'deflate' }]);
+  const { vaultId, collectionKeyId } = createTestVaultWithCollections(vaultDir, passphrase);
+  const unlocked = unlockByPassphrase(join(vaultDir, 'keyring', 'keyring.json'), vaultId, passphrase);
+
+  const archiveA = await openArchive(zipPath);
+  const archiveB = await openArchive(zipPath);
+  const writer = VaultWriter.open(vaultDir, unlocked);
+  try {
+    const [resA, resB] = await Promise.allSettled([
+      importArchive({
+        archive: archiveA,
+        writer,
+        importers: DEFAULT_IMPORTERS,
+        resolveCollectionKeyId: () => collectionKeyId,
+        vaultDir,
+        unlocked,
+        readVaultRecord,
+      }),
+      importArchive({
+        archive: archiveB,
+        writer,
+        importers: DEFAULT_IMPORTERS,
+        resolveCollectionKeyId: () => collectionKeyId,
+        vaultDir,
+        unlocked,
+        readVaultRecord,
+      }),
+    ]);
+
+    const fulfilled = [resA, resB].filter(r => r.status === 'fulfilled');
+    const rejected = [resA, resB].filter(r => r.status === 'rejected');
+    assert.equal(fulfilled.length, 1, 'exactly one concurrent import must succeed');
+    assert.equal(rejected.length, 1, 'the overlapping import on the same writer must fail fast');
+    assert.ok(rejected[0].reason instanceof ImportError);
+    assert.equal(rejected[0].reason.code, 'BUSY');
+    assert.equal(fulfilled[0].value.totalItemsImported, 8);
+
+    // After the first call completes, the writer guard must be released so sequential re-import works and adds nothing.
+    const sequential = await importArchive({
+      archive: archiveB,
+      writer,
+      importers: DEFAULT_IMPORTERS,
+      resolveCollectionKeyId: () => collectionKeyId,
+      vaultDir,
+      unlocked,
+      readVaultRecord,
+      closeSegmentOnFinish: true,
+    });
+    assert.equal(sequential.totalItemsImported, 0);
+    assert.equal(sequential.totalItemsSkipped, 8);
+  } finally {
+    writer.release();
+    await archiveA.close();
+    await archiveB.close();
+  }
+
+  const records = readAllVaultRecords(vaultDir, unlocked);
+  assert.equal(records.events.length, 8);
+  assert.equal(records.blobs.length, 8);
+  assert.equal(new Set(records.events.map(e => e.json.body.item_key)).size, 8);
+  assert.equal(verifyVaultDeep(vaultDir, unlocked).position.lastEventSequence, 8);
+});
+
+test('preserves two-digit year 0099 in vCard REV without shifting to 1999 or dropping to undated (Round 2 Finding 10)', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'foundry-v5-r2-f10-'));
+  t.after(() => makeWritableAndRemove(root));
+  const zipPath = join(root, 'year99.zip');
+  const vaultDir = join(root, 'vault');
+  const passphrase = 'TEST ONLY v5 r2 f10 passphrase';
+
+  const vcfBytes = Buffer.from(
+    ['BEGIN:VCARD', 'VERSION:3.0', 'FN:Year 99 Contact', 'REV:00990101T003000Z', 'END:VCARD', ''].join('\r\n'),
+    'utf8',
+  );
+  await writeZipArchive(zipPath, [{ path: 'Takeout/Contacts/year99.vcf', data: vcfBytes, compression: 'deflate' }]);
+
+  const { vaultId, collectionKeyId } = createTestVaultWithCollections(vaultDir, passphrase);
+  const unlocked = unlockByPassphrase(join(vaultDir, 'keyring', 'keyring.json'), vaultId, passphrase);
+
+  const archive = await openArchive(zipPath);
+  const writer = VaultWriter.open(vaultDir, unlocked);
+  try {
+    const res = await importArchive({
+      archive,
+      writer,
+      importers: DEFAULT_IMPORTERS,
+      resolveCollectionKeyId: () => collectionKeyId,
+      vaultDir,
+      unlocked,
+      readVaultRecord,
+      closeSegmentOnFinish: true,
+    });
+    assert.equal(res.totalItemsImported, 1);
+  } finally {
+    writer.release();
+    await archive.close();
+  }
+
+  const records = readAllVaultRecords(vaultDir, unlocked);
+  assert.equal(records.events.length, 1);
+  assert.equal(records.events[0].json.collection, 'google-takeout/contacts/0099');
+  assert.equal(records.events[0].json.body.source_ts, '0099-01-01T00:30:00Z');
+  assert.equal(verifyVaultDeep(vaultDir, unlocked).position.lastEventSequence, 1);
 });

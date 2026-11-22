@@ -16,6 +16,7 @@ const AT_SIGN = String.fromCharCode(64);
 const SYNTHETIC_DOMAIN = ['example', 'invalid'].join('.');
 
 const SIG_LFH = 0x04034b50;
+const SIG_DATA_DESC = 0x08074b50;
 const SIG_CD = 0x02014b50;
 const SIG_EOCD = 0x06054b50;
 const SIG_ZIP64_EOCD = 0x06064b50;
@@ -559,6 +560,154 @@ export async function writeZipArchive(
     eocd.writeUInt16LE(needZip64End ? SENTINEL_U16 : Number(totalCount), 10);
     eocd.writeUInt32LE(needZip64End ? SENTINEL_U32 : Number(cdSize), 12);
     eocd.writeUInt32LE(needZip64End ? SENTINEL_U32 : Number(cdOffset), 16);
+    eocd.writeUInt16LE(0, 20);
+    offset = writeAllSync(fd, eocd, offset);
+  } finally {
+    closeSync(fd);
+  }
+
+  return { totalCompressedBytes: totalComp, totalUncompressedBytes: totalUncomp };
+}
+
+export interface StreamedZip64Entry {
+  path: string;
+  data: Buffer;
+  compression?: 'store' | 'deflate';
+  deflateLevel?: number;
+  /** Override CRC-32 written in the trailing ZIP64 data descriptor (for mismatch tests). */
+  descriptorCrc?: number;
+  /** Override compressed size written in the trailing ZIP64 data descriptor (for mismatch tests). */
+  descriptorCompressedSize?: bigint;
+  /** Override uncompressed size written in the trailing ZIP64 data descriptor (for mismatch tests). */
+  descriptorUncompressedSize?: bigint;
+}
+
+/**
+ * Writes a streamed ZIP64 archive matching the layout Python's `zipfile` emits with
+ * `force_zip64=True` on a non-seekable output stream: bit 3 set, LFH CRC = 0, LFH 32-bit
+ * sizes = 0xffffffff, LFH ZIP64 extra field containing zero placeholders [0n, 0n], a signed
+ * 24-byte ZIP64 data descriptor after the payload, and matching ZIP64 central directory +
+ * ZIP64 end records.
+ */
+export async function writeStreamedZip64Archive(
+  filePath: string,
+  entries: readonly StreamedZip64Entry[],
+): Promise<{ totalCompressedBytes: bigint; totalUncompressedBytes: bigint }> {
+  const fd = openSync(filePath, 'w');
+  let offset = 0n;
+  let totalComp = 0n;
+  let totalUncomp = 0n;
+  const cdRecords: WrittenCdRecord[] = [];
+
+  try {
+    for (const entry of entries) {
+      const pathBuf = Buffer.from(entry.path, 'utf8');
+      const method = entry.compression === 'deflate' ? 8 : 0;
+      const lfhOffset = offset;
+      const raw = entry.data;
+      const entryCrc = crc32(raw) >>> 0;
+      const payload = method === 8 ? deflateRawSync(raw, { level: entry.deflateLevel ?? 1 }) : raw;
+      const uncompSize = BigInt(raw.length);
+      const compSize = BigInt(payload.length);
+
+      // LFH: bit 3 (0x0008) + UTF-8 (0x0800), crc = 0, both sizes = 0xffffffff, ZIP64 extra = [0n, 0n].
+      const placeholderExtra = encodeZip64Extra([0n, 0n]);
+      const lfh = Buffer.alloc(30);
+      lfh.writeUInt32LE(SIG_LFH, 0);
+      lfh.writeUInt16LE(45, 4);
+      lfh.writeUInt16LE(0x0808, 6);
+      lfh.writeUInt16LE(method, 8);
+      lfh.writeUInt16LE(0, 10);
+      lfh.writeUInt16LE(0x5821, 12);
+      lfh.writeUInt32LE(0, 14);
+      lfh.writeUInt32LE(SENTINEL_U32, 18);
+      lfh.writeUInt32LE(SENTINEL_U32, 22);
+      lfh.writeUInt16LE(pathBuf.length, 26);
+      lfh.writeUInt16LE(placeholderExtra.length, 28);
+
+      offset = writeAllSync(fd, lfh, offset);
+      offset = writeAllSync(fd, pathBuf, offset);
+      offset = writeAllSync(fd, placeholderExtra, offset);
+      offset = writeAllSync(fd, payload, offset);
+
+      // Signed ZIP64 data descriptor (24 bytes): sig + crc32 + 64-bit compSize + 64-bit uncompSize.
+      const desc = Buffer.alloc(24);
+      desc.writeUInt32LE(SIG_DATA_DESC, 0);
+      desc.writeUInt32LE((entry.descriptorCrc ?? entryCrc) >>> 0, 4);
+      desc.writeBigUInt64LE(entry.descriptorCompressedSize ?? compSize, 8);
+      desc.writeBigUInt64LE(entry.descriptorUncompressedSize ?? uncompSize, 16);
+      offset = writeAllSync(fd, desc, offset);
+
+      cdRecords.push({
+        pathBuf,
+        compressionMethod: method,
+        crc: entryCrc,
+        compressedSize: compSize,
+        uncompressedSize: uncompSize,
+        localHeaderOffset: lfhOffset,
+      });
+      totalComp += compSize;
+      totalUncomp += uncompSize;
+    }
+
+    const cdOffset = offset;
+    for (const rec of cdRecords) {
+      const extra = encodeZip64Extra([rec.uncompressedSize, rec.compressedSize, rec.localHeaderOffset]);
+      const cd = Buffer.alloc(46);
+      cd.writeUInt32LE(SIG_CD, 0);
+      cd.writeUInt16LE(45, 4);
+      cd.writeUInt16LE(45, 6);
+      cd.writeUInt16LE(0x0808, 8);
+      cd.writeUInt16LE(rec.compressionMethod, 10);
+      cd.writeUInt16LE(0, 12);
+      cd.writeUInt16LE(0x5821, 14);
+      cd.writeUInt32LE(rec.crc >>> 0, 16);
+      cd.writeUInt32LE(SENTINEL_U32, 20);
+      cd.writeUInt32LE(SENTINEL_U32, 24);
+      cd.writeUInt16LE(rec.pathBuf.length, 28);
+      cd.writeUInt16LE(extra.length, 30);
+      cd.writeUInt16LE(0, 32);
+      cd.writeUInt16LE(0, 34);
+      cd.writeUInt16LE(0, 36);
+      cd.writeUInt32LE(0, 38);
+      cd.writeUInt32LE(SENTINEL_U32, 42);
+
+      offset = writeAllSync(fd, cd, offset);
+      offset = writeAllSync(fd, rec.pathBuf, offset);
+      offset = writeAllSync(fd, extra, offset);
+    }
+
+    const cdSize = offset - cdOffset;
+    const totalCount = BigInt(cdRecords.length);
+    const z64EocdOffset = offset;
+    const z64Eocd = Buffer.alloc(56);
+    z64Eocd.writeUInt32LE(SIG_ZIP64_EOCD, 0);
+    z64Eocd.writeBigUInt64LE(44n, 4);
+    z64Eocd.writeUInt16LE(45, 12);
+    z64Eocd.writeUInt16LE(45, 14);
+    z64Eocd.writeUInt32LE(0, 16);
+    z64Eocd.writeUInt32LE(0, 20);
+    z64Eocd.writeBigUInt64LE(totalCount, 24);
+    z64Eocd.writeBigUInt64LE(totalCount, 32);
+    z64Eocd.writeBigUInt64LE(cdSize, 40);
+    z64Eocd.writeBigUInt64LE(cdOffset, 48);
+    offset = writeAllSync(fd, z64Eocd, offset);
+
+    const locator = Buffer.alloc(20);
+    locator.writeUInt32LE(SIG_ZIP64_LOCATOR, 0);
+    locator.writeUInt32LE(0, 4);
+    locator.writeBigUInt64LE(z64EocdOffset, 8);
+    locator.writeUInt32LE(1, 16);
+    offset = writeAllSync(fd, locator, offset);
+
+    const eocd = Buffer.alloc(22);
+    eocd.writeUInt32LE(SIG_EOCD, 0);
+    eocd.writeUInt16LE(0, 4);
+    eocd.writeUInt16LE(0, 6);
+    eocd.writeUInt16LE(SENTINEL_U16, 8);
+    eocd.writeUInt16LE(SENTINEL_U16, 10);
+    eocd.writeUInt32LE(SENTINEL_U32, 12);
+    eocd.writeUInt32LE(SENTINEL_U32, 16);
     eocd.writeUInt16LE(0, 20);
     offset = writeAllSync(fd, eocd, offset);
   } finally {

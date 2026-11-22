@@ -74,8 +74,8 @@ export type { ParsedEmail, ParsedEmailAddress } from './importers/mail.js';
 export { computeBlobId, deriveCollectionIdKey, loadExistingItemKeys } from './vault-state.js';
 export type { ReadVaultRecordFn } from './vault-state.js';
 
-export { importArchive } from './pipeline.js';
-export type { ImportArchiveOptions } from './pipeline.js';
+export { importArchive, ImportError } from './pipeline.js';
+export type { ImportArchiveOptions, ImportErrorCode } from './pipeline.js';
 
 export {
   createSeededRng,
@@ -84,10 +84,16 @@ export {
   generateSyntheticVcards,
   syntheticEmail,
   writeMultiPartTakeoutFolder,
+  writeStreamedZip64Archive,
   writeSyntheticLargeMboxZip,
   writeZipArchive,
 } from './fixtures/generators.js';
-export type { SeededRng, SyntheticMboxOptions, ZipBuildEntry } from './fixtures/generators.js';
+export type {
+  SeededRng,
+  StreamedZip64Entry,
+  SyntheticMboxOptions,
+  ZipBuildEntry,
+} from './fixtures/generators.js';
 
 import { calendarDeriver, calendarImporter } from './importers/calendar.js';
 import { contactsDeriver, contactsImporter } from './importers/contacts.js';
