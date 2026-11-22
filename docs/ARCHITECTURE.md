@@ -443,9 +443,11 @@ must be kept in step across copies.
   byte 0x0A and the exact UTF-8 bytes of `N`, with no case folding, normalization or
   trimming. `NK` is HKDF-SHA256 with MK as input key material, the 16 raw vault ID
   bytes as salt and ASCII info `foundry/collection-key-id/v1`. The collection key itself
-  stays random. Names that start with `foundry:` are reserved. Each profile that uses
-  the rule holds an active marker collection entry under the ID derived from the name
-  `foundry:collection-key-id-rule/v1`. See [A-41 in DECISIONS.md](DECISIONS.md).
+  stays random. Names that start with `foundry:` are reserved. The rule finds collections
+  only for profiles allocated under the current MK, that is before any `rekeyAll`; a
+  marker entry (the ID derived from `foundry:collection-key-id-rule/v1`) turns a profile
+  with collections but no active marker into a `KEY` failure. See
+  [A-41 in DECISIONS.md](DECISIONS.md).
 - The working device keeps a register of every keyring copy Foundry has written: which
   second copy, which keyring version, when. `foundry erase` prints the copies that still
   hold the old key.

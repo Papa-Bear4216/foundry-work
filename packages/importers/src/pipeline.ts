@@ -122,7 +122,7 @@ async function readItemBytesBounded(
   }
 
   if (exceeded) return { exceeded: true, observedBytes: total };
-  return { buffer: chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks), exceeded: false };
+  return { buffer: chunks.length === 1 ? Buffer.from(chunks[0]!) : Buffer.concat(chunks), exceeded: false };
 }
 
 async function drainEntryStream(entry: ArchiveEntry): Promise<void> {

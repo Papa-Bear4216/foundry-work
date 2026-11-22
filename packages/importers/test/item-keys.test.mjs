@@ -3,9 +3,10 @@
 import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
 import { randomBytes } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import { test } from 'node:test';
 import {
   decodeKeyring,
@@ -49,13 +50,14 @@ function removeTree(dir) {
 }
 
 /** Synthetic vault unlocked by recovery key (no scrypt on unlock). */
-function createVault(vaultDir) {
+function createVault(vaultDir, { secondCollection = false } = {}) {
   const vaultId = randomBytes(16).toString('hex');
   const createdAt = '2026-11-22T00:00:00Z';
   const recoveryKey = randomBytes(32);
   const signingSeed = randomBytes(32);
   const profileKeyId = randomBytes(16).toString('hex');
   const collectionKeyId = randomBytes(16).toString('hex');
+  const secondCollectionKeyId = randomBytes(16).toString('hex');
   const keyring = join(vaultDir, 'keyring', 'keyring.json');
   mkdirSync(join(vaultDir, 'keyring'), { recursive: true });
   writeFileSync(keyring, encodeKeyring({
@@ -66,10 +68,17 @@ function createVault(vaultDir) {
       { key_id: randomBytes(16).toString('hex'), kind: 'signing', parent: 'master', state: 'active', created_at: createdAt, key: signingSeed },
       { key_id: profileKeyId, kind: 'profile', parent: 'master', state: 'active', created_at: createdAt, key: randomBytes(32), label: 'me' },
       { key_id: collectionKeyId, kind: 'collection', parent: profileKeyId, state: 'active', created_at: createdAt, key: randomBytes(32) },
+      ...(secondCollection
+        ? [{ key_id: secondCollectionKeyId, kind: 'collection', parent: profileKeyId, state: 'active', created_at: createdAt, key: randomBytes(32) }]
+        : []),
     ],
   }, 'TEST ONLY v7 item-key passphrase', recoveryKey));
   initializeVault(vaultDir, { vaultId, createdAt, signingPublicKey: signingPublicKey(signingSeed) });
-  return { collectionKeyId, unlock: () => decodeKeyring(readFileSync(keyring), { recoveryKey }, vaultId) };
+  return {
+    collectionKeyId,
+    ...(secondCollection ? { secondCollectionKeyId } : {}),
+    unlock: () => decodeKeyring(readFileSync(keyring), { recoveryKey }, vaultId),
+  };
 }
 
 async function setup(t, name) {
@@ -279,4 +288,104 @@ test('a resolver returning undefined defers that collection; a second run with a
   assert.equal(third.totalItemsImported, 0);
   assert.equal(third.totalItemsDeferred, 0);
   assert.equal(storedCount(ctx), MESSAGES + CONTACTS);
+});
+
+// V-7a review round 1: the bounded reader must return a buffer the pipeline owns. Zeroing a deferred or
+// skipped item must never wipe another item that shares the importer's backing Buffer.
+const SHARED_TEXT = 'TEST ONLY shared item bytes for the owned-buffer regression';
+const SHARED_ENTRY = 'Takeout/TestOnly/shared.bin';
+const SHARED_SOURCE = 'test-only/shared';
+
+/** Test importer: reads its entry into ONE Buffer and yields it as the stream of two items in different years. */
+const sharedBufferImporter = {
+  id: SHARED_SOURCE,
+  matches: entry => entry.path === SHARED_ENTRY,
+  async *split(entry) {
+    const chunks = [];
+    for await (const chunk of entry.open()) chunks.push(Buffer.from(chunk));
+    const shared = Buffer.concat(chunks);
+    const base = { mime: 'application/octet-stream', tags: [] };
+    yield { ...base, bytes: Readable.from([shared]), path: 'shared/first.bin', sourceTs: '2020-01-01T00:00:00Z' };
+    yield { ...base, bytes: Readable.from([shared]), path: 'shared/second.bin', sourceTs: '2021-01-01T00:00:00Z' };
+  },
+};
+
+/** Decrypted plaintext of every blob record in the vault (sealed and open segments), via readVaultRecord. */
+function storedBlobs({ vaultDir, unlock }) {
+  const unlocked = unlock();
+  const blobs = [];
+  try {
+    const scanDir = (dir, segment) => {
+      if (!existsSync(dir)) return;
+      for (const stream of readdirSync(dir).filter(f => f.endsWith('.fvr')).sort()) {
+        const size = statSync(join(dir, stream)).size;
+        let offset = 0;
+        while (offset < size) {
+          const rec = readVaultRecord(vaultDir, { segment, stream, offset }, unlocked);
+          if (rec.type === 2) blobs.push(Buffer.from(rec.plaintext));
+          const plainLen = rec.plaintext.length;
+          const frames = plainLen === 0 ? 1 : Math.ceil(plainLen / 1_048_576);
+          offset += 69 + plainLen + frames * 20; // FVR1 record length
+        }
+      }
+    };
+    const segDir = join(vaultDir, 'segments');
+    let maxSeg = 0;
+    if (existsSync(segDir)) {
+      for (const seg of readdirSync(segDir).sort()) {
+        maxSeg = Number.parseInt(seg, 10);
+        scanDir(join(segDir, seg), maxSeg);
+      }
+    }
+    scanDir(join(vaultDir, 'open'), maxSeg + 1);
+    return blobs;
+  } finally {
+    unlocked.masterKey.fill(0);
+    for (const key of unlocked.keys.values()) key.fill(0);
+  }
+}
+
+test('two items sharing one backing Buffer: deferring or skipping one never zeroes the other before it is stored', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'foundry-v7a-shared-'));
+  t.after(() => removeTree(root));
+  const zipPath = join(root, 'takeout.zip');
+  const vaultDir = join(root, 'vault');
+  await writeZipArchive(zipPath, [{ path: SHARED_ENTRY, data: Buffer.from(SHARED_TEXT), compression: 'deflate' }]);
+  const ctx = { zipPath, vaultDir, ...createVault(vaultDir, { secondCollection: true }) };
+  const expected = Buffer.from(SHARED_TEXT); // independent copy: never the importer's shared Buffer
+  const importers = [sharedBufferImporter];
+  const lookup = recordingLookup();
+  const first2020 = `${SHARED_SOURCE}/2020`;
+  const second2021 = `${SHARED_SOURCE}/2021`;
+
+  // Run 1: the 2020 item is pending when the 2021 item is deferred (and zeroed).
+  const first = await runImport(ctx, {
+    importers, itemKeys: lookup,
+    resolveCollectionKeyId: name => (name === first2020 ? ctx.collectionKeyId : undefined),
+  });
+  assert.equal(first.totalItemsImported, 1);
+  assert.equal(first.totalItemsDeferred, 1);
+  assert.deepEqual(first.missingCollections, [second2021]);
+  const afterFirst = storedBlobs(ctx);
+  assert.equal(afterFirst.length, 1);
+  assert.deepEqual(afterFirst[0], expected, 'the stored first item holds the original bytes, not zeros');
+
+  // Run 2: the resolver now has a key for 2021. The 2020 item is skipped (and zeroed) first.
+  const resolveBoth = name => (name === first2020 ? ctx.collectionKeyId : name === second2021 ? ctx.secondCollectionKeyId : undefined);
+  const second = await runImport(ctx, { importers, itemKeys: lookup, resolveCollectionKeyId: resolveBoth });
+  assert.equal(second.totalItemsImported, 1, 'only the deferred item');
+  assert.equal(second.totalItemsSkipped, 1);
+  assert.equal(second.totalItemsDeferred, 0);
+  assert.equal(second.totalBlobsWritten, 1);
+  const afterSecond = storedBlobs(ctx);
+  assert.equal(afterSecond.length, 2);
+  for (const blob of afterSecond) assert.deepEqual(blob, expected, 'every stored item holds the original bytes');
+
+  // Run 3: nothing new.
+  const third = await runImport(ctx, { importers, itemKeys: lookup, resolveCollectionKeyId: resolveBoth });
+  assert.equal(third.totalItemsImported, 0);
+  assert.equal(third.totalEventsWritten, 0);
+  assert.equal(third.totalItemsDeferred, 0);
+  assert.equal(storedBlobs(ctx).length, 2);
+  assert.equal(storedCount(ctx), 2);
 });
