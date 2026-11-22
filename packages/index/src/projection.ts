@@ -1,10 +1,10 @@
 import { createHmac } from 'node:crypto';
-import type { openVaultReplay, VaultReplayItem } from '../../vault/codec/dist/index.js';
+import type { openVaultReplay, VaultReplayItem } from 'vault';
 import { IndexError, transaction } from './driver.ts';
 import type { SqlDriver } from './driver.ts';
 import { integer, object, optionalString, string } from './event.ts';
 import { isGraphEvent, projectGraph } from './graph.ts';
-import { SCHEMA_SQL, SCHEMA_VERSION } from './schema.ts';
+import { OLDER_SCHEMA_VERSIONS, SCHEMA_SQL, SCHEMA_VERSION } from './schema.ts';
 import { importDate } from './search.ts';
 import { chunkText, MAX_CHUNKS } from './text.ts';
 
@@ -35,10 +35,23 @@ export interface ProjectionResult {
   hiddenChanged: boolean;
 }
 
+/** Thrown when an index file uses an older supported schema. The caller replaces it with a rebuild. */
+export class OutdatedSchemaError extends IndexError {
+  constructor() {
+    super('PROJECTION', 'The working index uses an older format. Update or rebuild it.');
+    this.name = 'OutdatedSchemaError';
+  }
+}
+
+function isOlderVersion(version: unknown): boolean {
+  return typeof version === 'number' && OLDER_SCHEMA_VERSIONS.has(version);
+}
+
 export function initializeSchema(db: SqlDriver): void {
   transaction(db, () => {
     const version = db.prepare('PRAGMA user_version').get()?.user_version;
     if (version === SCHEMA_VERSION) return;
+    if (isOlderVersion(version)) throw new OutdatedSchemaError();
     if (version !== 0 || db.prepare('SELECT name FROM sqlite_schema LIMIT 1').get()) {
       throw new IndexError('FORMAT', 'The file is not a supported Foundry index.');
     }
@@ -48,8 +61,10 @@ export function initializeSchema(db: SqlDriver): void {
 }
 
 export function assertSchema(db: SqlDriver): void {
-  if (db.prepare('PRAGMA user_version').get()?.user_version !== SCHEMA_VERSION ||
-      !db.prepare("SELECT name FROM sqlite_schema WHERE name='projection_state' AND type='table'").get()) {
+  const version = db.prepare('PRAGMA user_version').get()?.user_version;
+  const hasState = db.prepare("SELECT name FROM sqlite_schema WHERE name='projection_state' AND type='table'").get();
+  if (hasState && isOlderVersion(version)) throw new OutdatedSchemaError();
+  if (version !== SCHEMA_VERSION || !hasState) {
     throw new IndexError('FORMAT', 'The file is not a supported Foundry index.');
   }
 }
@@ -85,6 +100,7 @@ function prepareStatements(db: SqlDriver) {
     `),
     insertOrigin: db.prepare('INSERT INTO event_origin VALUES (?, ?, ?, ?)'),
     insertGraphEvent: db.prepare('INSERT INTO graph_events VALUES (?, ?, ?)'),
+    insertItemKey: db.prepare('INSERT OR IGNORE INTO item_keys VALUES (?)'),
     insertItem: db.prepare(`
       INSERT INTO items (item_id, event_seq, source, profile, collection, tier, sensitivity,
         title, path, mime, size, source_at, imported_at, blob_id, key_id)
@@ -170,6 +186,11 @@ function projectEvent(stmts: Statements, { event, seq, keyId }: Event): void {
   const profile = optionalString(event.profile, 'profile');
   const collection = optionalString(event.collection, 'collection');
   const itemId = kind === 'item.imported' ? optionalString(body?.item_id, 'item_id') ?? String(seq) : null;
+  // Same rule as the importer's vault scan: every item.imported event under a live key counts,
+  // hidden or not. Only the stored body.item_key is used; the index never recomputes a key.
+  if (kind === 'item.imported' && typeof body?.item_key === 'string' && body.item_key.length === 64) {
+    stmts.insertItemKey.run(body.item_key);
+  }
   if (stmts.isHidden.get(itemId, String(seq), keyId, profile, collection)) return;
 
   stmts.insertOrigin.run(seq, keyId, profile, collection);

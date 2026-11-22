@@ -1,6 +1,14 @@
-export const SCHEMA_VERSION = 1;
+/** Version 2 adds `item_keys`. An index at an older version is replaced by a rebuild. */
+export const SCHEMA_VERSION = 2;
+export const OLDER_SCHEMA_VERSIONS: ReadonlySet<number> = new Set([1]);
 
 export const SCHEMA_SQL = `
+-- Importer item keys from every item.imported event (body.item_key), including hidden items, for
+-- idempotent re-import. Events under destroyed collection keys reach the projection as skipped records.
+CREATE TABLE item_keys (
+  item_key TEXT PRIMARY KEY
+) WITHOUT ROWID;
+
 CREATE TABLE meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL

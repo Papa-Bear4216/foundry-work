@@ -4,5 +4,5 @@ export { applyIncremental, initializeSchema } from './projection.ts';
 export type { DeriveItem, ProjectionOptions, ProjectionResult } from './projection.ts';
 export { search } from './search.ts';
 export type { SearchHit, SearchOptions } from './search.ts';
-export { rebuildIndex, searchIndex, updateIndex } from './store.ts';
-export type { IndexStoreOptions } from './store.ts';
+export { openItemKeyLookup, rebuildIndex, searchIndex, updateIndex } from './store.ts';
+export type { IndexItemKeyLookup, IndexStoreOptions } from './store.ts';

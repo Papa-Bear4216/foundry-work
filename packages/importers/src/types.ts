@@ -152,6 +152,15 @@ export interface UnlockedKeyringLike {
   readonly keys: ReadonlyMap<string, Buffer>;
 }
 
+/**
+ * Durable lookup of item keys already stored in the vault (for example backed by the working index).
+ * `importArchive` calls `add` only after the batch holding that item is durably appended to the vault.
+ */
+export interface ItemKeyLookup {
+  has(itemKey: string): boolean;
+  add(itemKey: string): void;
+}
+
 /** Injectable crash checkpoints for resumability tests. */
 export type ImportCrashPoint =
   | 'after-blob-before-event'

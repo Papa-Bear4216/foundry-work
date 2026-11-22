@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
-import { openVaultReplay, retireIndexKey } from '../../vault/codec/dist/index.js';
+import { openVaultReplay, retireIndexKey } from 'vault';
 import { applyIncremental, initializeSchema, openSqlDriver, rebuildIndex, search, searchIndex, updateIndex } from '../dist/index.js';
 import { ids, note, syntheticVault, systemEvent, tombstone } from './fixture.mjs';
 

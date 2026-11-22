@@ -114,7 +114,7 @@ test('plain requires an explicit opt-in and a positive disk encryption check', (
     assert.equal(db.prepare('PRAGMA temp_store').get().temp_store, 2);
     assert.equal(db.prepare('PRAGMA secure_delete').get().secure_delete, 1);
     initializeSchema(db);
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 1);
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 2);
   } finally {
     db.close();
   }

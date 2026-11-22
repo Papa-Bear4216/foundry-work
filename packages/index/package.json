@@ -9,10 +9,14 @@
   "scripts": {
     "build": "npm --prefix ../vault/codec run build && tsc -p tsconfig.json",
     "typecheck": "npm --prefix ../vault/codec run build && tsc -p tsconfig.json --noEmit",
-    "test": "node --test --test-concurrency=1 test/driver.test.mjs test/projection.test.mjs",
+    "test": "npm --prefix ../importers run build && node --test --test-concurrency=1 test/driver.test.mjs test/projection.test.mjs test/item-keys.test.mjs",
     "budgets": "node test/budgets.mjs"
   },
   "dependencies": {
-    "better-sqlite3-multiple-ciphers": "13.2.0"
+    "better-sqlite3-multiple-ciphers": "13.2.0",
+    "vault": "0.0.0"
+  },
+  "devDependencies": {
+    "importers": "0.0.0"
   }
 }

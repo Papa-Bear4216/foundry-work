@@ -17,6 +17,7 @@ import type {
   Importer,
   ImportResult,
   ItemErrorInfo,
+  ItemKeyLookup,
   SensitivityTier,
   SourceImportCounts,
   UnlockedKeyringLike,
@@ -67,6 +68,13 @@ export interface ImportArchiveOptions {
   unlocked: UnlockedKeyringLike;
   /** V-3 `readVaultRecord` function used to scan persisted `events-*.fvr` streams. */
   readVaultRecord: ReadVaultRecordFn;
+  /**
+   * Durable lookup of item keys already in the vault (for example `openItemKeyLookup` from the index
+   * package). When given, the vault is never scanned and no structure grows with the vault; keys are
+   * added only after their batch is durably appended. When absent, every key in the vault is loaded
+   * into an in-memory set: for tests and small vaults only, because it grows with the vault.
+   */
+  itemKeys?: ItemKeyLookup;
   /** Profile name stamped on imported events (defaults to `me`, per A-36). */
   profile?: string;
   /** Override sensitivity resolution per source/item (defaults to A-36 fixed table). */
@@ -206,8 +214,16 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
     options.onUnrecognisedEntry?.(path);
   }
 
-  // Phase 1 (Ruling 9): Always build durable identity state from the vault.
-  let existingItemKeys = loadExistingItemKeys(options.vaultDir, options.unlocked, options.readVaultRecord);
+  // Phase 1 (Ruling 9): Identity state comes from the vault: either the caller's durable lookup
+  // (V-7, A-36 (d)) or, without one, an in-memory set scanned from the vault (grows with the vault).
+  const durableKeys = options.itemKeys;
+  let memoryKeys: Set<string> | undefined = durableKeys
+    ? undefined
+    : loadExistingItemKeys(options.vaultDir, options.unlocked, options.readVaultRecord);
+  const existingItemKeys: ItemKeyLookup = durableKeys ?? {
+    has: key => memoryKeys!.has(key),
+    add: key => { memoryKeys!.add(key); },
+  };
 
   // Cache derived collection ID keys for blobId pre-checking, zeroed in finally.
   const idKeyCache = new Map<string, Buffer>();
@@ -292,7 +308,7 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
   };
 
   const rederiveIdentityFromVault = (): void => {
-    existingItemKeys = loadExistingItemKeys(options.vaultDir, options.unlocked, options.readVaultRecord);
+    memoryKeys = loadExistingItemKeys(options.vaultDir, options.unlocked, options.readVaultRecord);
   };
 
   const flushBatch = (): void => {
@@ -301,6 +317,9 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
     pending = [];
     pendingKeys.clear();
     pendingBytes = 0;
+    // Ordering invariant (data-loss guard): keys are recorded only after every append of this batch
+    // has returned. A key recorded for an item that was never stored would hide it from later imports.
+    const stored: string[] = [];
 
     try {
       // Product 6.3 rule 1: Store original bytes first (blobs), then append item events.
@@ -334,11 +353,12 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
           options.writer.appendBatch([
             { type: 'event', keyId: item.keyId, event: buildEvent(item) },
           ]);
-          existingItemKeys.add(item.itemKey);
+          stored.push(item.itemKey);
           counts.itemsImported++;
           totalItemsImported++;
           totalEventsWritten++;
         }
+        for (const key of stored) existingItemKeys.add(key);
         const last = batch[batch.length - 1]!;
         options.checkpoint('after-batch', {
           itemIndex: last.itemIndex,
@@ -376,18 +396,22 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
             totalBytesStored += item.size;
           }
         }
-        existingItemKeys.add(item.itemKey);
+        stored.push(item.itemKey);
         counts.itemsImported++;
         totalItemsImported++;
         totalEventsWritten++;
       }
+      for (const key of stored) existingItemKeys.add(key);
     } catch (error) {
       for (const item of batch) item.plaintext.fill(0);
       // Ruling 9: After any append throws, re-derive identity state from the vault before any further write.
-      try {
-        rederiveIdentityFromVault();
-      } catch {
-        existingItemKeys.clear();
+      // A durable lookup needs no re-derivation: nothing from a failed batch was added to it.
+      if (!durableKeys) {
+        try {
+          rederiveIdentityFromVault();
+        } catch {
+          memoryKeys = new Set();
+        }
       }
       throw error;
     }
