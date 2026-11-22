@@ -37,6 +37,7 @@ export function projectGraph(db: SqlDriver): void {
       AND NOT EXISTS (SELECT 1 FROM graph_positions WHERE node_id = ?)
   `);
   const deletePosition = db.prepare('DELETE FROM graph_positions WHERE node_id = ?');
+  const clearPositions = db.prepare('DELETE FROM graph_positions');
   const hasNode = (id: string) => findNode.get(id) !== undefined;
   const hasEvidence = (id: number) => findEvidence.get(id) !== undefined;
 
@@ -89,7 +90,7 @@ export function projectGraph(db: SqlDriver): void {
         }
         case 'layout.epoch':
           epoch = integer(body.epoch, 'epoch');
-          db.exec('DELETE FROM graph_positions');
+          clearPositions.run();
           break;
         case 'layout.placed':
         case 'layout.moved': {

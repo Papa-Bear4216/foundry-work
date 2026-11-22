@@ -30,10 +30,12 @@ try {
   console.log(JSON.stringify({ corpusItems: seed.items + append.items, corpusBytes: seed.bytes + append.bytes }));
   // Both credential paths start with the same pending append and checkpointed generation.
   cpSync(recovery, passphrase, { recursive: true });
-  const measured = Object.keys(ceilings).map(phase => run(phase));
-  for (const phase of ['incremental', 'rebuild', 'search']) run(phase, 'passphrase');
-  for (const { phase, overBudget, ceilingMiB } of measured) {
-    assert.ok(!overBudget, `${phase} exceeded ${ceilingMiB} MiB peak RSS.`);
+  const measured = [
+    ...Object.keys(ceilings).map(phase => run(phase)),
+    ...['incremental', 'rebuild', 'search'].map(phase => run(phase, 'passphrase')),
+  ];
+  for (const { phase, credential, overBudget, ceilingMiB } of measured) {
+    assert.ok(!overBudget, `${credential} ${phase} exceeded ${ceilingMiB} MiB peak RSS.`);
   }
 } finally {
   for (const root of [recovery, passphrase]) {
