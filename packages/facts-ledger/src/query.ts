@@ -2,7 +2,7 @@ import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { TextDecoder, TextEncoder } from 'node:util';
-import { defaultIndexPath, openSyncedIndexForQuery } from './index-db.js';
+import { defaultIndexPath, openIndexReadOnlyStrict, openSyncedIndexForQuery } from './index-db.js';
 import { complementClause, conflictSubject, factsConflict } from './conflicts.js';
 import { compareBytewise } from './log.js';
 import {
@@ -675,12 +675,15 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
 
   let syncResult!: ReturnType<typeof openSyncedIndexForQuery>['syncResult'];
   let collected: Array<{ fact: IndexedFact; stage: QueryStage; label: QueryLabel; score?: number }> = [];
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const maxAttempts = options.readOnlyIndex ? 1 : 2;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     collected = [];
     const seenIds = new Set<string>();
     let db: DatabaseSync | undefined;
     try {
-      const opened = openSyncedIndexForQuery(options.logPath, indexPath, attempt > 0);
+      const opened = options.readOnlyIndex
+        ? openIndexReadOnlyStrict(options.logPath, indexPath)
+        : openSyncedIndexForQuery(options.logPath, indexPath, attempt > 0);
       db = opened.db;
       syncResult = opened.syncResult;
       // Stage 1: Exact metadata match (runs first whenever any metadata selector is supplied).
@@ -923,7 +926,7 @@ export async function queryFacts(options: QueryOptions): Promise<QueryResult> {
       if (error instanceof EmbedderInvocationError) {
         throw error.cause;
       }
-      if (attempt === 0) {
+      if (!options.readOnlyIndex && attempt === 0) {
         continue;
       }
       throw error;

@@ -146,7 +146,7 @@ export function streamNames(directory: string, artifacts: readonly string[]): st
 
 export function scanStreams(
   directory: string, names: string[], previous: number, scanner: StreamScanner, unlocked?: UnlockedKeyring,
-  expected?: ManifestFile[], inspect?: InspectRecord,
+  expected?: ManifestFile[], inspect?: InspectRecord, limits?: ReadonlyMap<string, number>,
 ) {
   const keyIds = new Set<string>();
   const files: ManifestFile[] = [];
@@ -158,7 +158,9 @@ export function scanStreams(
   const byName = expected && new Map(expected.map(file => [file.name, file]));
   for (const name of names) {
     const type = streamType(name);
-    const result = streamFile(join(directory, name), (fd, size) => {
+    const result = streamFile(join(directory, name), (fd, physicalSize) => {
+      const size = limits?.get(name) ?? physicalSize;
+      check(size <= physicalSize, 'FILE_SIZE');
       const wanted = byName?.get(name);
       if (wanted) check(size === wanted.bytes, 'FILE_SIZE');
       const scanned = scanner.scan(fd, size, type, record => {
@@ -190,6 +192,7 @@ export function scanStreams(
 export function scanSealed(
   directory: string, vault: VaultMetadata, scanner: StreamScanner, unlocked?: UnlockedKeyring, anchor?: VaultAnchor,
   inspect?: (segment: number, ...args: Parameters<InspectRecord>) => void,
+  verified?: (segment: number, files: ManifestFile[]) => void,
 ) {
   const root = join(directory, 'segments');
   check(statIfPresent(root)?.isDirectory(), 'INVENTORY');
@@ -224,17 +227,20 @@ export function scanSealed(
     previous = position;
     position = { segment: number, hash: sha256(bytes), lastEventSequence: result.last };
     if (anchor?.segment === number) check(anchor.manifestHash === position.hash, 'ANCHOR');
+    verified?.(number, manifest.files);
   }
   return { position, previous, erased };
 }
 
 export function scanOpen(
   directory: string, last: number, scanner: StreamScanner, unlocked?: UnlockedKeyring, recovering = false,
-  inspect?: InspectRecord,
+  inspect?: InspectRecord, limits?: ReadonlyMap<string, number>,
 ) {
-  if (!statIfPresent(directory)) return { last, files: [], totalBytes: 0, incomplete: [], erased: 0 };
-  const names = streamNames(directory, recovering ? OPEN_ARTIFACTS : []);
-  const result = scanStreams(directory, names, last, scanner, unlocked, undefined, inspect);
+  if (limits?.size === 0 || !limits && !statIfPresent(directory)) {
+    return { last, files: [], totalBytes: 0, incomplete: [], erased: 0 };
+  }
+  const names = limits ? [...limits.keys()] : streamNames(directory, recovering ? OPEN_ARTIFACTS : []);
+  const result = scanStreams(directory, names, last, scanner, unlocked, undefined, inspect, limits);
   if (!recovering) {
     check(result.incomplete.length === 0, 'LENGTH');
   } else {
@@ -243,6 +249,16 @@ export function scanOpen(
     }
   }
   return result;
+}
+
+export function checkVerifiedHead(directory: string, position: ChainPosition, previous: ChainPosition): void {
+  const head = readHead(directory);
+  if (statIfPresent(join(directory, HEAD_PENDING))) {
+    check(position.segment > 0 && headMatches(head, previous) && !statIfPresent(join(directory, 'open'))
+      && headMatches(readHead(directory, HEAD_PENDING, 'INVENTORY'), position), 'INVENTORY');
+  } else {
+    check(headMatches(head, position), 'HEAD');
+  }
 }
 
 export function makeReadOnly(directory: string): void {

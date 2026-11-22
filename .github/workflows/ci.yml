@@ -110,6 +110,8 @@ jobs:
         run: npm --prefix packages/vault/codec run budgets
       - name: Vault append, close and verification peak RSS (pinned runtime)
         run: npm --prefix packages/vault/codec run vault-budgets
+      - name: Vault replay and streamed blob peak RSS (pinned runtime)
+        run: npm --prefix packages/vault/codec run replay-budgets
 
   v0-measure:
     concurrency:
@@ -141,6 +143,32 @@ jobs:
         env:
           FOUNDRY_V0_REQUIRE_BUILT: "1"
         run: node benchmarks/v0/run-all.mjs
+
+  working-index:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          package-manager-cache: false
+      - name: Install workspace and packaged native addon
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Build working index
+        run: npm run build --workspace foundry-index
+      - name: Verify installed x64 prebuild loads on pinned Node
+        run: node packages/index/test/prebuild-check.mjs
+      - name: Working index tests (serial)
+        run: npm test --workspace foundry-index
+      - name: Working index peak RSS
+        run: npm run budgets --workspace foundry-index
 
   importers:
     strategy:

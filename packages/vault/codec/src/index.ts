@@ -16,3 +16,6 @@ export { readVaultRecord, verifyVault, verifyVaultDeep } from './vault-reader.ts
 export type { VaultRecordLocation } from './vault-reader.ts';
 export type { VaultAnchor, VerifyOptions } from './vault-directory.ts';
 export type { UnlockedKeyring } from './record-file.ts';
+export { openVaultReplay } from './vault-replay.ts';
+export type { ReplayLocation, ReplayOptions, VaultReplayItem } from './vault-replay.ts';
+export { retireIndexKey, stageIndexKey } from './index-keys.ts';

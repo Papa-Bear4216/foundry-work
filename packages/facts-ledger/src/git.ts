@@ -104,6 +104,7 @@ export function runGit(repoDir: string, args: readonly string[], input?: string)
     env: gitEnv(repoDir),
     input,
     timeout: CALL_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
     maxBuffer: OUTPUT_CAP_BYTES,
     windowsHide: true,
     shell: false,
@@ -238,6 +239,7 @@ const TEMPLATES: Readonly<Record<string, TemplateSpec>> = Object.freeze({
     run: () => {
       const r = spawnSync(process.execPath, ['--version'], {
         timeout: CALL_TIMEOUT_MS,
+        killSignal: 'SIGKILL',
         maxBuffer: OUTPUT_CAP_BYTES,
         windowsHide: true,
         shell: false,

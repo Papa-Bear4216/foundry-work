@@ -188,6 +188,44 @@ export function nextKeyringVersion(version: number): number {
   return version + 1;
 }
 
+export function updateIndexEntry(
+  bytes: Buffer, vaultId: string, credential: Unlock, keyId: string, operation: 'stage' | 'retire',
+): { next?: Buffer; key?: Buffer } {
+  hex(keyId, 16);
+  const ring = readKeyring(bytes, vaultId);
+  const { mac: _mac, ...body } = ring;
+  const master = unlockMaster(ring, credential);
+  try {
+    const existing = body.keys.find(entry => entry.key_id === keyId);
+    const slot = aad(vaultId, keyId, 'index', 'master');
+    if (operation === 'stage' && existing) {
+      check(existing.kind === 'index' && existing.state === 'active', 'KEY');
+      return { key: unwrap(master, slot, existing.wrapped) };
+    }
+    const date = new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z');
+    if (operation === 'retire') {
+      check(existing?.kind === 'index', 'KEY');
+      if (existing.state === 'destroyed') return {};
+      const retired: Entry = { key_id: keyId, kind: 'index', parent: 'master', state: 'destroyed',
+        destroyed_at: date, wrapped: null };
+      const keys = body.keys.map(entry => entry === existing ? retired : entry);
+      return { next: encodeBody({ ...body, version: nextKeyringVersion(body.version), keys }, master) };
+    }
+    const key = randomBytes(32);
+    try {
+      const staged: Entry = { key_id: keyId, kind: 'index', parent: 'master', state: 'active',
+        created_at: date, wrapped: wrap(master, randomBytes(12), slot, key) };
+      const keys = [...body.keys, staged].sort((a, b) => a.key_id < b.key_id ? -1 : 1);
+      return { next: encodeBody({ ...body, version: nextKeyringVersion(body.version), keys }, master), key };
+    } catch (error) {
+      key.fill(0);
+      throw error;
+    }
+  } finally {
+    master.fill(0);
+  }
+}
+
 export function changeKeyringPassphrase(
   bytes: Buffer, vaultId: string, current: string, replacement: string, parallelism?: KdfParallelism,
 ): Buffer {

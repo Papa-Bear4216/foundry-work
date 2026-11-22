@@ -5,7 +5,7 @@ import { diskRecord, StreamScanner, streamFile } from './record-file.ts';
 import type { UnlockedKeyring } from './record-file.ts';
 import { HEADER_BYTES } from './record.ts';
 import {
-  checkRootInventory, HEAD_PENDING, headMatches, metadata, readHead, scanOpen, scanSealed, segmentName, statIfPresent,
+  checkRootInventory, checkVerifiedHead, metadata, readHead, scanOpen, scanSealed, segmentName, statIfPresent,
   streamType,
 } from './vault-directory.ts';
 import type { VerifyOptions } from './vault-directory.ts';
@@ -24,13 +24,7 @@ function verify(directory: string, { anchor }: VerifyOptions, unlocked?: Unlocke
   const scanner = new StreamScanner();
   const { position, previous, erased } = scanSealed(directory, vault, scanner, unlocked, anchor);
   const openPath = join(directory, 'open');
-  const head = readHead(directory);
-  if (statIfPresent(join(directory, HEAD_PENDING))) {
-    check(position.segment > 0 && headMatches(head, previous) && !statIfPresent(openPath)
-      && headMatches(readHead(directory, HEAD_PENDING, 'INVENTORY'), position), 'INVENTORY');
-  } else {
-    check(headMatches(head, position), 'HEAD');
-  }
+  checkVerifiedHead(directory, position, previous);
   const open = scanOpen(openPath, position.lastEventSequence, scanner, unlocked);
   const erasedCount = erased + open.erased;
   if (erasedCount) throw new VaultFormatError('ERASED', `${erasedCount} record(s)`);
