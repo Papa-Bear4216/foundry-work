@@ -18,7 +18,22 @@ export const MAX_STORED_PROBLEMS = 20;
 
 const CITATION_RE = /\[(fact|asserted):([^\]\s]*)\]/g;
 const FACT_ID_RE = /^[0-9a-f]{12}\.\d{1,4}$/;
-const ABSTAIN_RE = /^ABSTAIN:\s*\S/;
+const ABSTAIN_RE = /^ABSTAIN:[ \t\r]*\S/;
+
+function isRealWhitespace(code: number): boolean {
+  return code === 0x20 || code === 0x09 || code === 0x0d || code === 0x0a;
+}
+
+/** Reject U+0000-U+001F (except tab/CR/LF) and U+007F anywhere on a line before scoring. */
+function hasDisallowedControlChar(text: string, start: number, end: number): boolean {
+  for (let i = start; i < end; i++) {
+    const code = text.charCodeAt(i);
+    if ((code < 0x20 && code !== 0x09 && code !== 0x0d && code !== 0x0a) || code === 0x7f) {
+      return true;
+    }
+  }
+  return false;
+}
 
 export interface AnswerProblem {
   readonly line: number;
@@ -102,6 +117,7 @@ export function createAnswerScanner(
   const pending: PendingCitation[] = [];
   let statements = 0;
   let abstentions = 0;
+  let hasNonBlankLine = false;
   let lineNo = 0;
   let started = false;
   let carry = '';
@@ -166,15 +182,24 @@ export function createAnswerScanner(
   };
 
   const processSpan = (text: string, start: number, end: number, nextBracket: number): number => {
+    if (hasDisallowedControlChar(text, start, end)) {
+      hasNonBlankLine = true;
+      let s = start;
+      while (s < end && isRealWhitespace(text.charCodeAt(s))) s++;
+      const kind = text.startsWith('ABSTAIN:', s) ? 'abstain' : 'statement';
+      recordProblem(lineNo, 'line contains disallowed control character');
+      onNonBlankLine?.(lineNo, kind, false);
+      return nextBracket;
+    }
     let s = start;
-    let e = end > start && text.charCodeAt(end - 1) === 13 ? end - 1 : end;
-    while (s < e && text.charCodeAt(s) <= 32) s++;
-    while (e > s && text.charCodeAt(e - 1) <= 32) e--;
+    let e = end;
+    while (s < e && isRealWhitespace(text.charCodeAt(s))) s++;
+    while (e > s && isRealWhitespace(text.charCodeAt(e - 1))) e--;
     if (s === e) return nextBracket;
+    hasNonBlankLine = true;
 
     // Fast path for non-ABSTAIN lines without '[' (O(1) amortized, avoids slicing up to 131k short lines).
-    const hasNonAsciiEdge = text.charCodeAt(s) > 127 || text.charCodeAt(e - 1) > 127;
-    if (!hasNonAsciiEdge && !text.startsWith('ABSTAIN:', s)) {
+    if (!text.startsWith('ABSTAIN:', s)) {
       let nb = nextBracket;
       if (nb === -2 || (nb !== -1 && nb < s)) {
         nb = text.indexOf('[', s);
@@ -188,8 +213,7 @@ export function createAnswerScanner(
       nextBracket = nb;
     }
 
-    const line = hasNonAsciiEdge ? text.slice(s, e).trim() : text.slice(s, e);
-    processSlowLine(line);
+    processSlowLine(text.slice(s, e));
     return nextBracket;
   };
 
@@ -284,7 +308,7 @@ export function createAnswerScanner(
         recordProblem(p.line, `${p.kind}:${p.id}: ${problem}`);
       }
     }
-    if (statements === 0 && abstentions === 0) recordProblem(0, 'answer is empty');
+    if (statements === 0 && abstentions === 0 && !hasNonBlankLine) recordProblem(0, 'answer is empty');
     problems.sort(compareProblems);
     return {
       ok: problemCount === 0,

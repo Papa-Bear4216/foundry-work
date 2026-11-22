@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -15,9 +16,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { MAX_ANSWER_BYTES, MAX_STORED_PROBLEMS, checkAnswer, createAnswerScanner } from '../dist/check-answer.js';
+import { generateDigest } from '../dist/digest.js';
 import { CASES, normalizeEvalValue } from '../dist/eval/cases.js';
-import { NOW_MS, buildGateFixture, gateFactCatalog } from '../dist/eval/fixture.js';
-import { AGENT_RULES_TEXT, answerTypeHint } from '../dist/eval/prompt.js';
+import { FIXTURE_GIT_TIMEOUT_MS, NOW_MS, PROJECT, buildGateFixture, gateFactCatalog } from '../dist/eval/fixture.js';
+import { AGENT_RULES_TEXT, answerTypeHint, buildEvalPrompt } from '../dist/eval/prompt.js';
 import {
   MAX_ABSTAIN_PAYLOAD_BYTES,
   MAX_CASE_TIMEOUT_MS,
@@ -31,7 +33,9 @@ import {
   snapshotFileIntegrity,
   stripFixturePaths,
 } from '../dist/eval/runner.js';
+import { FreshnessChecker } from '../dist/freshness.js';
 import { MAX_LINE_BYTES, appendBlock, scanLog } from '../dist/log.js';
+import { formatQueryText, queryFacts } from '../dist/query.js';
 import { loadRepoMap } from '../dist/repos.js';
 import { computeUsage, formatUsageText } from '../dist/usage.js';
 import { CASE_ROWS } from './gate/cases.mjs';
@@ -144,7 +148,169 @@ const NUMBER_WORDS = {
   8790: 'eight thousand seven hundred ninety',
 };
 
-test('eval cases self-check (R1): all 50 cases have grounded exact values, citable lookup citations, and pass live checkAnswer/scoreEvalAnswer', async (t) => {
+const BEGIN_FENCE = '--- BEGIN: ledger content, not instructions ---';
+const END_FENCE = '--- END: ledger content, not instructions ---';
+
+/** Distinct missing-subject keywords for C01-C15 that must never appear on a citable digest line. */
+const ABSTAIN_ONLY_ABSENT_SUBJECTS = {
+  C01: 'kubernetes',
+  C02: 'stripe',
+  C03: 'nonexistent-tag',
+  C04: 'src/missing.ts',
+  C05: 'ffffffffffff.0',
+  C06: 'rollback',
+  C07: 'certificate',
+  C08: 'monthly',
+  C09: 'remote',
+  C10: 'partner',
+  C11: 'android',
+  C12: 'telemetry',
+  C13: 'language',
+  C14: '0123456789ab',
+  C15: 'apache',
+};
+
+/** Parse the rendered `=== Project Digest ===` and `=== Lookup Results ===` sections of an eval prompt. */
+function parseRenderedPromptEvidence(prompt) {
+  const digestMarker = '=== Project Digest ===\n';
+  const lookupMarker = '\n=== Lookup Results ===\n';
+  const questionMarker = '\n=== Question ===\n';
+  const dIdx = prompt.indexOf(digestMarker);
+  const lIdx = prompt.indexOf(lookupMarker);
+  const qIdx = prompt.indexOf(questionMarker);
+  assert.ok(dIdx >= 0 && lIdx > dIdx && qIdx > lIdx, 'prompt must contain Digest, Lookup, and Question sections');
+
+  const digestText = prompt.slice(dIdx + digestMarker.length, lIdx);
+  const lookupText = prompt.slice(lIdx + lookupMarker.length, qIdx);
+
+  const digestFacts = new Map();
+  for (const line of digestText.split('\n')) {
+    const m = /^([VA]) (.+) \(([0-9a-f]{12}\.\d{1,4})\)$/.exec(line);
+    if (m) {
+      digestFacts.set(m[3], {
+        as: m[1] === 'V' ? 'fact' : 'asserted',
+        claim: m[2],
+      });
+    }
+  }
+
+  const lookupRows = [];
+  const lookupLines = lookupText.split('\n');
+  const beginIdx = lookupLines.indexOf(BEGIN_FENCE);
+  const endIdx = lookupLines.indexOf(END_FENCE);
+  if (beginIdx >= 0 && endIdx > beginIdx) {
+    let cur = null;
+    for (let i = beginIdx + 1; i < endIdx; i++) {
+      const line = lookupLines[i];
+      const hdr = /^\[([A-Z]+)\] \[(match|related)\/([a-z]+)\] \[(supported|moved|stale|expired|unverifiable)\] \(([0-9a-f]{12}\.\d{1,4})\) (.*)$/.exec(line);
+      if (hdr) {
+        if (cur) lookupRows.push(cur);
+        cur = {
+          badge: hdr[1],
+          label: hdr[2],
+          stage: hdr[3],
+          freshness: hdr[4],
+          id: hdr[5],
+          claim: hdr[6],
+          note: null,
+          rule: null,
+        };
+      } else if (cur && line.startsWith('  note: ')) {
+        cur.note = line.slice('  note: '.length);
+      } else if (cur && line.startsWith('  rule: ')) {
+        cur.rule = line.slice('  rule: '.length);
+      }
+    }
+    if (cur) lookupRows.push(cur);
+  }
+
+  return { digestText, lookupText, digestFacts, lookupRows };
+}
+
+function isLookupRowCitableAs(row, asPrefix) {
+  if (row.label !== 'match') return false;
+  if (row.freshness !== 'supported' && row.freshness !== 'moved') return false;
+  if (asPrefix === 'fact') {
+    return row.badge === 'VERIFIED' && row.rule === 'May be cited as fact.';
+  }
+  return (
+    row.badge === 'ASSERTED' &&
+    typeof row.rule === 'string' &&
+    row.rule.startsWith('May be cited only with the word "asserted"')
+  );
+}
+
+/**
+ * Validate rendered prompt evidence for one eval case (R1 + R3):
+ * - Every accepted citation must appear in rendered lookup evidence AND be marked citable there
+ *   with the matching prefix/rule (not RELATED / STALE / EXPIRED / etc.), and ground its values.
+ * - Every abstain-only case must have zero citable lookup rows and no citable answer in the digest.
+ */
+function validateRenderedPromptEvidence(evalCase, prompt) {
+  const problems = [];
+  const { digestFacts, lookupRows } = parseRenderedPromptEvidence(prompt);
+  const accept = evalCase.expect.accept ?? [];
+
+  if (accept.length > 0) {
+    for (const opt of accept) {
+      const matchingRows = lookupRows.filter((r) => r.id === opt.id);
+      const citableRow = matchingRows.find((r) => isLookupRowCitableAs(r, opt.as));
+      if (!citableRow) {
+        const seen = matchingRows.map((r) => `${r.badge}/${r.label} (rule: ${r.rule})`).join(', ') || 'absent';
+        problems.push(
+          `${evalCase.id}: accepted citation [${opt.as}:${opt.id}] is not marked citable in rendered Lookup Results (saw: ${seen})`,
+        );
+        continue;
+      }
+      const renderedText = (citableRow.note ? `${citableRow.claim} ${citableRow.note}` : citableRow.claim)
+        .normalize('NFKC')
+        .toLowerCase();
+      if (evalCase.id === 'B10' && !renderedText.includes('takeout')) {
+        problems.push(`${evalCase.id}: citable lookup row for ${opt.id} does not support "Takeout" detail`);
+      }
+      for (const v of opt.values) {
+        if (evalCase.answerType === 'word') {
+          if (!new RegExp(`\\b${escapeRegExp(v)}\\b`, 'i').test(renderedText)) {
+            problems.push(`${evalCase.id}: word "${v}" not grounded in citable lookup text for ${opt.id}`);
+          }
+        } else if (evalCase.answerType === 'number') {
+          const num = parseIntegerValue(v);
+          const digitOk = num !== null && new RegExp(`\\b${num}\\b`).test(renderedText);
+          const wordForm = num !== null ? NUMBER_WORDS[num] : undefined;
+          const wordOk = wordForm ? new RegExp(`\\b${escapeRegExp(wordForm)}\\b`, 'i').test(renderedText) : false;
+          if (!digitOk && !wordOk) {
+            problems.push(`${evalCase.id}: number "${v}" not grounded in citable lookup text for ${opt.id}`);
+          }
+        }
+      }
+    }
+  } else {
+    // Abstain-only case: must have zero citable lookup rows and no citable digest answer.
+    const citableLookupRows = lookupRows.filter(
+      (r) => isLookupRowCitableAs(r, 'fact') || isLookupRowCitableAs(r, 'asserted'),
+    );
+    if (citableLookupRows.length > 0) {
+      problems.push(
+        `${evalCase.id}: abstain-only case has citable lookup row(s): ${citableLookupRows.map((r) => r.id).join(', ')}`,
+      );
+    }
+    if (evalCase.target && digestFacts.has(evalCase.target)) {
+      problems.push(`${evalCase.id}: abstain-only target ${evalCase.target} appears as citable in digest`);
+    }
+    const absentTerm = ABSTAIN_ONLY_ABSENT_SUBJECTS[evalCase.id];
+    if (absentTerm) {
+      for (const [id, df] of digestFacts) {
+        if (df.claim.toLowerCase().includes(absentTerm)) {
+          problems.push(`${evalCase.id}: abstain-only subject "${absentTerm}" appears in citable digest fact ${id}`);
+        }
+      }
+    }
+  }
+
+  return problems;
+}
+
+test('eval cases self-check (R1 + R3): all 50 cases have grounded exact values, citable rendered prompt evidence, and pass live checkAnswer/scoreEvalAnswer', async (t) => {
   assert.equal(CASES.length, 50);
   const catalog = gateFactCatalog();
   const seenQuestions = new Set();
@@ -153,6 +319,8 @@ test('eval cases self-check (R1): all 50 cases have grounded exact values, citab
   t.after(() => rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5 }));
   const fx = buildGateFixture(tempRoot);
   const repos = loadRepoMap(fx.reposPath);
+  const dryRun = await runEvalDryRun();
+  const promptById = new Map(dryRun.cases.map((item) => [item.id, item.prompt]));
 
   for (const c of CASES) {
     assert.equal(typeof c.question, 'string');
@@ -161,8 +329,13 @@ test('eval cases self-check (R1): all 50 cases have grounded exact values, citab
     seenQuestions.add(c.question);
     assert.ok(['number', 'word', 'yes-no'].includes(c.answerType), `${c.id} has valid answerType`);
 
+    const renderedPrompt = promptById.get(c.id);
+    assert.ok(renderedPrompt, `${c.id} must have a rendered prompt`);
+    const promptProblems = validateRenderedPromptEvidence(c, renderedPrompt);
+    assert.deepEqual(promptProblems, [], `${c.id} rendered prompt evidence check failed`);
+
     const lookupIds = new Set((CASE_ROWS[c.id] ?? []).map(([id]) => id));
-    const maxSensRank = SENSITIVITY_RANK[c.query.maxSensitivity ?? 'personal'];
+    const maxSensRank = SENSITIVITY_RANK[(c.evalQuery ?? c.query).maxSensitivity ?? 'personal'];
 
     if (c.group === 'A' || c.group === 'B') {
       assert.equal(c.expect.abstain, undefined, `${c.id} must not allow abstain`);
@@ -225,7 +398,7 @@ test('eval cases self-check (R1): all 50 cases have grounded exact values, citab
           indexPath: fx.indexPath,
           repos,
           nowMs: NOW_MS,
-          ...(c.query.maxSensitivity ? { maxSensitivity: c.query.maxSensitivity } : {}),
+          ...((c.evalQuery ?? c.query).maxSensitivity ? { maxSensitivity: (c.evalQuery ?? c.query).maxSensitivity } : {}),
         });
         assert.equal(checked.ok, true, `${c.id} live checkAnswer failed for "${answerLine.trim()}"`);
         const scored = scoreEvalAnswer(c, answerLine, checked);
@@ -235,8 +408,12 @@ test('eval cases self-check (R1): all 50 cases have grounded exact values, citab
     }
   }
 
-  // Verify specific R1 case rulings.
+  // Verify specific R1 and Round 4 case rulings.
   const byId = new Map(CASES.map((c) => [c.id, c]));
+  for (const id of ['A02', 'A15', 'B02']) {
+    assert.ok(byId.get(id).expect.accept[0].values.includes('8,790'), `${id} must accept comma-formatted 8,790`);
+  }
+  assert.match(byId.get('B03').question, /ordinal/i, 'B03 question must ask unambiguously for an ordinal step');
   assert.equal(byId.get('C09').expect.accept, undefined, 'C09 must be abstain-only (no relationship rebuttals)');
   assert.deepEqual(
     byId.get('E01').expect.accept.map((o) => [o.id, o.as, [...o.values]]),
@@ -250,6 +427,51 @@ test('eval cases self-check (R1): all 50 cases have grounded exact values, citab
     byId.get('E04').expect.accept.map((o) => [o.id, o.as, [...o.values]]),
     [['a30000000003.2', 'asserted', ['yes']]],
   );
+});
+
+test('facts eval (R3/B10): rendered-prompt validator fails on legacy RELATED-only B10 prompt and passes on eval B10 prompt', async (t) => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'facts-eval-b10-check-'));
+  t.after(() => rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5 }));
+
+  const fx = buildGateFixture(tempRoot);
+  const repos = loadRepoMap(fx.reposPath);
+  const checker = new FreshnessChecker({ repos });
+  const digestText = generateDigest({
+    logPath: fx.logPath,
+    indexPath: fx.indexPath,
+    project: PROJECT,
+    repos,
+    nowMs: NOW_MS,
+    write: false,
+  }).text;
+
+  const b10 = CASES.find((c) => c.id === 'B10');
+  assert.ok(b10);
+
+  // Build today's legacy B10 prompt using the gate's partial `c.query` (which yields RELATED / citable=false).
+  const legacyResult = await queryFacts({
+    logPath: fx.logPath,
+    indexPath: fx.indexPath,
+    ...b10.query,
+    nowMs: NOW_MS,
+    freshnessResolver: checker.resolver(),
+    freshnessPrefetch: checker.prefetcher(),
+  });
+  const legacyPrompt = buildEvalPrompt(b10, digestText, formatQueryText(legacyResult));
+  const legacyProblems = validateRenderedPromptEvidence(b10, legacyPrompt);
+  assert.ok(
+    legacyProblems.length > 0 && legacyProblems.some((p) => /not marked citable.*RELATED/.test(p)),
+    `expected legacy B10 prompt to fail citability check, got: ${JSON.stringify(legacyProblems)}`,
+  );
+  // Confirm the digest line for a10000000001.6 alone does not contain "Takeout" either.
+  const { digestFacts } = parseRenderedPromptEvidence(legacyPrompt);
+  assert.equal(digestFacts.get('a10000000001.6')?.claim.toLowerCase().includes('takeout'), false);
+
+  // Now verify the actual eval B10 prompt (using `evalQuery`) passes with a citable VERIFIED row containing Takeout.
+  const evalDry = await runEvalDryRun(['B10']);
+  assert.deepEqual(validateRenderedPromptEvidence(b10, evalDry.cases[0].prompt), []);
+  assert.match(evalDry.cases[0].prompt, /\[VERIFIED\] \[match\/lexical\] \[supported\] \(a10000000001\.6\)/);
+  assert.match(evalDry.cases[0].prompt, /note: A Takeout importer module exists\./);
 });
 
 test('facts eval --dry-run (R1/F2/F6): deterministic prompts require single-line ANSWER/ABSTAIN, state value type, and omit case IDs/fixture paths', async () => {
@@ -1606,4 +1828,261 @@ test('facts usage works seamlessly on blocks written by appendBlock and facts ev
   const res = runCli(['usage', '--log', logPath]);
   assert.equal(res.status, 0, res.stderr);
   assert.match(res.stdout, /agent=agent-1 task=coding blocks=1 input=400 output=100 total=500 models=m1/);
+});
+
+test('facts eval (R4-r3 comma & B03): A02/A15/B02 accept 8,790 and rephrased B03 accepts first', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'facts-eval-r4-comma-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
+
+  const answersPath = join(dir, 'answers.json');
+  writeFileSync(
+    answersPath,
+    JSON.stringify(
+      buildQuestionAnswerMap({
+        A02: 'ANSWER: 8,790 [fact:a10000000001.1]\n',
+        A15: 'ANSWER: 8,790. [fact:a10000000001.1]\n',
+        B02: 'ANSWER: 8,790 [fact:a10000000001.1]\n',
+        B03: 'ANSWER: first [asserted:a10000000001.7]\n',
+      }),
+    ),
+    'utf8',
+  );
+  const modelScript = writeFakeModel(dir, 'model.mjs', QUESTION_HASH_MODEL_BODY);
+  const res = await runEval({
+    modelCmd: process.execPath,
+    modelArgs: [modelScript, answersPath],
+    modelName: 'comma-port-model',
+    caseIds: ['A02', 'A15', 'B02', 'B03'],
+    logPath: join(dir, 'ledger.jsonl'),
+    project: 'foundry',
+    agent: 'eval-tester',
+  });
+  assert.equal(res.counts.correct, 4);
+  assert.equal(res.unsupported_claims, 0);
+});
+
+test('facts check-answer & eval (R4-r3 control chars): trims only real whitespace and rejects NUL and other control characters before scoring', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'facts-eval-ctrl-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
+
+  const fx = buildGateFixture(dir);
+  const repos = loadRepoMap(fx.reposPath);
+  const opts = { logPath: fx.logPath, indexPath: fx.indexPath, repos, nowMs: NOW_MS };
+
+  // Real whitespace (space, tab, CR, LF) is trimmed cleanly and accepted.
+  const okWhitespace = await checkAnswer(' \t ANSWER: 7 [fact:a10000000001.0]\t \r\n\t \r\n', opts);
+  assert.equal(okWhitespace.ok, true);
+  assert.equal(okWhitespace.statements, 1);
+
+  const okAbstainWs = await checkAnswer('\t ABSTAIN: not recorded.\t \r\n', opts);
+  assert.equal(okAbstainWs.ok, true);
+  assert.equal(okAbstainWs.abstentions, 1);
+
+  // A01 correct answer + newline + NUL (and trailing NUL on same line) must be rejected.
+  const badCases = [
+    'ANSWER: 7 [fact:a10000000001.0]\n\x00',
+    'ANSWER: 7 [fact:a10000000001.0]\x00\n',
+    '\x01ANSWER: 7 [fact:a10000000001.0]\n',
+    'ANSWER: 7\x0b [fact:a10000000001.0]\n',
+    'ANSWER: 7 [fact:a10000000001.0]\x7f\n',
+    'ABSTAIN: not known\x00\n',
+    'ABSTAIN: not known\x07\n',
+    'ABSTAIN: not known\x0b\n',
+    'ABSTAIN: not known\x0c\n',
+    'ABSTAIN: not known\x7f\n',
+    '\x00',
+  ];
+  for (const sample of badCases) {
+    const res = await checkAnswer(sample, opts);
+    assert.equal(res.ok, false, `expected control-char sample ${JSON.stringify(sample)} to be rejected`);
+    assert.ok(
+      res.problems.some((p) => p.problem.includes('disallowed control character')),
+      `expected disallowed control character problem for ${JSON.stringify(sample)}, got ${JSON.stringify(res.problems)}`,
+    );
+  }
+
+  // End-to-end eval check: A01 correct answer + newline + NUL and ABSTAIN + NUL both score unsupported.
+  const ctrlAnswersPath = join(dir, 'ctrl-answers.json');
+  writeFileSync(
+    ctrlAnswersPath,
+    JSON.stringify(
+      buildQuestionAnswerMap({
+        A01: 'ANSWER: 7 [fact:a10000000001.0]\n\x00',
+        C01: 'ABSTAIN: nothing here.\x00\n',
+      }),
+    ),
+    'utf8',
+  );
+  const modelScript = writeFakeModel(dir, 'ctrl-model.mjs', QUESTION_HASH_MODEL_BODY);
+  const evalRes = await runEval({
+    modelCmd: process.execPath,
+    modelArgs: [modelScript, ctrlAnswersPath],
+    modelName: 'ctrl-model',
+    caseIds: ['A01', 'C01'],
+    logPath: join(dir, 'eval-ledger.jsonl'),
+    project: 'foundry',
+    agent: 'eval-tester',
+  });
+  assert.equal(evalRes.counts.unsupported, 2);
+  assert.equal(evalRes.counts.correct, 0);
+  assert.equal(evalRes.counts.abstained_correctly, 0);
+  assert.equal(evalRes.unsupported_claims, 2);
+});
+
+test('facts eval (R5-r3 index/WAL immutability): modifying fixture index or WAL during the query window invalidates the run instead of re-baselining', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'facts-eval-r5-idx-'));
+  const sandboxTmp = join(dir, 'sandbox-tmp');
+  mkdirSync(sandboxTmp, { recursive: true });
+  const prevTmp = { TMP: process.env.TMP, TEMP: process.env.TEMP, TMPDIR: process.env.TMPDIR };
+  process.env.TMP = sandboxTmp;
+  process.env.TEMP = sandboxTmp;
+  process.env.TMPDIR = sandboxTmp;
+  t.after(() => {
+    for (const [k, v] of Object.entries(prevTmp)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+  });
+
+  // Helper waits for goFile, then modifies either `ledger.index.sqlite` or `ledger.index.sqlite-wal`
+  // inside the active temp fixture directory and writes doneFile.
+  const helperScript = writeFakeModel(
+    dir,
+    'query-window-helper.mjs',
+    [
+      "import { appendFileSync, existsSync, readdirSync, writeFileSync } from 'node:fs';",
+      "import { join } from 'node:path';",
+      'const [tmp, targetName, goPath, donePath] = process.argv.slice(2);',
+      'const deadline = Date.now() + 10000;',
+      'const tick = () => {',
+      '  if (existsSync(goPath)) {',
+      '    const fxDir = readdirSync(tmp).find((n) => n.startsWith("facts-eval-") && !n.startsWith("facts-eval-cwd-"));',
+      '    if (fxDir) appendFileSync(join(tmp, fxDir, targetName), "tampered-during-query\\n");',
+      '    writeFileSync(donePath, "done\\n");',
+      '    process.exit(0);',
+      '  }',
+      '  if (Date.now() > deadline) process.exit(1);',
+      '  setTimeout(tick, 10);',
+      '};',
+      'tick();',
+    ].join('\n'),
+  );
+
+  for (const [label, targetName, expectedPattern] of [
+    ['index', 'ledger.index.sqlite', /Fixture integrity check failed during case A02 query.*fixture index changed/],
+    ['wal', 'ledger.index.sqlite-wal', /Fixture integrity check failed during case A02 query.*fixture index WAL changed/],
+  ]) {
+    const goFile = join(dir, `go-${label}`);
+    const doneFile = join(dir, `done-${label}`);
+    const countFile = join(dir, `count-${label}.txt`);
+    const logPath = join(dir, `ledger-${label}.jsonl`);
+    const spawnerModel = writeFakeModel(
+      dir,
+      `spawner-${label}.mjs`,
+      [
+        "import { spawn } from 'node:child_process';",
+        "import { appendFileSync, readFileSync } from 'node:fs';",
+        'readFileSync(0, "utf8");',
+        'const [helper, tmp, target, goPath, donePath, countPath] = process.argv.slice(2);',
+        'appendFileSync(countPath, "1\\n");',
+        'const child = spawn(process.execPath, [helper, tmp, target, goPath, donePath], { detached: true, stdio: "ignore", windowsHide: true });',
+        'child.unref();',
+        'process.stdout.write("ANSWER: 7 [fact:a10000000001.0]\\n");',
+      ].join('\n'),
+    );
+
+    await assert.rejects(
+      runEval({
+        modelCmd: process.execPath,
+        modelArgs: [spawnerModel, helperScript, sandboxTmp, targetName, goFile, doneFile, countFile],
+        modelName: `query-window-${label}`,
+        logPath,
+        project: 'foundry',
+        agent: 'eval-tester',
+        onAfterQuery: async (caseId) => {
+          if (caseId === 'A02') {
+            writeFileSync(goFile, 'go\n');
+            const deadline = Date.now() + 5000;
+            while (!existsSync(doneFile) && Date.now() < deadline) {
+              await new Promise((r) => setTimeout(r, 10));
+            }
+            assert.equal(existsSync(doneFile), true, `query-window helper (${label}) must finish before afterQuery`);
+          }
+        },
+      }),
+      expectedPattern,
+    );
+
+    assert.equal(readFileSync(countFile, 'utf8').trim().split('\n').length, 1, `case A02 must never invoke model (${label})`);
+    assert.equal(existsSync(logPath), false, `must not append block after query-window ${label} tamper`);
+  }
+});
+
+test('facts eval (R6-r3 POSIX): SIGTERM-ignoring git wrapper is killed with SIGKILL within timeout for snapshots and fixture creation', {
+  skip: process.platform === 'win32' && 'POSIX SIGTERM-ignoring git wrapper test skipped on Windows',
+}, (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'facts-eval-r6-sigkill-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
+
+  assert.ok(FIXTURE_GIT_TIMEOUT_MS > 0);
+  const fx = buildGateFixture(join(dir, 'seed'));
+
+  // POSIX git wrapper that replaces its shell process with node ignoring SIGTERM for 30s.
+  const wrapperPath = join(dir, 'git-ignore-sigterm.sh');
+  const escapedNode = process.execPath.replace(/'/g, "'\\''");
+  writeFileSync(
+    wrapperPath,
+    `#!/bin/sh\nexec '${escapedNode}' -e "process.on('SIGTERM', () => {}); setTimeout(() => {}, 30000);"\n`,
+    'utf8',
+  );
+  chmodSync(wrapperPath, 0o755);
+
+  const runnerUrl = new URL('../dist/eval/runner.js', import.meta.url).href;
+  const fixtureUrl = new URL('../dist/eval/fixture.js', import.meta.url).href;
+
+  // 1) Snapshot git command must kill the SIGTERM-ignoring wrapper via SIGKILL well before 30s.
+  const snapStart = Date.now();
+  const snapRes = spawnSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `import { gitSnapshotCommand } from ${JSON.stringify(runnerUrl)};
+try { gitSnapshotCommand(${JSON.stringify(fx.repoDir)}, ['rev-parse', 'HEAD'], 250); process.exit(2); }
+catch (err) { console.log(err.message); }`,
+    ],
+    {
+      env: { ...process.env, FACTS_LEDGER_GIT: wrapperPath },
+      encoding: 'utf8',
+      timeout: 10_000,
+    },
+  );
+  const snapElapsed = Date.now() - snapStart;
+  assert.equal(snapRes.status, 0, snapRes.stderr);
+  assert.match(snapRes.stdout, /timed out/);
+  assert.ok(snapElapsed < 5_000, `expected snapshot git SIGKILL within 5s, took ${snapElapsed} ms`);
+
+  // 2) Fixture creation git calls must also kill the SIGTERM-ignoring wrapper via SIGKILL well before 30s.
+  const fxTargetDir = join(dir, 'timeout-fx');
+  const fxStart = Date.now();
+  const fxRes = spawnSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `import { buildGateFixture } from ${JSON.stringify(fixtureUrl)};
+try { buildGateFixture(${JSON.stringify(fxTargetDir)}, { gitTimeoutMs: 250 }); process.exit(2); }
+catch (err) { console.log(err.message); }`,
+    ],
+    {
+      env: { ...process.env, FACTS_LEDGER_GIT: wrapperPath },
+      encoding: 'utf8',
+      timeout: 10_000,
+    },
+  );
+  const fxElapsed = Date.now() - fxStart;
+  assert.equal(fxRes.status, 0, fxRes.stderr);
+  assert.match(fxRes.stdout, /timed out/);
+  assert.ok(fxElapsed < 5_000, `expected fixture git SIGKILL within 5s, took ${fxElapsed} ms`);
 });

@@ -32,6 +32,7 @@ import {
 import { generateDigest } from '../digest.js';
 import { FreshnessChecker } from '../freshness.js';
 import { resolveGitExecutable } from '../git.js';
+import { rebuildIndex } from '../index-db.js';
 import { appendBlock, type ExpectedLogPrecondition } from '../log.js';
 import { formatQueryText, queryFacts, sanitizeInlineText } from '../query.js';
 import { loadRepoMap } from '../repos.js';
@@ -117,6 +118,8 @@ export interface EvalOptions {
   readonly logPath: string;
   readonly project: string;
   readonly agent: string;
+  /** Optional hook firing after prompt/query build and before the post-query integrity check. */
+  readonly onAfterQuery?: (caseId: string) => void | Promise<void>;
   /** Optional per-case completion hook (fires after scoring a case, before the next case). */
   readonly onCaseComplete?: (result: EvalCaseResult) => void | Promise<void>;
 }
@@ -352,6 +355,7 @@ export function gitSnapshotCommand(
       windowsHide: true,
       shell: false,
       timeout: timeoutMs,
+      killSignal: 'SIGKILL',
     },
   );
   if (r.error) {
@@ -385,25 +389,17 @@ function snapshotFixtureIntegrity(fx: GateFixture): FixtureIntegritySnapshot {
   };
 }
 
-function diffImmutableFixtureIntegrity(
+function diffFixtureIntegrity(
   before: FixtureIntegritySnapshot,
   after: FixtureIntegritySnapshot,
 ): string[] {
   const diffs: string[] = [];
   if (!sameFileIntegrity(before.ledger, after.ledger)) diffs.push('fixture ledger changed');
+  if (!sameFileIntegrity(before.index, after.index)) diffs.push('fixture index changed');
+  if (!sameFileIntegrity(before.indexWal, after.indexWal)) diffs.push('fixture index WAL changed');
   if (!sameFileIntegrity(before.repos, after.repos)) diffs.push('fixture repos.json changed');
   if (before.gitHead !== after.gitHead) diffs.push('fixture git HEAD changed');
   if (before.gitStatus !== after.gitStatus) diffs.push('fixture git working tree changed');
-  return diffs;
-}
-
-function diffFixtureIntegrity(
-  before: FixtureIntegritySnapshot,
-  after: FixtureIntegritySnapshot,
-): string[] {
-  const diffs = diffImmutableFixtureIntegrity(before, after);
-  if (!sameFileIntegrity(before.index, after.index)) diffs.push('fixture index changed');
-  if (!sameFileIntegrity(before.indexWal, after.indexWal)) diffs.push('fixture index WAL changed');
   return diffs;
 }
 
@@ -757,7 +753,7 @@ function createEvalAnswerScorer(evalCase: EvalCase): EvalStreamingScorer {
 
     if (nonBlankLines === 1) {
       if (kind === 'abstain') {
-        const payload = (line ?? '').slice('ABSTAIN:'.length).trim();
+        const payload = (line ?? '').slice('ABSTAIN:'.length).replace(/^[ \t\r]+|[ \t\r]+$/g, '');
         firstLine = {
           kind: 'abstain',
           lineNo,
@@ -970,6 +966,7 @@ export async function runEvalDryRun(caseIds?: readonly string[]): Promise<EvalDr
   const tempRoot = mkdtempSync(join(tmpdir(), 'facts-eval-'));
   try {
     const fx = buildGateFixture(tempRoot);
+    rebuildIndex(fx.logPath, fx.indexPath);
     const fixturePaths = [tempRoot, fx.repoDir, fx.logPath, fx.indexPath, fx.reposPath];
     const repos = loadRepoMap(fx.reposPath);
     const checker = new FreshnessChecker({ repos });
@@ -994,7 +991,8 @@ export async function runEvalDryRun(caseIds?: readonly string[]): Promise<EvalDr
 
     const out: EvalDryRunCase[] = [];
     for (const c of cases) {
-      const { text, ...rest } = c.query;
+      const evalQuery = c.evalQuery ?? c.query;
+      const { text, ...rest } = evalQuery;
       const queryResult = await queryFacts({
         logPath: fx.logPath,
         indexPath: fx.indexPath,
@@ -1005,7 +1003,7 @@ export async function runEvalDryRun(caseIds?: readonly string[]): Promise<EvalDr
         freshnessPrefetch: checker.prefetcher(),
       });
       const prompt = stripFixturePaths(
-        buildEvalPrompt(c, digestFor(c.query.maxSensitivity), formatQueryText(queryResult)),
+        buildEvalPrompt(c, digestFor(evalQuery.maxSensitivity), formatQueryText(queryResult)),
         fixturePaths,
       );
       out.push({ id: c.id, group: c.group, prompt, input_tokens: estimateTokens(prompt) });
@@ -1072,6 +1070,9 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
   const modelCwd = mkdtempSync(join(tmpdir(), 'facts-eval-cwd-'));
   try {
     const fx = buildGateFixture(tempRoot);
+    // Build and sync the fixture index BEFORE running any model so index + WAL stay byte-identical
+    // across query, digest generation, model execution, and grading for every case.
+    rebuildIndex(fx.logPath, fx.indexPath);
     const fixturePaths = [tempRoot, fx.repoDir, fx.logPath, fx.indexPath, fx.reposPath];
     const repos = loadRepoMap(fx.reposPath);
     const checker = new FreshnessChecker({ repos });
@@ -1094,19 +1095,22 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
       return cached;
     };
 
-    // R2: keep one running snapshot chained across all cases.
-    let lastSnapshot = snapshotFixtureIntegrity(fx);
+    const baselineSnapshot = snapshotFixtureIntegrity(fx);
+    if (!baselineSnapshot.index.exists) {
+      throw new Error('Fixture integrity check failed: pre-synced fixture index is missing');
+    }
     for (const c of cases) {
-      // Verify fixture is unchanged since the end of the previous case (or initial build).
+      // Verify fixture (including pre-synced index and WAL) matches baseline before query.
       const beforeQuery = snapshotFixtureIntegrity(fx);
-      const betweenDiffs = diffFixtureIntegrity(lastSnapshot, beforeQuery);
+      const betweenDiffs = diffFixtureIntegrity(baselineSnapshot, beforeQuery);
       if (betweenDiffs.length > 0) {
         throw new Error(
           `Fixture integrity check failed before case ${c.id} (${betweenDiffs.join('; ')}); aborting eval without appending a block`,
         );
       }
 
-      const { text, ...rest } = c.query;
+      const evalQuery = c.evalQuery ?? c.query;
+      const { text, ...rest } = evalQuery;
       const queryResult = await queryFacts({
         logPath: fx.logPath,
         indexPath: fx.indexPath,
@@ -1117,22 +1121,25 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
         freshnessPrefetch: checker.prefetcher(),
       });
       const prompt = stripFixturePaths(
-        buildEvalPrompt(c, digestFor(c.query.maxSensitivity), formatQueryText(queryResult)),
+        buildEvalPrompt(c, digestFor(evalQuery.maxSensitivity), formatQueryText(queryResult)),
         fixturePaths,
       );
       const inputTokens = estimateTokens(prompt);
       totalInputTokens += inputTokens;
 
-      // Capture the new running snapshot after the harness's own query/digest maintenance;
-      // immutable files (ledger, repos.json, git HEAD/status) must never change during query.
+      if (options.onAfterQuery) {
+        await options.onAfterQuery(c.id);
+      }
+
+      // Require the entire fixture — including index and WAL — to stay byte-identical across
+      // query and digest generation (never silently re-baseline).
       const afterQuery = snapshotFixtureIntegrity(fx);
-      const queryImmutableDiffs = diffImmutableFixtureIntegrity(beforeQuery, afterQuery);
-      if (queryImmutableDiffs.length > 0) {
+      const queryDiffs = diffFixtureIntegrity(baselineSnapshot, afterQuery);
+      if (queryDiffs.length > 0) {
         throw new Error(
-          `Fixture integrity check failed during case ${c.id} query (${queryImmutableDiffs.join('; ')}); aborting eval without appending a block`,
+          `Fixture integrity check failed during case ${c.id} query (${queryDiffs.join('; ')}); aborting eval without appending a block`,
         );
       }
-      lastSnapshot = afterQuery;
 
       // Stream stdout chunks directly into the incremental line scanner/scorer so a 256 KiB
       // answer is never buffered as raw chunks + concatenated bytes + decoded full string.
@@ -1145,7 +1152,7 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
       });
 
       const afterModel = snapshotFixtureIntegrity(fx);
-      const afterModelDiffs = diffFixtureIntegrity(lastSnapshot, afterModel);
+      const afterModelDiffs = diffFixtureIntegrity(baselineSnapshot, afterModel);
       if (afterModelDiffs.length > 0) {
         throw new Error(
           `Fixture integrity check failed after case ${c.id} (${afterModelDiffs.join('; ')}); aborting eval without appending a block`,
@@ -1178,7 +1185,7 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
             repos,
             nowMs: NOW_MS,
             maxProblems: MAX_EVAL_CASE_PROBLEMS,
-            ...(c.query.maxSensitivity ? { maxSensitivity: c.query.maxSensitivity } : {}),
+            ...(evalQuery.maxSensitivity ? { maxSensitivity: evalQuery.maxSensitivity } : {}),
           });
         } catch (err) {
           const msg = sanitizeInlineText((err as Error).message);
@@ -1193,9 +1200,9 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
           };
         }
 
-        // Verify grading saw the exact same fixture state the prompt came from.
+        // Verify grading saw the exact same fixture state (including index and WAL) as baseline.
         const afterGrade = snapshotFixtureIntegrity(fx);
-        const afterGradeDiffs = diffFixtureIntegrity(lastSnapshot, afterGrade);
+        const afterGradeDiffs = diffFixtureIntegrity(baselineSnapshot, afterGrade);
         if (afterGradeDiffs.length > 0) {
           throw new Error(
             `Fixture integrity check failed during case ${c.id} grading (${afterGradeDiffs.join('; ')}); aborting eval without appending a block`,
@@ -1228,7 +1235,7 @@ export async function runEval(options: EvalOptions): Promise<EvalResult> {
 
     // Final fixture verification after the last case before releasing temp fixture / appending.
     const afterAll = snapshotFixtureIntegrity(fx);
-    const afterAllDiffs = diffFixtureIntegrity(lastSnapshot, afterAll);
+    const afterAllDiffs = diffFixtureIntegrity(baselineSnapshot, afterAll);
     if (afterAllDiffs.length > 0) {
       throw new Error(
         `Fixture integrity check failed after final case (${afterAllDiffs.join('; ')}); aborting eval without appending a block`,

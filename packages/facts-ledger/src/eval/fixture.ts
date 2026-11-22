@@ -22,6 +22,8 @@ export const REPO = 'gate';
 export const PROJECT = 'gate';
 /** The gate and eval harness fixed clock. */
 export const NOW_MS = Date.parse('2026-11-20T12:00:00Z');
+/** Timeout for synchronous git commands during fixture creation (with hard SIGKILL). */
+export const FIXTURE_GIT_TIMEOUT_MS = 10_000;
 const DAY_S = 24 * 3600;
 
 const encoder = new TextEncoder();
@@ -78,7 +80,12 @@ function gitEnv(date: string): Record<string, string> {
   };
 }
 
-function git(dir: string, args: readonly string[], date = '2026-11-01T00:00:00+00:00'): string {
+function git(
+  dir: string,
+  args: readonly string[],
+  date = '2026-11-01T00:00:00+00:00',
+  timeoutMs = FIXTURE_GIT_TIMEOUT_MS,
+): string {
   const r = spawnSync(
     resolveGitExecutable(),
     [
@@ -88,9 +95,25 @@ function git(dir: string, args: readonly string[], date = '2026-11-01T00:00:00+0
       '-c', 'init.defaultBranch=main',
       ...args,
     ],
-    { cwd: dir, env: gitEnv(date), windowsHide: true, shell: false },
+    {
+      cwd: dir,
+      env: gitEnv(date),
+      windowsHide: true,
+      shell: false,
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
+    },
   );
-  if (r.error) throw new Error(`git ${args.join(' ')} failed: ${r.error.message}`);
+  if (r.error) {
+    const code = (r.error as { code?: string }).code;
+    if (code === 'ETIMEDOUT') {
+      throw new Error(`git ${args.join(' ')} timed out after ${timeoutMs} ms`);
+    }
+    throw new Error(`git ${args.join(' ')} failed: ${r.error.message}`);
+  }
+  if (r.signal) {
+    throw new Error(`git ${args.join(' ')} terminated by signal ${r.signal}`);
+  }
   if (r.status !== 0) {
     throw new Error(`git ${args.join(' ')} failed: ${decoder.decode(r.stderr)}`);
   }
@@ -143,24 +166,29 @@ function iso(ms: number): string {
  * Build the fixture under `root`: `root/gate` (git repository), `root/repos.json`
  * (repo map, outside the repository) and `root/ledger.jsonl`.
  */
-export function buildGateFixture(root: string): GateFixture {
+export function buildGateFixture(
+  root: string,
+  options?: { readonly gitTimeoutMs?: number },
+): GateFixture {
+  const gitTimeoutMs = options?.gitTimeoutMs ?? FIXTURE_GIT_TIMEOUT_MS;
   const repoDir = join(root, REPO);
   mkdirSync(repoDir, { recursive: true });
-  git(repoDir, ['init', '--quiet', '--template=']);
+  git(repoDir, ['init', '--quiet', '--template='], undefined, gitTimeoutMs);
   writeFiles(repoDir, C1_FILES);
-  git(repoDir, ['add', '--all']);
-  git(repoDir, ['commit', '--quiet', '--no-verify', '-m', 'c1'], '2026-11-01T00:00:00+00:00');
-  const c1 = git(repoDir, ['rev-parse', 'HEAD']);
-  const blobAt = (rev: string, path: string): string => git(repoDir, ['rev-parse', `${rev}:${path}`]);
+  git(repoDir, ['add', '--all'], undefined, gitTimeoutMs);
+  git(repoDir, ['commit', '--quiet', '--no-verify', '-m', 'c1'], '2026-11-01T00:00:00+00:00', gitTimeoutMs);
+  const c1 = git(repoDir, ['rev-parse', 'HEAD'], undefined, gitTimeoutMs);
+  const blobAt = (rev: string, path: string): string =>
+    git(repoDir, ['rev-parse', `${rev}:${path}`], undefined, gitTimeoutMs);
   const c1Blobs: Record<string, string> = Object.fromEntries(
     Object.keys(C1_FILES).map((p) => [p, blobAt(c1, p)]),
   );
 
   writeFiles(repoDir, C2_FILES);
-  git(repoDir, ['rm', '--quiet', 'src/old-sync.ts']);
-  git(repoDir, ['add', '--all']);
-  git(repoDir, ['commit', '--quiet', '--no-verify', '-m', 'c2'], '2026-11-02T00:00:00+00:00');
-  const c2 = git(repoDir, ['rev-parse', 'HEAD']);
+  git(repoDir, ['rm', '--quiet', 'src/old-sync.ts'], undefined, gitTimeoutMs);
+  git(repoDir, ['add', '--all'], undefined, gitTimeoutMs);
+  git(repoDir, ['commit', '--quiet', '--no-verify', '-m', 'c2'], '2026-11-02T00:00:00+00:00', gitTimeoutMs);
+  const c2 = git(repoDir, ['rev-parse', 'HEAD'], undefined, gitTimeoutMs);
 
   const blocks = gateBlocks(c1, c1Blobs);
 

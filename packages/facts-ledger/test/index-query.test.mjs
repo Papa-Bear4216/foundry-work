@@ -2085,8 +2085,10 @@ test('command embedder terminates descendant process tree on timeout and stdout 
   cleanupPids.push(floodPid);
   assert.throws(() => process.kill(floodPid, 0), { code: 'ESRCH' });
 
-  // 3) queryFacts semanticTimeoutMs still awaits command cleanup without early Promise.race leak.
+  // 3) queryFacts semanticTimeoutMs still awaits command cleanup without early Promise.race leak,
+  // and must fire well below the embedder's own 20s timeout.
   const queryPidFile = join(dir, 'query-hang.pid');
+  const queryStartedMs = Date.now();
   await assert.rejects(
     () =>
       queryFacts({
@@ -2097,6 +2099,11 @@ test('command embedder terminates descendant process tree on timeout and stdout 
         nowMs,
       }),
     /timed out/,
+  );
+  const queryElapsedMs = Date.now() - queryStartedMs;
+  assert.ok(
+    queryElapsedMs < 10_000,
+    `Expected 2s queryFacts semanticTimeoutMs to fire well below 20s embedder timeout (took ${queryElapsedMs} ms)`,
   );
   assert.equal(existsSync(queryPidFile), true);
   const queryPid = Number(readFileSync(queryPidFile, 'utf8'));

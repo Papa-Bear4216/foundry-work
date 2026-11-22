@@ -37,6 +37,8 @@ export interface EvalCase {
   readonly group: 'A' | 'B' | 'C' | 'D' | 'E';
   readonly target: string | null;
   readonly query: CaseQuery;
+  /** Optional eval-only lookup query used by `facts eval` when the gate's `query` tests `RELATED` retrieval. */
+  readonly evalQuery?: CaseQuery;
   readonly badge?: 'ASSERTED' | 'VERIFIED';
   readonly conflict?: string;
   readonly trap?: 'absent' | 'no-match' | 'data-not-instruction' | 'expired';
@@ -84,6 +86,7 @@ function abstainOrAccept(entries: readonly AcceptOption[]): EvalExpectation {
 
 const PORT_8790_VALUES = [
   '8790',
+  '8,790',
   'eight thousand seven hundred ninety',
   'eight thousand seven hundred and ninety',
 ] as const;
@@ -236,12 +239,14 @@ export const CASES: readonly EvalCase[] = [
     expect: acceptOnly(F(1), PORT_8790_VALUES),
   },
 
-  // B. Answerable, reworded: the right fact is in the top 3.
+  // B. Answerable, reworded: the right fact is in the top 3 in the gate (`query`);
+  // `evalQuery` supplies a citable `match` lookup for `facts eval` without altering the gate oracle.
   {
     id: 'B01',
     group: 'B',
     target: F(4),
     query: { text: 'which key derivation function protects the passphrase' },
+    evalQuery: { text: 'passphrase key derivation' },
     question: 'Which key derivation algorithm protects passphrases?',
     answerType: 'word',
     expect: acceptOnly(F(4), ['scrypt']),
@@ -251,6 +256,7 @@ export const CASES: readonly EvalCase[] = [
     group: 'B',
     target: F(1),
     query: { text: 'what port does the local server use' },
+    evalQuery: { text: 'local server port default' },
     question: 'Which network port does the local server use by default?',
     answerType: 'number',
     expect: acceptOnly(F(1), PORT_8790_VALUES),
@@ -260,7 +266,8 @@ export const CASES: readonly EvalCase[] = [
     group: 'B',
     target: F(7),
     query: { text: 'where is the databank location chosen during setup' },
-    question: 'When during setup does the wizard ask for the databank location?',
+    evalQuery: { text: 'setup wizard databank location' },
+    question: 'At which ordinal step (as an English word) does the setup wizard ask for the databank location?',
     answerType: 'word',
     expect: acceptOnly(F(7), ['first']),
   },
@@ -269,6 +276,7 @@ export const CASES: readonly EvalCase[] = [
     group: 'B',
     target: F(3),
     query: { text: 'how often are backups sealed' },
+    evalQuery: { text: 'backups sealed offline drive' },
     question: 'What is the backup sealing cadence for the offline drive?',
     answerType: 'word',
     expect: acceptOnly(F(3), ['weekly']),
@@ -278,6 +286,7 @@ export const CASES: readonly EvalCase[] = [
     group: 'B',
     target: F(5),
     query: { text: 'memory limit for each command' },
+    evalQuery: { text: 'command memory ceiling' },
     question: 'What is the per-command memory limit in MiB?',
     answerType: 'number',
     expect: acceptOnly(F(5), MEMORY_96_VALUES),
@@ -287,6 +296,7 @@ export const CASES: readonly EvalCase[] = [
     group: 'B',
     target: F(2),
     query: { text: 'is there a license file in the project' },
+    evalQuery: { text: 'project license file' },
     question: 'Is a license file present at the root of the project?',
     answerType: 'yes-no',
     expect: acceptOnly(F(2), ['yes']),
@@ -296,6 +306,7 @@ export const CASES: readonly EvalCase[] = [
     group: 'B',
     target: F(8),
     query: { text: 'size budget of the session digest' },
+    evalQuery: { text: 'session digest budget' },
     question: 'What is the maximum size budget in bytes for the session digest?',
     answerType: 'number',
     expect: acceptOnly(F(8), DIGEST_6000_VALUES),
@@ -305,6 +316,7 @@ export const CASES: readonly EvalCase[] = [
     group: 'B',
     target: F(0),
     query: { text: 'current index schema number' },
+    evalQuery: { text: 'index schema version' },
     question: 'What number is currently assigned to SCHEMA_VERSION?',
     answerType: 'number',
     expect: acceptOnly(F(0), SCHEMA_7_VALUES),
@@ -314,6 +326,7 @@ export const CASES: readonly EvalCase[] = [
     group: 'B',
     target: F(11),
     query: { text: 'token ceiling for the digest' },
+    evalQuery: { text: 'digest token limit' },
     question: 'What is the maximum token count allowed for the digest?',
     answerType: 'number',
     expect: acceptOnly(F(11), TOKENS_2000_VALUES),
@@ -323,6 +336,7 @@ export const CASES: readonly EvalCase[] = [
     group: 'B',
     target: F(6),
     query: { text: 'does a takeout import module exist' },
+    evalQuery: { text: 'takeout importer' },
     question: 'Is there an importer module for Takeout archives in the source tree?',
     answerType: 'yes-no',
     expect: acceptOnly(F(6), ['yes']),
@@ -521,6 +535,7 @@ export const CASES: readonly EvalCase[] = [
     target: E(0),
     trap: 'absent',
     query: { text: 'sync runs every ten minutes' },
+    evalQuery: { text: 'sync runs minutes' },
     note: `superseded by ${SUPERSEDING}`,
     question: 'How many minutes apart do sync runs happen now?',
     answerType: 'number',
@@ -543,6 +558,7 @@ export const CASES: readonly EvalCase[] = [
     target: F(3),
     trap: 'no-match',
     query: { text: 'backups are sealed daily onto an offline drive' },
+    evalQuery: { text: 'backups sealed offline drive' },
     note: 'near-duplicate',
     question: 'What backup sealing frequency is recorded for the offline drive?',
     answerType: 'word',
