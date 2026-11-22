@@ -46,8 +46,53 @@ interface KeyringInput {
   entries: readonly EntryInput[];
   parallelism?: Kdf['p'];
 }
-export type Unlock = { passphrase: string } | { recoveryKey: Buffer };
+export type VaultCredential = { passphrase: string } | { recoveryKey: Buffer };
+export type Unlock = VaultCredential | { session: UnlockSession };
 export type KdfParallelism = Kdf['p'];
+
+const SESSION_TOKEN = Symbol('foundry.vault.unlock-session');
+const sessionState = new WeakMap<UnlockSession, { vaultId: string; masterKey: Buffer; disposed: boolean }>();
+let kdfCalls = 0;
+
+/** @internal Test-only hook for counting scrypt KDF invocations. */
+export function getKdfCallCountForTest(): number {
+  return kdfCalls;
+}
+
+/** @internal Test-only hook for resetting the scrypt KDF counter. */
+export function resetKdfCallCountForTest(): void {
+  kdfCalls = 0;
+}
+
+/** @internal Test-only hook verifying that dispose() zeroed the owned master-key bytes. */
+export function isSessionMasterKeyZeroedForTest(session: UnlockSession): boolean {
+  const state = sessionState.get(session);
+  return state !== undefined && state.masterKey.every(byte => byte === 0);
+}
+
+/** Holds an unwrapped vault master key for one command so the KDF runs at most once. */
+export class UnlockSession {
+  readonly vaultId: string;
+
+  /** @internal Construct via unlockVault(). */
+  constructor(vaultId: string, masterKey: Buffer, token: symbol) {
+    check(token === SESSION_TOKEN && masterKey.length === 32, 'KEY');
+    hex(vaultId, 16);
+    this.vaultId = vaultId;
+    sessionState.set(this, { vaultId, masterKey, disposed: false });
+  }
+
+  get disposed(): boolean {
+    return sessionState.get(this)?.disposed ?? true;
+  }
+
+  dispose(): void {
+    const state = sessionState.get(this);
+    if (!state || state.disposed) return;
+    state.masterKey.fill(0);
+    state.disposed = true;
+  }
+}
 
 export function validateParallelism(value: unknown): asserts value is KdfParallelism {
   check(value === 1 || value === 2, 'KDF');
@@ -110,6 +155,7 @@ function passphraseKey(passphrase: string, kdf: Kdf): Buffer {
   const { N, r, p, salt } = kdf;
   const secret = Buffer.from(passphrase);
   try {
+    kdfCalls++;
     return scryptSync(secret, base64(salt, 32), 32, { N, r, p, maxmem: MAX_MEMORY });
   } finally {
     secret.fill(0);
@@ -229,11 +275,30 @@ export function updateIndexEntry(
 export function changeKeyringPassphrase(
   bytes: Buffer, vaultId: string, current: string, replacement: string, parallelism?: KdfParallelism,
 ): Buffer {
+  return rewrapPassphraseSlot(bytes, vaultId, { passphrase: current }, replacement, parallelism);
+}
+
+/** Re-wrap the unchanged master key under a new passphrase after unlocking it with the 32-byte recovery key. */
+export function resetKeyringPassphrase(
+  bytes: Buffer, vaultId: string, recoveryKey: Buffer, replacement: string, parallelism?: KdfParallelism,
+): Buffer {
+  return rewrapPassphraseSlot(bytes, vaultId, { recoveryKey }, replacement, parallelism);
+}
+
+/**
+ * Shared body of changeKeyringPassphrase and resetKeyringPassphrase: unlock the master key with the given credential,
+ * then encode the same keyring with a new KDF block, a new passphrase wrap of the same master key, `by_recovery` and
+ * `keys` unchanged, the next version and a MAC under the same master key. Nothing is rotated.
+ */
+function rewrapPassphraseSlot(
+  bytes: Buffer, vaultId: string, input: VaultCredential, replacement: string, parallelism?: KdfParallelism,
+): Buffer {
+  const credential = snapshotCredential(input, false) as VaultCredential;
   if (parallelism !== undefined) validateParallelism(parallelism);
   const keyring = readKeyring(bytes, vaultId);
   const version = nextKeyringVersion(keyring.version);
   const kdf = newKdf(replacementParallelism(keyring.kdf.p, parallelism), randomBytes);
-  const masterKey = unlockMaster(keyring, { passphrase: current });
+  const masterKey = unlockMaster(keyring, credential);
   try {
     return encodeBody({
       format: FORMAT, vault_id: vaultId, version, kdf, keys: keyring.keys,
@@ -300,14 +365,52 @@ export function readKeyring(bytes: Buffer, expectedVaultId: string): Keyring {
   return keyring;
 }
 
-function unlockMaster(keyring: Keyring, credential: Unlock): Buffer {
+/**
+ * Reads `passphrase`, `recoveryKey` and `session` from the caller's object at most once each into a fresh object that
+ * holds only the chosen field, so later validation never sees a getter's second answer. `passphrase` and `recoveryKey`
+ * use `in` for presence; `session` is read exactly once by value, and a credential is a session only when that value
+ * is defined. With `allowSession: false`, a defined session fails KEY. Field values are returned raw; callers validate
+ * their types.
+ */
+export function snapshotCredential(
+  credential: unknown, allowSession: boolean,
+): { passphrase: unknown } | { recoveryKey: unknown } | { session: unknown } {
+  check(credential !== null && typeof credential === 'object', 'KEY');
+  const source = credential as Record<string, unknown>;
+  const hasPassphrase = 'passphrase' in source;
+  const hasRecovery = 'recoveryKey' in source;
+  const passphrase = hasPassphrase ? source.passphrase : undefined;
+  const recoveryKey = hasRecovery ? source.recoveryKey : undefined;
+  const session = source.session;
+  const hasSession = session !== undefined;
+  check(allowSession || !hasSession, 'KEY');
+  check(Number(hasPassphrase) + Number(hasRecovery) + Number(hasSession) === 1, 'KEY');
+  return hasPassphrase ? { passphrase } : hasRecovery ? { recoveryKey } : { session };
+}
+
+function unlockMaster(keyring: Keyring, input: Unlock): Buffer {
   const { mac: storedMac, ...body } = keyring;
   const { vault_id: vaultId, kdf, master } = body;
+  const credential = snapshotCredential(input, true);
   const passphrase = 'passphrase' in credential;
-  check(passphrase !== ('recoveryKey' in credential), 'KEY');
+  const session = 'session' in credential;
+
+  if (session) {
+    const state = sessionState.get(credential.session as UnlockSession);
+    check(state && !state.disposed && state.vaultId === vaultId, 'KEY');
+    const masterKey = Buffer.from(state.masterKey);
+    try {
+      check(timingSafeEqual(base64(storedMac, 32), mac(body, masterKey)), 'KEY');
+      return masterKey;
+    } catch (error) {
+      masterKey.fill(0);
+      throw error;
+    }
+  }
+
   const slot = passphrase ? 'passphrase' : 'recovery';
-  const wrappingKey = passphrase ? passphraseKey(credential.passphrase, kdf)
-    : vaultKey(credential.recoveryKey, vaultId, 'recovery-wrap');
+  const wrappingKey = passphrase ? passphraseKey((credential as { passphrase: string }).passphrase, kdf)
+    : vaultKey((credential as { recoveryKey: Buffer }).recoveryKey, vaultId, 'recovery-wrap');
   let masterKey: Buffer;
   try {
     masterKey = unwrap(wrappingKey, aad(vaultId, 'master', 'master', slot, passphrase ? kdf : undefined),
@@ -318,6 +421,18 @@ function unlockMaster(keyring: Keyring, credential: Unlock): Buffer {
   try {
     check(timingSafeEqual(base64(storedMac, 32), mac(body, masterKey)), 'MAC');
     return masterKey;
+  } catch (error) {
+    masterKey.fill(0);
+    throw error;
+  }
+}
+
+export function createUnlockSession(bytes: Buffer, vaultId: string, input: VaultCredential): UnlockSession {
+  const credential = snapshotCredential(input, false) as VaultCredential;
+  const ring = readKeyring(bytes, vaultId);
+  const masterKey = unlockMaster(ring, credential);
+  try {
+    return new UnlockSession(vaultId, masterKey, SESSION_TOKEN);
   } catch (error) {
     masterKey.fill(0);
     throw error;

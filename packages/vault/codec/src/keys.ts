@@ -3,10 +3,10 @@ import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { check } from './bytes.ts';
 import {
-  changeKeyringPassphrase, decodeKeyring, encodeKeyring, nextKeyringVersion, readKeyring, replacementParallelism,
-  unlockKeyring, validateParallelism, vaultKey,
+  changeKeyringPassphrase, createUnlockSession, decodeKeyring, encodeKeyring, nextKeyringVersion, readKeyring,
+  replacementParallelism, resetKeyringPassphrase, snapshotCredential, unlockKeyring, validateParallelism, vaultKey,
 } from './keyring.ts';
-import type { KdfParallelism } from './keyring.ts';
+import type { KdfParallelism, UnlockSession, VaultCredential } from './keyring.ts';
 import { publishKeyring } from './keyring-file.ts';
 import { signingPublicKey } from './manifest.ts';
 import { decodeRecoveryKey, formatRecoveryKey } from './recovery.ts';
@@ -16,7 +16,7 @@ interface PassphraseOptions {
   parallelism?: KdfParallelism;
 }
 
-type Credential = { passphrase: string } | { recoveryKey: string };
+type Credential = { passphrase: string } | { recoveryKey: string } | { session: UnlockSession };
 
 function now(): string {
   return new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z');
@@ -46,6 +46,14 @@ export function create(path: string, { passphrase, parallelism = 1 }: Passphrase
   }
 }
 
+/** Run the KDF (or recovery unwrap) once and hold the unwrapped master key until dispose(). */
+export function unlockVault(
+  keyringPath: string, vaultId: string, input: VaultCredential,
+): UnlockSession {
+  const credential = snapshotCredential(input, false) as VaultCredential;
+  return createUnlockSession(readFileSync(keyringPath), vaultId, credential);
+}
+
 export function unlockByPassphrase(path: string, vaultId: string, passphrase: string): ReturnType<typeof decodeKeyring> {
   return decodeKeyring(readFileSync(path), { passphrase }, vaultId);
 }
@@ -65,6 +73,26 @@ export function changePassphrase(
   const previous = readFileSync(path);
   const next = changeKeyringPassphrase(previous, vaultId, currentPassphrase, replacement.passphrase, replacement.parallelism);
   publishKeyring(path, next, previous);
+}
+
+/**
+ * Forgotten passphrase: unlock with the printed recovery key and publish the same keyring with a new passphrase wrap of
+ * the SAME master key (new KDF salt). Rotates nothing; use rekeyAll when a credential may be known to someone else.
+ * On any failure before the atomic rename the keyring file stays byte-identical; as for changePassphrase, a failure
+ * after the rename (directory sync or writer-lock release) throws although the complete new keyring is already in
+ * place, so a caller that gets an error tries the new passphrase before it repeats the reset.
+ */
+export function resetPassphrase(
+  path: string, vaultId: string, recoveryKey: string, replacement: PassphraseOptions,
+): void {
+  const recovery = decodeRecoveryKey(recoveryKey);
+  try {
+    const previous = readFileSync(path);
+    const next = resetKeyringPassphrase(previous, vaultId, recovery, replacement.passphrase, replacement.parallelism);
+    publishKeyring(path, next, previous);
+  } finally {
+    recovery.fill(0);
+  }
 }
 
 interface RekeyOptions extends PassphraseOptions {
@@ -99,10 +127,17 @@ export function rekeyAll(path: string, vaultId: string, credential: Credential, 
     && currentIds.size + historicalIds.size === activeCollections.size
     && [...currentIds].every(id => activeCollections.has(id))
     && [...historicalIds].every(id => activeCollections.has(id) && !currentIds.has(id)), 'KEY');
-  check(('passphrase' in credential) !== ('recoveryKey' in credential), 'KEY');
-  const oldRecovery = 'recoveryKey' in credential ? decodeRecoveryKey(credential.recoveryKey) : undefined;
+  const snapshot = snapshotCredential(credential, true);
+  const hasPassphrase = 'passphrase' in snapshot;
+  const hasRecovery = 'recoveryKey' in snapshot;
+  const oldRecovery = hasRecovery ? decodeRecoveryKey((snapshot as { recoveryKey: string }).recoveryKey) : undefined;
   try {
-    const unlocked = unlockKeyring(ring, 'passphrase' in credential ? credential : { recoveryKey: oldRecovery! });
+    const unlocked = unlockKeyring(
+      ring,
+      hasRecovery ? { recoveryKey: oldRecovery! }
+        : hasPassphrase ? { passphrase: (snapshot as { passphrase: string }).passphrase }
+          : { session: (snapshot as { session: UnlockSession }).session },
+    );
     const generated: Buffer[] = [];
     try {
       const newKey = () => {
