@@ -318,15 +318,32 @@ export interface ZipBuildEntry {
   data: Buffer | (() => AsyncIterable<Buffer>);
   compression?: 'store' | 'deflate';
   deflateLevel?: number;
+  mtime?: Date;
 }
 
 interface WrittenCdRecord {
   pathBuf: Buffer;
   compressionMethod: number;
+  dosTime: number;
+  dosDate: number;
   crc: number;
   compressedSize: bigint;
   uncompressedSize: bigint;
   localHeaderOffset: bigint;
+}
+
+function encodeDosDateTime(mtime?: Date): { dosTime: number; dosDate: number } {
+  if (!mtime) return { dosTime: 0, dosDate: 0x5821 }; // 2024-01-01T00:00:00Z
+  const year = Math.max(1980, Math.min(2107, mtime.getUTCFullYear()));
+  const month = mtime.getUTCMonth() + 1;
+  const day = mtime.getUTCDate();
+  const hour = mtime.getUTCHours();
+  const minute = mtime.getUTCMinutes();
+  const second = Math.floor(mtime.getUTCSeconds() / 2);
+  return {
+    dosTime: (hour << 11) | (minute << 5) | second,
+    dosDate: ((year - 1980) << 9) | (month << 5) | day,
+  };
 }
 
 function encodeZip64Extra(fields: bigint[]): Buffer {
@@ -371,6 +388,7 @@ export async function writeZipArchive(
     for (const entry of entries) {
       const pathBuf = Buffer.from(entry.path, 'utf8');
       const method = entry.compression === 'deflate' ? 8 : 0;
+      const { dosTime, dosDate } = encodeDosDateTime(entry.mtime);
       const lfhOffset = offset;
 
       if (Buffer.isBuffer(entry.data)) {
@@ -387,8 +405,8 @@ export async function writeZipArchive(
         lfh.writeUInt16LE(useZ64Lfh ? 45 : 20, 4);
         lfh.writeUInt16LE(0x0800, 6); // UTF-8 filename flag
         lfh.writeUInt16LE(method, 8);
-        lfh.writeUInt16LE(0, 10);
-        lfh.writeUInt16LE(0x5821, 12); // 2024-01-01 DOS date
+        lfh.writeUInt16LE(dosTime, 10);
+        lfh.writeUInt16LE(dosDate, 12);
         lfh.writeUInt32LE(entryCrc, 14);
         lfh.writeUInt32LE(useZ64Lfh ? SENTINEL_U32 : Number(compSize), 18);
         lfh.writeUInt32LE(useZ64Lfh ? SENTINEL_U32 : Number(uncompSize), 22);
@@ -403,6 +421,8 @@ export async function writeZipArchive(
         cdRecords.push({
           pathBuf,
           compressionMethod: method,
+          dosTime,
+          dosDate,
           crc: entryCrc,
           compressedSize: compSize,
           uncompressedSize: uncompSize,
@@ -418,8 +438,8 @@ export async function writeZipArchive(
         lfh.writeUInt16LE(45, 4);
         lfh.writeUInt16LE(0x0800, 6);
         lfh.writeUInt16LE(method, 8);
-        lfh.writeUInt16LE(0, 10);
-        lfh.writeUInt16LE(0x5821, 12);
+        lfh.writeUInt16LE(dosTime, 10);
+        lfh.writeUInt16LE(dosDate, 12);
         lfh.writeUInt32LE(0, 14);
         lfh.writeUInt32LE(SENTINEL_U32, 18);
         lfh.writeUInt32LE(SENTINEL_U32, 22);
@@ -476,6 +496,8 @@ export async function writeZipArchive(
         cdRecords.push({
           pathBuf,
           compressionMethod: method,
+          dosTime,
+          dosDate,
           crc: finalCrc,
           compressedSize: compSize,
           uncompressedSize: uncompSize,
@@ -503,8 +525,8 @@ export async function writeZipArchive(
       cd.writeUInt16LE(z64Fields.length > 0 ? 45 : 20, 6);
       cd.writeUInt16LE(0x0800, 8);
       cd.writeUInt16LE(rec.compressionMethod, 10);
-      cd.writeUInt16LE(0, 12);
-      cd.writeUInt16LE(0x5821, 14);
+      cd.writeUInt16LE(rec.dosTime, 12);
+      cd.writeUInt16LE(rec.dosDate, 14);
       cd.writeUInt32LE(rec.crc >>> 0, 16);
       cd.writeUInt32LE(needComp ? SENTINEL_U32 : Number(rec.compressedSize), 20);
       cd.writeUInt32LE(needUncomp ? SENTINEL_U32 : Number(rec.uncompressedSize), 24);
@@ -641,6 +663,8 @@ export async function writeStreamedZip64Archive(
       cdRecords.push({
         pathBuf,
         compressionMethod: method,
+        dosTime: 0,
+        dosDate: 0x5821,
         crc: entryCrc,
         compressedSize: compSize,
         uncompressedSize: uncompSize,

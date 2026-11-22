@@ -891,13 +891,20 @@ test('accepts streamed ZIP64 bit-3 entries with 0xffffffff local sizes and zero 
   }
 });
 
-test('enforces Takeout part ordinal validation when opening a single file directly via openArchive (Round 2 Finding 3)', async t => {
+test('enforces Takeout part ordinal validation only on recognised Takeout part names when opening a single file via openArchive (Round 2 Finding 3 & Round 3 Finding 3)', async t => {
   const dir = makeTempDir(t, 'foundry-r2-f3-');
 
   const part2 = join(dir, 'takeout-20261121T000000Z-002.zip');
   await writeZipArchive(part2, [{ path: 'Takeout/b.txt', data: Buffer.from('part 2 only') }]);
   await assert.rejects(
     () => openArchive(part2),
+    err => err instanceof ArchiveError && err.code === 'INVALID_MULTIPART' && /part 1/i.test(err.message),
+  );
+
+  const part2Versioned = join(dir, 'takeout-20261121T000000Z-3-002.zip');
+  await writeZipArchive(part2Versioned, [{ path: 'Takeout/b2.txt', data: Buffer.from('versioned part 2 only') }]);
+  await assert.rejects(
+    () => openArchive(part2Versioned),
     err => err instanceof ArchiveError && err.code === 'INVALID_MULTIPART' && /part 1/i.test(err.message),
   );
 
@@ -918,13 +925,27 @@ test('enforces Takeout part ordinal validation when opening a single file direct
     await arch1.close();
   }
 
-  // Non-part archive filename still opens as a single archive
-  const single = join(dir, 'single-export.zip');
-  await writeZipArchive(single, [{ path: 'Takeout/single.txt', data: Buffer.from('single') }]);
-  const archSingle = await openArchive(single);
+  // Non-part archive filenames (including numbered standalone names like Calendar-2024.zip) open as single archives
+  for (const standaloneName of ['single-export.zip', 'Calendar-2024.zip', 'mail-backup-002.zip']) {
+    const standalonePath = join(dir, standaloneName);
+    await writeZipArchive(standalonePath, [{ path: 'Takeout/single.txt', data: Buffer.from(standaloneName) }]);
+    const archStandalone = await openArchive(standalonePath);
+    try {
+      assert.equal(archStandalone.entries.length, 1);
+      assert.ok((await streamToBuffer(archStandalone.entries[0].open())).equals(Buffer.from(standaloneName)));
+    } finally {
+      await archStandalone.close();
+    }
+  }
+
+  // A directory containing only a numbered standalone archive also opens normally
+  const standaloneDir = makeTempDir(t, 'foundry-r3-standalone-dir-');
+  await writeZipArchive(join(standaloneDir, 'Calendar-2024.zip'), [{ path: 'Takeout/cal.txt', data: Buffer.from('cal 2024') }]);
+  const archDir = await openArchive(standaloneDir);
   try {
-    assert.equal(archSingle.entries.length, 1);
+    assert.equal(archDir.entries.length, 1);
+    assert.deepEqual(archDir.parts, ['Calendar-2024.zip']);
   } finally {
-    await archSingle.close();
+    await archDir.close();
   }
 });

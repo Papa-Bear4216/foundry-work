@@ -6,6 +6,8 @@ import { getEntryDedupKey, openZipFile } from './zip-reader.js';
 import type { ZipOpenOptions } from './zip-reader.js';
 
 const PART_PATTERN = /^(.+)-(\d+)\.zip$/i;
+/** Recognised Google Takeout multi-part export filenames (`takeout-<YYYYMMDDTHHMMSSZ>[-<set>]-<NNN>.zip`). */
+const TAKEOUT_PART_PATTERN = /^(takeout-\d{8}T\d{6}Z(?:-\d+)?)-(\d+)\.zip$/i;
 
 /**
  * Deterministic comparator for multi-part Takeout zip filenames (e.g. takeout-...-001.zip, -002.zip).
@@ -30,7 +32,9 @@ export function comparePartNames(a: string, b: string): number {
 function validateAndOrderPartNames(zipNames: readonly string[]): string[] {
   if (zipNames.length === 1) {
     const only = zipNames[0]!;
-    const match = PART_PATTERN.exec(only);
+    // Apply the single-file ordinal check ONLY to recognised Takeout part names so
+    // ordinary standalone archives with numeric suffixes (e.g. Calendar-2024.zip) open normally.
+    const match = TAKEOUT_PART_PATTERN.exec(only);
     if (match) {
       const ordinal = Number.parseInt(match[2]!, 10);
       if (!Number.isSafeInteger(ordinal) || ordinal < 1) {

@@ -22,6 +22,7 @@ import {
   ArchiveError,
   DEFAULT_DERIVERS,
   DEFAULT_IMPORTERS,
+  generateSyntheticIcalendar,
   generateSyntheticMbox,
   generateSyntheticVcards,
   importArchive,
@@ -626,7 +627,7 @@ test('counts and reports unfinished and nested vCard errors in ImportResult whil
   assert.equal(verifyVaultDeep(vaultDir, unlocked).position.lastEventSequence, 1);
 });
 
-test('resolves identical UTC collections across TZ environments (including 00:30:00 Jan-01-2024 under UTC vs Pacific/Auckland) and re-import adds nothing (Ruling 12 & Round 2 Finding 9)', async t => {
+test('resolves identical UTC collections across TZ environments (including rejected header fallback to mbox separator and calendar ZIP entry time under UTC vs Pacific/Auckland) and re-import adds nothing (Ruling 12, Round 2 Finding 9, Round 3 Finding 1)', async t => {
   const root = mkdtempSync(join(tmpdir(), 'foundry-v5-tz-'));
   t.after(() => makeWritableAndRemove(root));
   const zipPath = join(root, 'zoneless.zip');
@@ -655,17 +656,31 @@ test('resolves identical UTC collections across TZ environments (including 00:30
     ].join('\r\n'),
     'utf8',
   );
-  // Round 2 Finding 9: unsupported `00:30:00 Jan-01-2024` Date header without mbox separator must
-  // deterministically resolve to undated under both TZ=UTC and TZ=Pacific/Auckland.
+  // Round 2 Finding 9 & Round 3 Finding 1:
+  // - Rejected `Date: 00:30:00 Jan-01-2024` with no mbox separator -> undated under both TZ=UTC and TZ=Pacific/Auckland.
+  // - Rejected `Date: 00:30:00 Jan-01-2024` with a 2019 mbox separator -> falls back to 2019 under both TZs.
   const unsupportedDateMbox = Buffer.from(
     [
       `From: <${syntheticEmail('tz-sender')}>`,
       `To: <${syntheticEmail('tz-recipient')}>`,
       'Date: 00:30:00 Jan-01-2024',
-      'Subject: TEST ONLY unsupported date format must be undated',
+      'Subject: TEST ONLY unsupported date without separator must be undated',
       'Content-Type: text/plain; charset="utf-8"',
       '',
       'Unsupported date body.\r\n',
+    ].join('\r\n'),
+    'utf8',
+  );
+  const rejectedHeaderWithSepMbox = Buffer.from(
+    [
+      'From 1003@xxx Tue Dec 31 23:45:00 2019',
+      `From: <${syntheticEmail('tz-sender')}>`,
+      `To: <${syntheticEmail('tz-recipient')}>`,
+      'Date: 00:30:00 Jan-01-2024',
+      'Subject: TEST ONLY unsupported Date header falls back to 2019 mbox separator',
+      'Content-Type: text/plain; charset="utf-8"',
+      '',
+      'Fallback separator body.\r\n',
     ].join('\r\n'),
     'utf8',
   );
@@ -694,12 +709,33 @@ test('resolves identical UTC collections across TZ environments (including 00:30
     ].join('\r\n'),
     'utf8',
   );
+  // Round 3 Finding 1: calendar whose only event date is rejected by the grammar falls back to ZIP entry time (2021).
+  const rejectedDateIcs = Buffer.from(
+    [
+      'BEGIN:VCALENDAR',
+      'VERSION:2.0',
+      'BEGIN:VEVENT',
+      'UID:tz-test-rejected-1',
+      'DTSTART:00:30:00 Jan-01-2024',
+      'SUMMARY:Rejected Date Event',
+      'END:VEVENT',
+      'END:VCALENDAR',
+      '',
+    ].join('\r\n'),
+    'utf8',
+  );
 
   await writeZipArchive(zipPath, [
     { path: 'Takeout/Mail/Zoneless.mbox', data: zonelessMbox },
     { path: 'Takeout/Mail/UnsupportedDate.mbox', data: unsupportedDateMbox },
+    { path: 'Takeout/Mail/RejectedHeaderWithSep.mbox', data: rejectedHeaderWithSepMbox },
     { path: 'Takeout/Contacts/Zoneless.vcf', data: zonelessVcf },
     { path: 'Takeout/Calendar/Zoneless.ics', data: zonelessIcs },
+    {
+      path: 'Takeout/Calendar/RejectedDate.ics',
+      data: rejectedDateIcs,
+      mtime: new Date('2021-12-31T23:30:00Z'),
+    },
   ]);
 
   const vA = createTestVaultWithCollections(vaultA, passphrase);
@@ -725,8 +761,8 @@ test('resolves identical UTC collections across TZ environments (including 00:30
   const utcRun = runInTz('UTC', vaultA, vA);
   const aucklandRun = runInTz('Pacific/Auckland', vaultB, vB);
 
-  assert.equal(utcRun.summary.totalItemsImported, 5);
-  assert.equal(aucklandRun.summary.totalItemsImported, 5);
+  assert.equal(utcRun.summary.totalItemsImported, 7);
+  assert.equal(aucklandRun.summary.totalItemsImported, 7);
   assert.deepEqual(utcRun.collections, aucklandRun.collections, 'collections and UTC timestamps must be identical under TZ=UTC and TZ=Pacific/Auckland');
 
   const unsupportedItem = utcRun.collections.find(c => c.path === 'Takeout/Mail/UnsupportedDate.mbox#1');
@@ -734,8 +770,23 @@ test('resolves identical UTC collections across TZ environments (including 00:30
   assert.equal(unsupportedItem.collection, 'google-takeout/mail/undated');
   assert.equal(unsupportedItem.sourceTs, undefined);
 
+  const fallbackMailItem = utcRun.collections.find(c => c.path === 'Takeout/Mail/RejectedHeaderWithSep.mbox#1');
+  assert.ok(fallbackMailItem);
+  assert.equal(fallbackMailItem.collection, 'google-takeout/mail/2019');
+  assert.equal(fallbackMailItem.sourceTs, '2019-12-31T23:45:00Z');
+
+  const fallbackCalItem = utcRun.collections.find(c => c.path === 'Takeout/Calendar/RejectedDate.ics');
+  assert.ok(fallbackCalItem);
+  assert.equal(fallbackCalItem.collection, 'google-takeout/calendar/2021');
+  assert.equal(fallbackCalItem.sourceTs, '2021-12-31T23:30:00Z');
+
+  const specialPaths = new Set([
+    'Takeout/Mail/UnsupportedDate.mbox#1',
+    'Takeout/Mail/RejectedHeaderWithSep.mbox#1',
+    'Takeout/Calendar/RejectedDate.ics',
+  ]);
   for (const item of utcRun.collections) {
-    if (item.path === 'Takeout/Mail/UnsupportedDate.mbox#1') continue;
+    if (specialPaths.has(item.path)) continue;
     assert.ok(item.collection.endsWith('/2024'), `expected 2024 UTC collection, got ${item.collection}`);
   }
 
@@ -745,7 +796,7 @@ test('resolves identical UTC collections across TZ environments (including 00:30
   assert.equal(crossTzReimport.summary.totalItemsImported, 0);
   assert.equal(crossTzReimport.summary.totalBlobsWritten, 0);
   assert.equal(crossTzReimport.summary.totalEventsWritten, 0);
-  assert.equal(crossTzReimport.summary.totalItemsSkipped, 5);
+  assert.equal(crossTzReimport.summary.totalItemsSkipped, 7);
   assert.equal(vaultByteSize(vaultA), bytesBeforeReimport);
 });
 
@@ -956,17 +1007,23 @@ test('imports valid streamed ZIP64 archive (Python zipfile force_zip64 layout) a
   assert.equal(verifyVault(vaultBad).position.lastEventSequence, 0);
 });
 
-test('rejects direct import of Takeout part 002 with zero writes while non-part single archive imports normally (Round 2 Finding 3)', async t => {
+test('rejects direct import of Takeout part 002 with zero writes while non-part and numbered standalone archives import normally (Round 2 Finding 3 & Round 3 Finding 3)', async t => {
   const root = mkdtempSync(join(tmpdir(), 'foundry-v5-r2-f3-'));
   t.after(() => makeWritableAndRemove(root));
   const part2Path = join(root, 'takeout-20261121T000000Z-002.zip');
   const singlePath = join(root, 'personal-export.zip');
+  const calendar2024Path = join(root, 'Calendar-2024.zip');
+  const mailBackupPath = join(root, 'mail-backup-002.zip');
   const vaultDir = join(root, 'vault');
   const passphrase = 'TEST ONLY v5 r2 f3 passphrase';
 
   const vcf = generateSyntheticVcards(2, 1301);
+  const ics = generateSyntheticIcalendar(1, 1302);
+  const mbox = generateSyntheticMbox(1, 1303);
   await writeZipArchive(part2Path, [{ path: 'Takeout/Contacts/contacts.vcf', data: vcf, compression: 'deflate' }]);
   await writeZipArchive(singlePath, [{ path: 'Takeout/Contacts/contacts.vcf', data: vcf, compression: 'deflate' }]);
+  await writeZipArchive(calendar2024Path, [{ path: 'Takeout/Calendar/year2024.ics', data: ics, compression: 'deflate' }]);
+  await writeZipArchive(mailBackupPath, [{ path: 'Takeout/Mail/backup.mbox', data: mbox, compression: 'deflate' }]);
 
   const { vaultId, collectionKeyId } = createTestVaultWithCollections(vaultDir, passphrase);
   const unlocked = unlockByPassphrase(join(vaultDir, 'keyring', 'keyring.json'), vaultId, passphrase);
@@ -977,25 +1034,31 @@ test('rejects direct import of Takeout part 002 with zero writes while non-part 
   );
   assert.equal(readAllVaultRecords(vaultDir, unlocked).events.length, 0);
 
-  const archive = await openArchive(singlePath);
-  const writer = VaultWriter.open(vaultDir, unlocked);
-  try {
-    const res = await importArchive({
-      archive,
-      writer,
-      importers: DEFAULT_IMPORTERS,
-      resolveCollectionKeyId: () => collectionKeyId,
-      vaultDir,
-      unlocked,
-      readVaultRecord,
-      closeSegmentOnFinish: true,
-    });
-    assert.equal(res.totalItemsImported, 2);
-  } finally {
-    writer.release();
-    await archive.close();
+  for (const [zipFile, expectedNew] of [
+    [singlePath, 2],
+    [calendar2024Path, 1],
+    [mailBackupPath, 1],
+  ]) {
+    const archive = await openArchive(zipFile);
+    const writer = VaultWriter.open(vaultDir, unlocked);
+    try {
+      const res = await importArchive({
+        archive,
+        writer,
+        importers: DEFAULT_IMPORTERS,
+        resolveCollectionKeyId: () => collectionKeyId,
+        vaultDir,
+        unlocked,
+        readVaultRecord,
+        closeSegmentOnFinish: zipFile === mailBackupPath,
+      });
+      assert.equal(res.totalItemsImported, expectedNew);
+    } finally {
+      writer.release();
+      await archive.close();
+    }
   }
-  assert.equal(verifyVaultDeep(vaultDir, unlocked).position.lastEventSequence, 2);
+  assert.equal(verifyVaultDeep(vaultDir, unlocked).position.lastEventSequence, 4);
 });
 
 test('rejects concurrent importArchive calls sharing one writer with typed BUSY error and zero duplicates (Round 2 Finding 8)', async t => {
