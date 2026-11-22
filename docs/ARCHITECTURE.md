@@ -252,12 +252,25 @@ and minutes and seconds 00 through 59.
 ### 4.6 Closing and crash safety
 
 - Appends go to `open/`. Each record is written with a single write call and fsynced at
-  the end of an import batch.
+  the end of an import batch. A short write fails the batch. A batch that crosses a
+  segment boundary syncs and seals its completed segment before continuing.
+- The writer holds the vault directory's SQLite writer lock until it releases the
+  session or exits. The lock database carries no vault content.
 - On start, a writer scans the tail of `open/`. A final record shorter than its
-  `total_len` is truncated away and reported.
-- Close: fsync files, write `MANIFEST.json` to a temp name, fsync, rename `open/` to
-  `segments/<n>/`, update `HEAD.json`. Closed segments are set read-only as a courtesy;
-  this is not a security control.
+  header or declared length is truncated away and reported. A complete record with
+  invalid framing or authentication fails recovery.
+- Close: fsync files, write and sync the manifest and signature under temporary names,
+  rename them into place in `open/`, and prepare and sync a temporary head. Rename
+  `open/` to `segments/<n>/` before replacing `HEAD.json`. Sync affected directories
+  on POSIX. Closed files are set read-only as a courtesy.
+- The convenience head contains `segment` and `manifest_sha256` in canonical JSON,
+  with segment zero and the genesis hash before the first seal. On startup a writer
+  replaces a head that matches the verified predecessor only when the pending head
+  matches the verified last segment. If the segment rename never happened, the
+  writer discards the pending close files and preserves the open records.
+- Public verification checks framing and sequence in `open/`, whose records have
+  no signed inventory until close. Deep verification authenticates open records as
+  well as sealed records, and reports `ERASED` if a destroyed key prevents a full check.
 - A segment closes when it reaches the soft cap, when a vault session starts, or on demand.
 
 ### 4.7 Reading the vault without Foundry
