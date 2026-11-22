@@ -47,6 +47,13 @@ interface CapturedStream extends ManifestFile {
 
 const withdrawalKinds = new Set<unknown>(['consent.withdrawn', 'redaction.applied', 'key.destroyed']);
 
+const activeIterators = new WeakMap<object, ReadonlySet<unknown>>();
+
+/** TEST ONLY: the number of started, unfinished iterators a replay source tracks for close(). */
+export function activeReplayIteratorCountForTest(source: object): number {
+  return activeIterators.get(source)?.size ?? 0;
+}
+
 function openCapturedStream(directory: string, stream: CapturedStream, openSegment: number): number {
   const sealed = join(directory, 'segments', segmentName(stream.segment));
   const openPath = join(directory, 'open', stream.name);
@@ -129,38 +136,64 @@ export function openVaultReplay(directory: string, credential: Unlock, { anchor 
     const active = new Set<() => void>();
 
     function track<T, R>(generator: Generator<T, R, undefined>): Generator<T, R, undefined> {
-      let endedByClose = closed;
+      // Registered in `active` on the first next()/throw(), so dropped unstarted iterators hold no reference.
+      let started = false;
+      let finished = false;
+      let endedByClose = false;
+      // True while this generator's body runs; close() must not call .return() on a running generator.
+      let running = false;
       const closeIterator = () => {
         endedByClose = true;
         active.delete(closeIterator);
-        generator.return(undefined as R);
+        // A running read fails KEY at its next checkpoint (or when its step returns) instead.
+        if (!running) generator.return(undefined as R);
       };
-      if (!closed) active.add(closeIterator);
+      const step = (resume: () => IteratorResult<T, R>): IteratorResult<T, R> => {
+        if (!started) {
+          started = true;
+          if (closed) {
+            endedByClose = true;
+            generator.return(undefined as R);
+          } else {
+            active.add(closeIterator);
+          }
+        }
+        if (endedByClose || (closed && !finished)) check(false, 'KEY');
+        let result: IteratorResult<T, R>;
+        running = true;
+        try {
+          result = resume();
+        } catch (error) {
+          finished = true;
+          active.delete(closeIterator);
+          throw error;
+        } finally {
+          running = false;
+        }
+        if (result.done) {
+          finished = true;
+          active.delete(closeIterator);
+        }
+        if (endedByClose) {
+          // close() ran during this step: end the generator now so its finally blocks wipe keys, then fail KEY.
+          if (!result.done) generator.return(undefined as R);
+          finished = true;
+          check(false, 'KEY');
+        }
+        return result;
+      };
       const iterator = Object.create(
         Object.getPrototypeOf(Object.getPrototypeOf(generator)),
       ) as Generator<T, R, undefined>;
-      iterator.next = () => {
-        if (endedByClose) check(false, 'KEY');
-        try {
-          const result = generator.next();
-          if (result.done) active.delete(closeIterator);
-          return result;
-        } catch (error) {
-          active.delete(closeIterator);
-          throw error;
-        }
-      };
+      iterator.next = () => step(() => generator.next());
       iterator.return = (value: R) => {
+        const result = generator.return(value);
+        started = true;
+        finished = true;
         active.delete(closeIterator);
-        return generator.return(value);
-      };
-      iterator.throw = (error: unknown) => {
-        if (endedByClose) check(false, 'KEY');
-        active.delete(closeIterator);
-        const result = generator.throw(error);
-        if (!result.done && !closed) active.add(closeIterator);
         return result;
       };
+      iterator.throw = (error: unknown) => step(() => generator.throw(error));
       iterator[Symbol.iterator] = () => iterator;
       return iterator;
     }
@@ -243,6 +276,8 @@ export function openVaultReplay(directory: string, credential: Unlock, { anchor 
     function* streamBlob(location: ReplayLocation): Generator<Buffer, void, undefined> {
       check(!closed, 'KEY');
       const { segment, stream: name, offset, encodedLength, headerSha256 } = location;
+      // Location getters run here and may call close().
+      check(!closed, 'KEY');
       integer(offset);
       integer(encodedLength, HEADER_BYTES + FRAME_OVERHEAD);
       const stream = packBySegment.get(`${segment}/${name}`);
@@ -254,10 +289,12 @@ export function openVaultReplay(directory: string, credential: Unlock, { anchor 
         check(record && record.end === offset + encodedLength, 'LENGTH');
         check(record.type === 2);
         check(sha256(record.header) === headerSha256, 'FILE_HASH');
+        check(!closed, 'KEY');
         const key = unlocked.collectionEncryptionKey(record.keyId);
         try {
           const frames = new StreamScanner().frameChunks(fd, record, undefined, { vaultId: vault.vault_id, key });
           for (const chunk of frames) {
+            check(!closed, 'KEY');
             yield chunk;
             check(!closed, 'KEY');
           }
@@ -269,7 +306,7 @@ export function openVaultReplay(directory: string, credential: Unlock, { anchor 
       }
     }
 
-    return {
+    const source = {
       boundary: {
         sealed: position,
         openSegment,
@@ -302,6 +339,8 @@ export function openVaultReplay(directory: string, credential: Unlock, { anchor 
         }
       },
     };
+    activeIterators.set(source, active);
+    return source;
   } catch (error) {
     clearKeys(unlocked);
     throw error;

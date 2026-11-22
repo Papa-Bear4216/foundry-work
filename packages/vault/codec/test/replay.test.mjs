@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { encodeRecord, FRAME_BYTES, openVaultReplay, VaultFormatError, VaultWriter, verifyVaultDeep } from '../src/index.ts';
 import { setFrameKeyObserverForTest } from '../src/record-file.ts';
+import { activeReplayIteratorCountForTest } from '../src/vault-replay.ts';
 import { blob, cases, event, fixture, identity, keyId, keyringPath, writable } from './vault-fixture.mjs';
 
 const credential = () => ({ recoveryKey: Buffer.from(cases.recovery_key, 'hex') });
@@ -218,4 +219,87 @@ test('close ends paused streamBlob and replay iterators, zeroes derived keys imm
   assert.throws(() => pausedReplay.next(), error => error instanceof VaultFormatError && error.code === 'KEY');
   assert.throws(() => unstarted.next(), error => error instanceof VaultFormatError && error.code === 'KEY');
   assert.equal(stream.return().done, true);
+});
+
+test('close called from a location getter during another read returns normally, wipes paused keys, and fails the running read with KEY', t => {
+  const vault = setup(t);
+  const payload = Buffer.alloc(FRAME_BYTES + 1, 0x42);
+  vault.write(writer => writer.appendBatch([event('TEST ONLY reentrant close'), blob(payload)]));
+  const source = openVaultReplay(vault.directory, credential());
+  t.after(() => source.close());
+  const blobItem = [...source.replay()].find(item => item.type === 'blob');
+  assert.ok(blobItem);
+
+  const observed = [];
+  setFrameKeyObserverForTest(keys => observed.push(keys));
+  t.after(() => setFrameKeyObserverForTest(undefined));
+
+  const paused = source.streamBlob(blobItem.location);
+  const firstChunk = paused.next();
+  assert.equal(firstChunk.done, false);
+  firstChunk.value.fill(0);
+  assert.equal(observed.length, 1);
+  assert.ok(observed[0].collectionKey.some(byte => byte !== 0));
+  assert.ok(observed[0].recordKey.some(byte => byte !== 0));
+
+  // The getter runs inside the second read's next(), while that generator is running.
+  let closeError = 'not called';
+  const trapLocation = {
+    ...blobItem.location,
+    get segment() {
+      try {
+        source.close();
+        closeError = undefined;
+      } catch (error) {
+        closeError = error;
+      }
+      return blobItem.location.segment;
+    },
+  };
+  const running = source.streamBlob(trapLocation);
+  assert.throws(() => running.next(), error => error instanceof VaultFormatError && error.code === 'KEY');
+  assert.equal(closeError, undefined);
+
+  // The paused stream's derived keys are zeroed and the running read derived no new key.
+  assert.deepEqual(observed[0].collectionKey, Buffer.alloc(32));
+  assert.deepEqual(observed[0].recordKey, Buffer.alloc(32));
+  assert.equal(observed.length, 1);
+  assert.equal(activeReplayIteratorCountForTest(source), 0);
+
+  // Every later read fails KEY.
+  assert.throws(() => running.next(), error => error instanceof VaultFormatError && error.code === 'KEY');
+  assert.throws(() => paused.next(), error => error instanceof VaultFormatError && error.code === 'KEY');
+  assert.throws(() => source.replay().next(), error => error instanceof VaultFormatError && error.code === 'KEY');
+  assert.throws(() => source.streamBlob(blobItem.location).next(),
+    error => error instanceof VaultFormatError && error.code === 'KEY');
+});
+
+test('iterators join the active set on their first next, so 1,000 dropped unstarted iterators leave it empty', t => {
+  const vault = setup(t);
+  vault.write(writer => writer.appendBatch([event('TEST ONLY lazy tracking'), blob('TEST ONLY lazy tracking')]));
+  const source = openVaultReplay(vault.directory, credential());
+  t.after(() => source.close());
+  const blobItem = [...source.replay()].find(item => item.type === 'blob');
+  assert.ok(blobItem);
+  assert.equal(activeReplayIteratorCountForTest(source), 0);
+
+  for (let index = 0; index < 1000; index += 1) {
+    if (index % 2 === 0) source.replay();
+    else source.streamBlob(blobItem.location);
+  }
+  assert.equal(activeReplayIteratorCountForTest(source), 0);
+
+  // A started iterator is tracked until it finishes.
+  const started = source.replay();
+  assert.equal(activeReplayIteratorCountForTest(source), 0);
+  assert.equal(started.next().done, false);
+  assert.equal(activeReplayIteratorCountForTest(source), 1);
+  for (let next = started.next(); !next.done; next = started.next());
+  assert.equal(activeReplayIteratorCountForTest(source), 0);
+
+  // An iterator created before close() but first read after it still fails KEY and is never tracked.
+  const createdBeforeClose = source.streamBlob(blobItem.location);
+  source.close();
+  assert.throws(() => createdBeforeClose.next(), error => error instanceof VaultFormatError && error.code === 'KEY');
+  assert.equal(activeReplayIteratorCountForTest(source), 0);
 });

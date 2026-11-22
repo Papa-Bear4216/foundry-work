@@ -10,7 +10,7 @@ import {
   UnlockSession, unlockVault, VaultFormatError, VaultWriter,
 } from '../src/index.ts';
 import {
-  getKdfCallCountForTest, isSessionMasterKeyZeroedForTest, resetKdfCallCountForTest,
+  createUnlockSession, getKdfCallCountForTest, isSessionMasterKeyZeroedForTest, resetKdfCallCountForTest,
 } from '../src/keyring.ts';
 import { formatRecoveryKey } from '../src/recovery.ts';
 import { blob, cases, event, fixture, identity, keyId, keyringPath, writable } from './vault-fixture.mjs';
@@ -408,6 +408,67 @@ test('legacy credentials with session: undefined unlock the committed fixture wh
     assert.equal(getKdfCallCountForTest(), 0);
   } finally {
     session.dispose();
+  }
+});
+
+test('credential fields are read once into a snapshot, so a getter that changes its answer cannot split validation from use', t => {
+  const vault = setupVault(t, 'vault-snapshot');
+  const forged = { vaultId: vault.vaultId, disposed: false, dispose() {} };
+  const changing = (field, first, later, extra = {}) => {
+    const counter = { reads: 0 };
+    const credential = { ...extra };
+    Object.defineProperty(credential, field, {
+      enumerable: true,
+      get() {
+        counter.reads += 1;
+        return counter.reads === 1 ? first : later;
+      },
+    });
+    return { credential, counter };
+  };
+
+  // unlockVault and createUnlockSession: session reads undefined first, then a real session.
+  const real = unlockVault(vault.path, vault.vaultId, { recoveryKey: recoveryKey() });
+  try {
+    const viaUnlock = changing('session', undefined, real, { recoveryKey: recoveryKey() });
+    const fromUnlock = unlockVault(vault.path, vault.vaultId, viaUnlock.credential);
+    fromUnlock.dispose();
+    assert.equal(viaUnlock.counter.reads, 1);
+
+    const viaCreate = changing('session', undefined, real, { recoveryKey: recoveryKey() });
+    const fromCreate = createUnlockSession(readFileSync(vault.path), vault.vaultId, viaCreate.credential);
+    fromCreate.dispose();
+    assert.equal(viaCreate.counter.reads, 1);
+
+    // A defined session still fails KEY for the credential-only entry points.
+    assert.throws(() => unlockVault(vault.path, vault.vaultId, { session: real }), { code: 'KEY' });
+    assert.throws(() => createUnlockSession(readFileSync(vault.path), vault.vaultId, { session: real }), { code: 'KEY' });
+
+    // decodeKeyring: session reads a real session first, then a forged one.
+    const viaDecode = changing('session', real, forged);
+    const decoded = decodeKeyring(readFileSync(vault.path), viaDecode.credential, vault.vaultId);
+    decoded.masterKey.fill(0);
+    for (const k of decoded.keys.values()) k.fill(0);
+    assert.equal(viaDecode.counter.reads, 1);
+
+    // decodeKeyring: recoveryKey reads the real key first, then a wrong one.
+    const viaRecovery = changing('recoveryKey', recoveryKey(), Buffer.alloc(32));
+    const byRecovery = decodeKeyring(readFileSync(vault.path), viaRecovery.credential, vault.vaultId);
+    byRecovery.masterKey.fill(0);
+    for (const k of byRecovery.keys.values()) k.fill(0);
+    assert.equal(viaRecovery.counter.reads, 1);
+
+    // rekeyAll: session reads a real session first, then a forged one.
+    const viaRekey = changing('session', real, forged);
+    const rekeyed = rekeyAll(vault.path, vault.vaultId, viaRekey.credential, {
+      passphrase: 'TEST ONLY snapshot rekey passphrase',
+      currentCollectionIds: [keyId],
+      historicalCollectionIds: [],
+    });
+    assert.equal(rekeyed.collectionIds.size, 1);
+    assert.equal(viaRekey.counter.reads, 1);
+  } finally {
+    real.dispose();
   }
 });
 

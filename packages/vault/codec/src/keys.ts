@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { check } from './bytes.ts';
 import {
   changeKeyringPassphrase, createUnlockSession, decodeKeyring, encodeKeyring, nextKeyringVersion, readKeyring,
-  replacementParallelism, unlockKeyring, validateParallelism, vaultKey,
+  replacementParallelism, snapshotCredential, unlockKeyring, validateParallelism, vaultKey,
 } from './keyring.ts';
 import type { KdfParallelism, UnlockSession, VaultCredential } from './keyring.ts';
 import { publishKeyring } from './keyring-file.ts';
@@ -48,10 +48,9 @@ export function create(path: string, { passphrase, parallelism = 1 }: Passphrase
 
 /** Run the KDF (or recovery unwrap) once and hold the unwrapped master key until dispose(). */
 export function unlockVault(
-  keyringPath: string, vaultId: string, credential: VaultCredential,
+  keyringPath: string, vaultId: string, input: VaultCredential,
 ): UnlockSession {
-  check(credential !== null && typeof credential === 'object'
-    && (!('session' in credential) || (credential as { session?: unknown }).session === undefined), 'KEY');
+  const credential = snapshotCredential(input, false) as VaultCredential;
   return createUnlockSession(readFileSync(keyringPath), vaultId, credential);
 }
 
@@ -108,18 +107,16 @@ export function rekeyAll(path: string, vaultId: string, credential: Credential, 
     && currentIds.size + historicalIds.size === activeCollections.size
     && [...currentIds].every(id => activeCollections.has(id))
     && [...historicalIds].every(id => activeCollections.has(id) && !currentIds.has(id)), 'KEY');
-  check(credential !== null && typeof credential === 'object', 'KEY');
-  const hasPassphrase = 'passphrase' in credential;
-  const hasRecovery = 'recoveryKey' in credential;
-  const hasSession = 'session' in credential && credential.session !== undefined;
-  check(Number(hasPassphrase) + Number(hasRecovery) + Number(hasSession) === 1, 'KEY');
-  const oldRecovery = hasRecovery ? decodeRecoveryKey((credential as { recoveryKey: string }).recoveryKey) : undefined;
+  const snapshot = snapshotCredential(credential, true);
+  const hasPassphrase = 'passphrase' in snapshot;
+  const hasRecovery = 'recoveryKey' in snapshot;
+  const oldRecovery = hasRecovery ? decodeRecoveryKey((snapshot as { recoveryKey: string }).recoveryKey) : undefined;
   try {
     const unlocked = unlockKeyring(
       ring,
       hasRecovery ? { recoveryKey: oldRecovery! }
-        : hasPassphrase ? { passphrase: (credential as { passphrase: string }).passphrase }
-          : { session: (credential as { session: UnlockSession }).session },
+        : hasPassphrase ? { passphrase: (snapshot as { passphrase: string }).passphrase }
+          : { session: (snapshot as { session: UnlockSession }).session },
     );
     const generated: Buffer[] = [];
     try {

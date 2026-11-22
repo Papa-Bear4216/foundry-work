@@ -346,17 +346,38 @@ export function readKeyring(bytes: Buffer, expectedVaultId: string): Keyring {
   return keyring;
 }
 
-function unlockMaster(keyring: Keyring, credential: Unlock): Buffer {
+/**
+ * Reads `passphrase`, `recoveryKey` and `session` from the caller's object at most once each into a fresh object that
+ * holds only the chosen field, so later validation never sees a getter's second answer. Presence uses `in`, and a
+ * credential is a session only when its `session` value is defined. With `allowSession: false`, a defined session
+ * fails KEY. Field values are returned raw; callers validate their types.
+ */
+export function snapshotCredential(
+  credential: unknown, allowSession: boolean,
+): { passphrase: unknown } | { recoveryKey: unknown } | { session: unknown } {
+  check(credential !== null && typeof credential === 'object', 'KEY');
+  const source = credential as Record<string, unknown>;
+  const hasPassphrase = 'passphrase' in source;
+  const hasRecovery = 'recoveryKey' in source;
+  const hasSessionKey = 'session' in source;
+  const passphrase = hasPassphrase ? source.passphrase : undefined;
+  const recoveryKey = hasRecovery ? source.recoveryKey : undefined;
+  const session = hasSessionKey ? source.session : undefined;
+  const hasSession = session !== undefined;
+  check(allowSession || !hasSession, 'KEY');
+  check(Number(hasPassphrase) + Number(hasRecovery) + Number(hasSession) === 1, 'KEY');
+  return hasPassphrase ? { passphrase } : hasRecovery ? { recoveryKey } : { session };
+}
+
+function unlockMaster(keyring: Keyring, input: Unlock): Buffer {
   const { mac: storedMac, ...body } = keyring;
   const { vault_id: vaultId, kdf, master } = body;
-  check(credential !== null && typeof credential === 'object', 'KEY');
+  const credential = snapshotCredential(input, true);
   const passphrase = 'passphrase' in credential;
-  const recovery = 'recoveryKey' in credential;
-  const session = 'session' in credential && credential.session !== undefined;
-  check(Number(passphrase) + Number(recovery) + Number(session) === 1, 'KEY');
+  const session = 'session' in credential;
 
   if (session) {
-    const state = sessionState.get((credential as { session: UnlockSession }).session);
+    const state = sessionState.get(credential.session as UnlockSession);
     check(state && !state.disposed && state.vaultId === vaultId, 'KEY');
     const masterKey = Buffer.from(state.masterKey);
     try {
@@ -387,9 +408,8 @@ function unlockMaster(keyring: Keyring, credential: Unlock): Buffer {
   }
 }
 
-export function createUnlockSession(bytes: Buffer, vaultId: string, credential: VaultCredential): UnlockSession {
-  check(credential !== null && typeof credential === 'object'
-    && (!('session' in credential) || (credential as { session?: unknown }).session === undefined), 'KEY');
+export function createUnlockSession(bytes: Buffer, vaultId: string, input: VaultCredential): UnlockSession {
+  const credential = snapshotCredential(input, false) as VaultCredential;
   const ring = readKeyring(bytes, vaultId);
   const masterKey = unlockMaster(ring, credential);
   try {
