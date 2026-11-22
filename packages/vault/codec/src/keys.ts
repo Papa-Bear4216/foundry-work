@@ -3,10 +3,10 @@ import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { check } from './bytes.ts';
 import {
-  changeKeyringPassphrase, decodeKeyring, encodeKeyring, nextKeyringVersion, readKeyring, replacementParallelism,
-  unlockKeyring, validateParallelism, vaultKey,
+  changeKeyringPassphrase, createUnlockSession, decodeKeyring, encodeKeyring, nextKeyringVersion, readKeyring,
+  replacementParallelism, unlockKeyring, validateParallelism, vaultKey,
 } from './keyring.ts';
-import type { KdfParallelism } from './keyring.ts';
+import type { KdfParallelism, UnlockSession, VaultCredential } from './keyring.ts';
 import { publishKeyring } from './keyring-file.ts';
 import { signingPublicKey } from './manifest.ts';
 import { decodeRecoveryKey, formatRecoveryKey } from './recovery.ts';
@@ -16,7 +16,7 @@ interface PassphraseOptions {
   parallelism?: KdfParallelism;
 }
 
-type Credential = { passphrase: string } | { recoveryKey: string };
+type Credential = { passphrase: string } | { recoveryKey: string } | { session: UnlockSession };
 
 function now(): string {
   return new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z');
@@ -44,6 +44,14 @@ export function create(path: string, { passphrase, parallelism = 1 }: Passphrase
     seed.fill(0);
     recovery.fill(0);
   }
+}
+
+/** Run the KDF (or recovery unwrap) once and hold the unwrapped master key until dispose(). */
+export function unlockVault(
+  keyringPath: string, vaultId: string, credential: VaultCredential,
+): UnlockSession {
+  check(credential !== null && typeof credential === 'object' && !('session' in credential), 'KEY');
+  return createUnlockSession(readFileSync(keyringPath), vaultId, credential);
 }
 
 export function unlockByPassphrase(path: string, vaultId: string, passphrase: string): ReturnType<typeof decodeKeyring> {
@@ -99,10 +107,14 @@ export function rekeyAll(path: string, vaultId: string, credential: Credential, 
     && currentIds.size + historicalIds.size === activeCollections.size
     && [...currentIds].every(id => activeCollections.has(id))
     && [...historicalIds].every(id => activeCollections.has(id) && !currentIds.has(id)), 'KEY');
-  check(('passphrase' in credential) !== ('recoveryKey' in credential), 'KEY');
-  const oldRecovery = 'recoveryKey' in credential ? decodeRecoveryKey(credential.recoveryKey) : undefined;
+  check(credential !== null && typeof credential === 'object', 'KEY');
+  const hasPassphrase = 'passphrase' in credential;
+  const hasRecovery = 'recoveryKey' in credential;
+  const hasSession = 'session' in credential;
+  check(Number(hasPassphrase) + Number(hasRecovery) + Number(hasSession) === 1, 'KEY');
+  const oldRecovery = hasRecovery ? decodeRecoveryKey(credential.recoveryKey) : undefined;
   try {
-    const unlocked = unlockKeyring(ring, 'passphrase' in credential ? credential : { recoveryKey: oldRecovery! });
+    const unlocked = unlockKeyring(ring, hasRecovery ? { recoveryKey: oldRecovery! } : credential);
     const generated: Buffer[] = [];
     try {
       const newKey = () => {
