@@ -239,8 +239,9 @@ test('Run B failure: one stderr line with the underlying code; "stored so far" o
   const none = await runInline(dir, ['import', folder, '--vault', fresh.home, '--passphrase-stdin'],
     { stdin: PASSPHRASE, hooks: { failRunB: true } });
   assert.equal(none.code, 2);
-  assert.match(none.stderr, /^foundry: [^\n]+ \[IO\]\n$/u);
-  assert.doesNotMatch(none.stderr, /stored so far|INDEX_BEHIND/u);
+  // After Run A started, repeating is always safe; nothing was stored, so the index is not behind.
+  assert.match(none.stderr, /^foundry: [^\n]+; repeating the import is safe \[IO\]\n$/u);
+  assert.doesNotMatch(none.stderr, /stored so far|INDEX_BEHIND|index is behind/u);
   assert.equal(storedItems(fresh.home, fresh.recoveryKey, decodeRecoveryKey), 0);
 
   // A vault with some collection keys: Run A stores the items of those collections, then Run B fails.
@@ -254,7 +255,8 @@ test('Run B failure: one stderr line with the underlying code; "stored so far" o
     { stdin: PASSPHRASE, hooks: { failRunB: true } });
   assert.equal(some.code, 2);
   assert.equal(some.stdout, '');
-  assert.match(some.stderr, /^foundry: [^\n]+; items stored so far stay stored; repeating the import is safe \[IO\]\n$/u);
+  assert.match(some.stderr,
+    /^foundry: [^\n]+; the index is behind; run `foundry index rebuild`; items stored so far stay stored; repeating the import is safe \[IO\]\n$/u);
   const between = storedItems(used.home, used.recoveryKey, decodeRecoveryKey);
   assert.ok(between > before, 'Run A stored items before Run B failed');
   const retry = await runInline(dir, ['import', bigger.folder, '--vault', used.home, '--passphrase-stdin', '--json'], { stdin: PASSPHRASE });
@@ -281,7 +283,27 @@ test('final index update failure: one stderr line, the underlying code, "index i
   const again = await runInline(dir, ['import', folder, '--vault', home, '--passphrase-stdin'],
     { stdin: PASSPHRASE, hooks: { failFinalIndexUpdate: true } });
   assert.equal(again.code, 2);
-  assert.match(again.stderr, /^foundry: [^\n]+; the index is behind; run `foundry index rebuild` \[IO\]\n$/u);
+  assert.match(again.stderr, /^foundry: [^\n]+; the index is behind; run `foundry index rebuild`; repeating the import is safe \[IO\]\n$/u);
+});
+
+test('index update between Run A and Run B fails after Run A stored items: one line with "index is behind", "stored so far" and "safe to repeat"', async t => {
+  const dir = scratch(t);
+  mkdirSync(join(dir, 'used'));
+  const used = await initVault(join(dir, 'used'));
+  const small = await takeoutFolder(join(dir, 'used', 'a'), { contactsCount: 1, calendarEvents: 1, mailMessages: 1 });
+  assert.equal((await runInline(dir, ['import', small.folder, '--vault', used.home, '--passphrase-stdin'], { stdin: PASSPHRASE })).code, 0);
+  // Run A stores the mail messages of the existing mail collection; new contact years need keys and Run B.
+  const bigger = await takeoutFolder(join(dir, 'used', 'b'), { contactsCount: 5, calendarEvents: 1, mailMessages: 3 });
+  const before = storedItems(used.home, used.recoveryKey, decodeRecoveryKey);
+  const failed = await runInline(dir, ['import', bigger.folder, '--vault', used.home, '--passphrase-stdin'],
+    { stdin: PASSPHRASE, hooks: { failBetweenRunsUpdate: true } });
+  assert.equal(failed.code, 2);
+  assert.equal(failed.stdout, '');
+  assert.match(failed.stderr,
+    /^foundry: [^\n]+; the index is behind; run `foundry index rebuild`; items stored so far stay stored; repeating the import is safe \[IO\]\n$/u);
+  assert.ok(storedItems(used.home, used.recoveryKey, decodeRecoveryKey) > before, 'Run A stored items before the update failed');
+  const retry = await runInline(dir, ['import', bigger.folder, '--vault', used.home, '--passphrase-stdin', '--json'], { stdin: PASSPHRASE });
+  assert.equal(retry.code, 0, retry.stderr);
 });
 
 test('the first part of one export opens only the parts of that export, not every zip in the folder', async t => {

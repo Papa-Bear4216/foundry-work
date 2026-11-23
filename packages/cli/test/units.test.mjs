@@ -1,7 +1,7 @@
 // TEST ONLY: unit tests of the foundry command line with synthetic values.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
@@ -331,14 +331,59 @@ test('lock: an unreadable lock gives BUSY naming the file and is never removed b
   assert.equal(readFileSync(path, 'utf8'), '{"pid":', 'the unreadable lock is left as it was');
 
   const other = join(dir, 'second.lock');
-  const failure = Object.assign(new Error('TEST ONLY disk full'), { code: 'ENOSPC' });
-  assert.throws(() => acquireLock(other, 'import', () => {}, { writeMetadata: () => { throw failure; } }), e => e === failure);
+  const failure = Object.assign(new Error(`TEST ONLY disk full at ${dir}`), { code: 'ENOSPC' });
+  // A file-system error of the lock becomes fixed text with its code only (review item 14): no path, no message.
+  const fixedEnospc = e => e instanceof CliError && e.code === 'IO'
+    && e.message === 'a file operation on the Foundry folder or its lock file failed (ENOSPC)';
+  assert.throws(() => acquireLock(other, 'import', () => {}, { writeMetadata: () => { throw failure; } }), fixedEnospc);
   assert.equal(existsSync(other), false, 'the file this command created is removed');
   const partial = join(dir, 'third.lock');
   assert.throws(() => acquireLock(partial, 'import', () => {}, {
     writeMetadata: fd => { writeFileSync(fd, '{"pid":1'); throw failure; },
-  }), e => e === failure);
+  }), fixedEnospc);
   assert.equal(existsSync(partial), false, 'a half-written lock is removed too');
+});
+
+const NOT_REGULAR_LINE = 'a file operation on the Foundry folder or its lock file failed (not a regular file)';
+
+test('lock path must be a regular file: a folder at the lock or recovery path gives BUSY with the fixed message, nothing opened or removed', async t => {
+  const dir = scratch(t);
+  const isNotRegular = e => e instanceof CliError && e.code === 'BUSY' && e.exit === 2 && e.message === NOT_REGULAR_LINE;
+
+  // A folder at the lock path.
+  const lockDir = join(dir, 'a', 'foundry.lock');
+  mkdirSync(lockDir, { recursive: true });
+  assert.throws(() => acquireLock(lockDir, 'search', () => assert.fail('no notice')), isNotRegular);
+  assert.ok(statSync(lockDir).isDirectory(), 'the folder is kept');
+
+  // A folder at the recovery path while a stale lock waits for recovery.
+  const lockPath = join(dir, 'b', 'foundry.lock');
+  mkdirSync(`${lockPath}.recover`, { recursive: true });
+  const stale = { pid: deadPid(), command: 'import', started: '2026-01-01T00:00:00.000Z', host: hostname() };
+  writeFileSync(lockPath, JSON.stringify(stale));
+  assert.throws(() => acquireLock(lockPath, 'search', () => assert.fail('no notice')), isNotRegular);
+  assert.deepEqual(JSON.parse(readFileSync(lockPath, 'utf8')), stale, 'the stale lock is not removed');
+  assert.ok(statSync(`${lockPath}.recover`).isDirectory());
+
+  // Through the command line: `init` on a home whose lock path is a folder. One fixed line, no path, also with --debug.
+  const home = join(dir, 'home');
+  mkdirSync(join(home, 'foundry.lock'), { recursive: true });
+  for (const debug of [[], ['--debug']]) {
+    let stderr = '';
+    const fd = stdinFile(dir, 'TEST ONLY lock type passphrase\n');
+    try {
+      const code = await runCli(['init', '--vault', home, '--passphrase-stdin', ...debug], {
+        inline: true, env: cleanEnv(), stdinFd: fd, isTerminal: () => false,
+        stdout: () => assert.fail('no output'), stderr: text => { stderr += text; },
+      });
+      assert.equal(code, 2);
+    } finally {
+      closeSync(fd);
+    }
+    assert.ok(stderr.endsWith(`foundry: ${NOT_REGULAR_LINE} [BUSY]\n`), stderr);
+    assert.ok(!stderr.includes(home), 'the home path is not echoed');
+  }
+  assert.deepEqual(readdirSync(home), ['foundry.lock'], 'no vault and no staging folder');
 });
 
 test('stdin flags refuse a terminal on stdin: exit 1 with a usage line before any read or lock', async t => {

@@ -1,5 +1,7 @@
 // TEST ONLY helpers for the foundry command-line tests. Every secret, archive and name here is synthetic.
+import { Buffer } from 'node:buffer';
 import { spawnSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { closeSync, mkdtempDisposableSync, openSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -84,6 +86,37 @@ export function runBin(dir, argv, { stdin = '', env = {}, timeout = 120_000 } = 
   } finally {
     closeSync(fd);
   }
+}
+
+/**
+ * A fake terminal for prompts (`runCli` option `terminal`). Each time a prompt writes its label, the next queued
+ * input string (if any) is emitted as a fresh Buffer on the next turn, after the prompt attached its listener.
+ * `rawCalls` records every `setRawMode` call; `buffers` collects what the prompt's `observe` hook hands over.
+ */
+export function fakeTerminal(inputs = []) {
+  const queue = [...inputs];
+  const input = new EventEmitter();
+  input.isTTY = true;
+  input.isRaw = false;
+  input.rawCalls = [];
+  input.setRawMode = mode => { input.isRaw = mode; input.rawCalls.push(mode); return input; };
+  input.pause = () => input;
+  input.resume = () => input;
+  const labels = [];
+  const buffers = [];
+  const output = {
+    write(text) {
+      if (text !== '\n') {
+        labels.push(text);
+        if (queue.length > 0) {
+          const next = queue.shift();
+          setImmediate(() => input.emit('data', Buffer.from(next, 'utf8')));
+        }
+      }
+      return true;
+    },
+  };
+  return { input, output, labels, buffers, observe: (role, bytes) => { buffers.push({ role, bytes }); } };
 }
 
 /** `foundry init` inline. Returns the home folder and the printed recovery key. */

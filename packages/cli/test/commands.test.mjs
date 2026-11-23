@@ -1,9 +1,13 @@
 // TEST ONLY: command tests run in this thread so the vault's KDF counting hook sees every scrypt run.
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { initVault, PASSPHRASE, runInline, scratch } from './helpers.mjs';
+
+/** init's ownership marker (fixed name and content, written as written by `commands.ts`). */
+const INIT_MARKER = '.foundry-init-owner';
+const initMarkerContent = name => `foundry init staging folder\n${name}\n`;
 
 const NEW_PASSPHRASE = 'TEST ONLY replacement passphrase';
 
@@ -27,15 +31,17 @@ test('init: KDF runs once, prints the recovery key once, builds no index, refuse
   assert.match((await runInline(dir, ['init', '--vault', other, '--passphrase-stdin'], { stdin: PASSPHRASE })).stderr, /NOT_EMPTY/u);
 });
 
-test('init builds in H/.init-<random> and renames it last: a leftover .init folder is ignored and removed; an interrupted init leaves no vault and a retry succeeds', async t => {
+test('init builds in H/.init-<random> and renames it last: an owned leftover .init folder is ignored and removed; an interrupted init leaves no vault and a retry succeeds', async t => {
   const dir = scratch(t);
   const home = join(dir, 'home');
-  const leftover = join(home, '.init-0123456789abcdef');
-  mkdirSync(join(leftover, 'keyring'), { recursive: true });
-  writeFileSync(join(leftover, 'keyring', 'partial.txt'), 'TEST ONLY partial init');
+  const leftoverName = '.init-0123456789abcdef';
+  const leftover = join(home, leftoverName);
+  mkdirSync(join(leftover, 'vault', 'keyring'), { recursive: true });
+  writeFileSync(join(leftover, INIT_MARKER), initMarkerContent(leftoverName));
+  writeFileSync(join(leftover, 'vault', 'keyring', 'partial.txt'), 'TEST ONLY partial init');
   const { init } = await initVault(dir);
   assert.equal(init.code, 0);
-  assert.deepEqual(readdirSync(home), ['vault'], 'the leftover folder is removed and no temporary folder remains');
+  assert.deepEqual(readdirSync(home), ['vault'], 'the owned leftover folder is removed and no staging folder remains');
 
   // Only the exact pattern is ignored: a look-alike folder still makes the target "not empty" and is kept.
   const near = join(dir, 'near');
@@ -54,6 +60,8 @@ test('init builds in H/.init-<random> and renames it last: a leftover .init fold
   const names = readdirSync(second);
   assert.equal(names.length, 1);
   assert.match(names[0], /^\.init-[0-9a-f]{16}$/u);
+  assert.equal(readFileSync(join(second, names[0], INIT_MARKER), 'utf8'), initMarkerContent(names[0]),
+    'the staging folder holds its ownership marker');
   const retry = await runInline(dir, ['init', '--vault', second, '--passphrase-stdin'], { stdin: PASSPHRASE + '\n' });
   assert.equal(retry.code, 0, retry.stderr);
   assert.match(retry.stdout, /RECOVERY KEY/u);
@@ -63,6 +71,29 @@ test('init builds in H/.init-<random> and renames it last: a leftover .init fold
   const search = await runInline(dir, ['search', 'q', '--vault', second, '--passphrase-stdin'], { stdin: PASSPHRASE });
   assert.equal(search.code, 0, search.stderr);
   assert.equal(search.stdout, 'No results.\n');
+});
+
+test('init removes only staging folders it owns: a matching .init-<16 hex> name without a valid ownership marker is user data (NOT_EMPTY, kept)', async t => {
+  const dir = scratch(t);
+  const name = '.init-00112233445566ff';
+  const cases = {
+    'no marker': folder => writeFileSync(join(folder, 'backup.txt'), 'TEST ONLY user backup'),
+    'wrong marker content': folder => writeFileSync(join(folder, INIT_MARKER), initMarkerContent('.init-ffeeddccbbaa9988')),
+    'marker is a folder': folder => mkdirSync(join(folder, INIT_MARKER)),
+  };
+  for (const [label, plant] of Object.entries(cases)) {
+    const home = join(dir, label.replaceAll(' ', '-'));
+    const folder = join(home, name);
+    mkdirSync(join(folder, 'vault'), { recursive: true });
+    writeFileSync(join(folder, 'vault', 'VAULT.json'), 'TEST ONLY an existing vault the user keeps here');
+    plant(folder);
+    const refused = await runInline(dir, ['init', '--vault', home, '--passphrase-stdin'], { stdin: PASSPHRASE });
+    assert.equal(refused.code, 2, label);
+    assert.match(refused.stderr, /\[NOT_EMPTY\]\n$/u, label);
+    assert.equal(refused.kdf, 0, label);
+    assert.ok(existsSync(join(folder, 'vault', 'VAULT.json')), `${label}: the look-alike folder is kept`);
+    assert.deepEqual(readdirSync(home), [name], `${label}: nothing else was created`);
+  }
 });
 
 test('init and vault reset-passphrase refuse an empty new passphrase before any vault call', async t => {

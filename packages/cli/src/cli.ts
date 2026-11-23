@@ -12,8 +12,11 @@
  * - the bin (`exitOnTimeout`) prints the `TIMEOUT` / `INTERRUPTED` line and ends the process WITHOUT removing the
  *   lock: the worker may still be writing until the process is gone. The dead pid then makes the lock stale, and the
  *   next command recovers it (`lock.ts`).
- * - the programmatic path prints the line, cancels a pending stdin read, awaits `worker.terminate()` and only then
- *   removes the lock.
+ * - the programmatic path prints the line, cancels a pending stdin read or terminal prompt (the prompt's listener is
+ *   removed, the input terminal's raw mode restored, its buffers wiped, synchronously), awaits `worker.terminate()`
+ *   and only then removes the lock.
+ * File-system errors of the home folder and the lock print a fixed message with the error code, never the path, also
+ * under `--debug` (`files.ts`).
  * No child process is started; no thread outlives the command.
  *
  * Location rule (design 4.1), first match wins: `--vault <dir>`, then `FOUNDRY_HOME`, then `<home directory>/Foundry`.
@@ -28,13 +31,14 @@ import { isatty } from 'node:tty';
 import { Worker } from 'node:worker_threads';
 import { HELP, isKeyed, parseCommandLine } from './args.ts';
 import type { ParsedCommand } from './args.ts';
-import { executeCommand, homePaths, isInitLeftover } from './commands.ts';
+import { executeCommand, homePaths, isOwnedInitFolder } from './commands.ts';
 import type { CommandIo, CommandRequest, CommandSecrets, TestHooks } from './commands.ts';
 import { CliError, debugText, errorLine, mapError, usage } from './errors.ts';
+import { withFixedFileErrors } from './files.ts';
 import { acquireLock, LOCK_NAME, RECOVERY_NAME } from './lock.ts';
 import type { HeldLock } from './lock.ts';
 import { promptHidden, readOneSecret, readTwoSecrets, restoreTerminal } from './secrets.ts';
-import type { PromptIo, StdinRead } from './secrets.ts';
+import type { Cancellable, PromptIo, StdinRead } from './secrets.ts';
 
 export { DEFAULT_TIMEOUTS } from './args.ts';
 export { executeCommand } from './commands.ts';
@@ -81,11 +85,18 @@ function guardMessage(error: unknown): CliError {
 
 type Run = Extract<ParsedCommand, { kind: 'run' }>;
 
-async function promptNew(terminal: PromptIo): Promise<Buffer> {
-  const first = await promptHidden('New passphrase: ', terminal);
+/** A new passphrase, typed twice. A cancel during the confirmation also zeroes the first passphrase, synchronously. */
+async function promptNew(terminal: PromptIo, track: (pending: Cancellable) => void): Promise<Buffer> {
+  const first = await promptHidden('New passphrase: ', terminal, track);
   let second: Buffer | undefined;
   try {
-    second = await promptHidden('Repeat the new passphrase: ', terminal);
+    terminal.observe?.('first', first);
+    second = await promptHidden('Repeat the new passphrase: ', terminal, pending => track({
+      cancel: () => {
+        first.fill(0);
+        pending.cancel();
+      },
+    }));
     if (!first.equals(second)) throw new CliError('PASSPHRASE_MISMATCH', 'the two passphrases are not the same');
     return first;
   } catch (error) {
@@ -98,22 +109,23 @@ async function promptNew(terminal: PromptIo): Promise<Buffer> {
 
 /**
  * Read every secret the command needs. The caller zeroes them. Every read is asynchronous, so the watchdog keeps
- * running; `track` receives each pending stdin read so a timeout can cancel it.
+ * running; `track` receives each pending stdin read and `trackPrompt` each open terminal prompt, so a timeout can
+ * cancel it.
  */
 async function readSecrets(run: Run, fd: number, terminal: PromptIo, secrets: CommandSecrets,
-  track: (read: StdinRead) => void): Promise<CommandRequest['credential']> {
+  track: (read: StdinRead) => void, trackPrompt: (pending: Cancellable) => void): Promise<CommandRequest['credential']> {
   switch (run.command) {
     case 'vault verify':
       return undefined;
     case 'init':
-      secrets.newPassphrase = run.passphraseStdin ? await readOneSecret(fd, track) : await promptNew(terminal);
+      secrets.newPassphrase = run.passphraseStdin ? await readOneSecret(fd, track) : await promptNew(terminal, trackPrompt);
       return undefined;
     case 'vault reset-passphrase':
       if (run.recoveryKeyStdin && run.passphraseStdin) {
         [secrets.recoveryKey, secrets.newPassphrase] = await readTwoSecrets(fd, track);
       } else {
-        secrets.recoveryKey = run.recoveryKeyStdin ? await readOneSecret(fd, track) : await promptHidden('Recovery key: ', terminal);
-        secrets.newPassphrase = run.passphraseStdin ? await readOneSecret(fd, track) : await promptNew(terminal);
+        secrets.recoveryKey = run.recoveryKeyStdin ? await readOneSecret(fd, track) : await promptHidden('Recovery key: ', terminal, trackPrompt);
+        secrets.newPassphrase = run.passphraseStdin ? await readOneSecret(fd, track) : await promptNew(terminal, trackPrompt);
       }
       return undefined;
     default:
@@ -121,7 +133,7 @@ async function readSecrets(run: Run, fd: number, terminal: PromptIo, secrets: Co
         secrets.recoveryKey = await readOneSecret(fd, track);
         return 'recovery';
       }
-      secrets.passphrase = run.passphraseStdin ? await readOneSecret(fd, track) : await promptHidden('Passphrase: ', terminal);
+      secrets.passphrase = run.passphraseStdin ? await readOneSecret(fd, track) : await promptHidden('Passphrase: ', terminal, trackPrompt);
       return 'passphrase';
   }
 }
@@ -137,14 +149,15 @@ function refuseTerminalStdin(run: Run, fd: number, isTerminal: (fd: number) => b
     + 'omit the flag to be prompted');
 }
 
-/** Names in H that do not make it "not empty" for `init`: the lock, its recovery file, and init's temporary folders. */
-function ignoredByInit(name: string): boolean {
-  return name === LOCK_NAME || name === RECOVERY_NAME || isInitLeftover(name);
+/** Names in H that do not make it "not empty" for `init`: the lock, its recovery file, and init's OWN staging folders. */
+function ignoredByInit(home: string, name: string): boolean {
+  return name === LOCK_NAME || name === RECOVERY_NAME || isOwnedInitFolder(home, name);
 }
 
+/** Home-folder preflight. A file-system error becomes fixed text with its code (the caller wraps it). */
 function checkHome(run: Run, home: string): void {
   if (run.command === 'init') {
-    if (existsSync(home) && readdirSync(home).some(name => !ignoredByInit(name))) {
+    if (existsSync(home) && readdirSync(home).some(name => !ignoredByInit(home, name))) {
       throw new CliError('NOT_EMPTY', 'the target folder exists and is not empty; choose another folder with --vault');
     }
     return;
@@ -229,6 +242,7 @@ export async function runCli(argv: readonly string[], options: RunOptions = {}):
   const handle: WorkerHandle = {};
   let lock: HeldLock | undefined;
   let pendingRead: StdinRead | undefined;
+  let pendingPrompt: Cancellable | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let finished = false;
 
@@ -246,13 +260,22 @@ export async function runCli(argv: readonly string[], options: RunOptions = {}):
     stop({ code: 'INTERRUPTED', message: `the command was stopped by ${String(args[0] ?? 'a signal')}` });
   };
 
+  const trackPrompt = (pending: Cancellable) => {
+    pendingPrompt = pending;
+    if (finished) pending.cancel(); // stopped already: never leave a prompt open
+  };
+
   const work = async (): Promise<number> => {
-    checkHome(run, home);
-    if (run.command === 'init') mkdirSync(home, { recursive: true, mode: 0o700 });
-    lock = acquireLock(join(home, LOCK_NAME), run.command, io.err);
-    checkHome(run, home); // again under the lock
-    const credential = await readSecrets(run, stdinFd, terminal, secrets, read => { pendingRead = read; });
+    // Fixed text for file-system errors here: the path may hold a secret pasted into --vault or FOUNDRY_HOME.
+    withFixedFileErrors(() => {
+      checkHome(run, home);
+      if (run.command === 'init') mkdirSync(home, { recursive: true, mode: 0o700 });
+      lock = acquireLock(join(home, LOCK_NAME), run.command, io.err);
+      checkHome(run, home); // again under the lock
+    });
+    const credential = await readSecrets(run, stdinFd, terminal, secrets, read => { pendingRead = read; }, trackPrompt);
     pendingRead = undefined;
+    pendingPrompt = undefined;
     const request: CommandRequest = {
       command: run.command, home, debug: run.debug, json: run.json, path: run.path, query: run.query,
       filters: run.filters, credential: isKeyed(run.command) ? credential : undefined, secrets,
@@ -284,6 +307,8 @@ export async function runCli(argv: readonly string[], options: RunOptions = {}):
     }
     const result = await Promise.race([work().catch(report), stopped]);
     if (typeof result === 'number') return result;
+    // Cancel an open prompt first, synchronously: listener off, the input terminal's raw mode off, buffers wiped.
+    pendingPrompt?.cancel();
     restoreTerminal();
     io.err(errorLine({ code: result.code, message: result.message, exit: 2 }));
     // The bin: end the process now and leave the lock. The worker may still be writing until the process is gone;

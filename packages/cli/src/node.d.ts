@@ -60,7 +60,15 @@ declare module 'node:fs' {
   export function mkdirSync(path: string, options?: { recursive?: boolean; mode?: number }): string | undefined;
   export function readFileSync(path: string): Buffer;
   export function readFileSync(path: string | URL, encoding: 'utf8'): string;
-  export function openSync(path: string, flags: 'r' | 'wx' | 'w', mode?: number): number;
+  export function openSync(path: string, flags: 'r' | 'wx' | 'w' | number, mode?: number): number;
+  export function fstatSync(fd: number): Stats;
+  export function readSync(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null): number;
+  /** Open flags. `O_NONBLOCK` and `O_NOFOLLOW` are absent on Windows. */
+  export const constants: {
+    readonly O_RDONLY: number;
+    readonly O_NONBLOCK?: number;
+    readonly O_NOFOLLOW?: number;
+  };
   export function writeSync(fd: number, data: string | Uint8Array): number;
   export function fsyncSync(fd: number): void;
   export function closeSync(fd: number): void;
@@ -201,7 +209,7 @@ declare class URL {
 }
 
 declare class TextDecoder {
-  constructor(label?: string, options?: { fatal?: boolean });
+  constructor(label?: string, options?: { fatal?: boolean; ignoreBOM?: boolean });
   decode(bytes?: Uint8Array, options?: { stream: boolean }): string;
 }
 

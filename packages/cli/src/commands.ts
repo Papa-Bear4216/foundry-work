@@ -7,13 +7,14 @@
  * passphrase and 0 with a recovery key. Packages are loaded on demand, so `vault verify` never loads the SQLite addon.
  */
 import { Buffer } from 'node:buffer';
-import { readFileSync } from 'node:fs';
+import { lstatSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { IndexStoreOptions } from 'foundry-index';
 import type { ImportResult } from 'importers';
 import type { UnlockSession } from 'vault';
 import type { CommandName, SearchFilters } from './args.ts';
 import { CliError, debugText, errorLine, isRecoveryFormatError, mapError } from './errors.ts';
+import { readSmallRegularFile } from './files.ts';
 
 export const PROFILE = 'me';
 /** `ensureCollectionKeys` accepts at most this many distinct names per call. */
@@ -57,6 +58,8 @@ export interface TestHooks {
   failFinalIndexUpdate?: boolean;
   /** `import`: Run B throws an errno-style error at its start (after any archive check, before it stores). */
   failRunB?: boolean;
+  /** `import`: the index update between Run A and Run B throws an errno-style error whose message quotes every secret. */
+  failBetweenRunsUpdate?: boolean;
   /**
    * `import`: called with the archive path after Run A has closed the archive, before Run B (it may change a part).
    * A function: it cannot cross into the worker thread, so only the inline path (`runCli` with `inline`) can use it.
@@ -88,12 +91,18 @@ function stall(hooks: TestHooks): void {
   if (hooks.stallSync) for (;;) { /* deliberately stuck synchronous section (test hook) */ }
 }
 
+export type ImportStage = 'before' | 'runA' | 'between' | 'runB' | 'final' | 'done';
+
 class Context {
   readonly paths: ReturnType<typeof homePaths>;
   /** Events this command durably appended (counted when the vault writer's `appendBatch` returns). */
   storedEvents = 0;
-  /** True while the final index update of `import` runs. */
-  finalIndexUpdate = false;
+  /**
+   * Stage of `import`, tracked apart from `storedEvents`: `before` (catch-up, archive resolution), `runA` (from the
+   * start of Run A), `between` (collection keys and the index update between the runs), `runB`, `final` (the final
+   * index update) and `done` (the final index update finished).
+   */
+  importStage: ImportStage = 'before';
   /** `vault reset-passphrase` failed in a way that may follow the atomic keyring replacement. */
   resetMayBeDone = false;
 
@@ -149,31 +158,67 @@ function requireNewPassphrase(ctx: Context): string {
   return value;
 }
 
-/** Temporary folders of `init` inside H: `.init-` and 16 lowercase hex digits. Nothing else matches. */
+/** Staging folders of `init` inside H: `.init-` and 16 lowercase hex digits. */
 const INIT_FOLDER = /^\.init-[0-9a-f]{16}$/u;
+/** The ownership marker `init` writes first into every staging folder it creates. */
+export const INIT_MARKER = '.foundry-init-owner';
 
-export function isInitLeftover(name: string): boolean {
-  return INIT_FOLDER.test(name);
+/** The exact marker content for the staging folder `name`: a fixed line and the folder's own random name. */
+export function initMarkerContent(name: string): string {
+  return `foundry init staging folder\n${name}\n`;
 }
 
 /**
- * `init` builds the vault in `H/.init-<random>` and renames it to `H/vault` as the last step, then prints the
- * recovery key. An interrupted init leaves at most such a folder; the next `init` (under the lock) removes only
- * folders that match the pattern, and the NOT_EMPTY check ignores them.
+ * True only for a staging folder `init` created itself: the name matches, it is a real folder (not a link), and it
+ * holds the marker as a regular file with exactly the expected content. A matching name without a valid marker is
+ * user data: `init` neither ignores nor removes it. The marker is read without a blocking open (`files.ts`).
+ */
+export function isOwnedInitFolder(home: string, name: string): boolean {
+  if (!INIT_FOLDER.test(name)) return false;
+  const folder = join(home, name);
+  try {
+    if (!lstatSync(folder, { throwIfNoEntry: false })?.isDirectory()) return false;
+    const marker = readSmallRegularFile(join(folder, INIT_MARKER), 256);
+    return Buffer.isBuffer(marker) && marker.equals(Buffer.from(initMarkerContent(name)));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * `init` creates `H/.init-<random>`, writes the ownership marker into it FIRST, builds the vault in
+ * `H/.init-<random>/vault`, renames that to `H/vault` as the last step, removes the staging folder (best effort) and
+ * prints the recovery key. An interrupted init leaves at most such a folder; the next `init` (under the lock) removes
+ * only folders it owns (`isOwnedInitFolder`), and only those are ignored by the NOT_EMPTY check.
  */
 async function init(ctx: Context): Promise<void> {
   const passphrase = requireNewPassphrase(ctx);
   const { createVault } = await import('vault');
   const { randomBytes } = await import('node:crypto');
-  const { readdirSync, renameSync, rmSync } = await import('node:fs');
+  const { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, renameSync, rmSync, writeSync } = await import('node:fs');
   for (const name of readdirSync(ctx.request.home)) {
-    if (isInitLeftover(name)) rmSync(join(ctx.request.home, name), { recursive: true, force: true });
+    if (isOwnedInitFolder(ctx.request.home, name)) rmSync(join(ctx.request.home, name), { recursive: true, force: true });
   }
-  const temporary = join(ctx.request.home, `.init-${randomBytes(8).toString('hex')}`);
+  const name = `.init-${randomBytes(8).toString('hex')}`;
+  const staging = join(ctx.request.home, name);
+  mkdirSync(staging, { mode: 0o700 });
+  const fd = openSync(join(staging, INIT_MARKER), 'wx', 0o600);
+  try {
+    writeSync(fd, initMarkerContent(name));
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  const temporary = join(staging, 'vault');
   stall(ctx.hooks);
   const identity = createVault(temporary, { passphrase });
   if (ctx.hooks.failBeforeInitRename) throw new Error('test hook: init stopped before the rename');
   renameSync(temporary, ctx.paths.vault);
+  try {
+    rmSync(staging, { recursive: true, force: true });
+  } catch {
+    // Best effort: the vault exists now, so the recovery key must still be shown. The folder stays owned.
+  }
   ctx.out(`Created a new Foundry vault in ${resolve(ctx.request.home)}.\n\n`
     + 'RECOVERY KEY. Write this down now and keep it somewhere safe. It is shown only this once:\n\n'
     + `    ${identity.recoveryKey}\n\n`
@@ -476,16 +521,20 @@ async function importCommand(ctx: Context): Promise<void> {
     const path = ctx.request.path!;
     const parts = await resolveArchiveParts(path);
     const stamps = await stampParts(parts);
+    ctx.importStage = 'runA';
     const runA = await importRun(ctx, session, id, options, parts);
     let runB: ImportResult | undefined;
     let collectionsCreated = 0;
     if (runA.missingCollections.length > 0) {
+      ctx.importStage = 'between';
       for (const slice of nameSlices(runA.missingCollections)) {
         collectionsCreated += ensureCollectionKeys(ctx.paths.keyring, id, { session }, PROFILE, slice).created;
       }
+      if (ctx.hooks.failBetweenRunsUpdate) throw hookError('index update between runs', secretTexts(ctx.request.secrets));
       updateIndex(options);
       ctx.hooks.betweenRuns?.(path);
       await checkArchiveUnchanged(path, stamps); // before Run B opens or stores anything
+      ctx.importStage = 'runB';
       if (ctx.hooks.failRunB) throw hookError('run B', secretTexts(ctx.request.secrets));
       runB = await importRun(ctx, session, id, options, parts);
       if (runB.missingCollections.length > 0) {
@@ -495,10 +544,10 @@ async function importCommand(ctx: Context): Promise<void> {
     const summary = summarise(runA, runB, collectionsCreated);
     // A failure here keeps its own code; `executeCommand` adds the "index is behind" guidance to the same line and
     // prints `--debug` text through the same redacting handler as every other error.
-    ctx.finalIndexUpdate = true;
+    ctx.importStage = 'final';
     if (ctx.hooks.failFinalIndexUpdate) throw hookError('final index update', secretTexts(ctx.request.secrets));
     updateIndex(options);
-    ctx.finalIndexUpdate = false;
+    ctx.importStage = 'done';
     if (ctx.request.json) {
       ctx.out(summary);
       return;
@@ -527,16 +576,22 @@ function secretTexts(secrets: CommandSecrets): string[] {
 }
 
 /**
- * Guidance added to the ONE failure line (design 4.6), after the message and before the code:
- * - `import`, failure in the final index update: the index is behind;
- * - `import`, only when this command durably stored at least one item: stored items stay, repeating is safe;
+ * Guidance added to the ONE failure line (design 4.6), after the message and before the code, in this order:
+ * - `import`, "the index is behind": a failure in the final index update, or any failure after this command stored
+ *   at least one item and before the final index update finished (this includes the update between the runs);
+ * - `import`, "items stored so far stay stored": only when this command durably stored at least one item;
+ * - `import`, "repeating the import is safe": every failure after Run A started;
  * - `vault reset-passphrase`, failure that may follow the keyring replacement (design 4.4; same line, not an extra one).
  */
 function failureGuidance(ctx: Context): string[] {
   const guidance: string[] = [];
   if (ctx.request.command === 'import') {
-    if (ctx.finalIndexUpdate) guidance.push('the index is behind; run `foundry index rebuild`');
-    if (ctx.storedEvents > 0) guidance.push('items stored so far stay stored; repeating the import is safe');
+    const stage = ctx.importStage;
+    if (stage === 'final' || (ctx.storedEvents > 0 && stage !== 'done')) {
+      guidance.push('the index is behind; run `foundry index rebuild`');
+    }
+    if (ctx.storedEvents > 0) guidance.push('items stored so far stay stored');
+    if (stage !== 'before') guidance.push('repeating the import is safe');
   }
   if (ctx.resetMayBeDone) guidance.push('the passphrase may already be changed; try the new passphrase before you repeat the reset');
   return guidance;

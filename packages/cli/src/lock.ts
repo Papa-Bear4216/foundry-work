@@ -15,13 +15,22 @@
  *
  * If writing or syncing a new lock's metadata fails, the file this command just created is removed.
  *
+ * File type (review item 22): before any open of the lock or the recovery file, the path is `lstat`-ed. A path that
+ * exists and is not a regular file (FIFO, folder, symbolic link, device) gives `BUSY` with the fixed file-error
+ * message, without any open. An existing lock is read only through `readSmallRegularFile` (`O_NONBLOCK` and
+ * `O_NOFOLLOW` where the platform has them, then `fstat`).
+ *
+ * Fixed text (review item 14): any other file-system error of the lock or the recovery file becomes exit 2 `IO` with
+ * a fixed message naming only the error code, never the path (`files.ts`). Releasing the lock is best effort.
+ *
  * Limits (for A-39): a reused pid looks alive, so such a stale lock needs manual removal; a lock written by another
  * host on a shared folder is never treated as stale.
  */
-import { closeSync, fsyncSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, fsyncSync, lstatSync, openSync, unlinkSync, writeSync } from 'node:fs';
 import { hostname } from 'node:os';
 import process from 'node:process';
 import { CliError } from './errors.ts';
+import { errnoCode, fileErrorMessage, fixedFileError, NOT_REGULAR, readSmallRegularFile } from './files.ts';
 
 export const LOCK_NAME = 'foundry.lock';
 export const RECOVERY_NAME = `${LOCK_NAME}.recover`;
@@ -56,14 +65,31 @@ export function isProcessAlive(pid: number): boolean {
   }
 }
 
-type ReadResult = LockInfo | 'missing' | 'unreadable';
+type ReadResult = LockInfo | 'missing' | 'unreadable' | 'not-regular';
+
+/** A lock file is a few hundred bytes; anything longer is damaged. */
+const MAX_LOCK_BYTES = 4096;
+
+/** The `BUSY` error for a lock or recovery path that exists and is not a regular file (fixed text, no path). */
+function notRegularError(): CliError {
+  return new CliError('BUSY', fileErrorMessage(NOT_REGULAR));
+}
+
+/** Throw `BUSY` if something other than a regular file is at `path` (checked with `lstat`, before any open). */
+function requireRegularOrAbsent(path: string): void {
+  const info = lstatSync(path, { throwIfNoEntry: false });
+  if (info !== undefined && !info.isFile()) throw notRegularError();
+}
 
 function readLock(path: string): ReadResult {
   let bytes;
   try {
-    bytes = readFileSync(path);
+    const read = readSmallRegularFile(path, MAX_LOCK_BYTES);
+    if (read === 'missing' || read === 'not-regular') return read;
+    if (read.length > MAX_LOCK_BYTES) return 'unreadable';
+    bytes = read;
   } catch (error) {
-    return (error as { code?: string }).code === 'ENOENT' ? 'missing' : 'unreadable';
+    return errnoCode(error) === 'ENOENT' ? 'missing' : 'unreadable';
   }
   try {
     const value = JSON.parse(bytes.toString('utf8')) as Partial<LockInfo>;
@@ -122,6 +148,7 @@ function sameHolder(a: LockInfo, b: LockInfo): boolean {
 /** Remove the lock of a dead holder, serialized by the recovery file. Returns true if this call removed it. */
 function recoverStale(path: string, holder: LockInfo, info: LockInfo, hooks: LockHooks): boolean {
   const guard = `${path}.recover`; // `H/foundry.lock.recover` (RECOVERY_NAME)
+  requireRegularOrAbsent(guard);
   if (!tryCreate(guard, info, hooks)) {
     throw new CliError('BUSY', `another foundry command is recovering the lock; try again shortly. If no foundry command is `
       + `running, delete the file ${RECOVERY_NAME} in the Foundry folder`);
@@ -138,10 +165,22 @@ function recoverStale(path: string, holder: LockInfo, info: LockInfo, hooks: Loc
   }
 }
 
-/** Take the lock or throw `BUSY`. `notice` receives one line when a stale lock is recovered. */
+/**
+ * Take the lock or throw `BUSY`. `notice` receives one line when a stale lock is recovered. Every file-system error
+ * becomes the fixed-text `IO` error (no path); a `CliError` passes unchanged.
+ */
 export function acquireLock(path: string, command: string, notice: (line: string) => void, hooks: LockHooks = {}): HeldLock {
+  try {
+    return takeLock(path, command, notice, hooks);
+  } catch (error) {
+    throw fixedFileError(error);
+  }
+}
+
+function takeLock(path: string, command: string, notice: (line: string) => void, hooks: LockHooks): HeldLock {
   const info: LockInfo = { pid: process.pid, command, started: new Date().toISOString(), host: hostname() };
   for (let attempt = 0; attempt < 3; attempt++) {
+    requireRegularOrAbsent(path);
     if (tryCreate(path, info, hooks)) {
       let released = false;
       return {
@@ -150,14 +189,19 @@ export function acquireLock(path: string, command: string, notice: (line: string
         release() {
           if (released) return;
           released = true;
-          const current = readLock(path);
-          if (typeof current === 'object' && sameHolder(current, info)) removeIfPresent(path);
+          try {
+            const current = readLock(path);
+            if (typeof current === 'object' && sameHolder(current, info)) removeIfPresent(path);
+          } catch {
+            // Best effort: a lock left behind holds this process's pid, so it becomes stale and is recovered later.
+          }
         },
       };
     }
     const holder = readLock(path);
     hooks.afterHolderRead?.();
     if (holder === 'missing') continue; // released in between: try again
+    if (holder === 'not-regular') throw notRegularError();
     if (holder === 'unreadable') {
       throw new CliError('BUSY', `the lock file ${LOCK_NAME} in the Foundry folder cannot be read; another foundry command `
         + `may be starting. If no foundry command is running, delete that file and try again`);

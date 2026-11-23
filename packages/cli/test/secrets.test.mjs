@@ -2,11 +2,12 @@
 // failure paths. The one deliberate exception: `foundry init` prints the recovery key once.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { closeSync } from 'node:fs';
+import { closeSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
-import { cleanEnv, runBin, scratch, stdinFile, takeoutFolder } from './helpers.mjs';
+import { runCli } from '../dist/cli.js';
+import { cleanEnv, fakeTerminal, runBin, runInline, scratch, stdinFile, takeoutFolder } from './helpers.mjs';
 
 const HOOK_BIN = fileURLToPath(new URL('./fixtures/hook-bin.mjs', import.meta.url));
 
@@ -78,6 +79,27 @@ test('planted marker: the home-folder error is fixed text (no --vault or FOUNDRY
       assert.match(result.stderr, /\[NO_VAULT\]\n$/u, name);
       clean(result, [PASS], name);
       assert.ok(!result.stderr.includes(pasted), `${name}: the home path is not echoed`);
+    }
+  }
+
+  // `init` against an existing FILE at the pasted location: a file-system error of the home preflight. Fixed text
+  // with the error code only, never the path or Node's message, also under --debug.
+  const pastedFile = join(dir, `${MARKER}-file`);
+  writeFileSync(pastedFile, 'TEST ONLY a file where a folder is expected');
+  for (const debug of [[], ['--debug']]) {
+    for (const [label, argv, env] of [
+      ['init --vault on a file', ['init', '--vault', pastedFile, '--passphrase-stdin', ...debug], {}],
+      ['init FOUNDRY_HOME on a file', ['init', '--passphrase-stdin', ...debug], { FOUNDRY_HOME: pastedFile }],
+    ]) {
+      const result = runBin(dir, argv, { env, stdin: PASS });
+      const name = `${label} ${debug.join(' ')}`;
+      assert.equal(result.code, 2, `${name}: ${result.stderr}`);
+      assert.match(result.stderr, /foundry: a file operation on the Foundry folder or its lock file failed \(E[A-Z0-9]+\) \[IO\]\n$/u, name);
+      clean(result, [PASS], name);
+      assert.ok(!result.stderr.includes(pastedFile), `${name}: the home path is not echoed`);
+      assert.doesNotMatch(result.stderr, /scandir|not a directory|mkdir/iu, `${name}: no message text from Node`);
+      if (debug.length) assert.match(result.stderr, /foundry: debug: /u, `${name}: --debug still prints its (fixed) details`);
+      else assert.equal(result.stderr.split('\n').length, 2, `${name}: one stderr line`);
     }
   }
 
@@ -153,4 +175,38 @@ test('crash text: an unexpected error whose message quotes the secrets prints a 
       }
     }
   }
+});
+
+test('a passphrase that starts with U+FEFF (BOM) keeps it on stdin: init with --passphrase-stdin unlocks through the prompt, and the other way round', async t => {
+  const dir = scratch(t);
+  const BOM_PASS = '﻿TEST ONLY bom passphrase';
+  const viaPrompt = async (argv, inputs) => {
+    let stdout = '';
+    let stderr = '';
+    const code = await runCli(argv, {
+      inline: true, env: cleanEnv(), terminal: fakeTerminal(inputs), isTerminal: () => false,
+      stdout: text => { stdout += text; }, stderr: text => { stderr += text; },
+    });
+    return { code, stdout, stderr };
+  };
+
+  // stdin -> prompt.
+  const first = join(dir, 'first');
+  const init = await runInline(dir, ['init', '--vault', first, '--passphrase-stdin'], { stdin: `${BOM_PASS}\n` });
+  assert.equal(init.code, 0, init.stderr);
+  const prompted = await viaPrompt(['search', 'q', '--vault', first], [`${BOM_PASS}\r`]);
+  assert.equal(prompted.code, 0, prompted.stderr);
+  assert.equal(prompted.stdout, 'No results.\n');
+  // Control: without the leading U+FEFF the passphrase is wrong, so the character is really part of the secret.
+  const withoutBom = await viaPrompt(['search', 'q', '--vault', first], [`${BOM_PASS.slice(1)}\r`]);
+  assert.equal(withoutBom.code, 2);
+  assert.match(withoutBom.stderr, /\[AUTH\]\n$/u);
+
+  // prompt -> stdin.
+  const second = join(dir, 'second');
+  const promptInit = await viaPrompt(['init', '--vault', second], [`${BOM_PASS}\r`, `${BOM_PASS}\r`]);
+  assert.equal(promptInit.code, 0, promptInit.stderr);
+  const stdinSearch = await runInline(dir, ['search', 'q', '--vault', second, '--passphrase-stdin'], { stdin: BOM_PASS });
+  assert.equal(stdinSearch.code, 0, stdinSearch.stderr);
+  assert.equal(stdinSearch.stdout, 'No results.\n');
 });

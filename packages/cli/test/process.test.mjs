@@ -1,14 +1,15 @@
 // TEST ONLY: process rules (Architecture 9): exit codes, the lock, the wall-clock limit, nothing outlives the command.
 import assert from 'node:assert/strict';
+import { Buffer } from 'node:buffer';
 import { spawn, spawnSync } from 'node:child_process';
-import { closeSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { runCli } from '../dist/cli.js';
 import { acquireLock, isProcessAlive } from '../dist/lock.js';
-import { BIN, cleanEnv, initVault, PASSPHRASE, runBin, runWorker, scratch, stdinFile } from './helpers.mjs';
+import { BIN, cleanEnv, fakeTerminal, initVault, PASSPHRASE, runBin, runWorker, scratch, stdinFile } from './helpers.mjs';
 
 const HOOK_BIN = fileURLToPath(new URL('./fixtures/hook-bin.mjs', import.meta.url));
 const MODULES = fileURLToPath(new URL('./fixtures/verify-modules.mjs', import.meta.url));
@@ -246,4 +247,72 @@ test('vault verify never loads the SQLite addon (positive control: index rebuild
   const control = run('rebuild');
   assert.equal(control.code, 0);
   assert.ok(control.loaded.length > 0, 'the filter sees the addon when the index is used');
+});
+
+const sleep = ms => new Promise(resolveSleep => setTimeout(resolveSleep, ms));
+const allZero = bytes => bytes.every(byte => byte === 0);
+
+test('programmatic timeout during a terminal prompt: the prompt is cancelled (listener removed, raw mode restored, editor buffer and first passphrase wiped) before runCli returns', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const cases = [
+    // One prompt with partial input (no Enter).
+    ['search prompt', ['search', 'q', '--vault', home], ['TEST ONLY partial passphrase'], home],
+    // init: the first new passphrase is complete; the confirmation prompt is open with partial input.
+    ['init confirmation', ['init', '--vault', join(dir, 'fresh')], ['TEST ONLY first new passphrase\r', 'TEST ONLY partial'], join(dir, 'fresh')],
+  ];
+  for (const [label, argv, inputs, target] of cases) {
+    const terminal = fakeTerminal(inputs);
+    let stderr = '';
+    const started = Date.now();
+    const pending = runCli([...argv, '--timeout', '1'], {
+      env: cleanEnv(), terminal, isTerminal: () => false, stdout: () => assert.fail(`${label}: no output`),
+      stderr: text => { stderr += text; },
+    });
+    // While the prompt waits, the typed bytes are in its buffers (sanity check of the observer).
+    await sleep(400);
+    assert.equal(terminal.input.listenerCount('data'), 1, `${label}: the prompt is open`);
+    assert.equal(terminal.input.isRaw, true, `${label}: raw mode is on while the prompt is open`);
+    const code = await pending;
+    assert.equal(code, 2, label);
+    assert.equal(stderr, 'foundry: the command passed its time limit of 1 second(s) [TIMEOUT]\n', label);
+    assert.ok(Date.now() - started < 1000 + 5000, `${label}: ended in time`);
+    assert.equal(terminal.input.listenerCount('data'), 0, `${label}: the data listener is removed`);
+    assert.equal(terminal.input.isRaw, false, `${label}: raw mode is restored on the injected input terminal`);
+    assert.equal(terminal.input.rawCalls.at(-1), false, label);
+    const editors = terminal.buffers.filter(entry => entry.role === 'editor');
+    assert.equal(editors.length, inputs.length, `${label}: one editor buffer per opened prompt`);
+    for (const { bytes } of editors) assert.ok(allZero(bytes), `${label}: the editor buffer is wiped`);
+    const firsts = terminal.buffers.filter(entry => entry.role === 'first');
+    assert.equal(firsts.length, label === 'init confirmation' ? 1 : 0, label);
+    for (const { bytes } of firsts) {
+      assert.equal(bytes.length, Buffer.byteLength('TEST ONLY first new passphrase'), `${label}: the first passphrase was held`);
+      assert.ok(allZero(bytes), `${label}: the first passphrase is wiped`);
+    }
+    assert.equal(existsSync(join(target, 'foundry.lock')), false, `${label}: the lock is released`);
+  }
+  assert.equal(existsSync(join(dir, 'fresh', 'vault')), false, 'the cancelled init created no vault');
+});
+
+test('lock path that is a FIFO: exit 2 BUSY with the fixed message, without a blocking open (skipped where mkfifo is missing or on Windows)', async t => {
+  if (process.platform === 'win32') {
+    t.skip('no FIFO on Windows');
+    return;
+  }
+  const hasMkfifo = spawnSync('mkfifo', ['--version'], { encoding: 'utf8', timeout: 10_000 });
+  if (hasMkfifo.error) {
+    t.skip('mkfifo is not available');
+    return;
+  }
+  const dir = scratch(t);
+  const home = join(dir, 'home');
+  mkdirSync(home);
+  const made = spawnSync('mkfifo', [join(home, 'foundry.lock')], { encoding: 'utf8', timeout: 10_000 });
+  assert.equal(made.status, 0, made.stderr);
+  // A blocking open of a FIFO with no writer never returns: the spawn timeout turns such a regression into a failure.
+  const result = runBin(dir, ['init', '--vault', home, '--passphrase-stdin', '--timeout', '5'],
+    { stdin: 'TEST ONLY fifo passphrase\n', timeout: 30_000 });
+  assert.equal(result.signal, null, 'the process ended by itself');
+  assert.equal(result.code, 2, result.stderr);
+  assert.equal(result.stderr, 'foundry: a file operation on the Foundry folder or its lock file failed (not a regular file) [BUSY]\n');
 });

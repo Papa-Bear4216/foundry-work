@@ -72,7 +72,9 @@ export function readStdinText(fd: number, track?: (read: StdinRead) => void): Pr
       }
       source.pause();
       try {
-        resolve(new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, length)));
+        // `ignoreBOM`: a leading U+FEFF is part of the secret (the prompt path keeps it too); only a trailing line
+        // ending is ever removed.
+        resolve(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes.subarray(0, length)));
       } catch {
         reject(usage('the secret on stdin is not valid UTF-8'));
       } finally {
@@ -179,29 +181,63 @@ export class LineEditor {
     this.#bytes.fill(0);
     this.#length = 0;
   }
+
+  /** The internal buffer itself (not a copy), so a test can check that it is zeroed. */
+  view(): Uint8Array {
+    return this.#bytes;
+  }
+}
+
+/** Something pending that a timeout or signal can stop; `cancel` is synchronous and safe to call more than once. */
+export interface Cancellable {
+  cancel(): void;
 }
 
 export interface PromptIo {
   input: typeof process.stdin;
   output: { write(text: string): boolean };
+  /**
+   * TEST ONLY observer (a `runCli` option through `terminal`): receives the prompt's internal editor buffer when a
+   * prompt opens (`editor`), and the first passphrase while the confirmation prompt is open (`first`), so a test can
+   * check that both are zeroed after a cancel.
+   */
+  observe?: (role: 'editor' | 'first', bytes: Uint8Array) => void;
 }
 
-/** Ask for a secret on the terminal without echo. Main thread only. */
-export function promptHidden(label: string, io: PromptIo = { input: process.stdin, output: process.stderr }): Promise<Buffer> {
+/**
+ * Ask for a secret on the terminal without echo. Main thread only. `track` receives a cancel handle: it removes the
+ * `data` listener, restores the input terminal's raw mode, pauses it, wipes the editor buffer and rejects the prompt
+ * with `INTERRUPTED`, all synchronously.
+ */
+export function promptHidden(label: string, io: PromptIo = { input: process.stdin, output: process.stderr },
+  track?: (pending: Cancellable) => void): Promise<Buffer> {
   const { input, output } = io;
   if (!input.isTTY || typeof input.setRawMode !== 'function') {
     return Promise.reject(usage('no terminal for a prompt; use --passphrase-stdin or --recovery-key-stdin'));
   }
   const editor = new LineEditor();
+  io.observe?.('editor', editor.view());
   output.write(label);
   return new Promise((resolve, reject) => {
-    const finish = () => {
+    let settled = false;
+    /** End the prompt once: listener off, raw mode off, input paused. False if it had already ended. */
+    const finish = (): boolean => {
+      if (settled) return false;
+      settled = true;
       input.off('data', onData);
-      input.setRawMode!(false);
-      input.pause();
-      output.write('\n');
+      try {
+        input.setRawMode!(false);
+      } finally {
+        input.pause();
+        output.write('\n');
+      }
+      return true;
     };
     const onData = (chunk: Uint8Array) => {
+      if (settled) {
+        chunk.fill(0);
+        return;
+      }
       let result: EditorResult;
       try {
         result = editor.feed(chunk);
@@ -225,6 +261,16 @@ export function promptHidden(label: string, io: PromptIo = { input: process.stdi
     input.setRawMode!(true);
     input.on('data', onData);
     input.resume();
+    track?.({
+      cancel: () => {
+        try {
+          finish();
+        } finally {
+          editor.wipe();
+          reject(new CliError('INTERRUPTED', 'the prompt was cancelled'));
+        }
+      },
+    });
   });
 }
 
