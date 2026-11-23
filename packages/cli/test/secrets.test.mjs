@@ -61,6 +61,53 @@ test('planted marker: passphrase and recovery key never reach output, errors or 
   }
 });
 
+test('planted marker: the home-folder error is fixed text (no --vault or FOUNDRY_HOME echo); the final index update error is redacted', async t => {
+  const dir = scratch(t);
+  // A credential pasted by mistake into the home location: the missing-vault error must not repeat it.
+  const pasted = join(dir, `${MARKER}-pasted`);
+  for (const debug of [[], ['--debug']]) {
+    for (const [label, argv, env, stdin] of [
+      ['verify --vault', ['vault', 'verify', '--vault', pasted, ...debug], {}, ''],
+      ['search --vault', ['search', 'q', '--vault', pasted, '--passphrase-stdin', ...debug], {}, PASS],
+      ['verify FOUNDRY_HOME', ['vault', 'verify', ...debug], { FOUNDRY_HOME: pasted }, ''],
+      ['search FOUNDRY_HOME', ['search', 'q', '--passphrase-stdin', ...debug], { FOUNDRY_HOME: pasted }, PASS],
+    ]) {
+      const result = runBin(dir, argv, { env, stdin });
+      const name = `${label} ${debug.join(' ')}`;
+      assert.equal(result.code, 2, `${name}: ${result.stderr}`);
+      assert.match(result.stderr, /\[NO_VAULT\]\n$/u, name);
+      clean(result, [PASS], name);
+      assert.ok(!result.stderr.includes(pasted), `${name}: the home path is not echoed`);
+    }
+  }
+
+  // The final index update fails with an error whose message quotes the secrets: --debug text is redacted.
+  const home = join(dir, 'home');
+  const init = runBin(dir, ['init', '--vault', home, '--passphrase-stdin'], { stdin: PASS });
+  assert.equal(init.code, 0, init.stderr);
+  const recoveryKey = /^\s{4}(\S+)$/mu.exec(init.stdout)[1];
+  const { folder } = await takeoutFolder(dir, { contactsCount: 2, calendarEvents: 1, mailMessages: 2 });
+  for (const [argv, stdin] of [[['--passphrase-stdin'], PASS], [['--recovery-key-stdin'], recoveryKey]]) {
+    for (const debug of [[], ['--debug']]) {
+      const fd = stdinFile(dir, stdin);
+      try {
+        const result = spawnSync(process.execPath,
+          [HOOK_BIN, 'failFinalIndexUpdate', 'import', folder, '--vault', home, ...argv, ...debug], {
+            stdio: [fd, 'pipe', 'pipe'], env: cleanEnv(), encoding: 'utf8', timeout: 120_000, windowsHide: true,
+          });
+        const label = `final index update ${argv.join(' ')} ${debug.join(' ')}`;
+        assert.equal(result.status, 2, `${label}: ${result.stderr}`);
+        assert.match(result.stderr, /the index is behind; run `foundry index rebuild`[^\n]* \[IO\]\n$/u, label);
+        if (debug.length) assert.match(result.stderr, /foundry: debug: Error: test hook: final index update: \[REDACTED\]/u, label);
+        else assert.equal(result.stderr.split('\n').length, 2, `${label}: one stderr line`);
+        clean({ stdout: result.stdout, stderr: result.stderr }, [PASS, recoveryKey], label);
+      } finally {
+        closeSync(fd);
+      }
+    }
+  }
+});
+
 test('secrets on the command line or in secret-looking environment variables are refused (exit 1) and not echoed', async t => {
   const dir = scratch(t);
   const home = join(dir, 'home');

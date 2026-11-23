@@ -1,14 +1,18 @@
 // TEST ONLY: unit tests of the foundry command line with synthetic values.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { DEFAULT_TIMEOUTS, parseCommandLine } from '../dist/args.js';
 import { resolveHome, runCli } from '../dist/cli.js';
-import { MAX_NAMES_PER_CALL, nameSlices, summarise } from '../dist/commands.js';
-import { chunkPlainText, DERIVER_VERSION, itemText, loadProjection } from '../dist/derive.js';
+import {
+  MAX_NAMES_PER_CALL, nameSlices, resolveArchiveParts, sameStamps, stampParts, summarise,
+} from '../dist/commands.js';
+import {
+  chunkPlainText, DERIVER_VERSION, itemText, loadProjection, MAX_DERIVE_BYTES, MAX_TEXT_BYTES,
+} from '../dist/derive.js';
 import { CliError, debugText, errorLine, mapError } from '../dist/errors.js';
 import { acquireLock, isProcessAlive } from '../dist/lock.js';
 import { LineEditor, readTwoSecrets, stripOneLineEnding } from '../dist/secrets.js';
@@ -219,6 +223,63 @@ test('search text deriver: mail, contact, calendar and plain text give chunks; o
   const long = chunkPlainText('word '.repeat(1000));
   assert.ok(long.length > 1 && long.every(chunk => chunk.length <= 800));
   assert.equal(chunkPlainText('x'.repeat(800 * 1100)).length, 1024);
+});
+
+test('calendar search text: the calendar name once per item, at most 1 MiB of text per item', async () => {
+  const parsers = await import('importers');
+  const name = `TEST ONLY Zebracalname ${'n'.repeat(4096)}`;
+  const ics = parsers.generateSyntheticIcalendar(1000, 303, name);
+  const text = itemText(parsers, 'text/calendar', ics);
+  assert.equal(text.split('Zebracalname').length - 1, 1, 'the calendar name is rendered once');
+  assert.ok(Buffer.byteLength(text) <= MAX_TEXT_BYTES, `rendered ${Buffer.byteLength(text)} bytes`);
+  assert.match(text, /Event: Synthetic [a-z]+ session #1\n/u);
+  assert.match(text, /Event: Synthetic [a-z]+ session #1000\n/u, 'every event fits: the name is not repeated');
+  // Far more events than fit: the text stops at the cap (whole UTF-8 characters only).
+  const many = parsers.generateSyntheticIcalendar(6000, 304, 'TEST ONLY \u{1F600} calendar');
+  const capped = itemText(parsers, 'text/calendar', many);
+  assert.ok(Buffer.byteLength(capped) <= MAX_TEXT_BYTES);
+  assert.ok(Buffer.byteLength(capped) > MAX_TEXT_BYTES - 4096, 'text is added up to the cap');
+  assert.ok(!/[\uD800-\uDBFF]$/u.test(capped), 'no split surrogate pair');
+  assert.equal(MAX_TEXT_BYTES, 1024 * 1024);
+  // The cap applies to every type: a long mail body.
+  const mail = Buffer.from(`Subject: TEST ONLY long body\r\n\r\n${'body words '.repeat(200_000)}\r\n`);
+  assert.ok(Buffer.byteLength(itemText(parsers, 'message/rfc822', mail)) <= MAX_TEXT_BYTES);
+});
+
+test('calendar search text: the 8 MiB input cut keeps the completed fields of a truncated first event', async () => {
+  const projection = await loadProjection();
+  const head = Buffer.from('BEGIN:VCALENDAR\r\nVERSION:2.0\r\nX-WR-CALNAME:TEST ONLY cut calendar\r\nBEGIN:VEVENT\r\n'
+    + 'UID:test-only-cut\r\nSUMMARY:Earlysummaryword planning\r\nLOCATION:Room é\r\nDESCRIPTION:');
+  const filler = Buffer.alloc(MAX_DERIVE_BYTES, 'filler é ');
+  const tail = Buffer.from('\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n');
+  const item = { itemId: 'i', eventSeq: 1, mime: 'text/calendar', source: 's' };
+  const chunks = [...projection.derive(item, [head, filler.subarray(0, 4_000_000), filler.subarray(4_000_000), tail])];
+  const text = chunks.join('\n');
+  assert.match(text, /Event: Earlysummaryword planning/u);
+  assert.match(text, /Location: Room é/u);
+  assert.match(text, /Calendar: TEST ONLY cut calendar/u);
+  assert.doesNotMatch(text, /Description:/u, 'the cut field is not completed, so it is left out');
+  // Not truncated: the same event with a short description keeps it.
+  const whole = [...projection.derive(item, [head, Buffer.from('short words'), tail])].join('\n');
+  assert.match(whole, /Description: short words/u);
+});
+
+test('one failure line: guidance goes into the same line before the code; part stamps notice a removed part', async t => {
+  assert.equal(errorLine({ code: 'IO', message: 'a file operation failed (EIO)', exit: 2 }, ['first hint', 'second hint']),
+    'foundry: a file operation failed (EIO); first hint; second hint [IO]\n');
+  assert.equal(errorLine({ code: 'AUTH', message: 'wrong', exit: 2 }), 'foundry: wrong [AUTH]\n');
+
+  const dir = scratch(t);
+  for (const name of ['takeout-x-001.zip', 'takeout-x-002.zip', 'takeout-y-001.zip', 'notes.zip']) writeFileSync(join(dir, name), name);
+  const parts = await resolveArchiveParts(join(dir, 'takeout-x-001.zip'));
+  assert.equal(parts.kind, 'set');
+  assert.deepEqual(parts.files, [join(dir, 'takeout-x-001.zip'), join(dir, 'takeout-x-002.zip')]);
+  assert.equal((await resolveArchiveParts(join(dir, 'takeout-y-001.zip'))).kind, 'file');
+  assert.equal((await resolveArchiveParts(dir)).files.length, 4);
+  const before = await stampParts(parts);
+  assert.ok(sameStamps(before, await stampParts(await resolveArchiveParts(join(dir, 'takeout-x-001.zip')))));
+  rmSync(join(dir, 'takeout-x-002.zip'));
+  assert.ok(!sameStamps(before, await stampParts(await resolveArchiveParts(join(dir, 'takeout-x-001.zip')))));
 });
 
 function deadPid() {

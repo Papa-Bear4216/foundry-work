@@ -108,9 +108,9 @@ export function mapError(error: unknown, context: { erasedInImport?: boolean } =
   return { code: 'INTERNAL', message: 'an unexpected internal error occurred; run again with --debug for details', exit: 2 };
 }
 
-/** The one stderr line for a mapped error. */
-export function errorLine(mapped: MappedError): string {
-  return `foundry: ${mapped.message} [${mapped.code}]\n`;
+/** The one stderr line for a mapped error. Fixed guidance texts go into the same line, before the code. */
+export function errorLine(mapped: MappedError, guidance: readonly string[] = []): string {
+  return `foundry: ${[mapped.message, ...guidance].join('; ')} [${mapped.code}]\n`;
 }
 
 /**

@@ -149,8 +149,9 @@ function checkHome(run: Run, home: string): void {
     }
     return;
   }
+  // Fixed text: the location comes from --vault or FOUNDRY_HOME, where a secret could have been pasted by mistake.
   if (!existsSync(join(homePaths(home).vault, 'VAULT.json'))) {
-    throw new CliError('NO_VAULT', `no vault found in ${home}; run \`foundry init\` or give --vault <dir>`);
+    throw new CliError('NO_VAULT', 'no vault found in the Foundry folder; run `foundry init`, or give --vault <dir>');
   }
 }
 

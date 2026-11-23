@@ -42,8 +42,21 @@ declare module 'node:fs' {
   export function lstatSync(path: string, options: { throwIfNoEntry: false }): Stats | undefined;
   export function statSync(path: string): Stats;
   export function statSync(path: string, options: { throwIfNoEntry: false }): Stats | undefined;
+  export interface BigIntStats {
+    size: bigint;
+    mtimeNs: bigint;
+    isFile(): boolean;
+    isDirectory(): boolean;
+  }
+  export function statSync(path: string, options: { bigint: true }): BigIntStats;
+  export interface Dirent {
+    name: string;
+    isFile(): boolean;
+    isDirectory(): boolean;
+  }
   export function existsSync(path: string): boolean;
   export function readdirSync(path: string): string[];
+  export function readdirSync(path: string, options: { withFileTypes: true }): Dirent[];
   export function mkdirSync(path: string, options?: { recursive?: boolean; mode?: number }): string | undefined;
   export function readFileSync(path: string): Buffer;
   export function readFileSync(path: string | URL, encoding: 'utf8'): string;

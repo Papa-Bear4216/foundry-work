@@ -53,6 +53,20 @@ export interface TestHooks {
   throwWithSecret?: boolean;
   /** `init`: fail after the vault is built in its temporary folder, before the rename to `H/vault`. */
   failBeforeInitRename?: boolean;
+  /** `import`: the final index update throws an errno-style error whose message quotes every secret. */
+  failFinalIndexUpdate?: boolean;
+  /** `import`: Run B throws an errno-style error at its start (after any archive check, before it stores). */
+  failRunB?: boolean;
+  /**
+   * `import`: called with the archive path after Run A has closed the archive, before Run B (it may change a part).
+   * A function: it cannot cross into the worker thread, so only the inline path (`runCli` with `inline`) can use it.
+   */
+  betweenRuns?: (archivePath: string) => void;
+}
+
+/** An errno-style error (maps to `IO`) whose message quotes the given secrets: test hooks only. */
+function hookError(what: string, secrets: readonly string[]): Error {
+  return Object.assign(new Error(`test hook: ${what}: ${secrets.join(' | ')}`), { code: 'EIO' });
 }
 
 export function homePaths(home: string) {
@@ -76,7 +90,12 @@ function stall(hooks: TestHooks): void {
 
 class Context {
   readonly paths: ReturnType<typeof homePaths>;
-  phase: 'start' | 'stored' = 'start';
+  /** Events this command durably appended (counted when the vault writer's `appendBatch` returns). */
+  storedEvents = 0;
+  /** True while the final index update of `import` runs. */
+  finalIndexUpdate = false;
+  /** `vault reset-passphrase` failed in a way that may follow the atomic keyring replacement. */
+  resetMayBeDone = false;
 
   constructor(readonly request: CommandRequest, readonly io: CommandIo, readonly hooks: TestHooks) {
     this.paths = homePaths(request.home);
@@ -224,9 +243,7 @@ async function resetPassphraseCommand(ctx: Context): Promise<void> {
     const code = (error as { code?: string }).code;
     const typed = error instanceof Error && error.name === 'VaultFormatError'
       && (code === 'AUTH' || code === 'KEY' || code === 'MAC' || code === 'KDF');
-    if (!typed && !isRecoveryFormatError(error)) {
-      throw Object.assign(error as object, { afterRenameNotice: true });
-    }
+    if (!typed && !isRecoveryFormatError(error)) ctx.resetMayBeDone = true;
     throw error;
   }
   ctx.out('The passphrase is changed. The master key and the recovery key were NOT rotated: '
@@ -270,41 +287,159 @@ export function summarise(runA: ImportResult, runB: ImportResult | undefined, co
   };
 }
 
-/** A zip, the first part of a multi-part set (its folder is opened), or a folder of parts. */
-async function openImportArchive(path: string) {
-  const { openArchive, parsePartName } = await import('importers');
+/**
+ * The archive parts an import reads, resolved from the path the user gave:
+ * - `file`: one zip (also the first part of a "set" whose other parts are absent);
+ * - `set`: the first part of a multi-part export; ONLY the parts of that export (same name prefix, part numbering) are
+ *   read, not every zip in its folder;
+ * - `folder`: a folder; the importers' `openArchive` reads every `.zip` file in it (the same filter is used here).
+ */
+export interface ArchiveParts {
+  kind: 'file' | 'set' | 'folder';
+  path: string;
+  /** Absolute paths of the parts, in order. */
+  files: string[];
+}
+
+export async function resolveArchiveParts(path: string): Promise<ArchiveParts> {
+  const { comparePartNames, parsePartName } = await import('importers');
   const { readdirSync, statSync } = await import('node:fs');
   const { basename, dirname } = await import('node:path');
   const info = statSync(path);
-  if (info.isFile()) {
-    const part = parsePartName(basename(path));
-    const folder = dirname(path);
-    if (part && part.ordinal === 1) {
-      const siblings = readdirSync(folder).filter(name => {
-        const other = parsePartName(name);
-        return other !== undefined && other.prefix === part.prefix && other.ordinal !== 1;
-      });
-      if (siblings.length > 0) return openArchive(folder);
-    }
+  if (info.isDirectory()) {
+    const names = readdirSync(path, { withFileTypes: true })
+      .filter(entry => entry.isFile() && entry.name.toLowerCase().endsWith('.zip'))
+      .map(entry => entry.name)
+      .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    return { kind: 'folder', path, files: names.map(name => join(path, name)) };
   }
-  return openArchive(path);
+  const part = info.isFile() ? parsePartName(basename(path)) : undefined;
+  if (part && part.ordinal === 1) {
+    const folder = dirname(path);
+    const names = readdirSync(folder, { withFileTypes: true })
+      .filter(entry => entry.isFile() && parsePartName(entry.name)?.prefix === part.prefix)
+      .map(entry => entry.name)
+      .sort(comparePartNames);
+    if (names.length > 1) return { kind: 'set', path, files: names.map(name => join(folder, name)) };
+  }
+  return { kind: 'file', path, files: [path] };
 }
 
-async function importRun(ctx: Context, session: UnlockSession, id: string, options: IndexStoreOptions) {
+/** Size and modification time (nanoseconds) of every part, taken before Run A and checked before Run B (4a.3). */
+export interface PartStamp {
+  file: string;
+  size: bigint;
+  mtimeNs: bigint;
+}
+
+export async function stampParts(parts: ArchiveParts): Promise<PartStamp[]> {
+  const { statSync } = await import('node:fs');
+  return parts.files.map(file => {
+    const info = statSync(file, { bigint: true });
+    return { file, size: info.size, mtimeNs: info.mtimeNs };
+  });
+}
+
+export function sameStamps(before: readonly PartStamp[], after: readonly PartStamp[]): boolean {
+  return before.length === after.length && before.every((stamp, i) => {
+    const other = after[i]!;
+    return other.file === stamp.file && other.size === stamp.size && other.mtimeNs === stamp.mtimeNs;
+  });
+}
+
+/** Design 4a.3: before Run B, the parts must be exactly the ones Run A read (no change, no part added or removed). */
+async function checkArchiveUnchanged(path: string, before: readonly PartStamp[]): Promise<void> {
+  let after: PartStamp[] | undefined;
+  try {
+    after = await stampParts(await resolveArchiveParts(path));
+  } catch {
+    after = undefined; // a part (or the path) is gone or unreadable
+  }
+  if (!after || !sameStamps(before, after)) {
+    throw new CliError('ARCHIVE_CHANGED', 'the archive changed during the import (a part was changed, added or removed)');
+  }
+}
+
+/**
+ * Open the resolved parts as one archive. A `set` is combined here from its parts only (the importers' `openArchive`
+ * opens every zip of a folder), with the same rules as `openArchive` for a folder: one prefix, part numbers 1..N
+ * without a gap or a duplicate, entries sorted by path, no entry path in two parts. (The importers compare raw entry
+ * name bytes for that last rule; their helper is not exported, so this compares the decoded path, which is stricter.)
+ */
+async function openParts(parts: ArchiveParts) {
+  const { ArchiveError, openArchive, openZipFile, parsePartName } = await import('importers');
+  if (parts.kind !== 'set') return openArchive(parts.path);
+  const { basename } = await import('node:path');
+  const names = parts.files.map(file => basename(file));
+  names.forEach((name, i) => {
+    if (parsePartName(name)?.ordinal !== i + 1) {
+      throw new ArchiveError('INVALID_MULTIPART', `Archive parts are not numbered 1 to ${names.length} (${name}).`);
+    }
+  });
+  const opened: Awaited<ReturnType<typeof openZipFile>>[] = [];
+  const entries: (typeof opened)[number]['entries'][number][] = [];
+  const seen = new Set<string>();
+  try {
+    for (const file of parts.files) {
+      const part = await openZipFile(file, { partName: basename(file) });
+      opened.push(part);
+      for (const entry of part.entries) {
+        if (seen.has(entry.path)) throw new ArchiveError('DUPLICATE_ENTRY', `Duplicate entry path across parts: ${entry.path}.`);
+        seen.add(entry.path);
+        entries.push(entry);
+      }
+    }
+  } catch (error) {
+    await Promise.allSettled(opened.map(part => part.close()));
+    throw error;
+  }
+  entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return {
+    entries, parts: names,
+    async close() {
+      const results = await Promise.allSettled(opened.map(part => part.close()));
+      const rejected = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+      if (rejected) throw rejected.reason;
+    },
+  };
+}
+
+/** Let the vault writer recover an interrupted append or seal (for example a pending HEAD), then release it. */
+async function recoverVaultWriter(ctx: Context, session: UnlockSession, id: string): Promise<void> {
+  const vault = await import('vault');
+  const unlocked = vault.decodeKeyring(readFileSync(ctx.paths.keyring), { session }, id);
+  try {
+    vault.VaultWriter.open(ctx.paths.vault, unlocked).release();
+  } finally {
+    unlocked.masterKey.fill(0);
+    for (const key of unlocked.keys.values()) key.fill(0);
+  }
+}
+
+async function importRun(ctx: Context, session: UnlockSession, id: string, options: IndexStoreOptions, parts: ArchiveParts) {
   const vault = await import('vault');
   const importers = await import('importers');
   const { openItemKeyLookup } = await import('foundry-index');
   const unlocked = vault.decodeKeyring(readFileSync(ctx.paths.keyring), { session }, id);
   let writer: ReturnType<typeof vault.VaultWriter.open> | undefined;
   let lookup: ReturnType<typeof openItemKeyLookup> | undefined;
-  let archive: Awaited<ReturnType<typeof openImportArchive>> | undefined;
+  let archive: Awaited<ReturnType<typeof openParts>> | undefined;
   try {
-    archive = await openImportArchive(ctx.request.path!);
-    writer = vault.VaultWriter.open(ctx.paths.vault, unlocked);
+    archive = await openParts(parts);
+    const opened = writer = vault.VaultWriter.open(ctx.paths.vault, unlocked);
+    // Counts the events this command durably stored: a batch counts once `appendBatch` has returned.
+    const counting = {
+      appendBatch(items: Parameters<typeof opened.appendBatch>[0]) {
+        const results = opened.appendBatch(items);
+        ctx.storedEvents += results.filter(result => result.type === 'event').length;
+        return results;
+      },
+      closeSegment: () => opened.closeSegment(),
+    };
     lookup = openItemKeyLookup(options);
     stall(ctx.hooks);
     return await importers.importArchive({
-      archive, writer, importers: importers.DEFAULT_IMPORTERS, profile: PROFILE,
+      archive, writer: counting, importers: importers.DEFAULT_IMPORTERS, profile: PROFILE,
       resolveCollectionKeyId: name => vault.collectionKeyId(unlocked, PROFILE, name),
       vaultDir: ctx.paths.vault, unlocked, itemKeys: lookup,
       // Not called while `itemKeys` is given; bound to this run's unlocked keyring for type safety.
@@ -334,9 +469,14 @@ async function importCommand(ctx: Context): Promise<void> {
     const options = await indexOptions(ctx, session);
     const { updateIndex } = await import('foundry-index');
     const { ensureCollectionKeys } = await import('vault');
+    // An earlier command may have stopped inside a segment seal (a pending HEAD). The read-only replay of the index
+    // update refuses that state; only the vault writer recovers it. So: writer first, then the catch-up update.
+    await recoverVaultWriter(ctx, session, id);
     updateIndex(options); // catch-up after an earlier crash: the item-key lookup needs a current index
-    ctx.phase = 'stored'; // from here on a failure may follow stored batches; re-running is safe
-    const runA = await importRun(ctx, session, id, options);
+    const path = ctx.request.path!;
+    const parts = await resolveArchiveParts(path);
+    const stamps = await stampParts(parts);
+    const runA = await importRun(ctx, session, id, options, parts);
     let runB: ImportResult | undefined;
     let collectionsCreated = 0;
     if (runA.missingCollections.length > 0) {
@@ -344,18 +484,21 @@ async function importCommand(ctx: Context): Promise<void> {
         collectionsCreated += ensureCollectionKeys(ctx.paths.keyring, id, { session }, PROFILE, slice).created;
       }
       updateIndex(options);
-      runB = await importRun(ctx, session, id, options);
+      ctx.hooks.betweenRuns?.(path);
+      await checkArchiveUnchanged(path, stamps); // before Run B opens or stores anything
+      if (ctx.hooks.failRunB) throw hookError('run B', secretTexts(ctx.request.secrets));
+      runB = await importRun(ctx, session, id, options, parts);
       if (runB.missingCollections.length > 0) {
         throw new CliError('INTERNAL', 'internal error: the second import run still found collections without a key');
       }
     }
     const summary = summarise(runA, runB, collectionsCreated);
-    try {
-      updateIndex(options);
-    } catch (error) {
-      if (ctx.request.debug) ctx.io.err(debugText(error, []));
-      throw new CliError('INDEX_BEHIND', 'items are stored; the index is behind; run `foundry index rebuild`');
-    }
+    // A failure here keeps its own code; `executeCommand` adds the "index is behind" guidance to the same line and
+    // prints `--debug` text through the same redacting handler as every other error.
+    ctx.finalIndexUpdate = true;
+    if (ctx.hooks.failFinalIndexUpdate) throw hookError('final index update', secretTexts(ctx.request.secrets));
+    updateIndex(options);
+    ctx.finalIndexUpdate = false;
     if (ctx.request.json) {
       ctx.out(summary);
       return;
@@ -383,6 +526,22 @@ function secretTexts(secrets: CommandSecrets): string[] {
     .filter(value => value.length > 0);
 }
 
+/**
+ * Guidance added to the ONE failure line (design 4.6), after the message and before the code:
+ * - `import`, failure in the final index update: the index is behind;
+ * - `import`, only when this command durably stored at least one item: stored items stay, repeating is safe;
+ * - `vault reset-passphrase`, failure that may follow the keyring replacement (design 4.4; same line, not an extra one).
+ */
+function failureGuidance(ctx: Context): string[] {
+  const guidance: string[] = [];
+  if (ctx.request.command === 'import') {
+    if (ctx.finalIndexUpdate) guidance.push('the index is behind; run `foundry index rebuild`');
+    if (ctx.storedEvents > 0) guidance.push('items stored so far stay stored; repeating the import is safe');
+  }
+  if (ctx.resetMayBeDone) guidance.push('the passphrase may already be changed; try the new passphrase before you repeat the reset');
+  return guidance;
+}
+
 /** Run one command body. Writes its own output and error line; returns the exit code. Zeroes every secret. */
 export async function executeCommand(request: CommandRequest, io: CommandIo, hooks: TestHooks = {}): Promise<number> {
   const ctx = new Context(request, io, hooks);
@@ -394,15 +553,7 @@ export async function executeCommand(request: CommandRequest, io: CommandIo, hoo
   } catch (error) {
     const mapped = mapError(error, { erasedInImport: request.command === 'import' });
     if (request.debug) io.err(debugText(error, secretTexts(request.secrets)));
-    io.err(errorLine(mapped));
-    if (request.command === 'import' && ctx.phase === 'stored' && mapped.code !== 'INDEX_BEHIND') {
-      io.err('foundry: items stored so far stay stored; running the same import again is safe (it adds nothing twice)\n');
-    } else if (request.command === 'import' && mapped.code === 'INDEX_BEHIND') {
-      io.err('foundry: running the same import again is safe (it adds nothing twice)\n');
-    }
-    if ((error as { afterRenameNotice?: boolean } | null)?.afterRenameNotice) {
-      io.err('foundry: the passphrase may already be changed; try the new passphrase before you repeat the reset\n');
-    }
+    io.err(errorLine(mapped, failureGuidance(ctx)));
     return mapped.exit;
   } finally {
     for (const bytes of [request.secrets.passphrase, request.secrets.recoveryKey, request.secrets.newPassphrase]) {

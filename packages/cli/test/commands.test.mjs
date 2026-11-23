@@ -138,7 +138,8 @@ test('typed failures: missing vault, bad recovery key format, wrong recovery key
   const dir = scratch(t);
   const missing = await runInline(dir, ['search', 'q', '--vault', join(dir, 'nothing'), '--passphrase-stdin'], { stdin: PASSPHRASE });
   assert.equal(missing.code, 2);
-  assert.match(missing.stderr, /\[NO_VAULT\]\n$/u);
+  assert.equal(missing.stderr,
+    'foundry: no vault found in the Foundry folder; run `foundry init`, or give --vault <dir> [NO_VAULT]\n');
 
   const { home, recoveryKey } = await initVault(dir);
   const malformed = await runInline(dir, ['search', 'q', '--vault', home, '--recovery-key-stdin'], { stdin: 'TEST-ONLY-NOT-A-KEY' });
