@@ -75,12 +75,13 @@ export async function runWorker(dir, argv, { stdin = '', env = {}, hooks } = {})
 }
 
 /** Spawn the built bin with `stdin` text as a file descriptor. */
-export function runBin(dir, argv, { stdin = '', env = {}, timeout = 120_000 } = {}) {
+export function runBin(dir, argv, { stdin = '', env = {}, timeout = 120_000, killSignal } = {}) {
   const fd = stdinFile(dir, stdin);
   try {
     const started = Date.now();
     const result = spawnSync(process.execPath, [BIN, ...argv], {
       stdio: [fd, 'pipe', 'pipe'], env: cleanEnv(env), encoding: 'utf8', timeout, windowsHide: true,
+      ...(killSignal ? { killSignal } : {}),
     });
     return { code: result.status, stdout: result.stdout, stderr: result.stderr, ms: Date.now() - started, signal: result.signal };
   } finally {

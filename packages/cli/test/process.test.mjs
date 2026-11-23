@@ -358,7 +358,7 @@ test('lock path that is a FIFO: exit 2 BUSY with the fixed message, without a bl
   assert.equal(made.status, 0, made.stderr);
   // A blocking open of a FIFO with no writer never returns: the spawn timeout turns such a regression into a failure.
   const result = runBin(dir, ['init', '--vault', home, '--passphrase-stdin', '--timeout', '5'],
-    { stdin: 'TEST ONLY fifo passphrase\n', timeout: 30_000 });
+    { stdin: 'TEST ONLY fifo passphrase\n', timeout: 30_000, killSignal: 'SIGKILL' });
   assert.equal(result.signal, null, 'the process ended by itself');
   assert.equal(result.code, 2, result.stderr);
   assert.equal(result.stderr, 'foundry: a file operation on the Foundry folder or its lock file failed (not a regular file) [BUSY]\n');

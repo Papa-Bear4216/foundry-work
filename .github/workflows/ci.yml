@@ -202,3 +202,36 @@ jobs:
       - name: Importer 1 GiB mbox peak RSS budget (pinned runtime)
         if: ${{ !cancelled() }}
         run: npm run budgets --workspace importers
+
+  cli:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          package-manager-cache: false
+      - name: Ensure strace on Linux
+        if: runner.os == 'Linux'
+        run: which strace || (sudo apt-get update && sudo apt-get install -y strace)
+      - name: Install workspace
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Build CLI and dependencies
+        run: npm run build --workspace foundry-cli
+      - name: CLI test suites (serial)
+        run: npm test --workspace foundry-cli
+      - name: CLI offline gate (preload + Linux strace)
+        env:
+          CLI_GATE_STRACE: ${{ runner.os == 'Linux' && '1' || '0' }}
+        run: npm run gate:offline --workspace foundry-cli
+      - name: CLI memory gate (95% headroom rule)
+        run: npm run gate:memory --workspace foundry-cli
+      - name: CLI 1 GiB end-to-end gate (command line only)
+        run: npm run gate:e2e --workspace foundry-cli
