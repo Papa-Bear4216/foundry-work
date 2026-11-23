@@ -141,7 +141,11 @@ function runInWorker(request: CommandRequest, hooks: TestHooks, io: CommandIo, h
       const m = message as { type: 'out' | 'err' | 'done'; text?: string; code?: number };
       if (m.type === 'out') io.out(m.text ?? '');
       else if (m.type === 'err') io.err(m.text ?? '');
-      else code = m.code;
+      else {
+        // The body is finished: end the thread now, even if some handle would keep it alive.
+        code = m.code;
+        void worker.terminate();
+      }
     });
     worker.on('error', error => {
       // Crash text never carries the message (it could quote input); --debug adds the error's name only.

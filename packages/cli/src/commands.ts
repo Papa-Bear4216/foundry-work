@@ -47,6 +47,10 @@ export interface CommandIo {
 export interface TestHooks {
   /** Enter a deliberately stuck synchronous section right before the command's main library call. */
   stallSync?: boolean;
+  /** Leave a timer running in the body's thread (proves the command does not wait for it). */
+  leakHandle?: boolean;
+  /** Throw a plain Error whose message quotes every secret (proves crash text never carries a secret). */
+  throwWithSecret?: boolean;
 }
 
 export function homePaths(home: string) {
@@ -361,6 +365,8 @@ function secretTexts(secrets: CommandSecrets): string[] {
 export async function executeCommand(request: CommandRequest, io: CommandIo, hooks: TestHooks = {}): Promise<number> {
   const ctx = new Context(request, io, hooks);
   try {
+    if (hooks.leakHandle) setInterval(() => {}, 1000);
+    if (hooks.throwWithSecret) throw new Error(`test hook: ${secretTexts(request.secrets).join(' | ')}`);
     await BODIES[request.command](ctx);
     return 0;
   } catch (error) {

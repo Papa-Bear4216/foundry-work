@@ -8,7 +8,8 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { cleanEnv, initVault, PASSPHRASE, runBin, runWorker, scratch, stdinFile } from './helpers.mjs';
 
-const STALL_BIN = fileURLToPath(new URL('./fixtures/stall-bin.mjs', import.meta.url));
+const HOOK_BIN = fileURLToPath(new URL('./fixtures/hook-bin.mjs', import.meta.url));
+const MODULES = fileURLToPath(new URL('./fixtures/verify-modules.mjs', import.meta.url));
 
 test('the bin: exit 0 on success, 1 on usage errors, 2 on typed failures; --help and --version take no lock', async t => {
   const dir = scratch(t);
@@ -83,7 +84,7 @@ test('wall-clock limit in a real process: exit 2 TIMEOUT within 5 s of the limit
   const fd = stdinFile(dir, PASSPHRASE);
   try {
     const started = Date.now();
-    const result = spawnSync(process.execPath, [STALL_BIN, 'search', 'q', '--vault', home, '--passphrase-stdin', '--timeout', '2'], {
+    const result = spawnSync(process.execPath, [HOOK_BIN, 'stallSync', 'search', 'q', '--vault', home, '--passphrase-stdin', '--timeout', '2'], {
       stdio: [fd, 'pipe', 'pipe'], env: cleanEnv(), encoding: 'utf8', timeout: 60_000, windowsHide: true,
     });
     const elapsed = Date.now() - started;
@@ -96,4 +97,35 @@ test('wall-clock limit in a real process: exit 2 TIMEOUT within 5 s of the limit
   } finally {
     closeSync(fd);
   }
+});
+
+test('the command ends when its body is done, even if the worker thread still holds a handle (no TIMEOUT)', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const started = Date.now();
+  const result = await runWorker(dir, ['vault', 'verify', '--vault', home, '--timeout', '30'], { hooks: { leakHandle: true } });
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.stderr, '');
+  assert.match(result.stdout, /^Vault OK/u);
+  assert.ok(Date.now() - started < 10_000, 'the worker is terminated after its done message');
+});
+
+test('vault verify never loads the SQLite addon (positive control: index rebuild does)', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const run = mode => {
+    const fd = stdinFile(dir, PASSPHRASE);
+    try {
+      const result = spawnSync(process.execPath, [MODULES, home, mode], {
+        stdio: [fd, 'pipe', 'pipe'], env: cleanEnv(), encoding: 'utf8', timeout: 120_000, windowsHide: true,
+      });
+      return JSON.parse(result.stdout);
+    } finally {
+      closeSync(fd);
+    }
+  };
+  assert.deepEqual(run('verify'), { code: 0, loaded: [] });
+  const control = run('rebuild');
+  assert.equal(control.code, 0);
+  assert.ok(control.loaded.length > 0, 'the filter sees the addon when the index is used');
 });

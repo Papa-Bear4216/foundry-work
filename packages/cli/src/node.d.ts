@@ -174,4 +174,5 @@ declare class TextDecoder {
 }
 
 declare function setTimeout(callback: () => void, ms: number): { unref(): void };
+declare function setInterval(callback: () => void, ms: number): unknown;
 declare function clearTimeout(handle: { unref(): void } | undefined): void;

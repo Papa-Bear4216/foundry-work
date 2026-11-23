@@ -1,9 +1,14 @@
 // TEST ONLY: planted-marker tests. No secret may reach stdout, stderr, --debug text or crash text, on success and
 // failure paths. The one deliberate exception: `foundry init` prints the recovery key once.
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { closeSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
-import { runBin, scratch, takeoutFolder } from './helpers.mjs';
+import { cleanEnv, runBin, scratch, stdinFile, takeoutFolder } from './helpers.mjs';
+
+const HOOK_BIN = fileURLToPath(new URL('./fixtures/hook-bin.mjs', import.meta.url));
 
 const MARKER = 'PLANTED-MARKER-7f3a9c';
 const PASS = `TEST ONLY ${MARKER} passphrase`;
@@ -70,5 +75,35 @@ test('secrets on the command line or in secret-looking environment variables are
     assert.equal(result.code, 1, name);
     assert.match(result.stderr, /secret environment variables .* are refused \[USAGE\]/u);
     clean(result, [PASS], name);
+  }
+});
+
+test('crash text: an unexpected error whose message quotes the secrets prints a fixed INTERNAL line, with or without --debug', async t => {
+  const dir = scratch(t);
+  const home = join(dir, 'home');
+  const init = runBin(dir, ['init', '--vault', home, '--passphrase-stdin'], { stdin: PASS });
+  assert.equal(init.code, 0, init.stderr);
+  const recoveryKey = /^\s{4}(\S+)$/mu.exec(init.stdout)[1];
+  const cases = [
+    [['search', 'q', '--passphrase-stdin'], PASS],
+    [['index', 'rebuild', '--recovery-key-stdin'], recoveryKey],
+    [['vault', 'reset-passphrase', '--recovery-key-stdin', '--passphrase-stdin'], `${recoveryKey}\n${NEW_PASS}\n`],
+  ];
+  for (const [argv, stdin] of cases) {
+    for (const debug of [[], ['--debug']]) {
+      const fd = stdinFile(dir, stdin);
+      try {
+        const result = spawnSync(process.execPath, [HOOK_BIN, 'throwWithSecret', ...argv, '--vault', home, ...debug], {
+          stdio: [fd, 'pipe', 'pipe'], env: cleanEnv(), encoding: 'utf8', timeout: 120_000, windowsHide: true,
+        });
+        const label = `${argv.join(' ')} ${debug.join(' ')}`;
+        assert.equal(result.status, 2, label);
+        assert.match(result.stderr, /\[INTERNAL\]\n$/u, label);
+        if (debug.length) assert.match(result.stderr, /foundry: debug: Error: test hook: \[REDACTED\]/u, label);
+        clean({ stdout: result.stdout, stderr: result.stderr }, [PASS, NEW_PASS, recoveryKey], label);
+      } finally {
+        closeSync(fd);
+      }
+    }
   }
 });
