@@ -221,8 +221,11 @@ function objectModeEntry(path, buf, chunkSize) {
   };
 }
 
-/** Counting wrapper: records the size of every Buffer created while `fn` runs, then restores Buffer. */
-async function recordBufferAllocations(fn) {
+/**
+ * Counting wrapper: records the size of every Buffer created while `fn` runs, then restores Buffer.
+ * With `withStacks`, each record also holds the call stack, so a test can tell which code allocated it.
+ */
+async function recordBufferAllocations(fn, { withStacks = false } = {}) {
   const methods = ['from', 'concat', 'alloc', 'allocUnsafe', 'allocUnsafeSlow'];
   const originals = new Map(methods.map(m => [m, Buffer[m]]));
   const sizes = [];
@@ -230,7 +233,9 @@ async function recordBufferAllocations(fn) {
     const original = originals.get(m);
     Buffer[m] = function countingAllocation(...args) {
       const result = original.apply(this, args);
-      if (Buffer.isBuffer(result)) sizes.push({ method: m, bytes: result.length });
+      if (Buffer.isBuffer(result)) {
+        sizes.push(withStacks ? { method: m, bytes: result.length, stack: new Error().stack ?? '' } : { method: m, bytes: result.length });
+      }
       return result;
     };
   }
@@ -287,6 +292,77 @@ test('mail header peek copies no more than the item limit for a long first heade
     if (chunkSize >= 4096) {
       assert.ok(largest <= PEEK_LIMIT, `${label}: splitter copied ${largest} bytes, ${JSON.stringify(sizes.filter(s => s.bytes > PEEK_LIMIT))}`);
     }
+  }
+});
+
+// Review round 3 item 2: the LIVE buffer capacity of one message (header prefix plus message blocks) stays
+// within the item limit plus one chunk, also when the limit falls between 64 KiB block boundaries.
+const BLOCK_BYTES = 64 * 1024;
+const CAPACITY_LIMIT = 2 * BLOCK_BYTES + 3000;
+
+/** A synthetic message of exactly `total` bytes. */
+function sizedMessage(day, subject, total) {
+  const bodyBytes = total - message(day, subject, 0).length;
+  const out = message(day, subject, bodyBytes);
+  assert.equal(out.length, total);
+  return out;
+}
+
+/** Reads a stream in flowing mode, so every chunk is one buffer the splitter pushed (no joins). */
+function pushedChunks(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on('data', chunk => chunks.push(chunk));
+    stream.on('end', () => resolve(chunks));
+    stream.on('error', reject);
+  });
+}
+
+test('mail message blocks: total live capacity of one message stays within the item limit plus one chunk when the limit falls between block boundaries', async () => {
+  const underLimit = sizedMessage(6, 'TEST ONLY capacity just under the limit', CAPACITY_LIMIT - 50);
+  const atLimit = sizedMessage(7, 'TEST ONLY capacity exactly at the limit', CAPACITY_LIMIT);
+  const overLimit = sizedMessage(8, 'TEST ONLY capacity one byte over the limit', CAPACITY_LIMIT + 1);
+  const capacityMbox = Buffer.concat([underLimit, atLimit, overLimit]);
+  // Precondition: the limit is not a multiple of the block size.
+  assert.notEqual(CAPACITY_LIMIT % BLOCK_BYTES, 0);
+
+  for (const chunkSize of [7, 500, 4096, 65536]) {
+    const label = `chunk ${chunkSize}`;
+    const errors = [];
+    const entry = objectModeEntry('Takeout/Mail/Capacity.mbox', capacityMbox, chunkSize);
+    const iterator = mailImporter.split(entry, { maxItemBytes: CAPACITY_LIMIT, onItemError: e => errors.push(e) })[Symbol.asyncIterator]();
+
+    /** Runs one generator step inside the counting window; returns the step and the bytes the message blocks allocated. */
+    const step = async () => {
+      let result;
+      const sizes = await recordBufferAllocations(async () => { result = await iterator.next(); }, { withStacks: true });
+      const blockBytes = sizes.filter(s => s.stack.includes('MessageBlocks.')).reduce((sum, s) => sum + s.bytes, 0);
+      return { result, blockBytes };
+    };
+
+    for (const expected of [underLimit, atLimit]) {
+      const { result, blockBytes } = await step();
+      assert.equal(result.done, false, label);
+      const chunks = await pushedChunks(result.value.bytes);
+      assert.ok(Buffer.concat(chunks).equals(expected), `${label}: message is byte-exact`);
+      // The first pushed buffer is the header prefix; the splitter keeps it live while it fills the blocks.
+      const headerBytes = chunks[0].length;
+      // Positive control: the stack filter does see the block allocations.
+      assert.ok(blockBytes >= expected.length - headerBytes, `${label}: block allocations seen (${blockBytes})`);
+      const liveCapacity = headerBytes + blockBytes;
+      const detail = `${expected.length}-byte message held ${liveCapacity} bytes of live capacity (header ${headerBytes}, blocks ${blockBytes}), limit ${CAPACITY_LIMIT}`;
+      // The ruling's bound, and the tighter bound that blocks sized to the remaining budget give.
+      assert.ok(liveCapacity <= CAPACITY_LIMIT + chunkSize, `${label}: ${detail}`);
+      assert.ok(liveCapacity <= CAPACITY_LIMIT, `${label}: ${detail}`);
+    }
+
+    // The over-limit message is dropped; the blocks it allocated before the drop also stay within the limit.
+    const last = await step();
+    assert.equal(last.result.done, true, label);
+    assert.ok(last.blockBytes <= CAPACITY_LIMIT + chunkSize, `${label}: dropped message allocated ${last.blockBytes} block bytes`);
+    assert.deepEqual(errors.map(e => [e.code, e.itemPath, e.observedBytes]), [
+      ['ITEM_TOO_LARGE', 'Takeout/Mail/Capacity.mbox#3', overLimit.length],
+    ], label);
   }
 });
 

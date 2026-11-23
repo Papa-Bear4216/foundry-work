@@ -13,6 +13,42 @@ import type { ProjectionOptions, ProjectionResult } from './projection.ts';
 import { search } from './search.ts';
 import type { SearchOptions } from './search.ts';
 
+// TEMPORARY memory probe (v-7 fix round 3, session B). Active only inside the budget child process.
+// Removed before the final commit.
+interface ProbeProcess {
+  argv: string[];
+  memoryUsage(): { rss: number; heapTotal: number; heapUsed: number; external: number; arrayBuffers: number };
+  resourceUsage(): { maxRSS: number };
+}
+const probeProcess = (globalThis as unknown as { process: ProbeProcess }).process;
+const probeEnabled = (probeProcess.argv[1] ?? '').replaceAll('\\', '/').endsWith('budget-child.mjs');
+let probeMarks: Record<string, number[]> = {};
+function probeMark(name: string): void {
+  if (!probeEnabled) return;
+  const usage = probeProcess.memoryUsage();
+  const kib = (bytes: number) => Math.round(bytes / 1024);
+  let anon = -1;
+  let file = -1;
+  try {
+    const status = readFileSync('/proc/self/status').toString();
+    anon = Number(/RssAnon:\s+(\d+)/u.exec(status)?.[1] ?? -1);
+    file = Number(/RssFile:\s+(\d+)/u.exec(status)?.[1] ?? -1);
+  } catch {
+    // Not Linux.
+  }
+  // [maxRSS, rss, heapTotal, heapUsed, external, arrayBuffers, RssAnon, RssFile] in KiB.
+  probeMarks[name] = [probeProcess.resourceUsage().maxRSS, kib(usage.rss), kib(usage.heapTotal), kib(usage.heapUsed),
+    kib(usage.external), kib(usage.arrayBuffers), anon, file];
+}
+probeMark('load');
+function probeResult(result: ProjectionResult): ProjectionResult {
+  if (!probeEnabled) return result;
+  probeMark('end');
+  const marks = probeMarks;
+  probeMarks = { load: marks.load! };
+  return { ...result, memoryProbe: marks } as ProjectionResult;
+}
+
 export interface IndexStoreOptions {
   directory: string;
   vaultDirectory: string;
@@ -182,13 +218,16 @@ function policyHash(bytes: Buffer): string {
 
 function capture(ctx: Context) {
   const raw = readFileSync(ctx.keyring);
+  probeMark('beforeDecode');
   const ring = decodeKeyring(raw, ctx.options.credential, ctx.vaultId);
+  probeMark('afterDecode');
   let replay: ReturnType<typeof openVaultReplay> | undefined;
   try {
     if (ring.keyring.version < readCatalog(ctx.catalog).keyring_floor) {
       throw new IndexError('PROJECTION', 'The vault keyring predates the index. Restore a current keyring.');
     }
     replay = openVaultReplay(ctx.vault, ctx.options.credential, ctx.options.verify);
+    probeMark('afterReplay');
     if (hash(raw) !== hash(readFileSync(ctx.keyring))) {
       throw new IndexError('PROJECTION', 'Vault keys changed during replay capture. Retry the index update.');
     }
@@ -269,7 +308,9 @@ function rebuildLocked(ctx: Context, input: Capture, hiddenChanged = false): Pro
       .run(id, input.stamp, version);
   }
   const path = indexPath(ctx, id);
+  probeMark('beforeStage');
   const key = stageIndexKey(ctx.keyring, ctx.vaultId, ctx.options.credential, id);
+  probeMark('afterStage');
   let result: ProjectionResult;
   try {
     const stagedFile = lstatSync(path, { throwIfNoEntry: false });
@@ -309,7 +350,9 @@ function rebuildLocked(ctx: Context, input: Capture, hiddenChanged = false): Pro
   `).run(id, input.stamp, result.lastEventSeq, input.ring.keyring.version);
   input.close();
   ctx.options.afterPublish?.();
+  probeMark('beforeRetire');
   retirePending(ctx);
+  probeMark('afterRetire');
   return { ...result, hiddenChanged };
 }
 
@@ -346,9 +389,12 @@ function updateLocked(ctx: Context, input: Capture): ProjectionResult {
 }
 
 function withCapture<T>(opts: IndexStoreOptions, work: (ctx: Context, input: Capture) => T): T {
+  probeMark('entry');
   return withCatalog(opts, ctx => {
+    probeMark('catalog');
     retirePending(ctx);
     const input = capture(ctx);
+    probeMark('afterCapture');
     try {
       return work(ctx, input);
     } finally {
@@ -358,11 +404,11 @@ function withCapture<T>(opts: IndexStoreOptions, work: (ctx: Context, input: Cap
 }
 
 export function updateIndex(options: IndexStoreOptions): ProjectionResult {
-  return withCapture(options, updateLocked);
+  return probeResult(withCapture(options, updateLocked));
 }
 
 export function rebuildIndex(options: IndexStoreOptions): ProjectionResult {
-  return withCapture(options, (ctx, input) => rebuildLocked(ctx, input));
+  return probeResult(withCapture(options, (ctx, input) => rebuildLocked(ctx, input)));
 }
 
 /** Search only a current generation. Updating or rebuilding has a separate memory budget. */

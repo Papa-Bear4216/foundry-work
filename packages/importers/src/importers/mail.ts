@@ -266,31 +266,39 @@ function findHeaderEnd(buf: Buffer): number {
 }
 
 /**
- * Copies message chunks into fixed blocks (64 KiB, or the item limit when that is smaller) so a
- * buffered message holds few objects and no block is larger than the item limit.
+ * Copies message chunks into blocks so a buffered message holds few objects. Review round 3
+ * item 2: each block is `min(64 KiB, remaining item budget)` bytes, where the budget is the
+ * item limit minus the header prefix and minus every block allocated before. So the live
+ * capacity of one message (header prefix plus blocks) never exceeds the item limit, also when
+ * the limit falls between block boundaries.
  */
 class MessageBlocks {
   readonly blocks: Buffer[] = [];
-  readonly #blockBytes: number;
+  #remaining: number;
   #block: Buffer | null = null;
   #used = 0;
 
-  constructor(maxItemBytes: number) {
-    this.#blockBytes = Math.min(MESSAGE_BLOCK_BYTES, maxItemBytes);
+  /** `budgetBytes` is the item limit minus the bytes the header prefix already holds. */
+  constructor(budgetBytes: number) {
+    this.#remaining = Math.max(0, budgetBytes);
   }
 
   push(chunk: Buffer): void {
     let rest = chunk;
     while (rest.length > 0) {
       if (this.#block === null) {
-        this.#block = Buffer.allocUnsafe(this.#blockBytes);
+        // The caller pushes only while the message fits the limit, so the budget covers `rest`.
+        const size = Math.min(MESSAGE_BLOCK_BYTES, this.#remaining);
+        if (size <= 0) throw new RangeError('mail message block budget exhausted');
+        this.#block = Buffer.allocUnsafe(size);
+        this.#remaining -= size;
         this.#used = 0;
       }
-      const take = Math.min(rest.length, this.#blockBytes - this.#used);
+      const take = Math.min(rest.length, this.#block.length - this.#used);
       rest.copy(this.#block, this.#used, 0, take);
       this.#used += take;
       rest = rest.subarray(take);
-      if (this.#used === this.#blockBytes) {
+      if (this.#used === this.#block.length) {
         this.blocks.push(this.#block);
         this.#block = null;
       }
@@ -298,7 +306,13 @@ class MessageBlocks {
   }
 
   finish(): Buffer[] {
-    if (this.#block !== null && this.#used > 0) this.blocks.push(Buffer.from(this.#block.subarray(0, this.#used)));
+    if (this.#block !== null && this.#used > 0) {
+      // Copy a partly used block to release its unused tail, but only when the copy also fits
+      // the remaining budget; otherwise keep a view of the block, which is already in budget.
+      this.blocks.push(this.#used <= this.#remaining
+        ? Buffer.from(this.#block.subarray(0, this.#used))
+        : this.#block.subarray(0, this.#used));
+    }
     this.#block = null;
     return this.blocks;
   }
@@ -383,7 +397,7 @@ async function* splitMboxStream(entry: ArchiveEntry, options?: SplitOptions): As
     // Buffer the message up to the limit. Past the limit, drop every buffered byte and read
     // forward to the next separator, counting bytes only.
     let observedBytes = prefixBytes;
-    let blocks: MessageBlocks | null = oversizedDuringPeek ? null : new MessageBlocks(maxItemBytes);
+    let blocks: MessageBlocks | null = oversizedDuringPeek ? null : new MessageBlocks(maxItemBytes - headerBuffer.length);
     if (!messageEndedDuringPeek) {
       for (;;) {
         const chunk = await cursor.readMessageChunk(false);
