@@ -145,10 +145,10 @@ test('planted marker: the home-folder error is fixed text (no --vault or FOUNDRY
     clean(result, [PASS], label);
     assert.ok(!result.stdout.includes(target) && !result.stderr.includes(target), `${label}: home path not echoed`);
   }
-  const hexSecret = 'a1b2c3d4e5f60718';
+  const plantedHex = 'a1b2c3d4e5f60718';
   for (const [kind, dirName, needle] of [
     ['non-hex staging', `.init-${MARKER}`, `.init-${MARKER}`],
-    ['hex-shaped unmarked staging', `.init-${hexSecret}`, hexSecret],
+    ['hex-shaped unmarked staging', `.init-${plantedHex}`, plantedHex],
   ]) {
     const stagingHome = join(dir, kind.replaceAll(' ', '-'));
     mkdirSync(join(stagingHome, dirName), { recursive: true });
