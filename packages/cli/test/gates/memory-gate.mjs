@@ -10,14 +10,20 @@ import { cleanupDir, measureCliPeakRss } from './peak-rss.mjs';
 assert.equal(process.versions.node, '24.22.3', `Expected pinned Node 24.22.3, got ${process.versions.node}`);
 
 const HEADROOM_FACTOR = 0.95;
-const FAKE_CEILING = process.env.CLI_GATE_FAKE_CEILING_MIB ? Number(process.env.CLI_GATE_FAKE_CEILING_MIB) : undefined;
-const SMOKE = process.env.CLI_GATE_SMOKE === '1';
+const negArg = process.argv.find(a => a.startsWith('--negative-control-ceiling-mib='));
+const NEG_CEILING = negArg ? Number(negArg.split('=')[1]) : undefined;
+if (negArg !== undefined) {
+  assert.ok(Number.isFinite(NEG_CEILING) && NEG_CEILING > 0 && NEG_CEILING < 128,
+    `--negative-control-ceiling-mib must be a finite number in (0, 128), got ${negArg}`);
+}
+const SMOKE = process.argv.includes('--smoke');
 
 const PASSPHRASE = 'TEST ONLY memory gate passphrase';
 const NEW_PASSPHRASE = 'TEST ONLY memory gate replacement passphrase';
 
-// Architecture section 9 + V-7 dispatch:
-// init, reset-passphrase and every passphrase command: 256 MiB; import: 256 MiB; search (recovery): 192 MiB; vault verify: 128 MiB.
+// Architecture section 9 + A-39:
+// init, reset-passphrase and every passphrase-KDF command (including passphrase search): 256 MiB;
+// import / index rebuild: 256 MiB; search (recovery key): 192 MiB; vault verify: 128 MiB.
 const CEILINGS_MIB = {
   'init:passphrase': 256,
   'import:passphrase': 256,
@@ -32,8 +38,9 @@ const CEILINGS_MIB = {
 
 function checkMeasurement(command, credential, measured) {
   const key = `${command}:${credential}`;
-  const ceilingMiB = FAKE_CEILING ?? CEILINGS_MIB[key];
-  assert.ok(Number.isFinite(ceilingMiB) && ceilingMiB > 0, `unknown ceiling for ${key}`);
+  const baseCeilingMiB = CEILINGS_MIB[key];
+  assert.ok(Number.isFinite(baseCeilingMiB) && baseCeilingMiB > 0, `unknown ceiling for ${key}`);
+  const ceilingMiB = NEG_CEILING !== undefined ? Math.min(baseCeilingMiB, NEG_CEILING) : baseCeilingMiB;
   const limit95KiB = Math.floor(ceilingMiB * 1024 * HEADROOM_FACTOR);
   const peakMiB = Number((measured.externalPeakKiB / 1024).toFixed(2));
   const headroom95MiB = Number((ceilingMiB * HEADROOM_FACTOR).toFixed(2));

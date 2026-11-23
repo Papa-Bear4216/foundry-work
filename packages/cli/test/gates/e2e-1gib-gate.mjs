@@ -16,17 +16,18 @@ import { cleanupDir, measureCliPeakRss } from './peak-rss.mjs';
 
 assert.equal(process.versions.node, '24.22.3', `Expected pinned Node 24.22.3, got ${process.versions.node}`);
 
-const TARGET_BYTES = process.env.CLI_GATE_TARGET_BYTES ? Number(process.env.CLI_GATE_TARGET_BYTES) : 1024 * 1024 * 1024;
+const FULL_TARGET_BYTES = 1024 * 1024 * 1024;
+const smokeArg = process.argv.find(a => a.startsWith('--smoke-mib='));
+const TARGET_BYTES = smokeArg ? Number(smokeArg.split('=')[1]) * 1024 * 1024 : FULL_TARGET_BYTES;
+assert.ok(Number.isFinite(TARGET_BYTES) && TARGET_BYTES >= 1024 * 1024, `invalid target bytes: ${TARGET_BYTES}`);
 const HEADROOM_FACTOR = 0.95;
-const FAKE_CEILING = process.env.CLI_GATE_FAKE_CEILING_MIB ? Number(process.env.CLI_GATE_FAKE_CEILING_MIB) : undefined;
 const PASSPHRASE = 'TEST ONLY e2e 1gib passphrase';
 const NEEDLE = 'foundrye2eneedle9417';
 
 function recordGate(step, measured, ceilingMiB) {
-  const effectiveCeiling = FAKE_CEILING ?? ceilingMiB;
-  const limit95KiB = Math.floor(effectiveCeiling * 1024 * HEADROOM_FACTOR);
+  const limit95KiB = Math.floor(ceilingMiB * 1024 * HEADROOM_FACTOR);
   const peakMiB = Number((measured.externalPeakKiB / 1024).toFixed(2));
-  const headroom95MiB = Number((effectiveCeiling * HEADROOM_FACTOR).toFixed(2));
+  const headroom95MiB = Number((ceilingMiB * HEADROOM_FACTOR).toFixed(2));
   const overBudget = measured.externalPeakKiB > limit95KiB;
   const rec = {
     gate: 'cli-e2e-1gib',
@@ -34,7 +35,7 @@ function recordGate(step, measured, ceilingMiB) {
     step,
     externalPeakKiB: measured.externalPeakKiB,
     peakMiB,
-    ceilingMiB: effectiveCeiling,
+    ceilingMiB,
     headroom95MiB,
     wallMs: measured.wallMs,
     overBudget,
@@ -106,18 +107,34 @@ try {
   });
   assert.equal(imp.status, 0, `e2e import failed: ${imp.stderr}`);
   const impSummary = JSON.parse(imp.stdout);
-  assert.ok(impSummary.itemsAdded >= mailStats.messageCount + 10, `unexpected itemsAdded count: ${impSummary.itemsAdded}`);
+  // Fixture has 11 contacts (10 generated + 1 planted), 1 calendar (8 events), and mailStats.messageCount mail items.
+  assert.equal(
+    impSummary.itemsAdded,
+    mailStats.messageCount + 11 + 1,
+    `expected exact itemsAdded (${mailStats.messageCount} mail + 11 contacts + 1 calendar), got ${impSummary.itemsAdded}`,
+  );
   assert.equal(impSummary.partsCount, 2, 'expected 2 Takeout parts');
   records.push(recordGate('import-1gib', imp, 256));
 
-  // 3. foundry search (before rebuild)
+  // 3. foundry search (before rebuild) — assert exact planted contact (source + needle) and verify all 3 sources indexed.
   const search1 = measureCliPeakRss(['search', NEEDLE, '--vault', home, '--recovery-key-stdin', '--json'], {
     stdin: recoveryKey + '\n',
   });
   assert.equal(search1.status, 0, `e2e search 1 failed: ${search1.stderr}`);
   const { results: hits1 } = JSON.parse(search1.stdout);
   assert.equal(hits1.length, 1, `expected 1 hit for ${NEEDLE}, got ${hits1.length}`);
+  assert.equal(hits1[0].source, 'google-takeout/contacts', `expected planted hit source=google-takeout/contacts, got ${hits1[0].source}`);
+  assert.ok(hits1[0].snippet.includes(NEEDLE), `expected planted hit snippet to include ${NEEDLE}`);
   records.push(recordGate('search-before-rebuild', search1, 192));
+
+  for (const [src, query] of [['google-takeout/calendar', 'Synthetic'], ['google-takeout/mail', 'synthetic']]) {
+    const srcSearch = measureCliPeakRss(['search', query, '--source', src, '--limit', '1', '--vault', home, '--recovery-key-stdin', '--json'], {
+      stdin: recoveryKey + '\n',
+    });
+    assert.equal(srcSearch.status, 0, `e2e source check (${src}) failed: ${srcSearch.stderr}`);
+    const { results: srcHits } = JSON.parse(srcSearch.stdout);
+    assert.ok(srcHits.length === 1 && srcHits[0].source === src, `expected indexed item from source=${src}`);
+  }
 
   // 4. foundry index rebuild
   const rebuild = measureCliPeakRss(['index', 'rebuild', '--vault', home, '--recovery-key-stdin'], {

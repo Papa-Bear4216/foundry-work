@@ -793,9 +793,9 @@ from the process's own peak-usage counter. A ceiling may be raised only by a rec
 |---|---|---|
 | Facts ledger, any subcommand | 96 MiB | Step Zero |
 | `vault verify` (no key) | 128 MiB | Streaming hashes |
-| Any command that runs the passphrase KDF | 256 MiB | scrypt needs about 128 MiB for under two seconds |
+| Any command that runs the passphrase KDF | 256 MiB | scrypt needs about 128 MiB for under two seconds (applies to `init`, `vault reset-passphrase`, and any passphrase-unlocked command including `search`) |
 | `import` | 256 MiB | Independent of archive size |
-| `search` | 192 MiB | Full text; vectors scanned in batches |
+| `search` (recovery key / no passphrase KDF) | 192 MiB | Full text; vectors scanned in batches (passphrase-unlocked `search` falls under the 256 MiB passphrase-KDF row above; see A-39) |
 | Wizard server | 192 MiB | Exits when the wizard closes |
 | Mode A receiver | 96 MiB | |
 

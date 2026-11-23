@@ -9,11 +9,11 @@ import { fileURLToPath } from 'node:url';
 export const BIN = fileURLToPath(new URL('../../bin/foundry.mjs', import.meta.url));
 const DEFAULT_TIMEOUT_MS = 600_000;
 
-/** Clean environment without FOUNDRY_* or VAULT_* variables (the CLI secret guard refuses secret-looking names). */
+/** Clean environment without FOUNDRY_*, VAULT_*, or NODE_OPTIONS variables. */
 export function cleanChildEnv(extra = {}) {
   const env = {};
   for (const [name, value] of Object.entries(process.env)) {
-    if (!/^(FOUNDRY_|VAULT_)/iu.test(name)) env[name] = value;
+    if (!/^(FOUNDRY_|VAULT_|NODE_OPTIONS$)/iu.test(name)) env[name] = value;
   }
   return { ...env, ...extra };
 }

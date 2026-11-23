@@ -12,7 +12,8 @@ function block(api) {
     try {
       appendFileSync(logPath, `${api}\n`, 'utf8');
     } catch {
-      // Best-effort log; still throw below.
+      // Fail closed if the attempt log cannot be written so a caught exception cannot hide an attempt.
+      process.exit(99);
     }
   }
   const err = new Error(`OFFLINE_GATE_VIOLATION: blocked network call (${api})`);
@@ -29,7 +30,7 @@ function blocker(api) {
 const require = createRequire(import.meta.url);
 
 const moduleFns = {
-  net: ['connect', 'createConnection', 'createServer', 'Socket', 'Server'],
+  net: ['connect', 'createConnection', 'createServer', 'Socket', 'Stream', 'Server'],
   tls: ['connect', 'createServer', 'TLSSocket', 'Server'],
   dgram: ['createSocket', 'Socket'],
   dns: [
