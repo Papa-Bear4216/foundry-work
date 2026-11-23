@@ -1,15 +1,32 @@
 // TEST ONLY: process rules (Architecture 9): exit codes, the lock, the wall-clock limit, nothing outlives the command.
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { closeSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { cleanEnv, initVault, PASSPHRASE, runBin, runWorker, scratch, stdinFile } from './helpers.mjs';
+import { runCli } from '../dist/cli.js';
+import { acquireLock, isProcessAlive } from '../dist/lock.js';
+import { BIN, cleanEnv, initVault, PASSPHRASE, runBin, runWorker, scratch, stdinFile } from './helpers.mjs';
 
 const HOOK_BIN = fileURLToPath(new URL('./fixtures/hook-bin.mjs', import.meta.url));
 const MODULES = fileURLToPath(new URL('./fixtures/verify-modules.mjs', import.meta.url));
+const PACKAGE_DIR = fileURLToPath(new URL('..', import.meta.url));
+
+test('the bin launcher: checked into git, package.json bin points at it, and it runs --version with exit 0 after a build', () => {
+  const manifest = JSON.parse(readFileSync(join(PACKAGE_DIR, 'package.json'), 'utf8'));
+  assert.deepEqual(manifest.bin, { foundry: './bin/foundry.mjs' });
+  assert.equal(join(PACKAGE_DIR, manifest.bin.foundry), BIN);
+  const tracked = spawnSync('git', ['ls-files', '--error-unmatch', 'bin/foundry.mjs'], {
+    cwd: PACKAGE_DIR, encoding: 'utf8', timeout: 60_000, windowsHide: true,
+  });
+  assert.equal(tracked.status, 0, `the launcher is in git: ${tracked.stderr}`);
+  assert.equal(tracked.stdout.trim(), 'bin/foundry.mjs');
+  const version = spawnSync(process.execPath, [BIN, '--version'], { env: cleanEnv(), encoding: 'utf8', timeout: 60_000, windowsHide: true });
+  assert.equal(version.status, 0, version.stderr);
+  assert.match(version.stdout, /^foundry \d+\.\d+\.\d+\n$/u);
+});
 
 test('the bin: exit 0 on success, 1 on usage errors, 2 on typed failures; --help and --version take no lock', async t => {
   const dir = scratch(t);
@@ -93,8 +110,109 @@ test('wall-clock limit in a real process: exit 2 TIMEOUT within 5 s of the limit
     assert.match(result.stderr, /\[TIMEOUT\]\n$/u);
     // Process start, init of the worker and the KDF run add to the 2 s limit; the requirement is limit + 5 s.
     assert.ok(elapsed < 2000 + 5000, `ended after ${elapsed} ms`);
-    assert.equal(existsSync(join(home, 'foundry.lock')), false);
+    // The lock is NOT removed on a timeout: it stays until the process is dead, then it is stale and recovered.
+    assertStaleLockRecovered(dir, home, result.pid);
   } finally {
+    closeSync(fd);
+  }
+});
+
+/** The lock left by a stopped bin names that (now dead) process; the next command recovers it with a notice. */
+function assertStaleLockRecovered(dir, home, pid) {
+  const lockPath = join(home, 'foundry.lock');
+  assert.ok(existsSync(lockPath), 'the lock stays after a timeout');
+  const left = JSON.parse(readFileSync(lockPath, 'utf8'));
+  assert.equal(left.pid, pid);
+  assert.equal(isProcessAlive(pid), false);
+  const next = runBin(dir, ['vault', 'verify', '--vault', home]);
+  assert.equal(next.code, 0, next.stderr);
+  assert.match(next.stderr, new RegExp(`notice: recovered a stale lock from process ${pid} \\(search,`, 'u'));
+  assert.equal(existsSync(lockPath), false);
+}
+
+test('wall-clock limit while a stdin read waits: a pipe that never sends EOF ends with exit 2 TIMEOUT within 5 s of the limit', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const started = Date.now();
+  const child = spawn(process.execPath, [BIN, 'search', 'q', '--vault', home, '--passphrase-stdin', '--timeout', '2'], {
+    stdio: ['pipe', 'pipe', 'pipe'], env: cleanEnv(), windowsHide: true,
+  });
+  t.after(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    child.stdin.destroy();
+  });
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', text => { stderr += text; });
+  child.stdout.resume();
+  child.stdin.on('error', () => {}); // the child may close its end first
+  child.stdin.write('TEST ONLY a line that never ends'); // and stdin is never ended: no EOF
+  const stderrDone = new Promise(resolveEnd => child.stderr.on('end', resolveEnd));
+  const [code, signal] = await new Promise(resolveExit => {
+    const killer = setTimeout(() => child.kill(), 60_000);
+    child.on('exit', (exitCode, exitSignal) => {
+      clearTimeout(killer);
+      resolveExit([exitCode, exitSignal]);
+    });
+  });
+  const elapsed = Date.now() - started;
+  await stderrDone;
+  assert.equal(signal, null, 'the process ended by itself, not by the test');
+  assert.equal(code, 2);
+  assert.equal(stderr, 'foundry: the command passed its time limit of 2 second(s) [TIMEOUT]\n');
+  assert.ok(elapsed < 2000 + 5000, `ended after ${elapsed} ms`);
+  assertStaleLockRecovered(dir, home, child.pid);
+
+  // Control: the same read from a pipe that does send EOF ends by itself with exit 0 (no handle keeps it alive).
+  const control = spawnSync(process.execPath, [BIN, 'search', 'q', '--vault', home, '--passphrase-stdin', '--timeout', '60'], {
+    input: PASSPHRASE + '\n', env: cleanEnv(), encoding: 'utf8', timeout: 60_000, windowsHide: true,
+  });
+  assert.equal(control.signal, null);
+  assert.equal(control.status, 0, control.stderr);
+  assert.equal(control.stdout, 'No results.\n');
+});
+
+test('programmatic timeout: the lock is held until the worker has stopped; a second command gets BUSY until then', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const lockPath = join(home, 'foundry.lock');
+  const probe = () => {
+    try {
+      acquireLock(lockPath, 'search', () => {}).release();
+      return 'acquired';
+    } catch (error) {
+      return error.code;
+    }
+  };
+  const fd = stdinFile(dir, PASSPHRASE);
+  let resolved = false;
+  const afterTimeout = [];
+  let poll;
+  try {
+    const first = runCli(['search', 'q', '--vault', home, '--passphrase-stdin', '--timeout', '2'], {
+      stdinFd: fd, env: cleanEnv(), testHooks: { stallSync: true }, stdout: () => {},
+      stderr: text => {
+        if (!text.includes('[TIMEOUT]')) return;
+        // From the TIMEOUT line until runCli returns, the lock must stay held.
+        const check = () => { if (!resolved) afterTimeout.push(probe()); };
+        setImmediate(check);
+        poll = setInterval(check, 2);
+      },
+    }).then(code => { resolved = true; clearInterval(poll); return code; });
+    // While the first command runs, a second command fails fast with BUSY.
+    await new Promise(resolveWait => setTimeout(resolveWait, 500));
+    const second = await runWorker(dir, ['vault', 'verify', '--vault', home]);
+    assert.equal(second.code, 2);
+    assert.match(second.stderr, /another foundry command is running .*\[BUSY\]\n$/u);
+    assert.equal(await first, 2);
+    assert.ok(afterTimeout.length > 0, 'the lock was probed between the TIMEOUT line and the end of runCli');
+    assert.deepEqual([...new Set(afterTimeout)], ['BUSY'], 'the lock was held until the worker had stopped');
+    assert.equal(existsSync(lockPath), false, 'then the lock is released');
+    assert.equal(probe(), 'acquired');
+    const after = await runWorker(dir, ['vault', 'verify', '--vault', home]);
+    assert.equal(after.code, 0, after.stderr);
+  } finally {
+    clearInterval(poll);
     closeSync(fd);
   }
 });

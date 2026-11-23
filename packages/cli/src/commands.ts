@@ -51,6 +51,8 @@ export interface TestHooks {
   leakHandle?: boolean;
   /** Throw a plain Error whose message quotes every secret (proves crash text never carries a secret). */
   throwWithSecret?: boolean;
+  /** `init`: fail after the vault is built in its temporary folder, before the rename to `H/vault`. */
+  failBeforeInitRename?: boolean;
 }
 
 export function homePaths(home: string) {
@@ -128,11 +130,31 @@ function requireNewPassphrase(ctx: Context): string {
   return value;
 }
 
+/** Temporary folders of `init` inside H: `.init-` and 16 lowercase hex digits. Nothing else matches. */
+const INIT_FOLDER = /^\.init-[0-9a-f]{16}$/u;
+
+export function isInitLeftover(name: string): boolean {
+  return INIT_FOLDER.test(name);
+}
+
+/**
+ * `init` builds the vault in `H/.init-<random>` and renames it to `H/vault` as the last step, then prints the
+ * recovery key. An interrupted init leaves at most such a folder; the next `init` (under the lock) removes only
+ * folders that match the pattern, and the NOT_EMPTY check ignores them.
+ */
 async function init(ctx: Context): Promise<void> {
   const passphrase = requireNewPassphrase(ctx);
   const { createVault } = await import('vault');
+  const { randomBytes } = await import('node:crypto');
+  const { readdirSync, renameSync, rmSync } = await import('node:fs');
+  for (const name of readdirSync(ctx.request.home)) {
+    if (isInitLeftover(name)) rmSync(join(ctx.request.home, name), { recursive: true, force: true });
+  }
+  const temporary = join(ctx.request.home, `.init-${randomBytes(8).toString('hex')}`);
   stall(ctx.hooks);
-  const identity = createVault(ctx.paths.vault, { passphrase });
+  const identity = createVault(temporary, { passphrase });
+  if (ctx.hooks.failBeforeInitRename) throw new Error('test hook: init stopped before the rename');
+  renameSync(temporary, ctx.paths.vault);
   ctx.out(`Created a new Foundry vault in ${resolve(ctx.request.home)}.\n\n`
     + 'RECOVERY KEY. Write this down now and keep it somewhere safe. It is shown only this once:\n\n'
     + `    ${identity.recoveryKey}\n\n`

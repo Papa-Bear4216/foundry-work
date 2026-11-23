@@ -27,6 +27,44 @@ test('init: KDF runs once, prints the recovery key once, builds no index, refuse
   assert.match((await runInline(dir, ['init', '--vault', other, '--passphrase-stdin'], { stdin: PASSPHRASE })).stderr, /NOT_EMPTY/u);
 });
 
+test('init builds in H/.init-<random> and renames it last: a leftover .init folder is ignored and removed; an interrupted init leaves no vault and a retry succeeds', async t => {
+  const dir = scratch(t);
+  const home = join(dir, 'home');
+  const leftover = join(home, '.init-0123456789abcdef');
+  mkdirSync(join(leftover, 'keyring'), { recursive: true });
+  writeFileSync(join(leftover, 'keyring', 'partial.txt'), 'TEST ONLY partial init');
+  const { init } = await initVault(dir);
+  assert.equal(init.code, 0);
+  assert.deepEqual(readdirSync(home), ['vault'], 'the leftover folder is removed and no temporary folder remains');
+
+  // Only the exact pattern is ignored: a look-alike folder still makes the target "not empty" and is kept.
+  const near = join(dir, 'near');
+  mkdirSync(join(near, '.init-notHex'), { recursive: true });
+  const refused = await runInline(dir, ['init', '--vault', near, '--passphrase-stdin'], { stdin: PASSPHRASE });
+  assert.match(refused.stderr, /\[NOT_EMPTY\]\n$/u);
+  assert.ok(existsSync(join(near, '.init-notHex')));
+
+  // A failure after the vault is built but before the rename: no H/vault, no recovery key printed.
+  const second = join(dir, 'second');
+  const failed = await runInline(dir, ['init', '--vault', second, '--passphrase-stdin'],
+    { stdin: PASSPHRASE + '\n', hooks: { failBeforeInitRename: true } });
+  assert.equal(failed.code, 2);
+  assert.equal(failed.stdout, '');
+  assert.equal(existsSync(join(second, 'vault')), false);
+  const names = readdirSync(second);
+  assert.equal(names.length, 1);
+  assert.match(names[0], /^\.init-[0-9a-f]{16}$/u);
+  const retry = await runInline(dir, ['init', '--vault', second, '--passphrase-stdin'], { stdin: PASSPHRASE + '\n' });
+  assert.equal(retry.code, 0, retry.stderr);
+  assert.match(retry.stdout, /RECOVERY KEY/u);
+  assert.deepEqual(readdirSync(second), ['vault']);
+  // The renamed vault works.
+  assert.equal((await runInline(dir, ['vault', 'verify', '--vault', second])).code, 0);
+  const search = await runInline(dir, ['search', 'q', '--vault', second, '--passphrase-stdin'], { stdin: PASSPHRASE });
+  assert.equal(search.code, 0, search.stderr);
+  assert.equal(search.stdout, 'No results.\n');
+});
+
 test('init and vault reset-passphrase refuse an empty new passphrase before any vault call', async t => {
   const dir = scratch(t);
   const empty = await runInline(dir, ['init', '--vault', join(dir, 'h'), '--passphrase-stdin'], { stdin: '\n' });

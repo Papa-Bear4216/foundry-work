@@ -8,7 +8,8 @@ import { writeMultiPartTakeoutFolder } from 'importers';
 import { runCli } from '../dist/cli.js';
 import { getKdfCallCountForTest, resetKdfCallCountForTest } from '../../vault/codec/dist/keyring.js';
 
-export const BIN = fileURLToPath(new URL('../dist/main.js', import.meta.url));
+/** The checked-in launcher that `package.json` `bin` points at (it loads `dist/main.js`). */
+export const BIN = fileURLToPath(new URL('../bin/foundry.mjs', import.meta.url));
 export const PASSPHRASE = 'TEST ONLY cli passphrase';
 
 /** A temporary folder removed after the test. */

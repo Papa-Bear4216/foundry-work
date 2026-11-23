@@ -52,6 +52,13 @@ declare module 'node:fs' {
   export function fsyncSync(fd: number): void;
   export function closeSync(fd: number): void;
   export function unlinkSync(path: string): void;
+  export function renameSync(from: string, to: string): void;
+  export function rmSync(path: string, options?: { recursive?: boolean; force?: boolean }): void;
+  export function createReadStream(path: string | null, options: { fd: number; autoClose?: boolean }): import('node:stream').Readable;
+}
+
+declare module 'node:tty' {
+  export function isatty(fd: number): boolean;
 }
 
 declare module 'node:os' {
@@ -73,6 +80,13 @@ declare module 'node:url' {
 declare module 'node:stream' {
   export interface Readable extends AsyncIterable<unknown> {
     destroy(error?: Error): this;
+    on(event: 'data', listener: (chunk: Uint8Array) => void): this;
+    on(event: 'end', listener: () => void): this;
+    on(event: 'error', listener: (error: Error) => void): this;
+    off(event: 'data', listener: (chunk: Uint8Array) => void): this;
+    off(event: 'end', listener: () => void): this;
+    off(event: 'error', listener: (error: Error) => void): this;
+    pause(): this;
   }
 }
 
@@ -137,9 +151,14 @@ declare module 'node:process' {
     isTTY?: boolean;
     setRawMode?(mode: boolean): void;
     on(event: 'data', listener: (chunk: Uint8Array) => void): void;
+    on(event: 'end', listener: () => void): void;
+    on(event: 'error', listener: (error: Error) => void): void;
     off(event: 'data', listener: (chunk: Uint8Array) => void): void;
+    off(event: 'end', listener: () => void): void;
+    off(event: 'error', listener: (error: Error) => void): void;
     resume(): void;
     pause(): void;
+    destroy(error?: Error): void;
   }
   const process: {
     argv: string[];

@@ -1,19 +1,19 @@
 // TEST ONLY: unit tests of the foundry command line with synthetic values.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { existsSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
+import { homedir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { DEFAULT_TIMEOUTS, parseCommandLine } from '../dist/args.js';
-import { resolveHome } from '../dist/cli.js';
+import { resolveHome, runCli } from '../dist/cli.js';
 import { MAX_NAMES_PER_CALL, nameSlices, summarise } from '../dist/commands.js';
 import { chunkPlainText, DERIVER_VERSION, itemText, loadProjection } from '../dist/derive.js';
 import { CliError, debugText, errorLine, mapError } from '../dist/errors.js';
 import { acquireLock, isProcessAlive } from '../dist/lock.js';
 import { LineEditor, readTwoSecrets, stripOneLineEnding } from '../dist/secrets.js';
-import { scratch, stdinFile } from './helpers.mjs';
-import { closeSync } from 'node:fs';
+import { cleanEnv, scratch, stdinFile } from './helpers.mjs';
+import { closeSync, readdirSync } from 'node:fs';
 
 const parse = (argv, env = {}) => parseCommandLine(argv, env);
 
@@ -81,7 +81,7 @@ test('the secret guard runs first: secret options, extra positionals and secret 
   }
 });
 
-test('stdin secrets: exactly one trailing line ending is removed; two secrets are line 1 and line 2', t => {
+test('stdin secrets: exactly one trailing line ending is removed; two secrets are line 1 and line 2', async t => {
   assert.equal(stripOneLineEnding('a\n'), 'a');
   assert.equal(stripOneLineEnding('a\r\n'), 'a');
   assert.equal(stripOneLineEnding('a\n\n'), 'a\n');
@@ -91,7 +91,7 @@ test('stdin secrets: exactly one trailing line ending is removed; two secrets ar
   for (const [input, first, second] of [['rk\npw\n', 'rk', 'pw'], ['rk\r\npw', 'rk', 'pw'], ['rk\n\n', 'rk', '']]) {
     const fd = stdinFile(dir, input);
     try {
-      const [a, b] = readTwoSecrets(fd);
+      const [a, b] = await readTwoSecrets(fd);
       assert.equal(a.toString(), first);
       assert.equal(b.toString(), second);
       assert.equal(a.byteOffset, 0, 'unpooled buffer');
@@ -103,7 +103,7 @@ test('stdin secrets: exactly one trailing line ending is removed; two secrets ar
   for (const input of ['only-one-line', 'a\nb\nc\n']) {
     const fd = stdinFile(dir, input);
     try {
-      assert.throws(() => readTwoSecrets(fd), e => e instanceof CliError && e.exit === 1);
+      await assert.rejects(readTwoSecrets(fd), e => e instanceof CliError && e.exit === 1);
     } finally {
       closeSync(fd);
     }
@@ -173,7 +173,7 @@ test('lock: exclusive, BUSY names the holder, stale lock of a dead process is re
 
   writeFileSync(path, JSON.stringify({ pid: deadPid, command: 'import', started: '2026-01-01T00:00:00.000Z', host: 'test-only-other-host' }));
   assert.throws(() => acquireLock(path, 'search', () => {}), e => e.code === 'BUSY' && /another computer/u.test(e.message));
-  // An unreadable lock is BUSY while it is young (it may be being written).
+  // An unreadable lock is BUSY (see the next test for an old one).
   writeFileSync(path, '');
   assert.throws(() => acquireLock(path, 'search', () => {}), e => e.code === 'BUSY');
 });
@@ -219,4 +219,97 @@ test('search text deriver: mail, contact, calendar and plain text give chunks; o
   const long = chunkPlainText('word '.repeat(1000));
   assert.ok(long.length > 1 && long.every(chunk => chunk.length <= 800));
   assert.equal(chunkPlainText('x'.repeat(800 * 1100)).length, 1024);
+});
+
+function deadPid() {
+  const child = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' });
+  const pid = Number(child.stdout);
+  assert.equal(isProcessAlive(pid), false);
+  return pid;
+}
+
+test("lock recovery: two contenders against one stale lock; only one proceeds and the winner's lock survives", t => {
+  const dir = scratch(t);
+  const path = join(dir, 'foundry.lock');
+  const stale = { pid: deadPid(), command: 'import', started: '2026-01-01T00:00:00.000Z', host: hostname() };
+  writeFileSync(path, JSON.stringify(stale));
+  // Contender B has read the dead holder. Before B acts on it, contender A recovers the same stale lock and takes it.
+  let winner;
+  const winnerNotices = [];
+  const loserNotices = [];
+  assert.throws(() => acquireLock(path, 'search', line => loserNotices.push(line), {
+    afterHolderRead: () => {
+      if (winner === undefined) winner = acquireLock(path, 'import', line => winnerNotices.push(line));
+    },
+  }), e => e.code === 'BUSY' && e.message.includes(`process ${process.pid}, import`));
+  assert.equal(winnerNotices.length, 1, 'the winner recovered the stale lock');
+  assert.deepEqual(loserNotices, [], 'the loser removed nothing');
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')), winner.info, "the winner's live lock survives");
+  assert.deepEqual(readdirSync(dir), ['foundry.lock'], 'no recovery file is left');
+  winner.release();
+  assert.equal(existsSync(path), false);
+
+  // A recovery in progress (or one interrupted by a crash) blocks recovery: BUSY, and nothing is removed.
+  writeFileSync(path, JSON.stringify(stale));
+  writeFileSync(`${path}.recover`, JSON.stringify(stale));
+  assert.throws(() => acquireLock(path, 'search', () => assert.fail('no notice')),
+    e => e.code === 'BUSY' && /delete the file foundry\.lock\.recover in the Foundry folder/u.test(e.message) && !e.message.includes(dir));
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')), stale);
+  assert.ok(existsSync(`${path}.recover`));
+});
+
+test('lock: an unreadable lock gives BUSY naming the file and is never removed by age; a failed metadata write leaves no lock', t => {
+  const dir = scratch(t);
+  const path = join(dir, 'foundry.lock');
+  writeFileSync(path, '{"pid":');
+  const hourAgo = new Date(Date.now() - 3_600_000);
+  utimesSync(path, hourAgo, hourAgo);
+  assert.throws(() => acquireLock(path, 'search', () => assert.fail('no notice')), e => e.code === 'BUSY'
+    && /the lock file foundry\.lock in the Foundry folder cannot be read/u.test(e.message)
+    && /If no foundry command is running, delete that file/u.test(e.message) && !e.message.includes(dir));
+  assert.equal(readFileSync(path, 'utf8'), '{"pid":', 'the unreadable lock is left as it was');
+
+  const other = join(dir, 'second.lock');
+  const failure = Object.assign(new Error('TEST ONLY disk full'), { code: 'ENOSPC' });
+  assert.throws(() => acquireLock(other, 'import', () => {}, { writeMetadata: () => { throw failure; } }), e => e === failure);
+  assert.equal(existsSync(other), false, 'the file this command created is removed');
+  const partial = join(dir, 'third.lock');
+  assert.throws(() => acquireLock(partial, 'import', () => {}, {
+    writeMetadata: fd => { writeFileSync(fd, '{"pid":1'); throw failure; },
+  }), e => e === failure);
+  assert.equal(existsSync(partial), false, 'a half-written lock is removed too');
+});
+
+test('stdin flags refuse a terminal on stdin: exit 1 with a usage line before any read or lock', async t => {
+  const dir = scratch(t);
+  const home = join(dir, 'home');
+  const cases = [
+    [['init', '--vault', home, '--passphrase-stdin'], 'do not use --passphrase-stdin on a terminal; omit the flag to be prompted'],
+    [['search', 'q', '--vault', home, '--recovery-key-stdin'], 'do not use --recovery-key-stdin on a terminal; omit the flag to be prompted'],
+    [['import', 'x.zip', '--vault', home, '--passphrase-stdin'], 'do not use --passphrase-stdin on a terminal; omit the flag to be prompted'],
+    [['vault', 'reset-passphrase', '--vault', home, '--recovery-key-stdin', '--passphrase-stdin'],
+      'do not use --recovery-key-stdin and --passphrase-stdin on a terminal; omit the flags to be prompted'],
+  ];
+  for (const [argv, message] of cases) {
+    let stderr = '';
+    const asked = [];
+    const code = await runCli(argv, {
+      env: cleanEnv(), stdinFd: 0, isTerminal: fd => { asked.push(fd); return true; },
+      stdout: () => assert.fail('no output'), stderr: text => { stderr += text; },
+    });
+    assert.equal(code, 1, argv.join(' '));
+    assert.equal(stderr, `foundry: ${message} [USAGE]\n`);
+    assert.deepEqual(asked, [0]);
+    assert.equal(existsSync(home), false, 'nothing was created');
+  }
+  // Control: the same flag without a terminal on stdin goes ahead.
+  const fd = stdinFile(dir, 'TEST ONLY terminal control passphrase\n');
+  try {
+    const code = await runCli(['init', '--vault', home, '--passphrase-stdin'], {
+      inline: true, env: cleanEnv(), stdinFd: fd, isTerminal: () => false, stdout: () => {}, stderr: () => {},
+    });
+    assert.equal(code, 0);
+  } finally {
+    closeSync(fd);
+  }
 });

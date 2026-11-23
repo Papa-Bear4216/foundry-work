@@ -2,18 +2,29 @@
  * One heavy job at a time (Architecture 9, design 4.7): `H/foundry.lock`, created exclusively.
  *
  * Content: JSON with `pid`, `command`, `started` (ISO time) and `host`. A lock whose holder runs on this host and
- * whose pid is not alive is stale: it is replaced with a notice. Any other lock fails fast with `BUSY`. Limits (for
- * A-39): a reused pid looks alive, so such a stale lock needs manual removal; a lock written by another host on a
- * shared folder is never treated as stale.
+ * whose pid is not alive is stale. Any other lock fails fast with `BUSY`.
+ *
+ * Stale recovery is serialized by a second exclusive file, `H/foundry.lock.recover`. Only its creator may remove a
+ * lock that is not its own, and only after it re-reads the lock under that file and finds the SAME dead holder (pid,
+ * start time, host). A new lock can only be created while no lock file exists, so a live holder's lock is never
+ * removed. The recovery file is held for a few file operations; if it exists, the command fails with `BUSY`.
+ *
+ * Nothing is removed by age: an unreadable lock file (or a recovery file left by a crash) gives `BUSY` with a message
+ * that names the file and says to delete it if no Foundry command runs. The message names the file inside the
+ * Foundry folder, never the full path (the folder may come from `--vault`).
+ *
+ * If writing or syncing a new lock's metadata fails, the file this command just created is removed.
+ *
+ * Limits (for A-39): a reused pid looks alive, so such a stale lock needs manual removal; a lock written by another
+ * host on a shared folder is never treated as stale.
  */
-import { closeSync, fsyncSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, fsyncSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
 import { hostname } from 'node:os';
 import process from 'node:process';
 import { CliError } from './errors.ts';
 
 export const LOCK_NAME = 'foundry.lock';
-/** An unreadable lock younger than this may still be being written by its holder. */
-const UNREADABLE_GRACE_MS = 10_000;
+export const RECOVERY_NAME = `${LOCK_NAME}.recover`;
 
 export interface LockInfo {
   pid: number;
@@ -28,6 +39,14 @@ export interface HeldLock {
   release(): void;
 }
 
+/** Test hooks, reachable only by calling `acquireLock` directly (never argv or environment). */
+export interface LockHooks {
+  /** Runs right after the current holder was read, before any recovery decision. */
+  afterHolderRead?: () => void;
+  /** Replaces the metadata write (to inject a failure). */
+  writeMetadata?: (fd: number, text: string) => void;
+}
+
 export function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -37,34 +56,25 @@ export function isProcessAlive(pid: number): boolean {
   }
 }
 
-function readLock(path: string): LockInfo | undefined {
+type ReadResult = LockInfo | 'missing' | 'unreadable';
+
+function readLock(path: string): ReadResult {
+  let bytes;
   try {
-    const value = JSON.parse(readFileSync(path).toString('utf8')) as Partial<LockInfo>;
+    bytes = readFileSync(path);
+  } catch (error) {
+    return (error as { code?: string }).code === 'ENOENT' ? 'missing' : 'unreadable';
+  }
+  try {
+    const value = JSON.parse(bytes.toString('utf8')) as Partial<LockInfo>;
     if (Number.isSafeInteger(value.pid) && typeof value.command === 'string' && typeof value.started === 'string'
       && typeof value.host === 'string') {
       return value as LockInfo;
     }
   } catch {
-    // Unreadable or half-written; handled by the caller.
+    // Half-written or damaged: unreadable.
   }
-  return undefined;
-}
-
-function tryCreate(path: string, info: LockInfo): boolean {
-  let fd: number;
-  try {
-    fd = openSync(path, 'wx', 0o600);
-  } catch (error) {
-    if ((error as { code?: string }).code === 'EEXIST') return false;
-    throw error;
-  }
-  try {
-    writeSync(fd, JSON.stringify(info) + '\n');
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  return true;
+  return 'unreadable';
 }
 
 function removeIfPresent(path: string): void {
@@ -75,11 +85,64 @@ function removeIfPresent(path: string): void {
   }
 }
 
+/** Create `path` exclusively with `info`. False if it exists. On a write or sync failure the new file is removed. */
+function tryCreate(path: string, info: LockInfo, hooks: LockHooks): boolean {
+  let fd: number;
+  try {
+    fd = openSync(path, 'wx', 0o600);
+  } catch (error) {
+    if ((error as { code?: string }).code === 'EEXIST') return false;
+    throw error;
+  }
+  let complete = false;
+  try {
+    const text = JSON.stringify(info) + '\n';
+    if (hooks.writeMetadata) hooks.writeMetadata(fd, text);
+    else writeSync(fd, text);
+    fsyncSync(fd);
+    closeSync(fd);
+    complete = true;
+  } finally {
+    if (!complete) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Already closed, or the close itself failed: the file is removed below either way.
+      }
+      removeIfPresent(path);
+    }
+  }
+  return true;
+}
+
+function sameHolder(a: LockInfo, b: LockInfo): boolean {
+  return a.pid === b.pid && a.started === b.started && a.host === b.host && a.command === b.command;
+}
+
+/** Remove the lock of a dead holder, serialized by the recovery file. Returns true if this call removed it. */
+function recoverStale(path: string, holder: LockInfo, info: LockInfo, hooks: LockHooks): boolean {
+  const guard = `${path}.recover`; // `H/foundry.lock.recover` (RECOVERY_NAME)
+  if (!tryCreate(guard, info, hooks)) {
+    throw new CliError('BUSY', `another foundry command is recovering the lock; try again shortly. If no foundry command is `
+      + `running, delete the file ${RECOVERY_NAME} in the Foundry folder`);
+  }
+  try {
+    const again = readLock(path);
+    if (typeof again === 'object' && sameHolder(again, holder) && !isProcessAlive(again.pid)) {
+      unlinkSync(path);
+      return true;
+    }
+    return false;
+  } finally {
+    removeIfPresent(guard);
+  }
+}
+
 /** Take the lock or throw `BUSY`. `notice` receives one line when a stale lock is recovered. */
-export function acquireLock(path: string, command: string, notice: (line: string) => void): HeldLock {
+export function acquireLock(path: string, command: string, notice: (line: string) => void, hooks: LockHooks = {}): HeldLock {
   const info: LockInfo = { pid: process.pid, command, started: new Date().toISOString(), host: hostname() };
-  for (let attempt = 0; attempt < 2; attempt++) {
-    if (tryCreate(path, info)) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (tryCreate(path, info, hooks)) {
       let released = false;
       return {
         path,
@@ -88,21 +151,21 @@ export function acquireLock(path: string, command: string, notice: (line: string
           if (released) return;
           released = true;
           const current = readLock(path);
-          if (current && current.pid === info.pid && current.started === info.started) removeIfPresent(path);
+          if (typeof current === 'object' && sameHolder(current, info)) removeIfPresent(path);
         },
       };
     }
     const holder = readLock(path);
-    if (holder === undefined) {
-      const age = Date.now() - (statSync(path, { throwIfNoEntry: false })?.mtimeMs ?? 0);
-      if (age < UNREADABLE_GRACE_MS) throw new CliError('BUSY', 'another foundry command is starting; try again shortly');
-      removeIfPresent(path);
-      notice('foundry: notice: replaced an unreadable lock file left by an earlier command\n');
-      continue;
+    hooks.afterHolderRead?.();
+    if (holder === 'missing') continue; // released in between: try again
+    if (holder === 'unreadable') {
+      throw new CliError('BUSY', `the lock file ${LOCK_NAME} in the Foundry folder cannot be read; another foundry command `
+        + `may be starting. If no foundry command is running, delete that file and try again`);
     }
     if (holder.host === info.host && !isProcessAlive(holder.pid)) {
-      removeIfPresent(path);
-      notice(`foundry: notice: recovered a stale lock from process ${holder.pid} (${holder.command}, started ${holder.started})\n`);
+      if (recoverStale(path, holder, info, hooks)) {
+        notice(`foundry: notice: recovered a stale lock from process ${holder.pid} (${holder.command}, started ${holder.started})\n`);
+      }
       continue;
     }
     throw new CliError('BUSY',
