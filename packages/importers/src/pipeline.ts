@@ -35,6 +35,7 @@ import {
 } from './defaults.js';
 import { computeBlobId, deriveCollectionIdKey, loadExistingItemKeys } from './vault-state.js';
 import type { ReadVaultRecordFn } from './vault-state.js';
+import { MAIL_SOURCE_ID } from './importers/mail.js';
 
 const DEFAULT_BATCH_MAX_ITEMS = 16;
 const DEFAULT_BATCH_MAX_BYTES = 4 * 1024 * 1024;
@@ -426,7 +427,14 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
     for (const { entry, importer } of matchedPlan) {
       const counts = ensureSourceCounts(importer.id);
 
-      for await (const rawItem of importer.split(entry, { maxItemBytes, onItemError: recordItemError })) {
+      // Review round 1 #5: before V-7 the mail splitter yielded an over-limit message and this loop
+      // counted it before rejecting it. The splitter now reports it without yielding, so count it here
+      // to keep checkpoint item numbers unchanged. Other splitter reports (vCard) never counted.
+      const onSplitError = (err: ItemErrorInfo): void => {
+        if (err.source === MAIL_SOURCE_ID && err.code === 'ITEM_TOO_LARGE') globalItemIndex++;
+        recordItemError(err);
+      };
+      for await (const rawItem of importer.split(entry, { maxItemBytes, onItemError: onSplitError })) {
         globalItemIndex++;
         const read = await readItemBytesBounded(rawItem.bytes, maxItemBytes);
         if (read.exceeded) {

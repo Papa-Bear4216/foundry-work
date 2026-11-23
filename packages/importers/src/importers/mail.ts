@@ -265,24 +265,32 @@ function findHeaderEnd(buf: Buffer): number {
   return crlf < lf ? crlf + 4 : lf + 2;
 }
 
-/** Copies message chunks into fixed 64 KiB blocks so a buffered message holds few objects. */
+/**
+ * Copies message chunks into fixed blocks (64 KiB, or the item limit when that is smaller) so a
+ * buffered message holds few objects and no block is larger than the item limit.
+ */
 class MessageBlocks {
   readonly blocks: Buffer[] = [];
+  readonly #blockBytes: number;
   #block: Buffer | null = null;
   #used = 0;
+
+  constructor(maxItemBytes: number) {
+    this.#blockBytes = Math.min(MESSAGE_BLOCK_BYTES, maxItemBytes);
+  }
 
   push(chunk: Buffer): void {
     let rest = chunk;
     while (rest.length > 0) {
       if (this.#block === null) {
-        this.#block = Buffer.allocUnsafe(MESSAGE_BLOCK_BYTES);
+        this.#block = Buffer.allocUnsafe(this.#blockBytes);
         this.#used = 0;
       }
-      const take = Math.min(rest.length, MESSAGE_BLOCK_BYTES - this.#used);
+      const take = Math.min(rest.length, this.#blockBytes - this.#used);
       rest.copy(this.#block, this.#used, 0, take);
       this.#used += take;
       rest = rest.subarray(take);
-      if (this.#used === MESSAGE_BLOCK_BYTES) {
+      if (this.#used === this.#blockBytes) {
         this.blocks.push(this.#block);
         this.#block = null;
       }
@@ -335,6 +343,7 @@ async function* splitMboxStream(entry: ArchiveEntry, options?: SplitOptions): As
     const prefixChunks: Buffer[] = [];
     let prefixBytes = 0;
     let messageEndedDuringPeek = false;
+    let oversizedDuringPeek = false;
     let first = true;
 
     while (prefixBytes < peekLimit) {
@@ -342,6 +351,14 @@ async function* splitMboxStream(entry: ArchiveEntry, options?: SplitOptions): As
       first = false;
       if (chunk === null) {
         messageEndedDuringPeek = true;
+        break;
+      }
+      if (prefixBytes + chunk.length > maxItemBytes) {
+        // Review round 1 #4: check the count before copying. At the crossing, drop the prefix and
+        // copy nothing; the rest of the message is only counted below.
+        prefixChunks.length = 0;
+        prefixBytes += chunk.length;
+        oversizedDuringPeek = true;
         break;
       }
       prefixChunks.push(Buffer.from(chunk));
@@ -356,15 +373,17 @@ async function* splitMboxStream(entry: ArchiveEntry, options?: SplitOptions): As
 
     if (prefixBytes === 0) continue;
 
-    const headerBuffer = prefixChunks.length === 1 ? prefixChunks[0]! : Buffer.concat(prefixChunks);
+    const headerBuffer = oversizedDuringPeek
+      ? EMPTY
+      : prefixChunks.length === 1 ? prefixChunks[0]! : Buffer.concat(prefixChunks);
     prefixChunks.length = 0;
     messageIndex++;
     const itemPath = `${entry.path}#${messageIndex}`;
 
     // Buffer the message up to the limit. Past the limit, drop every buffered byte and read
     // forward to the next separator, counting bytes only.
-    let observedBytes = headerBuffer.length;
-    let blocks: MessageBlocks | null = observedBytes > maxItemBytes ? null : new MessageBlocks();
+    let observedBytes = prefixBytes;
+    let blocks: MessageBlocks | null = oversizedDuringPeek ? null : new MessageBlocks(maxItemBytes);
     if (!messageEndedDuringPeek) {
       for (;;) {
         const chunk = await cursor.readMessageChunk(false);
