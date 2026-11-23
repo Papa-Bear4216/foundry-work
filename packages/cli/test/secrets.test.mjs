@@ -2,7 +2,7 @@
 // failure paths. The one deliberate exception: `foundry init` prints the recovery key once.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { closeSync, writeFileSync } from 'node:fs';
+import { closeSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
@@ -100,6 +100,37 @@ test('planted marker: the home-folder error is fixed text (no --vault or FOUNDRY
       assert.doesNotMatch(result.stderr, /scandir|not a directory|mkdir/iu, `${name}: no message text from Node`);
       if (debug.length) assert.match(result.stderr, /foundry: debug: /u, `${name}: --debug still prints its (fixed) details`);
       else assert.equal(result.stderr.split('\n').length, 2, `${name}: one stderr line`);
+    }
+  }
+
+  // A failure AFTER preflight: init's staging-marker write fails (test hook) with a Node-style error whose message and
+  // `path` quote the pasted home. The line and the --debug text are fixed text: no path, no Node message.
+  for (const debug of [[], ['--debug']]) {
+    for (const [label, argv, env, target] of [
+      ['marker write --vault', ['init', '--vault', join(dir, `${MARKER}-init-a`), '--passphrase-stdin', ...debug], {},
+        join(dir, `${MARKER}-init-a`)],
+      ['marker write FOUNDRY_HOME', ['init', '--passphrase-stdin', ...debug], { FOUNDRY_HOME: join(dir, `${MARKER}-init-b`) },
+        join(dir, `${MARKER}-init-b`)],
+    ]) {
+      const fd = stdinFile(dir, PASS + '\n');
+      try {
+        const result = spawnSync(process.execPath, [HOOK_BIN, 'failInitMarkerWrite', ...argv], {
+          stdio: [fd, 'pipe', 'pipe'], env: cleanEnv(env), encoding: 'utf8', timeout: 120_000, windowsHide: true,
+        });
+        const name = `${label} ${debug.join(' ')}`;
+        assert.equal(result.status, 2, `${name}: ${result.stderr}`);
+        assert.match(result.stderr,
+          /foundry: a file operation on the Foundry folder or its lock file failed \(ENAMETOOLONG\) \[IO\]\n$/u, name);
+        clean({ stdout: result.stdout, stderr: result.stderr }, [PASS], name);
+        assert.ok(!result.stderr.includes(target), `${name}: the home path is not echoed`);
+        assert.doesNotMatch(result.stderr, /name too long|\.foundry-init-owner|test hook/iu, `${name}: no message text from Node`);
+        if (debug.length) assert.match(result.stderr, /foundry: debug: /u, `${name}: --debug still prints its (fixed) details`);
+        else assert.equal(result.stderr.split('\n').length, 2, `${name}: one stderr line`);
+        assert.deepEqual(readdirSync(target), [], `${name}: no staging folder, marker, vault or lock is left`);
+      } finally {
+        closeSync(fd);
+      }
+      rmSync(target, { recursive: true, force: true });
     }
   }
 

@@ -12,18 +12,20 @@
  * - the bin (`exitOnTimeout`) prints the `TIMEOUT` / `INTERRUPTED` line and ends the process WITHOUT removing the
  *   lock: the worker may still be writing until the process is gone. The dead pid then makes the lock stale, and the
  *   next command recovers it (`lock.ts`).
- * - the programmatic path prints the line, cancels a pending stdin read or terminal prompt (the prompt's listener is
- *   removed, the input terminal's raw mode restored, its buffers wiped, synchronously), awaits `worker.terminate()`
- *   and only then removes the lock.
+ * - the programmatic path prints the line, cancels a pending stdin read or terminal prompt (its buffers wiped, its
+ *   listener removed, the input terminal's previous raw-mode state put back, synchronously; the cancel never throws),
+ *   awaits `worker.terminate()` and only then removes the lock.
  * File-system errors of the home folder and the lock print a fixed message with the error code, never the path, also
- * under `--debug` (`files.ts`).
+ * under `--debug` (`files.ts`). `H/vault` or `H/index` as a symbolic link or junction is refused (`LINKED_FOLDER`).
+ * `init` refuses any `.init-*` folder in H and never deletes a folder it did not just create (`commands.ts`).
  * No child process is started; no thread outlives the command.
  *
  * Location rule (design 4.1), first match wins: `--vault <dir>`, then `FOUNDRY_HOME`, then `<home directory>/Foundry`.
  * The home `H` holds `H/vault/`, `H/index/` and `H/foundry.lock`.
  */
 import type { Buffer } from 'node:buffer';
-import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
+import type { Stats } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import process from 'node:process';
@@ -31,13 +33,13 @@ import { isatty } from 'node:tty';
 import { Worker } from 'node:worker_threads';
 import { HELP, isKeyed, parseCommandLine } from './args.ts';
 import type { ParsedCommand } from './args.ts';
-import { executeCommand, homePaths, isOwnedInitFolder } from './commands.ts';
+import { executeCommand, homePaths, INIT_PREFIX } from './commands.ts';
 import type { CommandIo, CommandRequest, CommandSecrets, TestHooks } from './commands.ts';
 import { CliError, debugText, errorLine, mapError, usage } from './errors.ts';
 import { withFixedFileErrors } from './files.ts';
 import { acquireLock, LOCK_NAME, RECOVERY_NAME } from './lock.ts';
 import type { HeldLock } from './lock.ts';
-import { promptHidden, readOneSecret, readTwoSecrets, restoreTerminal } from './secrets.ts';
+import { promptHidden, readOneSecret, readTwoSecrets } from './secrets.ts';
 import type { Cancellable, PromptIo, StdinRead } from './secrets.ts';
 
 export { DEFAULT_TIMEOUTS } from './args.ts';
@@ -149,15 +151,56 @@ function refuseTerminalStdin(run: Run, fd: number, isTerminal: (fd: number) => b
     + 'omit the flag to be prompted');
 }
 
-/** Names in H that do not make it "not empty" for `init`: the lock, its recovery file, and init's OWN staging folders. */
-function ignoredByInit(home: string, name: string): boolean {
-  return name === LOCK_NAME || name === RECOVERY_NAME || isOwnedInitFolder(home, name);
+/** Names in H that do not make it "not empty" for `init`: the lock and its recovery file. Nothing else. */
+function ignoredByInit(name: string): boolean {
+  return name === LOCK_NAME || name === RECOVERY_NAME;
+}
+
+/** `lstat` that treats a missing path, or a home that is not a folder, as "nothing there". */
+function lstatOrNothing(path: string): Stats | undefined {
+  try {
+    return lstatSync(path, { throwIfNoEntry: false });
+  } catch (error) {
+    if ((error as { code?: unknown }).code === 'ENOTDIR') return undefined;
+    throw error;
+  }
+}
+
+function samePath(a: string, b: string): boolean {
+  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+/**
+ * Two homes must never reach one vault or index through a link (each would take its own lock). Refuse `H/vault` and
+ * `H/index` when either is a symbolic link or a junction: `lstat`, and also the real path of the folder against the
+ * real path of H joined with its name (so only a link at that last step counts; a linked or short-named parent of H
+ * does not). Fixed text, exit 2 `LINKED_FOLDER`.
+ */
+function refuseLinkedFolders(home: string): void {
+  const paths = homePaths(home);
+  for (const [which, path] of [['vault', paths.vault], ['index', paths.index]] as const) {
+    const info = lstatOrNothing(path);
+    if (info === undefined) continue;
+    if (info.isSymbolicLink() || !samePath(realpathSync.native(path), join(realpathSync.native(home), which))) {
+      throw new CliError('LINKED_FOLDER',
+        `the ${which} folder in the Foundry folder is a symbolic link or junction; Foundry needs a real folder there`);
+    }
+  }
 }
 
 /** Home-folder preflight. A file-system error becomes fixed text with its code (the caller wraps it). */
 function checkHome(run: Run, home: string): void {
+  refuseLinkedFolders(home);
   if (run.command === 'init') {
-    if (existsSync(home) && readdirSync(home).some(name => !ignoredByInit(home, name))) {
+    if (!existsSync(home)) return;
+    const names = readdirSync(home).sort();
+    // init never deletes a folder: any `.init-*` folder (owned leftover or not) is refused and named (name only).
+    const leftover = names.find(name => name.startsWith(INIT_PREFIX) && lstatOrNothing(join(home, name))?.isDirectory());
+    if (leftover !== undefined) {
+      throw new CliError('NOT_EMPTY', `the target folder holds the folder ${JSON.stringify(leftover)}; if it is a leftover `
+        + 'of an interrupted `foundry init`, delete it and try again');
+    }
+    if (names.some(name => !ignoredByInit(name))) {
       throw new CliError('NOT_EMPTY', 'the target folder exists and is not empty; choose another folder with --vault');
     }
     return;
@@ -307,9 +350,14 @@ export async function runCli(argv: readonly string[], options: RunOptions = {}):
     }
     const result = await Promise.race([work().catch(report), stopped]);
     if (typeof result === 'number') return result;
-    // Cancel an open prompt first, synchronously: listener off, the input terminal's raw mode off, buffers wiped.
-    pendingPrompt?.cancel();
-    restoreTerminal();
+    // Cancel an open prompt first, synchronously: buffers wiped, listener off, the input terminal's previous raw-mode
+    // state put back. The cancel never throws (a failing terminal restore is ignored); the guard below is only a
+    // second line of defence, so the stop always ends as TIMEOUT / INTERRUPTED.
+    try {
+      pendingPrompt?.cancel();
+    } catch {
+      // Never reached by the prompts of this module.
+    }
     io.err(errorLine({ code: result.code, message: result.message, exit: 2 }));
     // The bin: end the process now and leave the lock. The worker may still be writing until the process is gone;
     // the dead pid then makes the lock stale and the next command recovers it.

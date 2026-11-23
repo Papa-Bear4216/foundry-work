@@ -294,6 +294,53 @@ test('programmatic timeout during a terminal prompt: the prompt is cancelled (li
   assert.equal(existsSync(join(dir, 'fresh', 'vault')), false, 'the cancelled init created no vault');
 });
 
+test('prompt cancel never throws: a terminal whose setRawMode throws during the restore still ends as TIMEOUT with the listener removed and both buffers wiped; the previous raw mode is restored', async t => {
+  const dir = scratch(t);
+  // Case 1: init confirmation prompt open (first passphrase held); the terminal then fails every setRawMode call.
+  const terminal = fakeTerminal(['TEST ONLY first new passphrase\r', 'TEST ONLY partial']);
+  let failRestore = false;
+  const setRaw = terminal.input.setRawMode;
+  terminal.input.setRawMode = mode => {
+    if (failRestore) throw Object.assign(new Error('TEST ONLY the terminal is gone'), { code: 'EIO' });
+    return setRaw(mode);
+  };
+  let stderr = '';
+  const pending = runCli(['init', '--vault', join(dir, 'fresh'), '--timeout', '1'], {
+    env: cleanEnv(), terminal, isTerminal: () => false, stdout: () => assert.fail('no output'),
+    stderr: text => { stderr += text; },
+  });
+  await sleep(400);
+  assert.equal(terminal.input.listenerCount('data'), 1, 'the confirmation prompt is open');
+  failRestore = true;
+  const code = await pending;
+  assert.equal(code, 2);
+  assert.equal(stderr, 'foundry: the command passed its time limit of 1 second(s) [TIMEOUT]\n');
+  assert.equal(terminal.input.listenerCount('data'), 0, 'the data listener is removed');
+  const editors = terminal.buffers.filter(entry => entry.role === 'editor');
+  assert.equal(editors.length, 2);
+  for (const { bytes } of editors) assert.ok(allZero(bytes), 'the editor buffer is wiped');
+  const firsts = terminal.buffers.filter(entry => entry.role === 'first');
+  assert.equal(firsts.length, 1);
+  assert.ok(allZero(firsts[0].bytes), 'the first passphrase is wiped');
+  assert.equal(existsSync(join(dir, 'fresh', 'foundry.lock')), false, 'the lock is released');
+  assert.equal(existsSync(join(dir, 'fresh', 'vault')), false);
+
+  // Case 2: the terminal was already in raw mode before the prompt: the cancel restores raw mode ON, not off.
+  const { home } = await initVault(dir);
+  const raw = fakeTerminal(['TEST ONLY partial passphrase']);
+  raw.input.isRaw = true;
+  let rawErr = '';
+  const rawCode = await runCli(['search', 'q', '--vault', home, '--timeout', '1'], {
+    env: cleanEnv(), terminal: raw, isTerminal: () => false, stdout: () => assert.fail('no output'),
+    stderr: text => { rawErr += text; },
+  });
+  assert.equal(rawCode, 2);
+  assert.equal(rawErr, 'foundry: the command passed its time limit of 1 second(s) [TIMEOUT]\n');
+  assert.equal(raw.input.listenerCount('data'), 0);
+  assert.deepEqual(raw.input.rawCalls, [true, true], 'raw mode on for the prompt, then the previous state (on)');
+  assert.equal(raw.input.isRaw, true);
+});
+
 test('lock path that is a FIFO: exit 2 BUSY with the fixed message, without a blocking open (skipped where mkfifo is missing or on Windows)', async t => {
   if (process.platform === 'win32') {
     t.skip('no FIFO on Windows');

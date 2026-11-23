@@ -205,9 +205,10 @@ export interface PromptIo {
 }
 
 /**
- * Ask for a secret on the terminal without echo. Main thread only. `track` receives a cancel handle: it removes the
- * `data` listener, restores the input terminal's raw mode, pauses it, wipes the editor buffer and rejects the prompt
- * with `INTERRUPTED`, all synchronously.
+ * Ask for a secret on the terminal without echo. Main thread only. `track` receives a cancel handle: it wipes the
+ * editor buffer, removes the `data` listener, puts back the raw-mode state from before the prompt, pauses the input
+ * and rejects the prompt with `INTERRUPTED`, all synchronously. The cancel never throws: a terminal restore that
+ * fails is ignored.
  */
 export function promptHidden(label: string, io: PromptIo = { input: process.stdin, output: process.stderr },
   track?: (pending: Cancellable) => void): Promise<Buffer> {
@@ -218,18 +219,33 @@ export function promptHidden(label: string, io: PromptIo = { input: process.stdi
   const editor = new LineEditor();
   io.observe?.('editor', editor.view());
   output.write(label);
+  // The raw-mode state before this prompt; the prompt puts it back (not blindly `false`).
+  const wasRaw = input.isRaw === true;
   return new Promise((resolve, reject) => {
     let settled = false;
-    /** End the prompt once: listener off, raw mode off, input paused. False if it had already ended. */
+    /**
+     * End the prompt once: listener off, then the terminal restore (previous raw mode, pause, line break). NEVER
+     * throws: a terminal that fails here (for example a disconnected one) cannot stop the cancel. False if it had
+     * already ended.
+     */
     const finish = (): boolean => {
       if (settled) return false;
       settled = true;
       input.off('data', onData);
       try {
-        input.setRawMode!(false);
-      } finally {
+        input.setRawMode!(wasRaw);
+      } catch {
+        // Best effort: the terminal may be gone.
+      }
+      try {
         input.pause();
+      } catch {
+        // Best effort.
+      }
+      try {
         output.write('\n');
+      } catch {
+        // Best effort.
       }
       return true;
     };
@@ -253,8 +269,8 @@ export function promptHidden(label: string, io: PromptIo = { input: process.stdi
         finish();
         resolve(editor.take());
       } else if (result === 'abort') {
-        finish();
         editor.wipe();
+        finish();
         reject(new CliError('INTERRUPTED', 'the prompt was cancelled'));
       }
     };
@@ -262,23 +278,13 @@ export function promptHidden(label: string, io: PromptIo = { input: process.stdi
     input.on('data', onData);
     input.resume();
     track?.({
+      // Never throws: the buffer is wiped first, `finish` swallows a failing terminal restore, and the prompt is
+      // rejected (a no-op if it had already settled).
       cancel: () => {
-        try {
-          finish();
-        } finally {
-          editor.wipe();
-          reject(new CliError('INTERRUPTED', 'the prompt was cancelled'));
-        }
+        editor.wipe();
+        finish();
+        reject(new CliError('INTERRUPTED', 'the prompt was cancelled'));
       },
     });
   });
-}
-
-/** Restore the terminal after an abnormal end (timeout, signal). Safe to call at any time. */
-export function restoreTerminal(): void {
-  try {
-    if (process.stdin.isTTY) process.stdin.setRawMode?.(false);
-  } catch {
-    // Best effort only.
-  }
 }

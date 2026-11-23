@@ -1,7 +1,10 @@
 // TEST ONLY: command tests run in this thread so the vault's KDF counting hook sees every scrypt run.
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
+import process from 'node:process';
 import { test } from 'node:test';
 import { initVault, PASSPHRASE, runInline, scratch } from './helpers.mjs';
 
@@ -31,26 +34,14 @@ test('init: KDF runs once, prints the recovery key once, builds no index, refuse
   assert.match((await runInline(dir, ['init', '--vault', other, '--passphrase-stdin'], { stdin: PASSPHRASE })).stderr, /NOT_EMPTY/u);
 });
 
-test('init builds in H/.init-<random> and renames it last: an owned leftover .init folder is ignored and removed; an interrupted init leaves no vault and a retry succeeds', async t => {
+/** The NOT_EMPTY line for a `.init-*` folder in H: it names the folder (name only) and says when to delete it. */
+const leftoverLine = name => `foundry: the target folder holds the folder "${name}"; if it is a leftover of an interrupted `
+  + '`foundry init`, delete it and try again [NOT_EMPTY]\n';
+
+test('init builds in H/.init-<random> and renames it last; an interrupted init leaves no vault, keeps its staging folder and names it; init never deletes it', async t => {
   const dir = scratch(t);
-  const home = join(dir, 'home');
-  const leftoverName = '.init-0123456789abcdef';
-  const leftover = join(home, leftoverName);
-  mkdirSync(join(leftover, 'vault', 'keyring'), { recursive: true });
-  writeFileSync(join(leftover, INIT_MARKER), initMarkerContent(leftoverName));
-  writeFileSync(join(leftover, 'vault', 'keyring', 'partial.txt'), 'TEST ONLY partial init');
-  const { init } = await initVault(dir);
-  assert.equal(init.code, 0);
-  assert.deepEqual(readdirSync(home), ['vault'], 'the owned leftover folder is removed and no staging folder remains');
-
-  // Only the exact pattern is ignored: a look-alike folder still makes the target "not empty" and is kept.
-  const near = join(dir, 'near');
-  mkdirSync(join(near, '.init-notHex'), { recursive: true });
-  const refused = await runInline(dir, ['init', '--vault', near, '--passphrase-stdin'], { stdin: PASSPHRASE });
-  assert.match(refused.stderr, /\[NOT_EMPTY\]\n$/u);
-  assert.ok(existsSync(join(near, '.init-notHex')));
-
-  // A failure after the vault is built but before the rename: no H/vault, no recovery key printed.
+  // A failure after the vault is built but before the rename: no H/vault, no recovery key printed. The staging folder
+  // holds what this run wrote, which cannot be proven to be only that, so it stays and the error names it.
   const second = join(dir, 'second');
   const failed = await runInline(dir, ['init', '--vault', second, '--passphrase-stdin'],
     { stdin: PASSPHRASE + '\n', hooks: { failBeforeInitRename: true } });
@@ -62,10 +53,21 @@ test('init builds in H/.init-<random> and renames it last: an owned leftover .in
   assert.match(names[0], /^\.init-[0-9a-f]{16}$/u);
   assert.equal(readFileSync(join(second, names[0], INIT_MARKER), 'utf8'), initMarkerContent(names[0]),
     'the staging folder holds its ownership marker');
+  assert.equal(failed.stderr.split('\n').length, 2, 'one stderr line');
+  assert.ok(failed.stderr.includes(`"${names[0]}"`), `the error names the staging folder: ${failed.stderr}`);
+  assert.ok(!failed.stderr.includes(second), 'the error names the folder only, not its path');
+  // The next init refuses the leftover (it is never deleted by init) and names it.
+  const refusedRetry = await runInline(dir, ['init', '--vault', second, '--passphrase-stdin'], { stdin: PASSPHRASE + '\n' });
+  assert.equal(refusedRetry.code, 2);
+  assert.equal(refusedRetry.stderr, leftoverLine(names[0]));
+  assert.equal(refusedRetry.kdf, 0);
+  assert.deepEqual(readdirSync(second), names, 'the leftover is kept');
+  // The user deletes it; then init succeeds.
+  rmSync(join(second, names[0]), { recursive: true, force: true });
   const retry = await runInline(dir, ['init', '--vault', second, '--passphrase-stdin'], { stdin: PASSPHRASE + '\n' });
   assert.equal(retry.code, 0, retry.stderr);
   assert.match(retry.stdout, /RECOVERY KEY/u);
-  assert.deepEqual(readdirSync(second), ['vault']);
+  assert.deepEqual(readdirSync(second), ['vault'], 'no staging folder remains after a successful init');
   // The renamed vault works.
   assert.equal((await runInline(dir, ['vault', 'verify', '--vault', second])).code, 0);
   const search = await runInline(dir, ['search', 'q', '--vault', second, '--passphrase-stdin'], { stdin: PASSPHRASE });
@@ -73,26 +75,92 @@ test('init builds in H/.init-<random> and renames it last: an owned leftover .in
   assert.equal(search.stdout, 'No results.\n');
 });
 
-test('init removes only staging folders it owns: a matching .init-<16 hex> name without a valid ownership marker is user data (NOT_EMPTY, kept)', async t => {
+test('init never deletes a folder: any .init-* folder in H (owned leftover with a valid marker, or not) gives NOT_EMPTY naming it, and is kept', async t => {
   const dir = scratch(t);
-  const name = '.init-00112233445566ff';
-  const cases = {
-    'no marker': folder => writeFileSync(join(folder, 'backup.txt'), 'TEST ONLY user backup'),
-    'wrong marker content': folder => writeFileSync(join(folder, INIT_MARKER), initMarkerContent('.init-ffeeddccbbaa9988')),
-    'marker is a folder': folder => mkdirSync(join(folder, INIT_MARKER)),
-  };
-  for (const [label, plant] of Object.entries(cases)) {
+  const owned = '.init-0123456789abcdef';
+  const cases = [
+    ['owned leftover', owned, folder => writeFileSync(join(folder, INIT_MARKER), initMarkerContent(owned))],
+    ['no marker', '.init-00112233445566ff', folder => writeFileSync(join(folder, 'backup.txt'), 'TEST ONLY user backup')],
+    ['wrong marker content', '.init-00112233445566ff',
+      folder => writeFileSync(join(folder, INIT_MARKER), initMarkerContent('.init-ffeeddccbbaa9988'))],
+    ['marker is a folder', '.init-00112233445566ff', folder => mkdirSync(join(folder, INIT_MARKER))],
+    ['look-alike name', '.init-notHex', () => {}],
+  ];
+  for (const [label, name, plant] of cases) {
     const home = join(dir, label.replaceAll(' ', '-'));
     const folder = join(home, name);
+    // A valid marker next to an existing backup vault: init must not touch it.
     mkdirSync(join(folder, 'vault'), { recursive: true });
     writeFileSync(join(folder, 'vault', 'VAULT.json'), 'TEST ONLY an existing vault the user keeps here');
     plant(folder);
     const refused = await runInline(dir, ['init', '--vault', home, '--passphrase-stdin'], { stdin: PASSPHRASE });
     assert.equal(refused.code, 2, label);
-    assert.match(refused.stderr, /\[NOT_EMPTY\]\n$/u, label);
+    assert.equal(refused.stderr, leftoverLine(name), label);
     assert.equal(refused.kdf, 0, label);
-    assert.ok(existsSync(join(folder, 'vault', 'VAULT.json')), `${label}: the look-alike folder is kept`);
+    assert.ok(existsSync(join(folder, 'vault', 'VAULT.json')), `${label}: the folder and its backup are kept`);
     assert.deepEqual(readdirSync(home), [name], `${label}: nothing else was created`);
+  }
+});
+
+test('init: a failure of the staging-marker write removes only what this run created (the marker, then the empty folder)', async t => {
+  const dir = scratch(t);
+  const home = join(dir, 'home');
+  const failed = await runInline(dir, ['init', '--vault', home, '--passphrase-stdin'],
+    { stdin: PASSPHRASE + '\n', hooks: { failInitMarkerWrite: true } });
+  assert.equal(failed.code, 2);
+  assert.equal(failed.stdout, '');
+  assert.equal(failed.stderr, 'foundry: a file operation on the Foundry folder or its lock file failed (ENAMETOOLONG) [IO]\n');
+  assert.deepEqual(readdirSync(home), [], 'no staging folder, no marker, no vault, no lock');
+});
+
+test('linked folders: every command refuses H/vault or H/index when it is a symbolic link or junction (LINKED_FOLDER), also under --debug without a path', async t => {
+  const dir = scratch(t);
+  const linkType = process.platform === 'win32' ? 'junction' : 'dir';
+  // Home A: a real vault with an index.
+  const { home: homeA } = await initVault(dir);
+  const firstSearch = await runInline(dir, ['search', 'q', '--vault', homeA, '--passphrase-stdin'], { stdin: PASSPHRASE });
+  assert.equal(firstSearch.code, 0, firstSearch.stderr);
+  assert.ok(existsSync(join(homeA, 'index')), 'home A has an index folder');
+  // Home B: H/vault links to home A's vault (another lock file, the same vault).
+  const homeB = join(dir, 'home-b');
+  mkdirSync(homeB);
+  const vaultLink = join(homeB, 'vault');
+  symlinkSync(join(homeA, 'vault'), vaultLink, linkType);
+  // Home C: a real vault of its own, but H/index links to home A's index.
+  const { home: homeC } = await initVault(scratch(t));
+  const indexLink = join(homeC, 'index');
+  symlinkSync(join(homeA, 'index'), indexLink, linkType);
+  try {
+    assert.ok(lstatSync(vaultLink).isSymbolicLink() || realpathSync.native(vaultLink) !== vaultLink, 'the link exists');
+    const line = which => `foundry: the ${which} folder in the Foundry folder is a symbolic link or junction; `
+      + `Foundry needs a real folder there [LINKED_FOLDER]\n`;
+    for (const debug of [[], ['--debug']]) {
+      for (const [label, argv, stdin, which, home] of [
+        ['verify B', ['vault', 'verify', '--vault', homeB], '', 'vault', homeB],
+        ['search B', ['search', 'q', '--vault', homeB, '--passphrase-stdin'], PASSPHRASE, 'vault', homeB],
+        ['rebuild B', ['index', 'rebuild', '--vault', homeB, '--passphrase-stdin'], PASSPHRASE, 'vault', homeB],
+        ['init B', ['init', '--vault', homeB, '--passphrase-stdin'], PASSPHRASE, 'vault', homeB],
+        ['search C', ['search', 'q', '--vault', homeC, '--passphrase-stdin'], PASSPHRASE, 'index', homeC],
+        ['verify C', ['vault', 'verify', '--vault', homeC], '', 'index', homeC],
+      ]) {
+        const name = `${label} ${debug.join(' ')}`;
+        const result = await runInline(dir, [...argv, ...debug], { stdin });
+        assert.equal(result.code, 2, `${name}: ${result.stderr}`);
+        assert.ok(result.stderr.endsWith(line(which)), `${name}: ${result.stderr}`);
+        assert.equal(result.kdf, 0, name);
+        assert.ok(!result.stderr.includes(home) && !result.stderr.includes(homeA), `${name}: no path in the output`);
+        if (!debug.length) assert.equal(result.stderr, line(which), name);
+      }
+    }
+    // Positive control: home A itself still works, and no lock was left in either home.
+    const control = await runInline(dir, ['search', 'q', '--vault', homeA, '--passphrase-stdin'], { stdin: PASSPHRASE });
+    assert.equal(control.code, 0, control.stderr);
+    assert.deepEqual(readdirSync(homeB), ['vault']);
+    assert.equal(existsSync(join(homeA, 'foundry.lock')), false);
+  } finally {
+    // Remove the links themselves (never their targets) before the scratch folders are removed.
+    rmSync(vaultLink, { force: true });
+    rmSync(indexLink, { force: true });
   }
 });
 

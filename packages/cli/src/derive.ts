@@ -10,8 +10,9 @@
  * Memory: at most `MAX_DERIVE_BYTES` of an item's plaintext is copied for parsing; the copy is zeroed afterwards.
  * A larger item (for example a mail with a big attachment) is parsed from its first `MAX_DERIVE_BYTES`, which hold
  * the headers and the leading text parts. For a calendar cut this way, the completed fields of the cut event are kept.
- * The rendered text of one item is at most `MAX_TEXT_BYTES` (UTF-8); a calendar is bounded while it is built and
- * names its calendar once, not once per event.
+ * The rendered text of one item is at most `MAX_TEXT_BYTES` (UTF-8) for EVERY type (mail, vCard, plain text,
+ * calendar): each is rendered into one byte budget, and the chunks the index receives are capped again in total. A
+ * calendar is bounded while it is built and names its calendar once, not once per event.
  */
 import { Buffer } from 'node:buffer';
 import type { DeriveItem, ProjectionOptions } from 'foundry-index';
@@ -67,10 +68,14 @@ function copyFrames(frames: Iterable<Uint8Array>): { bytes: Buffer; truncated: b
   return { bytes, truncated };
 }
 
-/** Collects text pieces up to `MAX_TEXT_BYTES` (UTF-8). At the cap it stops adding text. */
+/** Collects text pieces up to `limit` (default `MAX_TEXT_BYTES`) UTF-8 bytes. At the cap it stops adding text. */
 class TextBudget {
   readonly #pieces: string[] = [];
-  #left = MAX_TEXT_BYTES;
+  #left: number;
+
+  constructor(limit = MAX_TEXT_BYTES) {
+    this.#left = limit;
+  }
 
   get full(): boolean {
     return this.#left <= 0;
@@ -142,51 +147,71 @@ function eventText(ev: ParsedCalendarEvent): string {
 
 /**
  * The text of one item, at most `MAX_TEXT_BYTES` (UTF-8), or undefined when its type has no text deriver. Parse
- * failures yield no text. `truncated`: `bytes` is the first `MAX_DERIVE_BYTES` of a larger item.
+ * failures yield no text. `truncated`: `bytes` is the first `MAX_DERIVE_BYTES` of a larger item. Every type (mail,
+ * vCard, plain text, calendar) is rendered into ONE `TextBudget`, piece by piece, so the byte cap is the same for all.
  */
 export function itemText(parsers: Parsers, mime: string | null, bytes: Buffer, truncated = false): string | undefined {
-  const text = renderItem(parsers, mime, bytes, truncated);
-  if (text === undefined) return undefined;
   const budget = new TextBudget();
-  budget.add(text);
-  return budget.text();
+  return renderItem(parsers, mime, bytes, truncated, budget) ? budget.text() : undefined;
 }
 
-function renderItem(parsers: Parsers, mime: string | null, bytes: Buffer, truncated: boolean): string | undefined {
+/** Render the item's text into `budget`. False when its type has no text deriver. A parse failure adds no text. */
+function renderItem(parsers: Parsers, mime: string | null, bytes: Buffer, truncated: boolean, budget: TextBudget): boolean {
   const type = (mime ?? '').split(';', 1)[0]!.trim().toLowerCase();
+  if (!['message/rfc822', 'text/vcard', 'text/calendar', 'text/plain'].includes(type)) return false;
+  const lines = (values: readonly string[]) => {
+    values.forEach((line, i) => {
+      if (!budget.full) budget.add((i > 0 ? '\n' : '') + line);
+    });
+  };
   try {
     if (type === 'message/rfc822') {
       const mail = parsers.parseEmailMessage(bytes);
-      const lines = [`Subject: ${mail.subject}`];
-      if (mail.from.length > 0) lines.push(`From: ${mail.from.map(person).join(', ')}`);
-      if (mail.to.length > 0) lines.push(`To: ${mail.to.map(person).join(', ')}`);
-      if (mail.cc.length > 0) lines.push(`Cc: ${mail.cc.map(person).join(', ')}`);
-      if (mail.date) lines.push(`Date: ${mail.date}`);
-      if (mail.labels.length > 0) lines.push(`Labels: ${mail.labels.join(', ')}`);
-      if (mail.attachments.length > 0) lines.push(`Attachments: ${mail.attachments.map(a => a.filename).join(', ')}`);
-      if (mail.bodyText) lines.push('', mail.bodyText);
-      return lines.join('\n');
-    }
-    if (type === 'text/vcard') {
+      const head = [`Subject: ${mail.subject}`];
+      if (mail.from.length > 0) head.push(`From: ${mail.from.map(person).join(', ')}`);
+      if (mail.to.length > 0) head.push(`To: ${mail.to.map(person).join(', ')}`);
+      if (mail.cc.length > 0) head.push(`Cc: ${mail.cc.map(person).join(', ')}`);
+      if (mail.date) head.push(`Date: ${mail.date}`);
+      if (mail.labels.length > 0) head.push(`Labels: ${mail.labels.join(', ')}`);
+      if (mail.attachments.length > 0) head.push(`Attachments: ${mail.attachments.map(a => a.filename).join(', ')}`);
+      if (mail.bodyText) head.push('', mail.bodyText);
+      lines(head);
+    } else if (type === 'text/vcard') {
       const contact = parsers.parseVcard(bytes.toString('utf8'));
-      return contact ? parsers.formatContactText(contact) : '';
-    }
-    if (type === 'text/calendar') {
+      if (contact) budget.add(parsers.formatContactText(contact));
+    } else if (type === 'text/calendar') {
       const ics = bytes.toString('utf8');
       const calendar = parsers.parseIcalendar(truncated ? closeTruncatedCalendar(ics) : ics);
       // Bounded while it is built: the name once, then events until the 1 MiB cap.
-      const budget = new TextBudget();
       if (calendar.calendarName) budget.add(`Calendar: ${calendar.calendarName}\n\n`);
       calendar.events.forEach((ev, i) => {
         if (!budget.full) budget.add((i > 0 ? '\n\n' : '') + eventText(ev));
       });
-      return budget.text();
+    } else {
+      budget.add(new TextDecoder().decode(bytes));
     }
-    if (type === 'text/plain') return new TextDecoder().decode(bytes);
   } catch {
-    return '';
+    // A parse failure yields no text (text added before the failure stays: it is already within the cap).
   }
-  return undefined;
+  return true;
+}
+
+/**
+ * Chunks of at most `MAX_TEXT_BYTES` in total (UTF-8). `itemText` already caps the text; this second cap is on what
+ * the index actually receives, so no chunking change can push one item's search text past 1 MiB.
+ */
+export function capChunks(chunks: readonly string[]): string[] {
+  const out: string[] = [];
+  let left = MAX_TEXT_BYTES;
+  for (const chunk of chunks) {
+    const budget = new TextBudget(left);
+    budget.add(chunk);
+    const kept = budget.text();
+    if (kept) out.push(kept);
+    left -= Buffer.byteLength(kept);
+    if (left <= 0 || kept.length < chunk.length) break;
+  }
+  return out;
 }
 
 /** Build the projection options every index call of the command line uses. */
@@ -198,7 +223,7 @@ export async function loadProjection(): Promise<ProjectionOptions> {
     derive(item: DeriveItem, frames: Iterable<Uint8Array>): Iterable<string> {
       const { bytes, truncated } = copyFrames(frames);
       try {
-        return chunkPlainText(itemText(parsers, item.mime, bytes, truncated) ?? '');
+        return capChunks(chunkPlainText(itemText(parsers, item.mime, bytes, truncated) ?? ''));
       } finally {
         bytes.fill(0);
       }

@@ -246,6 +246,29 @@ test('calendar search text: the calendar name once per item, at most 1 MiB of te
   assert.ok(Buffer.byteLength(itemText(parsers, 'message/rfc822', mail)) <= MAX_TEXT_BYTES);
 });
 
+test('search text budget: for every MIME type (mail, vCard, plain text, calendar) the derived chunks of multibyte input stay at or under 1 MiB of UTF-8', async () => {
+  const projection = await loadProjection();
+  const wide = '\u{1F600}\u{1F680} '; // two 4-byte characters and a space: 9 UTF-8 bytes, 5 UTF-16 code units
+  const words = count => wide.repeat(count);
+  const cases = [
+    ['message/rfc822', Buffer.from('Subject: TEST ONLY wide mail\r\nContent-Type: text/plain; charset=utf-8\r\n'
+      + `Content-Transfer-Encoding: 8bit\r\n\r\n${words(400_000)}\r\n`)],
+    ['text/vcard', Buffer.from(`BEGIN:VCARD\r\nVERSION:3.0\r\nFN:TEST ONLY Wide\r\nNOTE:${words(400_000)}\r\nEND:VCARD\r\n`)],
+    ['text/plain; charset=utf-8', Buffer.from(words(400_000))],
+    ['text/calendar', Buffer.from('BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test-only-wide\r\n'
+      + `SUMMARY:TEST ONLY wide\r\nDESCRIPTION:${words(400_000)}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n`)],
+  ];
+  for (const [mime, bytes] of cases) {
+    assert.ok(bytes.length > 2 * MAX_TEXT_BYTES && bytes.length < MAX_DERIVE_BYTES, `${mime}: input of ${bytes.length} bytes`);
+    const chunks = [...projection.derive({ itemId: 'i', eventSeq: 1, mime, source: 's' }, [bytes])];
+    const total = chunks.reduce((sum, chunk) => sum + Buffer.byteLength(chunk), 0);
+    assert.ok(total <= MAX_TEXT_BYTES, `${mime}: ${total} bytes of search text`);
+    // Positive control: the text really reaches the cap (no parser or chunk limit stops it earlier).
+    assert.ok(total > MAX_TEXT_BYTES - 8192, `${mime}: only ${total} bytes of search text`);
+    assert.ok(chunks.every(chunk => !/[\uD800-\uDBFF]$|^[\uDC00-\uDFFF]/u.test(chunk)), `${mime}: no split surrogate pair`);
+  }
+});
+
 test('calendar search text: the 8 MiB input cut keeps the completed fields of a truncated first event', async () => {
   const projection = await loadProjection();
   const head = Buffer.from('BEGIN:VCALENDAR\r\nVERSION:2.0\r\nX-WR-CALNAME:TEST ONLY cut calendar\r\nBEGIN:VEVENT\r\n'

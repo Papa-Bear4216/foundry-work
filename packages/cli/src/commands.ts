@@ -7,14 +7,14 @@
  * passphrase and 0 with a recovery key. Packages are loaded on demand, so `vault verify` never loads the SQLite addon.
  */
 import { Buffer } from 'node:buffer';
-import { lstatSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { IndexStoreOptions } from 'foundry-index';
 import type { ImportResult } from 'importers';
 import type { UnlockSession } from 'vault';
 import type { CommandName, SearchFilters } from './args.ts';
 import { CliError, debugText, errorLine, isRecoveryFormatError, mapError } from './errors.ts';
-import { readSmallRegularFile } from './files.ts';
+import { homeSystemError, withFixedFileErrors, withHomeSystemErrors } from './files.ts';
 
 export const PROFILE = 'me';
 /** `ensureCollectionKeys` accepts at most this many distinct names per call. */
@@ -54,6 +54,11 @@ export interface TestHooks {
   throwWithSecret?: boolean;
   /** `init`: fail after the vault is built in its temporary folder, before the rename to `H/vault`. */
   failBeforeInitRename?: boolean;
+  /**
+   * `init`: the staging-marker write fails (after the preflight and the lock) with a Node-style `ENAMETOOLONG` error
+   * whose message and `path` quote the marker path.
+   */
+  failInitMarkerWrite?: boolean;
   /** `import`: the final index update throws an errno-style error whose message quotes every secret. */
   failFinalIndexUpdate?: boolean;
   /** `import`: Run B throws an errno-style error at its start (after any archive check, before it stores). */
@@ -105,6 +110,8 @@ class Context {
   importStage: ImportStage = 'before';
   /** `vault reset-passphrase` failed in a way that may follow the atomic keyring replacement. */
   resetMayBeDone = false;
+  /** `init` failed before the rename and left its staging folder (this name, inside H). */
+  initLeftover: string | undefined;
 
   constructor(readonly request: CommandRequest, readonly io: CommandIo, readonly hooks: TestHooks) {
     this.paths = homePaths(request.home);
@@ -117,7 +124,7 @@ class Context {
 
 async function vaultId(ctx: Context): Promise<string> {
   const { decodeVaultMetadata } = await import('vault');
-  return decodeVaultMetadata(readFileSync(join(ctx.paths.vault, 'VAULT.json'))).vault_id;
+  return decodeVaultMetadata(withFixedFileErrors(() => readFileSync(join(ctx.paths.vault, 'VAULT.json')))).vault_id;
 }
 
 async function openSession(ctx: Context, id: string): Promise<UnlockSession> {
@@ -158,9 +165,9 @@ function requireNewPassphrase(ctx: Context): string {
   return value;
 }
 
-/** Staging folders of `init` inside H: `.init-` and 16 lowercase hex digits. */
-const INIT_FOLDER = /^\.init-[0-9a-f]{16}$/u;
-/** The ownership marker `init` writes first into every staging folder it creates. */
+/** Names in H that start with this make `init` refuse (its staging folders, a leftover, or a look-alike). */
+export const INIT_PREFIX = '.init-';
+/** The marker `init` writes first into every staging folder it creates (it names the folder as init's own). */
 export const INIT_MARKER = '.foundry-init-owner';
 
 /** The exact marker content for the staging folder `name`: a fixed line and the folder's own random name. */
@@ -168,56 +175,85 @@ export function initMarkerContent(name: string): string {
   return `foundry init staging folder\n${name}\n`;
 }
 
+/** TEST ONLY: the Node-style error of a failed staging-marker write; its message and `path` quote the marker path. */
+function markerWriteHookError(path: string): Error {
+  return Object.assign(new Error(`ENAMETOOLONG: name too long, open '${path}'`), {
+    code: 'ENAMETOOLONG', errno: -36, syscall: 'open', path,
+  });
+}
+
 /**
- * True only for a staging folder `init` created itself: the name matches, it is a real folder (not a link), and it
- * holds the marker as a regular file with exactly the expected content. A matching name without a valid marker is
- * user data: `init` neither ignores nor removes it. The marker is read without a blocking open (`files.ts`).
+ * After a failure before the rename: remove ONLY what this run created, and only while that is provably all there
+ * is. The folder must hold nothing but this run's marker (or nothing, if the marker was never created); then the
+ * marker is unlinked and the folder removed with a NON-recursive `rmdir` (which itself fails on anything else).
+ * True if the folder is gone. Any doubt or error: false, and everything stays.
  */
-export function isOwnedInitFolder(home: string, name: string): boolean {
-  if (!INIT_FOLDER.test(name)) return false;
-  const folder = join(home, name);
+function removeOwnStaging(staging: string, markerCreated: boolean, fs: typeof import('node:fs')): boolean {
   try {
-    if (!lstatSync(folder, { throwIfNoEntry: false })?.isDirectory()) return false;
-    const marker = readSmallRegularFile(join(folder, INIT_MARKER), 256);
-    return Buffer.isBuffer(marker) && marker.equals(Buffer.from(initMarkerContent(name)));
+    const names = fs.readdirSync(staging);
+    const expected = markerCreated ? [INIT_MARKER] : [];
+    if (names.length !== expected.length || names.some((name, i) => name !== expected[i])) return false;
+    if (markerCreated) {
+      const marker = join(staging, INIT_MARKER);
+      if (!fs.lstatSync(marker).isFile()) return false;
+      fs.unlinkSync(marker);
+    }
+    fs.rmdirSync(staging);
+    return true;
   } catch {
     return false;
   }
 }
 
 /**
- * `init` creates `H/.init-<random>`, writes the ownership marker into it FIRST, builds the vault in
- * `H/.init-<random>/vault`, renames that to `H/vault` as the last step, removes the staging folder (best effort) and
- * prints the recovery key. An interrupted init leaves at most such a folder; the next `init` (under the lock) removes
- * only folders it owns (`isOwnedInitFolder`), and only those are ignored by the NOT_EMPTY check.
+ * `init` never deletes a folder it did not just create, and never deletes recursively. Under the lock (any `.init-*`
+ * folder in H was refused by the preflight in `cli.ts`):
+ * 1. create `H/.init-<random>` and write the marker into it FIRST;
+ * 2. build the vault in `H/.init-<random>/vault`;
+ * 3. rename that to `H/vault` as the last step;
+ * 4. unlink the marker and `rmdir` the then-empty staging folder (best effort: a notice if it stays), then print the
+ *    recovery key.
+ * On a failure before the rename, only this run's marker and empty folder are removed (`removeOwnStaging`); if the
+ * folder holds anything else (for example the partly built vault), it stays and the error line names it.
+ * Every file-system call here gives fixed text on failure (`files.ts`): no path, no Node message, also for `--debug`.
  */
 async function init(ctx: Context): Promise<void> {
   const passphrase = requireNewPassphrase(ctx);
   const { createVault } = await import('vault');
   const { randomBytes } = await import('node:crypto');
-  const { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, renameSync, rmSync, writeSync } = await import('node:fs');
-  for (const name of readdirSync(ctx.request.home)) {
-    if (isOwnedInitFolder(ctx.request.home, name)) rmSync(join(ctx.request.home, name), { recursive: true, force: true });
-  }
-  const name = `.init-${randomBytes(8).toString('hex')}`;
+  const fs = await import('node:fs');
+  const name = `${INIT_PREFIX}${randomBytes(8).toString('hex')}`;
   const staging = join(ctx.request.home, name);
-  mkdirSync(staging, { mode: 0o700 });
-  const fd = openSync(join(staging, INIT_MARKER), 'wx', 0o600);
-  try {
-    writeSync(fd, initMarkerContent(name));
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
+  const marker = join(staging, INIT_MARKER);
   const temporary = join(staging, 'vault');
-  stall(ctx.hooks);
-  const identity = createVault(temporary, { passphrase });
-  if (ctx.hooks.failBeforeInitRename) throw new Error('test hook: init stopped before the rename');
-  renameSync(temporary, ctx.paths.vault);
+  let folderCreated = false;
+  let markerCreated = false;
+  let identity: ReturnType<typeof createVault>;
   try {
-    rmSync(staging, { recursive: true, force: true });
-  } catch {
-    // Best effort: the vault exists now, so the recovery key must still be shown. The folder stays owned.
+    withFixedFileErrors(() => {
+      fs.mkdirSync(staging, { mode: 0o700 });
+      folderCreated = true;
+      const fd = fs.openSync(marker, 'wx', 0o600);
+      markerCreated = true;
+      try {
+        if (ctx.hooks.failInitMarkerWrite) throw markerWriteHookError(marker);
+        fs.writeSync(fd, initMarkerContent(name));
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+    });
+    stall(ctx.hooks);
+    identity = withHomeSystemErrors(() => createVault(temporary, { passphrase }));
+    if (ctx.hooks.failBeforeInitRename) throw new Error('test hook: init stopped before the rename');
+    withFixedFileErrors(() => fs.renameSync(temporary, ctx.paths.vault));
+  } catch (error) {
+    if (folderCreated && !removeOwnStaging(staging, markerCreated, fs)) ctx.initLeftover = name;
+    throw error;
+  }
+  if (!removeOwnStaging(staging, true, fs)) {
+    // The vault exists now, so the recovery key must still be shown; say which empty folder stays.
+    ctx.io.err(`foundry: notice: the staging folder "${name}" stays in the Foundry folder; delete it\n`);
   }
   ctx.out(`Created a new Foundry vault in ${resolve(ctx.request.home)}.\n\n`
     + 'RECOVERY KEY. Write this down now and keep it somewhere safe. It is shown only this once:\n\n'
@@ -449,10 +485,15 @@ async function openParts(parts: ArchiveParts) {
   };
 }
 
+/** The keyring file's bytes (a home-folder read: fixed text on failure). */
+function readKeyring(ctx: Context): Buffer {
+  return withFixedFileErrors(() => readFileSync(ctx.paths.keyring));
+}
+
 /** Let the vault writer recover an interrupted append or seal (for example a pending HEAD), then release it. */
 async function recoverVaultWriter(ctx: Context, session: UnlockSession, id: string): Promise<void> {
   const vault = await import('vault');
-  const unlocked = vault.decodeKeyring(readFileSync(ctx.paths.keyring), { session }, id);
+  const unlocked = vault.decodeKeyring(readKeyring(ctx), { session }, id);
   try {
     vault.VaultWriter.open(ctx.paths.vault, unlocked).release();
   } finally {
@@ -465,7 +506,7 @@ async function importRun(ctx: Context, session: UnlockSession, id: string, optio
   const vault = await import('vault');
   const importers = await import('importers');
   const { openItemKeyLookup } = await import('foundry-index');
-  const unlocked = vault.decodeKeyring(readFileSync(ctx.paths.keyring), { session }, id);
+  const unlocked = vault.decodeKeyring(readKeyring(ctx), { session }, id);
   let writer: ReturnType<typeof vault.VaultWriter.open> | undefined;
   let lookup: ReturnType<typeof openItemKeyLookup> | undefined;
   let archive: Awaited<ReturnType<typeof openParts>> | undefined;
@@ -594,6 +635,10 @@ function failureGuidance(ctx: Context): string[] {
     if (stage !== 'before') guidance.push('repeating the import is safe');
   }
   if (ctx.resetMayBeDone) guidance.push('the passphrase may already be changed; try the new passphrase before you repeat the reset');
+  if (ctx.initLeftover !== undefined) {
+    guidance.push(`the unfinished staging folder "${ctx.initLeftover}" stays in the Foundry folder; `
+      + 'delete it before you run `foundry init` again');
+  }
   return guidance;
 }
 
@@ -605,7 +650,10 @@ export async function executeCommand(request: CommandRequest, io: CommandIo, hoo
     if (hooks.throwWithSecret) throw new Error(`test hook: ${secretTexts(request.secrets).join(' | ')}`);
     await BODIES[request.command](ctx);
     return 0;
-  } catch (error) {
+  } catch (thrown) {
+    // Last line of defence: a Node system error about the home folder (from a library call) becomes fixed text, so
+    // neither the line nor the `--debug` text can quote the path.
+    const error = homeSystemError(thrown, request.home) ?? thrown;
     const mapped = mapError(error, { erasedInImport: request.command === 'import' });
     if (request.debug) io.err(debugText(error, secretTexts(request.secrets)));
     io.err(errorLine(mapped, failureGuidance(ctx)));

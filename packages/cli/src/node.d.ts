@@ -37,6 +37,7 @@ declare module 'node:fs' {
     mtimeMs: number;
     isFile(): boolean;
     isDirectory(): boolean;
+    isSymbolicLink(): boolean;
   }
   export function lstatSync(path: string): Stats;
   export function lstatSync(path: string, options: { throwIfNoEntry: false }): Stats | undefined;
@@ -73,6 +74,11 @@ declare module 'node:fs' {
   export function fsyncSync(fd: number): void;
   export function closeSync(fd: number): void;
   export function unlinkSync(path: string): void;
+  export function rmdirSync(path: string): void;
+  export const realpathSync: {
+    (path: string): string;
+    native(path: string): string;
+  };
   export function renameSync(from: string, to: string): void;
   export function rmSync(path: string, options?: { recursive?: boolean; force?: boolean }): void;
   export function createReadStream(path: string | null, options: { fd: number; autoClose?: boolean }): import('node:stream').Readable;
@@ -92,6 +98,7 @@ declare module 'node:path' {
   export function basename(path: string): string;
   export function join(...parts: string[]): string;
   export function resolve(...parts: string[]): string;
+  export const sep: string;
 }
 
 declare module 'node:url' {
@@ -170,6 +177,7 @@ declare module 'node:process' {
   }
   interface ReadableTty {
     isTTY?: boolean;
+    isRaw?: boolean;
     setRawMode?(mode: boolean): void;
     on(event: 'data', listener: (chunk: Uint8Array) => void): void;
     on(event: 'end', listener: () => void): void;
