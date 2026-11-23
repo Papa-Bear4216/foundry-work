@@ -145,15 +145,21 @@ test('planted marker: the home-folder error is fixed text (no --vault or FOUNDRY
     clean(result, [PASS], label);
     assert.ok(!result.stdout.includes(target) && !result.stderr.includes(target), `${label}: home path not echoed`);
   }
-  const secretStagingHome = join(dir, 'secret-staging-home');
-  mkdirSync(join(secretStagingHome, `.init-${MARKER}`), { recursive: true });
-  for (const debug of [[], ['--debug']]) {
-    const result = runBin(dir, ['init', '--vault', secretStagingHome, '--passphrase-stdin', ...debug], { stdin: PASS + '\n' });
-    const label = `init non-hex staging ${debug.join(' ')}`;
-    assert.equal(result.code, 2, `${label}: ${result.stderr}`);
-    assert.match(result.stderr, /\[NOT_EMPTY\]\n$/u, label);
-    clean(result, [PASS], label);
-    assert.ok(!result.stderr.includes(`.init-${MARKER}`), `${label}: non-generated .init-* name not echoed`);
+  const hexSecret = 'a1b2c3d4e5f60718';
+  for (const [kind, dirName, needle] of [
+    ['non-hex staging', `.init-${MARKER}`, `.init-${MARKER}`],
+    ['hex-shaped unmarked staging', `.init-${hexSecret}`, hexSecret],
+  ]) {
+    const stagingHome = join(dir, kind.replaceAll(' ', '-'));
+    mkdirSync(join(stagingHome, dirName), { recursive: true });
+    for (const debug of [[], ['--debug']]) {
+      const result = runBin(dir, ['init', '--vault', stagingHome, '--passphrase-stdin', ...debug], { stdin: PASS + '\n' });
+      const label = `init ${kind} ${debug.join(' ')}`;
+      assert.equal(result.code, 2, `${label}: ${result.stderr}`);
+      assert.match(result.stderr, /\[NOT_EMPTY\]\n$/u, label);
+      clean(result, [PASS], label);
+      assert.ok(!result.stderr.includes(needle), `${label}: unowned .init-* name not echoed`);
+    }
   }
 
   // The final index update fails with an error whose message quotes the secrets: --debug text is redacted.

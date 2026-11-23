@@ -34,8 +34,8 @@ test('init: KDF runs once, prints the recovery key once, builds no index, refuse
   assert.match((await runInline(dir, ['init', '--vault', other, '--passphrase-stdin'], { stdin: PASSPHRASE })).stderr, /NOT_EMPTY/u);
 });
 
-/** The NOT_EMPTY line for a generated `.init-<16 hex>` folder in H (name only) vs any other `.init-*` folder (fixed text). */
-const leftoverLine = name => /^\.init-[0-9a-f]{16}$/u.test(name)
+/** The NOT_EMPTY line for an owned `.init-<16 hex>` folder (name only) vs any unowned `.init-*` folder (fixed text). */
+const leftoverLine = (name, owned = true) => owned
   ? `foundry: the target folder holds the folder "${name}"; if it is a leftover of an interrupted `
     + '`foundry init`, delete it and try again [NOT_EMPTY]\n'
   : 'foundry: the target folder holds a `.init-*` folder; if it is a leftover of an interrupted '
@@ -78,18 +78,18 @@ test('init builds in H/.init-<random> and renames it last; an interrupted init l
   assert.equal(search.stdout, 'No results.\n');
 });
 
-test('init never deletes a folder: any .init-* folder in H (owned leftover with a valid marker, or not) gives NOT_EMPTY naming it, and is kept', async t => {
+test('init never deletes a folder: any .init-* folder in H gives NOT_EMPTY (naming only verified owned leftovers), and is kept', async t => {
   const dir = scratch(t);
   const owned = '.init-0123456789abcdef';
   const cases = [
-    ['owned leftover', owned, folder => writeFileSync(join(folder, INIT_MARKER), initMarkerContent(owned))],
-    ['no marker', '.init-00112233445566ff', folder => writeFileSync(join(folder, 'backup.txt'), 'TEST ONLY user backup')],
-    ['wrong marker content', '.init-00112233445566ff',
+    ['owned leftover', owned, true, folder => writeFileSync(join(folder, INIT_MARKER), initMarkerContent(owned))],
+    ['no marker', '.init-00112233445566ff', false, folder => writeFileSync(join(folder, 'backup.txt'), 'TEST ONLY user backup')],
+    ['wrong marker content', '.init-00112233445566ff', false,
       folder => writeFileSync(join(folder, INIT_MARKER), initMarkerContent('.init-ffeeddccbbaa9988'))],
-    ['marker is a folder', '.init-00112233445566ff', folder => mkdirSync(join(folder, INIT_MARKER))],
-    ['look-alike name', '.init-notHex', () => {}],
+    ['marker is a folder', '.init-00112233445566ff', false, folder => mkdirSync(join(folder, INIT_MARKER))],
+    ['look-alike name', '.init-notHex', false, () => {}],
   ];
-  for (const [label, name, plant] of cases) {
+  for (const [label, name, isOwned, plant] of cases) {
     const home = join(dir, label.replaceAll(' ', '-'));
     const folder = join(home, name);
     // A valid marker next to an existing backup vault: init must not touch it.
@@ -98,7 +98,7 @@ test('init never deletes a folder: any .init-* folder in H (owned leftover with 
     plant(folder);
     const refused = await runInline(dir, ['init', '--vault', home, '--passphrase-stdin'], { stdin: PASSPHRASE });
     assert.equal(refused.code, 2, label);
-    assert.equal(refused.stderr, leftoverLine(name), label);
+    assert.equal(refused.stderr, leftoverLine(name, isOwned), label);
     assert.equal(refused.kdf, 0, label);
     assert.ok(existsSync(join(folder, 'vault', 'VAULT.json')), `${label}: the folder and its backup are kept`);
     assert.deepEqual(readdirSync(home), [name], `${label}: nothing else was created`);

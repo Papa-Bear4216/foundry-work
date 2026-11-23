@@ -33,7 +33,7 @@ import { isatty } from 'node:tty';
 import { Worker } from 'node:worker_threads';
 import { HELP, isKeyed, parseCommandLine } from './args.ts';
 import type { ParsedCommand } from './args.ts';
-import { executeCommand, homePaths, INIT_PREFIX } from './commands.ts';
+import { executeCommand, homePaths, INIT_MARKER, initMarkerContent, INIT_PREFIX } from './commands.ts';
 import type { CommandIo, CommandRequest, CommandSecrets, TestHooks } from './commands.ts';
 import { CliError, debugText, errorLine, mapError, usage } from './errors.ts';
 import { withFixedFileErrors } from './files.ts';
@@ -188,17 +188,32 @@ function refuseLinkedFolders(home: string): void {
   }
 }
 
+/** True only when `home/name` is a generated staging folder holding a regular ownership marker with exact content. */
+function isOwnedInitStaging(home: string, name: string): boolean {
+  if (!/^\.init-[0-9a-f]{16}$/u.test(name)) return false;
+  const markerPath = join(home, name, INIT_MARKER);
+  const expected = initMarkerContent(name);
+  try {
+    const info = lstatSync(markerPath);
+    if (!info.isFile() || info.size !== expected.length) return false;
+    return readFileSync(markerPath, 'utf8') === expected;
+  } catch {
+    return false;
+  }
+}
+
 /** Home-folder preflight. A file-system error becomes fixed text with its code (the caller wraps it). */
 function checkHome(run: Run, home: string): void {
   refuseLinkedFolders(home);
   if (run.command === 'init') {
     if (!existsSync(home)) return;
     const names = readdirSync(home).sort();
-    // init never deletes a folder: any `.init-*` folder is refused. Only quote generated hex staging names
-    // (`.init-<16 hex>`); any other `.init-*` name gets fixed text so a secret in a directory name is never echoed.
+    // init never deletes a folder: any `.init-*` folder is refused. Only quote a generated hex staging folder whose
+    // ownership marker is a regular file with exact content; any other `.init-*` folder gets fixed text so a secret
+    // in a directory name (even a 16-hex one) is never echoed.
     const leftover = names.find(name => name.startsWith(INIT_PREFIX) && lstatOrNothing(join(home, name))?.isDirectory());
     if (leftover !== undefined) {
-      const detail = /^\.init-[0-9a-f]{16}$/u.test(leftover)
+      const detail = isOwnedInitStaging(home, leftover)
         ? `the target folder holds the folder ${JSON.stringify(leftover)}; if it is a leftover of an interrupted \`foundry init\`, delete it and try again`
         : 'the target folder holds a `.init-*` folder; if it is a leftover of an interrupted `foundry init`, delete it and try again';
       throw new CliError('NOT_EMPTY', detail);
