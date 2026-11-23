@@ -34,9 +34,12 @@ test('init: KDF runs once, prints the recovery key once, builds no index, refuse
   assert.match((await runInline(dir, ['init', '--vault', other, '--passphrase-stdin'], { stdin: PASSPHRASE })).stderr, /NOT_EMPTY/u);
 });
 
-/** The NOT_EMPTY line for a `.init-*` folder in H: it names the folder (name only) and says when to delete it. */
-const leftoverLine = name => `foundry: the target folder holds the folder "${name}"; if it is a leftover of an interrupted `
-  + '`foundry init`, delete it and try again [NOT_EMPTY]\n';
+/** The NOT_EMPTY line for a generated `.init-<16 hex>` folder in H (name only) vs any other `.init-*` folder (fixed text). */
+const leftoverLine = name => /^\.init-[0-9a-f]{16}$/u.test(name)
+  ? `foundry: the target folder holds the folder "${name}"; if it is a leftover of an interrupted `
+    + '`foundry init`, delete it and try again [NOT_EMPTY]\n'
+  : 'foundry: the target folder holds a `.init-*` folder; if it is a leftover of an interrupted '
+    + '`foundry init`, delete it and try again [NOT_EMPTY]\n';
 
 test('init builds in H/.init-<random> and renames it last; an interrupted init leaves no vault, keeps its staging folder and names it; init never deletes it', async t => {
   const dir = scratch(t);

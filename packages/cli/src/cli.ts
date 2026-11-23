@@ -194,11 +194,14 @@ function checkHome(run: Run, home: string): void {
   if (run.command === 'init') {
     if (!existsSync(home)) return;
     const names = readdirSync(home).sort();
-    // init never deletes a folder: any `.init-*` folder (owned leftover or not) is refused and named (name only).
+    // init never deletes a folder: any `.init-*` folder is refused. Only quote generated hex staging names
+    // (`.init-<16 hex>`); any other `.init-*` name gets fixed text so a secret in a directory name is never echoed.
     const leftover = names.find(name => name.startsWith(INIT_PREFIX) && lstatOrNothing(join(home, name))?.isDirectory());
     if (leftover !== undefined) {
-      throw new CliError('NOT_EMPTY', `the target folder holds the folder ${JSON.stringify(leftover)}; if it is a leftover `
-        + 'of an interrupted `foundry init`, delete it and try again');
+      const detail = /^\.init-[0-9a-f]{16}$/u.test(leftover)
+        ? `the target folder holds the folder ${JSON.stringify(leftover)}; if it is a leftover of an interrupted \`foundry init\`, delete it and try again`
+        : 'the target folder holds a `.init-*` folder; if it is a leftover of an interrupted `foundry init`, delete it and try again';
+      throw new CliError('NOT_EMPTY', detail);
     }
     if (names.some(name => !ignoredByInit(name))) {
       throw new CliError('NOT_EMPTY', 'the target folder exists and is not empty; choose another folder with --vault');

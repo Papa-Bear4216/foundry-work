@@ -2,7 +2,7 @@
 // failure paths. The one deliberate exception: `foundry init` prints the recovery key once.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { closeSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
@@ -132,6 +132,28 @@ test('planted marker: the home-folder error is fixed text (no --vault or FOUNDRY
       }
       rmSync(target, { recursive: true, force: true });
     }
+  }
+
+  // `init` success never echoes --vault or FOUNDRY_HOME, and NOT_EMPTY never echoes a non-generated `.init-*` name.
+  for (const [label, argv, env, target] of [
+    ['init ok --vault', ['init', '--vault', join(dir, `${MARKER}-ok-a`), '--passphrase-stdin'], {}, join(dir, `${MARKER}-ok-a`)],
+    ['init ok FOUNDRY_HOME', ['init', '--passphrase-stdin'], { FOUNDRY_HOME: join(dir, `${MARKER}-ok-b`) }, join(dir, `${MARKER}-ok-b`)],
+  ]) {
+    const result = runBin(dir, argv, { env, stdin: PASS + '\n' });
+    assert.equal(result.code, 0, `${label}: ${result.stderr}`);
+    assert.match(result.stdout, /^Created a new Foundry vault\.\n\nRECOVERY KEY\./u, label);
+    clean(result, [PASS], label);
+    assert.ok(!result.stdout.includes(target) && !result.stderr.includes(target), `${label}: home path not echoed`);
+  }
+  const secretStagingHome = join(dir, 'secret-staging-home');
+  mkdirSync(join(secretStagingHome, `.init-${MARKER}`), { recursive: true });
+  for (const debug of [[], ['--debug']]) {
+    const result = runBin(dir, ['init', '--vault', secretStagingHome, '--passphrase-stdin', ...debug], { stdin: PASS + '\n' });
+    const label = `init non-hex staging ${debug.join(' ')}`;
+    assert.equal(result.code, 2, `${label}: ${result.stderr}`);
+    assert.match(result.stderr, /\[NOT_EMPTY\]\n$/u, label);
+    clean(result, [PASS], label);
+    assert.ok(!result.stderr.includes(`.init-${MARKER}`), `${label}: non-generated .init-* name not echoed`);
   }
 
   // The final index update fails with an error whose message quotes the secrets: --debug text is redacted.

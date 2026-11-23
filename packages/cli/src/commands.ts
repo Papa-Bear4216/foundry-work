@@ -8,7 +8,7 @@
  */
 import { Buffer } from 'node:buffer';
 import { readFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import type { IndexStoreOptions } from 'foundry-index';
 import type { ImportResult } from 'importers';
 import type { UnlockSession } from 'vault';
@@ -255,7 +255,8 @@ async function init(ctx: Context): Promise<void> {
     // The vault exists now, so the recovery key must still be shown; say which empty folder stays.
     ctx.io.err(`foundry: notice: the staging folder "${name}" stays in the Foundry folder; delete it\n`);
   }
-  ctx.out(`Created a new Foundry vault in ${resolve(ctx.request.home)}.\n\n`
+  // Fixed text: never echo the home path (a secret may have been pasted into --vault or FOUNDRY_HOME).
+  ctx.out('Created a new Foundry vault.\n\n'
     + 'RECOVERY KEY. Write this down now and keep it somewhere safe. It is shown only this once:\n\n'
     + `    ${identity.recoveryKey}\n\n`
     + 'You need the recovery key to set a new passphrase if you forget the current one.\n');
