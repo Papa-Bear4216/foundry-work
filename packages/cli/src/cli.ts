@@ -242,6 +242,8 @@ function runInWorker(request: CommandRequest, hooks: TestHooks, io: CommandIo, h
     let code: number | undefined;
     const worker = new Worker(new URL('./worker.js', import.meta.url), {
       workerData: { request, hooks }, transferList, stdin: false,
+      // Bound V8 old-gen growth inside the worker on large-RAM hosts (e.g. 1 GiB import/rebuild on glibc).
+      resourceLimits: { maxOldGenerationSizeMb: 80 },
     });
     handle.worker = worker;
     worker.on('message', message => {

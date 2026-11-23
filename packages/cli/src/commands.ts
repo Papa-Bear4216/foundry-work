@@ -144,9 +144,10 @@ async function openSession(ctx: Context, id: string): Promise<UnlockSession> {
 
 async function indexOptions(ctx: Context, session: UnlockSession): Promise<IndexStoreOptions> {
   const { loadProjection } = await import('./derive.ts');
+  const base = await loadProjection();
   return {
     directory: ctx.paths.index, vaultDirectory: ctx.paths.vault, credential: { session },
-    projection: await loadProjection(),
+    projection: { ...base, checkpoint: () => maybeCollectGarbage() },
   };
 }
 

@@ -161,6 +161,7 @@ declare module 'node:worker_threads' {
       stdin?: boolean;
       stdout?: boolean;
       stderr?: boolean;
+      resourceLimits?: { maxOldGenerationSizeMb?: number };
     });
     on(event: 'message', listener: (message: unknown) => void): this;
     on(event: 'error', listener: (error: Error) => void): this;
