@@ -399,7 +399,8 @@ test('a running read closed by one getter fails KEY when a later getter throws; 
 });
 
 test('close, return, next fails KEY on a never-started iterator; the other close and return orders keep their results', t => {
-  // A repeated return() after close() keeps an already-ended iterator done; only a never-started one fails KEY.
+  // An iterator that ended before close() stays done. An iterator that close() ended while it was suspended fails KEY,
+  // and so does a never-started iterator that is first returned after close().
   const vault = setup(t);
   const payload = Buffer.alloc(FRAME_BYTES + 1, 0x42);
   vault.write(writer => writer.appendBatch([event('TEST ONLY close return order'), blob(payload)]));
