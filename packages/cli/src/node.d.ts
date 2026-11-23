@@ -221,6 +221,14 @@ declare class TextDecoder {
   decode(bytes?: Uint8Array, options?: { stream: boolean }): string;
 }
 
+declare module 'node:v8' {
+  export function setFlagsFromString(flags: string): void;
+}
+
+declare module 'node:vm' {
+  export function runInNewContext(code: string): unknown;
+}
+
 declare function setTimeout(callback: () => void, ms: number): { unref(): void };
 declare function setInterval(callback: () => void, ms: number): unknown;
 declare function clearTimeout(handle: { unref(): void } | undefined): void;

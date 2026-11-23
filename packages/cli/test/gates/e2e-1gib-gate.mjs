@@ -8,6 +8,7 @@ import process from 'node:process';
 import {
   generateSyntheticIcalendar,
   generateSyntheticVcards,
+  syntheticEmail,
   writeSyntheticLargeMboxZip,
   writeZipArchive,
 } from 'importers';
@@ -56,7 +57,7 @@ try {
         'VERSION:3.0',
         'FN:TEST ONLY E2E Contact',
         `NOTE:TEST ONLY synthetic search marker ${NEEDLE}`,
-        'EMAIL:e2e-contact@synthetic.invalid',
+        `EMAIL:${syntheticEmail('e2e-contact')}`,
         'END:VCARD',
         '',
       ].join('\r\n'),

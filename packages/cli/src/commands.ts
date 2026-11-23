@@ -9,6 +9,8 @@
 import { Buffer } from 'node:buffer';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
 import type { IndexStoreOptions } from 'foundry-index';
 import type { ImportResult } from 'importers';
 import type { UnlockSession } from 'vault';
@@ -503,6 +505,26 @@ async function recoverVaultWriter(ctx: Context, session: UnlockSession, id: stri
   }
 }
 
+let gcFn: (() => void) | null | undefined;
+
+/** Best-effort V8 GC between heavy import batches and before index update (v7-design section 5; no-ops if refused). */
+function maybeCollectGarbage(): void {
+  if (gcFn === undefined) {
+    try {
+      setFlagsFromString('--expose-gc');
+      const fn = runInNewContext('gc') as unknown;
+      gcFn = typeof fn === 'function' ? (fn as () => void) : null;
+    } catch {
+      gcFn = null;
+    }
+  }
+  gcFn?.();
+}
+
+const IMPORT_BATCH_MAX_BYTES = 1024 * 1024;
+const IMPORT_BATCH_MAX_ITEMS = 8;
+const IMPORT_GC_EVERY_BATCHES = 32;
+
 async function importRun(ctx: Context, session: UnlockSession, id: string, options: IndexStoreOptions, parts: ArchiveParts) {
   const vault = await import('vault');
   const importers = await import('importers');
@@ -511,6 +533,7 @@ async function importRun(ctx: Context, session: UnlockSession, id: string, optio
   let writer: ReturnType<typeof vault.VaultWriter.open> | undefined;
   let lookup: ReturnType<typeof openItemKeyLookup> | undefined;
   let archive: Awaited<ReturnType<typeof openParts>> | undefined;
+  let batches = 0;
   try {
     archive = await openParts(parts);
     const opened = writer = vault.VaultWriter.open(ctx.paths.vault, unlocked);
@@ -519,6 +542,7 @@ async function importRun(ctx: Context, session: UnlockSession, id: string, optio
       appendBatch(items: Parameters<typeof opened.appendBatch>[0]) {
         const results = opened.appendBatch(items);
         ctx.storedEvents += results.filter(result => result.type === 'event').length;
+        if (++batches % IMPORT_GC_EVERY_BATCHES === 0) maybeCollectGarbage();
         return results;
       },
       closeSegment: () => opened.closeSegment(),
@@ -529,6 +553,7 @@ async function importRun(ctx: Context, session: UnlockSession, id: string, optio
       archive, writer: counting, importers: importers.DEFAULT_IMPORTERS, profile: PROFILE,
       resolveCollectionKeyId: name => vault.collectionKeyId(unlocked, PROFILE, name),
       vaultDir: ctx.paths.vault, unlocked, itemKeys: lookup,
+      batchMaxBytes: IMPORT_BATCH_MAX_BYTES, batchMaxItems: IMPORT_BATCH_MAX_ITEMS,
       // Not called while `itemKeys` is given; bound to this run's unlocked keyring for type safety.
       readVaultRecord: (directory, location) => vault.readVaultRecord(directory, location, unlocked),
     });
@@ -588,6 +613,7 @@ async function importCommand(ctx: Context): Promise<void> {
     // prints `--debug` text through the same redacting handler as every other error.
     ctx.importStage = 'final';
     if (ctx.hooks.failFinalIndexUpdate) throw hookError('final index update', secretTexts(ctx.request.secrets));
+    maybeCollectGarbage();
     updateIndex(options);
     ctx.importStage = 'done';
     if (ctx.request.json) {

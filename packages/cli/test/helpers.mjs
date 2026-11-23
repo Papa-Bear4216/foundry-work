@@ -2,7 +2,7 @@
 import { Buffer } from 'node:buffer';
 import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { closeSync, mkdtempDisposableSync, openSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, mkdtempDisposableSync, openSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,10 +14,25 @@ import { getKdfCallCountForTest, resetKdfCallCountForTest } from '../../vault/co
 export const BIN = fileURLToPath(new URL('../bin/foundry.mjs', import.meta.url));
 export const PASSPHRASE = 'TEST ONLY cli passphrase';
 
-/** A temporary folder removed after the test. */
+function makeWritableTree(dir) {
+  if (!existsSync(dir)) return;
+  try { chmodSync(dir, 0o700); } catch { /* ignore */ }
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) makeWritableTree(full);
+    else if (entry.isFile()) {
+      try { chmodSync(full, 0o600); } catch { /* ignore */ }
+    }
+  }
+}
+
+/** A temporary folder removed after the test (restoring write bits on sealed POSIX vault segments first). */
 export function scratch(t, prefix = 'foundry-cli-') {
   const temp = mkdtempDisposableSync(join(tmpdir(), prefix));
-  t.after(() => temp.remove());
+  t.after(() => {
+    makeWritableTree(temp.path);
+    temp.remove();
+  });
   return temp.path;
 }
 
