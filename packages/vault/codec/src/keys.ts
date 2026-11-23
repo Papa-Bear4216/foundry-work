@@ -78,9 +78,13 @@ export function changePassphrase(
 /**
  * Forgotten passphrase: unlock with the printed recovery key and publish the same keyring with a new passphrase wrap of
  * the SAME master key (new KDF salt). Rotates nothing; use rekeyAll when a credential may be known to someone else.
- * On any failure before the atomic rename the keyring file stays byte-identical; as for changePassphrase, a failure
- * after the rename (directory sync or writer-lock release) throws although the complete new keyring is already in
- * place, so a caller that gets an error tries the new passphrase before it repeats the reset.
+ * On any failure before the atomic rename this call leaves the keyring file untouched (if this call reaches its
+ * previous-bytes check and the current keyring is missing or differs from the bytes this call read, the check fails
+ * this call and the current keyring stays in place; a call that fails earlier, for example on an invalid replacement,
+ * runs no check and leaves the keyring file untouched, although the publish step may already have created its lock
+ * file); as for changePassphrase, a failure after the rename (directory sync or writer-lock release) throws although
+ * the complete new keyring is already in place, so a caller that gets an error tries the new passphrase before it
+ * repeats the reset.
  */
 export function resetPassphrase(
   path: string, vaultId: string, recoveryKey: string, replacement: PassphraseOptions,
