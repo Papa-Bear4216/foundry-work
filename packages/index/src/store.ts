@@ -4,11 +4,13 @@ import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readF
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { platform } from 'node:process';
 import { DatabaseSync } from 'node:sqlite';
-import { decodeKeyring, decodeVaultMetadata, openVaultReplay, retireIndexKey, stageIndexKey } from '../../vault/codec/dist/index.js';
-import type { Unlock, VerifyOptions } from '../../vault/codec/dist/index.js';
+import {
+  decodeKeyring, decodeVaultMetadata, openVaultReplay, retireIndexKey, stageIndexKey, unlockVault,
+} from 'vault';
+import type { Unlock, VaultCredential, VerifyOptions } from 'vault';
 import { assertIndexPolicy, IndexError, openSqlDriver, transaction } from './driver.ts';
-import type { IndexPolicy, SqlDriver } from './driver.ts';
-import { applyIncremental, applyRebuild, assertSchema, initializeSchema, validateVersion } from './projection.ts';
+import type { IndexPolicy, SqlDriver, SqlStatement } from './driver.ts';
+import { applyIncremental, applyRebuild, assertSchema, initializeSchema, OutdatedSchemaError, validateVersion } from './projection.ts';
 import type { ProjectionOptions, ProjectionResult } from './projection.ts';
 import { search } from './search.ts';
 import type { SearchOptions } from './search.ts';
@@ -45,6 +47,8 @@ interface Context {
   policy: IndexPolicy;
   catalog: SqlDriver;
   options: IndexStoreOptions;
+  /** The credential for every vault call in this public call: the caller's session, or the call's own session. */
+  credential: Unlock;
 }
 
 const hash = (value: string | Uint8Array): string => createHash('sha256').update(value).digest('hex');
@@ -64,7 +68,14 @@ function readCatalog(db: SqlDriver): Catalog {
   return state;
 }
 
-function withCatalog<T>(opts: IndexStoreOptions, work: (ctx: Context) => T): T {
+interface Store {
+  directory: string;
+  vault: string;
+  vaultId: string;
+  policy: IndexPolicy;
+}
+
+function prepareStore(opts: IndexStoreOptions): Store {
   const directory = resolve(opts.directory);
   const vault = resolve(opts.vaultDirectory);
   if (nested(vault, directory) || nested(directory, vault)) {
@@ -75,39 +86,74 @@ function withCatalog<T>(opts: IndexStoreOptions, work: (ctx: Context) => T): T {
   const { vault_id: vaultId } = decodeVaultMetadata(readFileSync(join(vault, 'VAULT.json')));
   const created = mkdirSync(directory, { recursive: true, mode: 0o700 });
   if (created) syncDirectory(dirname(created));
+  return { directory, vault, vaultId, policy };
+}
 
-  // The serialization lock lives in a separate file. Catalog transactions must
-  // commit independently while the lock stays held across stage, publish and retire.
-  const lock = new DatabaseSync(join(directory, 'writer-lock.sqlite'), { timeout: 5000 });
+// The serialization lock lives in a separate file. Catalog transactions must
+// commit independently while the lock stays held across stage, publish and retire.
+function openWriterLock(store: Store): SqlDriver {
+  return new DatabaseSync(join(store.directory, 'writer-lock.sqlite'), { timeout: 5000 });
+}
+
+/**
+ * A-42: the index unlocks once per public call. A caller's `{ session }` is used unchanged and never disposed.
+ * A passphrase or recovery key opens ONE `UnlockSession` (one KDF run with a passphrase, none with a recovery key);
+ * every vault call in `work` gets `{ session }`, and the session is disposed in `finally` on every path.
+ * The caller's credential object is read once here; `unlockVault` takes its own snapshot of the secret field.
+ */
+function withUnlock<T>(store: Store, opts: IndexStoreOptions, work: (credential: Unlock) => T): T {
+  const credential = opts.credential;
+  if (credential !== null && typeof credential === 'object' &&
+      (credential as { session?: unknown }).session !== undefined) {
+    return work(credential);
+  }
+  const session = unlockVault(join(store.vault, 'keyring', 'keyring.json'), store.vaultId,
+    credential as VaultCredential);
   try {
-    return transaction(lock, () => {
-      const catalog = new DatabaseSync(join(directory, 'generations.sqlite'), { timeout: 5000 });
-      try {
-        catalog.exec(`
-          PRAGMA synchronous = FULL;
-          CREATE TABLE IF NOT EXISTS catalog (
-            singleton INTEGER PRIMARY KEY CHECK (singleton=1),
-            vault_id TEXT NOT NULL, adapter TEXT NOT NULL,
-            active TEXT, snapshot TEXT, staged TEXT, staged_snapshot TEXT, staged_version INTEGER,
-            retiring TEXT, last_seq INTEGER NOT NULL DEFAULT 0, keyring_floor INTEGER NOT NULL DEFAULT 0
-          ) STRICT;
-        `);
-        const adapter = policy.adapter ?? 'sqlcipher';
-        catalog.prepare('INSERT OR IGNORE INTO catalog (singleton, vault_id, adapter) VALUES (1, ?, ?)')
-          .run(vaultId, adapter);
-        syncDirectory(directory);
-        const state = readCatalog(catalog);
-        if (state.vault_id !== vaultId || state.adapter !== adapter) {
-          throw new IndexError('CONFIG', 'Index directory belongs to a different vault or adapter.');
-        }
-        return work({ directory, vault, vaultId, keyring: join(vault, 'keyring', 'keyring.json'),
-          policy, catalog, options: opts });
-      } finally {
-        catalog.close();
-      }
-    });
+    return work({ session });
   } finally {
-    lock.close();
+    session.dispose();
+  }
+}
+
+function withCatalog<T>(opts: IndexStoreOptions, work: (ctx: Context) => T): T {
+  const store = prepareStore(opts);
+  return withUnlock(store, opts, credential => {
+    const lock = openWriterLock(store);
+    try {
+      return transaction(lock, () => openCatalog(store, opts, credential, work));
+    } finally {
+      lock.close();
+    }
+  });
+}
+
+/** Runs `work` with the catalog open. The caller holds the writer lock. */
+function openCatalog<T>(store: Store, opts: IndexStoreOptions, credential: Unlock, work: (ctx: Context) => T): T {
+  const { directory, vault, vaultId, policy } = store;
+  const catalog = new DatabaseSync(join(directory, 'generations.sqlite'), { timeout: 5000 });
+  try {
+    catalog.exec(`
+      PRAGMA synchronous = FULL;
+      CREATE TABLE IF NOT EXISTS catalog (
+        singleton INTEGER PRIMARY KEY CHECK (singleton=1),
+        vault_id TEXT NOT NULL, adapter TEXT NOT NULL,
+        active TEXT, snapshot TEXT, staged TEXT, staged_snapshot TEXT, staged_version INTEGER,
+        retiring TEXT, last_seq INTEGER NOT NULL DEFAULT 0, keyring_floor INTEGER NOT NULL DEFAULT 0
+      ) STRICT;
+    `);
+    const adapter = policy.adapter ?? 'sqlcipher';
+    catalog.prepare('INSERT OR IGNORE INTO catalog (singleton, vault_id, adapter) VALUES (1, ?, ?)')
+      .run(vaultId, adapter);
+    syncDirectory(directory);
+    const state = readCatalog(catalog);
+    if (state.vault_id !== vaultId || state.adapter !== adapter) {
+      throw new IndexError('CONFIG', 'Index directory belongs to a different vault or adapter.');
+    }
+    return work({ directory, vault, vaultId, keyring: join(vault, 'keyring', 'keyring.json'),
+      policy, catalog, options: opts, credential });
+  } finally {
+    catalog.close();
   }
 }
 
@@ -146,7 +192,7 @@ function removeGeneration(ctx: Context, id: string): void {
 function retirePending(ctx: Context): void {
   const { retiring } = readCatalog(ctx.catalog);
   if (!retiring) return;
-  retireIndexKey(ctx.keyring, ctx.vaultId, ctx.options.credential, retiring);
+  retireIndexKey(ctx.keyring, ctx.vaultId, ctx.credential, retiring);
   removeGeneration(ctx, retiring);
   ctx.catalog.exec('UPDATE catalog SET retiring=NULL WHERE singleton=1');
 }
@@ -163,13 +209,13 @@ function policyHash(bytes: Buffer): string {
 
 function capture(ctx: Context) {
   const raw = readFileSync(ctx.keyring);
-  const ring = decodeKeyring(raw, ctx.options.credential, ctx.vaultId);
+  const ring = decodeKeyring(raw, ctx.credential, ctx.vaultId);
   let replay: ReturnType<typeof openVaultReplay> | undefined;
   try {
     if (ring.keyring.version < readCatalog(ctx.catalog).keyring_floor) {
       throw new IndexError('PROJECTION', 'The vault keyring predates the index. Restore a current keyring.');
     }
-    replay = openVaultReplay(ctx.vault, ctx.options.credential, ctx.options.verify);
+    replay = openVaultReplay(ctx.vault, ctx.credential, ctx.options.verify);
     if (hash(raw) !== hash(readFileSync(ctx.keyring))) {
       throw new IndexError('PROJECTION', 'Vault keys changed during replay capture. Retry the index update.');
     }
@@ -203,7 +249,7 @@ function capture(ctx: Context) {
 
 type Capture = ReturnType<typeof capture>;
 
-function published<T>(ctx: Context, input: Capture, id: string, work: (db: SqlDriver) => T): T {
+function openPublished(ctx: Context, input: Capture, id: string): SqlDriver {
   const entry = input.ring.keyring.keys.find(key => key.key_id === id);
   if (entry?.kind !== 'index' || entry.state !== 'active') {
     throw new IndexError('KEY', 'The published index generation key is unavailable. Rebuild the working index.');
@@ -212,6 +258,16 @@ function published<T>(ctx: Context, input: Capture, id: string, work: (db: SqlDr
   const db = openSqlDriver(indexPath(ctx, id), { ...ctx.policy, key });
   try {
     assertSchema(db);
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+}
+
+function published<T>(ctx: Context, input: Capture, id: string, work: (db: SqlDriver) => T): T {
+  const db = openPublished(ctx, input, id);
+  try {
     return work(db);
   } finally {
     db.close();
@@ -229,7 +285,7 @@ function rebuildLocked(ctx: Context, input: Capture, hiddenChanged = false): Pro
   if (id && (state.staged_snapshot !== input.stamp || state.staged_version !== version ||
       (stagedKey ? stagedKey.state !== 'active' : existsSync(indexPath(ctx, id))))) {
     // If the process stopped before staging a key, no entry exists to retire.
-    if (stagedKey) retireIndexKey(ctx.keyring, ctx.vaultId, ctx.options.credential, id);
+    if (stagedKey) retireIndexKey(ctx.keyring, ctx.vaultId, ctx.credential, id);
     ctx.catalog.exec('UPDATE catalog SET staged=NULL, staged_snapshot=NULL, staged_version=NULL WHERE singleton=1');
     removeGeneration(ctx, id);
     id = null;
@@ -240,21 +296,33 @@ function rebuildLocked(ctx: Context, input: Capture, hiddenChanged = false): Pro
       .run(id, input.stamp, version);
   }
   const path = indexPath(ctx, id);
-  const key = stageIndexKey(ctx.keyring, ctx.vaultId, ctx.options.credential, id);
+  const key = stageIndexKey(ctx.keyring, ctx.vaultId, ctx.credential, id);
   let result: ProjectionResult;
   try {
     const stagedFile = lstatSync(path, { throwIfNoEntry: false });
     const empty = stagedFile?.isFile() && stagedFile.size === 0;
     if (empty) removeGeneration(ctx, id);
-    const db = openSqlDriver(path, { ...ctx.policy, key: ctx.policy.adapter === 'plain' ? undefined : key,
-      create: !stagedFile || empty });
+    const open = (create: boolean) => openSqlDriver(path, { ...ctx.policy,
+      key: ctx.policy.adapter === 'plain' ? undefined : key, create });
+    let db: SqlDriver | undefined = open(!stagedFile || !!empty);
     try {
-      initializeSchema(db);
+      try {
+        initializeSchema(db);
+      } catch (error) {
+        // A staged generation left by an older schema cannot resume: start this generation again.
+        if (!(error instanceof OutdatedSchemaError)) throw error;
+        const stale: SqlDriver = db;
+        db = undefined;
+        stale.close();
+        removeGeneration(ctx, id);
+        db = open(true);
+        initializeSchema(db);
+      }
       result = applyRebuild(db, input.replay, ctx.options.projection, input.tombstone);
       const checkpoint = db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
       if (checkpoint?.busy !== 0) throw new IndexError('PROJECTION', 'Could not checkpoint the rebuilt index.');
     } finally {
-      db.close();
+      db?.close();
     }
   } finally {
     key.fill(0);
@@ -298,7 +366,8 @@ function updateLocked(ctx: Context, input: Capture): ProjectionResult {
       return result;
     });
   } catch (error) {
-    if (error !== requiresRebuild) throw error;
+    // An active generation at an older schema version is replaced by a new generation.
+    if (error !== requiresRebuild && !(error instanceof OutdatedSchemaError)) throw error;
     return rebuildLocked(ctx, input, hiddenChanged);
   }
 }
@@ -345,4 +414,114 @@ export function searchIndex(options: IndexStoreOptions, query: string, filters?:
       input.close();
     }
   });
+}
+
+/**
+ * Structural mirror of the importers' `ItemKeyLookup` (this package does not depend on importers).
+ * `close` must be called in `finally`.
+ */
+export interface IndexItemKeyLookup {
+  has(itemKey: string): boolean;
+  add(itemKey: string): void;
+  close(): void;
+}
+
+/**
+ * Opens a durable item-key lookup over the current working index generation (`item_keys` table).
+ *
+ * - The index must be current: run `updateIndex` first. A stale or missing index is a PROJECTION error.
+ * - Memory does not grow with the vault: every `has` is one primary-key lookup in the open index.
+ * - `add` writes the key with `INSERT OR IGNORE` straight into the open generation. The caller adds a key
+ *   only after its event is durably in the vault, so a rebuild reproduces the same rows. The connection
+ *   uses `synchronous = NORMAL`: a power loss can drop recent rows, never corrupt the file, and the next
+ *   incremental update projects the same events again (projection progress is not moved by `add`).
+ * - The writer lock is held until `close`. Close the lookup before the next update, rebuild or search.
+ */
+export function openItemKeyLookup(options: IndexStoreOptions): IndexItemKeyLookup {
+  const store = prepareStore(options);
+  // The lookup uses the vault only while it opens, so the call's own session is disposed before it returns.
+  return withUnlock(store, options, credential => openLookup(store, options, credential));
+}
+
+function openLookup(store: Store, options: IndexStoreOptions, credential: Unlock): IndexItemKeyLookup {
+  const lock = openWriterLock(store);
+  let db: SqlDriver | undefined;
+  let locked = false;
+  try {
+    lock.exec('BEGIN IMMEDIATE');
+    locked = true;
+    db = openCatalog(store, options, credential, ctx => {
+      const { active, snapshot, last_seq: last, staged, retiring } = readCatalog(ctx.catalog);
+      const stale = () => new IndexError('PROJECTION', 'Working index is stale. Update it before importing.');
+      if (!active || staged || retiring) throw stale();
+      const input = capture(ctx);
+      try {
+        if (snapshot !== input.stamp) throw stale();
+        const opened = openPublished(ctx, input, active);
+        try {
+          const current = opened.prepare("SELECT deriver_version, last_event_seq FROM projection_state WHERE projection='complete'").get();
+          if (current?.deriver_version !== validateVersion(options.projection ?? {}) || current.last_event_seq !== last) {
+            throw stale();
+          }
+          input.checkKeys();
+          opened.exec('PRAGMA synchronous = NORMAL');
+          return opened;
+        } catch (error) {
+          opened.close();
+          throw error;
+        }
+      } finally {
+        input.close();
+      }
+    });
+  } catch (error) {
+    try {
+      if (locked) lock.exec('ROLLBACK');
+    } finally {
+      lock.close();
+    }
+    throw error;
+  }
+
+  const index = db;
+  let closed = false;
+  const release = () => {
+    if (closed) return;
+    closed = true;
+    try {
+      index.close();
+    } finally {
+      try {
+        lock.exec('COMMIT');
+      } finally {
+        lock.close();
+      }
+    }
+  };
+  let hasKey: SqlStatement;
+  let addKey: SqlStatement;
+  try {
+    hasKey = index.prepare('SELECT 1 AS found FROM item_keys WHERE item_key = ?');
+    addKey = index.prepare('INSERT OR IGNORE INTO item_keys VALUES (?)');
+  } catch (error) {
+    release();
+    throw error;
+  }
+  const usable = (itemKey: unknown): string => {
+    if (closed) throw new IndexError('CONFIG', 'The item-key lookup is closed.');
+    // Same rule as the projection, so a rebuild reproduces every added row.
+    if (typeof itemKey !== 'string' || itemKey.length !== 64) {
+      throw new IndexError('PROJECTION', 'An item key must be a 64-character string.');
+    }
+    return itemKey;
+  };
+  return {
+    has(itemKey) {
+      return hasKey.get(usable(itemKey)) !== undefined;
+    },
+    add(itemKey) {
+      addKey.run(usable(itemKey));
+    },
+    close: release,
+  };
 }

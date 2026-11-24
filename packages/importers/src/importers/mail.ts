@@ -9,8 +9,8 @@
 
 import { Buffer } from 'node:buffer';
 import { Readable } from 'node:stream';
-import type { ArchiveEntry, Derived, Deriver, Importer, RawItem, StoredItem } from '../types.js';
-import { normalizeTimestamp, uniqueSorted } from '../defaults.js';
+import type { ArchiveEntry, Derived, Deriver, Importer, RawItem, SplitOptions, StoredItem } from '../types.js';
+import { DEFAULT_MAX_ITEM_BYTES, normalizeTimestamp, uniqueSorted } from '../defaults.js';
 
 export const MAIL_SOURCE_ID = 'google-takeout/mail';
 
@@ -265,7 +265,90 @@ function findHeaderEnd(buf: Buffer): number {
   return crlf < lf ? crlf + 4 : lf + 2;
 }
 
-async function* splitMboxStream(entry: ArchiveEntry): AsyncIterable<RawItem> {
+/**
+ * Copies message chunks into blocks so a buffered message holds few objects. Review round 3
+ * item 2: each block is `min(64 KiB, remaining item budget)` bytes, where the budget is the
+ * item limit minus the header prefix and minus every block allocated before. So the live
+ * capacity of one message (header prefix plus blocks) never exceeds the item limit, also when
+ * the limit falls between block boundaries.
+ */
+class MessageBlocks {
+  readonly blocks: Buffer[] = [];
+  #remaining: number;
+  #block: Buffer | null = null;
+  #used = 0;
+
+  /** `budgetBytes` is the item limit minus the bytes the header prefix already holds. */
+  constructor(budgetBytes: number) {
+    this.#remaining = Math.max(0, budgetBytes);
+  }
+
+  push(chunk: Buffer): void {
+    let rest = chunk;
+    while (rest.length > 0) {
+      if (this.#block === null) {
+        // The caller pushes only while the message fits the limit, so the budget covers `rest`.
+        const size = Math.min(MESSAGE_BLOCK_BYTES, this.#remaining);
+        if (size <= 0) throw new RangeError('mail message block budget exhausted');
+        this.#block = Buffer.allocUnsafe(size);
+        this.#remaining -= size;
+        this.#used = 0;
+      }
+      const take = Math.min(rest.length, this.#block.length - this.#used);
+      rest.copy(this.#block, this.#used, 0, take);
+      this.#used += take;
+      rest = rest.subarray(take);
+      if (this.#used === this.#block.length) {
+        this.blocks.push(this.#block);
+        this.#block = null;
+      }
+    }
+  }
+
+  finish(): Buffer[] {
+    if (this.#block !== null && this.#used > 0) {
+      // Copy a partly used block to release its unused tail, but only when the copy also fits
+      // the remaining budget; otherwise keep a view of the block, which is already in budget.
+      this.blocks.push(this.#used <= this.#remaining
+        ? Buffer.from(this.#block.subarray(0, this.#used))
+        : this.#block.subarray(0, this.#used));
+    }
+    this.#block = null;
+    return this.blocks;
+  }
+}
+
+/** Streams buffered blocks and releases each one as it is read, so nothing stays referenced here. */
+function blockStream(blocks: Buffer[]): Readable {
+  let next = 0;
+  return new Readable({
+    highWaterMark: MESSAGE_BLOCK_BYTES,
+    read() {
+      if (next >= blocks.length) {
+        blocks.length = 0;
+        this.push(null);
+        return;
+      }
+      const block = blocks[next]!;
+      blocks[next++] = EMPTY;
+      this.push(block);
+    },
+  });
+}
+
+const MESSAGE_BLOCK_BYTES = 64 * 1024;
+const EMPTY = Buffer.alloc(0);
+
+/**
+ * Splits an mbox entry into messages. Each message is buffered only up to `maxItemBytes`
+ * (A-36 Finding 7): an over-limit message is dropped at the limit, the rest of it is read
+ * forward to the next separator without buffering, `ITEM_TOO_LARGE` is reported through
+ * `onItemError`, and splitting continues. Skipped messages keep their `#N` number, so paths
+ * and item keys of later messages do not depend on the limit.
+ */
+async function* splitMboxStream(entry: ArchiveEntry, options?: SplitOptions): AsyncIterable<RawItem> {
+  const maxItemBytes = Math.max(1, options?.maxItemBytes ?? DEFAULT_MAX_ITEM_BYTES);
+  const peekLimit = Math.min(MAX_HEADER_PEEK_BYTES, maxItemBytes + 1);
   const cursor = new MboxCursor(entry.open());
   let messageIndex = 0;
 
@@ -274,13 +357,22 @@ async function* splitMboxStream(entry: ArchiveEntry): AsyncIterable<RawItem> {
     const prefixChunks: Buffer[] = [];
     let prefixBytes = 0;
     let messageEndedDuringPeek = false;
+    let oversizedDuringPeek = false;
     let first = true;
 
-    while (prefixBytes < MAX_HEADER_PEEK_BYTES) {
+    while (prefixBytes < peekLimit) {
       const chunk = await cursor.readMessageChunk(first);
       first = false;
       if (chunk === null) {
         messageEndedDuringPeek = true;
+        break;
+      }
+      if (prefixBytes + chunk.length > maxItemBytes) {
+        // Review round 1 #4: check the count before copying. At the crossing, drop the prefix and
+        // copy nothing; the rest of the message is only counted below.
+        prefixChunks.length = 0;
+        prefixBytes += chunk.length;
+        oversizedDuringPeek = true;
         break;
       }
       prefixChunks.push(Buffer.from(chunk));
@@ -295,65 +387,61 @@ async function* splitMboxStream(entry: ArchiveEntry): AsyncIterable<RawItem> {
 
     if (prefixBytes === 0) continue;
 
-    const headerBuffer = prefixChunks.length === 1 ? prefixChunks[0]! : Buffer.concat(prefixChunks);
-    const meta = parseHeaderMetadata(headerBuffer);
+    const headerBuffer = oversizedDuringPeek
+      ? EMPTY
+      : prefixChunks.length === 1 ? prefixChunks[0]! : Buffer.concat(prefixChunks);
+    prefixChunks.length = 0;
     messageIndex++;
+    const itemPath = `${entry.path}#${messageIndex}`;
 
-    let prefixSent = false;
-    let bodyDone = messageEndedDuringPeek;
-    let reading = false;
-
-    const messageStream = new Readable({
-      highWaterMark: 64 * 1024,
-      read() {
-        if (reading) return;
-        if (!prefixSent) {
-          prefixSent = true;
-          this.push(headerBuffer);
-          if (bodyDone) this.push(null);
-          return;
+    // Buffer the message up to the limit. Past the limit, drop every buffered byte and read
+    // forward to the next separator, counting bytes only.
+    let observedBytes = prefixBytes;
+    let blocks: MessageBlocks | null = oversizedDuringPeek ? null : new MessageBlocks(maxItemBytes - headerBuffer.length);
+    if (!messageEndedDuringPeek) {
+      for (;;) {
+        const chunk = await cursor.readMessageChunk(false);
+        if (chunk === null) break;
+        observedBytes += chunk.length;
+        if (blocks === null) continue;
+        if (observedBytes > maxItemBytes) {
+          blocks = null;
+          continue;
         }
-        if (bodyDone) {
-          this.push(null);
-          return;
-        }
-        reading = true;
-        cursor.readMessageChunk(false).then(
-          chunk => {
-            reading = false;
-            if (chunk === null) {
-              bodyDone = true;
-              this.push(null);
-            } else {
-              this.push(Buffer.from(chunk));
-            }
-          },
-          err => {
-            reading = false;
-            this.destroy(err instanceof Error ? err : new Error(String(err)));
-          },
-        );
-      },
-    });
+        blocks.push(chunk);
+      }
+    }
 
+    if (blocks === null) {
+      options?.onItemError?.({
+        code: 'ITEM_TOO_LARGE',
+        source: MAIL_SOURCE_ID,
+        entryPath: entry.path,
+        itemPath,
+        message: `Mail message ${itemPath} (${observedBytes} bytes) exceeds per-item limit (${maxItemBytes} bytes).`,
+        limitBytes: maxItemBytes,
+        observedBytes,
+      });
+      continue;
+    }
+
+    const meta = parseHeaderMetadata(headerBuffer);
+    // The stream owns this array and empties it while it is read; this generator keeps no reference.
+    const messageBlocks = blocks.finish();
+    blocks = null;
+    messageBlocks.unshift(headerBuffer);
     const itemMeta: Record<string, unknown> = {};
     if (meta.mboxSeparator !== undefined) itemMeta.mbox_separator = meta.mboxSeparator;
     if (meta.messageId !== undefined) itemMeta.message_id = meta.messageId;
 
     yield {
-      bytes: messageStream,
-      path: `${entry.path}#${messageIndex}`,
+      bytes: blockStream(messageBlocks),
+      path: itemPath,
       mime: 'message/rfc822',
       sourceTs: meta.sourceTs,
       tags: meta.tags,
       meta: Object.keys(itemMeta).length > 0 ? itemMeta : undefined,
     };
-
-    // If caller did not consume the entire message stream, drain remaining chunks to stay aligned.
-    while (!bodyDone) {
-      const chunk = await cursor.readMessageChunk(false);
-      if (chunk === null) bodyDone = true;
-    }
   }
 }
 
@@ -642,8 +730,8 @@ export const mailImporter: Importer = {
   matches(entry: ArchiveEntry): boolean {
     return entry.path.toLowerCase().endsWith('.mbox');
   },
-  split(entry: ArchiveEntry): AsyncIterable<RawItem> {
-    return splitMboxStream(entry);
+  split(entry: ArchiveEntry, options?: SplitOptions): AsyncIterable<RawItem> {
+    return splitMboxStream(entry, options);
   },
 };
 

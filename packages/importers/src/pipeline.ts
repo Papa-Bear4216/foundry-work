@@ -17,6 +17,7 @@ import type {
   Importer,
   ImportResult,
   ItemErrorInfo,
+  ItemKeyLookup,
   SensitivityTier,
   SourceImportCounts,
   UnlockedKeyringLike,
@@ -30,9 +31,11 @@ import {
   defaultCollectionName,
   defaultSensitivityForSource,
   formatUtcTimestamp,
+  uniqueSorted,
 } from './defaults.js';
 import { computeBlobId, deriveCollectionIdKey, loadExistingItemKeys } from './vault-state.js';
 import type { ReadVaultRecordFn } from './vault-state.js';
+import { MAIL_SOURCE_ID } from './importers/mail.js';
 
 const DEFAULT_BATCH_MAX_ITEMS = 16;
 const DEFAULT_BATCH_MAX_BYTES = 4 * 1024 * 1024;
@@ -58,15 +61,24 @@ export interface ImportArchiveOptions {
   importers: readonly Importer[];
   /**
    * Maps a logical collection name (e.g. `google-takeout/mail/2024`) to an active
-   * 32-hex collection key ID in the vault keyring.
+   * 32-hex collection key ID in the vault keyring. `undefined` means "no key for this collection yet"
+   * (A-41): the item is not stored, not an error, counted in `totalItemsDeferred`, and its collection
+   * name is reported in `missingCollections`.
    */
-  resolveCollectionKeyId: (collection: string) => string;
+  resolveCollectionKeyId: (collection: string) => string | undefined;
   /** Vault directory used to derive durable item identity state from persisted events. */
   vaultDir: string;
   /** Unlocked vault keyring used to compute collection-keyed blob IDs and read persisted events. */
   unlocked: UnlockedKeyringLike;
   /** V-3 `readVaultRecord` function used to scan persisted `events-*.fvr` streams. */
   readVaultRecord: ReadVaultRecordFn;
+  /**
+   * Durable lookup of item keys already in the vault (for example `openItemKeyLookup` from the index
+   * package). When given, the vault is never scanned and no structure grows with the vault; keys are
+   * added only after their batch is durably appended. When absent, every key in the vault is loaded
+   * into an in-memory set: for tests and small vaults only, because it grows with the vault.
+   */
+  itemKeys?: ItemKeyLookup;
   /** Profile name stamped on imported events (defaults to `me`, per A-36). */
   profile?: string;
   /** Override sensitivity resolution per source/item (defaults to A-36 fixed table). */
@@ -111,7 +123,7 @@ async function readItemBytesBounded(
   }
 
   if (exceeded) return { exceeded: true, observedBytes: total };
-  return { buffer: chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks), exceeded: false };
+  return { buffer: chunks.length === 1 ? Buffer.from(chunks[0]!) : Buffer.concat(chunks), exceeded: false };
 }
 
 async function drainEntryStream(entry: ArchiveEntry): Promise<void> {
@@ -206,8 +218,16 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
     options.onUnrecognisedEntry?.(path);
   }
 
-  // Phase 1 (Ruling 9): Always build durable identity state from the vault.
-  let existingItemKeys = loadExistingItemKeys(options.vaultDir, options.unlocked, options.readVaultRecord);
+  // Phase 1 (Ruling 9): Identity state comes from the vault: either the caller's durable lookup
+  // (V-7, A-36 (d)) or, without one, an in-memory set scanned from the vault (grows with the vault).
+  const durableKeys = options.itemKeys;
+  let memoryKeys: Set<string> | undefined = durableKeys
+    ? undefined
+    : loadExistingItemKeys(options.vaultDir, options.unlocked, options.readVaultRecord);
+  const existingItemKeys: ItemKeyLookup = durableKeys ?? {
+    has: key => memoryKeys!.has(key),
+    add: key => { memoryKeys!.add(key); },
+  };
 
   // Cache derived collection ID keys for blobId pre-checking, zeroed in finally.
   const idKeyCache = new Map<string, Buffer>();
@@ -229,6 +249,8 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
   let totalItemsImported = 0;
   let totalItemsSkipped = 0;
   let totalItemsErrored = 0;
+  let totalItemsDeferred = 0;
+  const missingCollections = new Set<string>();
   let totalBlobsWritten = 0;
   let totalBlobsDeduplicated = 0;
   let totalEventsWritten = 0;
@@ -292,7 +314,7 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
   };
 
   const rederiveIdentityFromVault = (): void => {
-    existingItemKeys = loadExistingItemKeys(options.vaultDir, options.unlocked, options.readVaultRecord);
+    memoryKeys = loadExistingItemKeys(options.vaultDir, options.unlocked, options.readVaultRecord);
   };
 
   const flushBatch = (): void => {
@@ -301,6 +323,9 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
     pending = [];
     pendingKeys.clear();
     pendingBytes = 0;
+    // Ordering invariant (data-loss guard): keys are recorded only after every append of this batch
+    // has returned. A key recorded for an item that was never stored would hide it from later imports.
+    const stored: string[] = [];
 
     try {
       // Product 6.3 rule 1: Store original bytes first (blobs), then append item events.
@@ -334,11 +359,12 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
           options.writer.appendBatch([
             { type: 'event', keyId: item.keyId, event: buildEvent(item) },
           ]);
-          existingItemKeys.add(item.itemKey);
+          stored.push(item.itemKey);
           counts.itemsImported++;
           totalItemsImported++;
           totalEventsWritten++;
         }
+        for (const key of stored) existingItemKeys.add(key);
         const last = batch[batch.length - 1]!;
         options.checkpoint('after-batch', {
           itemIndex: last.itemIndex,
@@ -376,18 +402,22 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
             totalBytesStored += item.size;
           }
         }
-        existingItemKeys.add(item.itemKey);
+        stored.push(item.itemKey);
         counts.itemsImported++;
         totalItemsImported++;
         totalEventsWritten++;
       }
+      for (const key of stored) existingItemKeys.add(key);
     } catch (error) {
       for (const item of batch) item.plaintext.fill(0);
       // Ruling 9: After any append throws, re-derive identity state from the vault before any further write.
-      try {
-        rederiveIdentityFromVault();
-      } catch {
-        existingItemKeys.clear();
+      // A durable lookup needs no re-derivation: nothing from a failed batch was added to it.
+      if (!durableKeys) {
+        try {
+          rederiveIdentityFromVault();
+        } catch {
+          memoryKeys = new Set();
+        }
       }
       throw error;
     }
@@ -397,7 +427,14 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
     for (const { entry, importer } of matchedPlan) {
       const counts = ensureSourceCounts(importer.id);
 
-      for await (const rawItem of importer.split(entry, { maxItemBytes, onItemError: recordItemError })) {
+      // Review round 1 #5: before V-7 the mail splitter yielded an over-limit message and this loop
+      // counted it before rejecting it. The splitter now reports it without yielding, so count it here
+      // to keep checkpoint item numbers unchanged. Other splitter reports (vCard) never counted.
+      const onSplitError = (err: ItemErrorInfo): void => {
+        if (err.source === MAIL_SOURCE_ID && err.code === 'ITEM_TOO_LARGE') globalItemIndex++;
+        recordItemError(err);
+      };
+      for await (const rawItem of importer.split(entry, { maxItemBytes, onItemError: onSplitError })) {
         globalItemIndex++;
         const read = await readItemBytesBounded(rawItem.bytes, maxItemBytes);
         if (read.exceeded) {
@@ -416,6 +453,13 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
         const plaintext = read.buffer;
         const collection = defaultCollectionName(importer.id, rawItem.sourceTs);
         const keyId = options.resolveCollectionKeyId(collection);
+        if (keyId === undefined) {
+          // A-41: no key for this collection yet. Not stored, not an error; the caller creates the key and imports again.
+          plaintext.fill(0);
+          totalItemsDeferred++;
+          missingCollections.add(collection);
+          continue;
+        }
         const sensitivity = resolveSensitivity(importer.id, rawItem.path);
         const idKey = getIdKey(keyId);
         const blobId = computeBlobId(idKey, plaintext);
@@ -484,6 +528,8 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
     totalItemsImported,
     totalItemsSkipped,
     totalItemsErrored,
+    totalItemsDeferred,
+    missingCollections: uniqueSorted(missingCollections),
     totalBlobsWritten,
     totalBlobsDeduplicated,
     totalEventsWritten,

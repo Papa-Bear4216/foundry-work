@@ -9,6 +9,7 @@ export type {
   ImportResult,
   ItemErrorCode,
   ItemErrorInfo,
+  ItemKeyLookup,
   RawItem,
   SensitivityTier,
   SourceImportCounts,

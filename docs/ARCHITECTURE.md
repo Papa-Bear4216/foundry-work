@@ -437,6 +437,19 @@ must be kept in step across copies.
   a transactional key store and makes every keyring backup a larger erasure liability.
 - Default collection grain: one collection per profile, source and calendar year. That
   bounds the cost of re-keying after a single-item erasure to one source-year.
+- Collection key IDs follow one fixed rule. The ID of the collection key for collection
+  name `N` in the profile with key ID `P` is the first 16 bytes, as 32 lowercase hex
+  characters, of HMAC-SHA256 under `NK` over the bytes of `P` (32 lowercase hex), one
+  byte 0x0A and the exact UTF-8 bytes of `N`, with no case folding, normalization or
+  trimming. `NK` is HKDF-SHA256 with MK as input key material, the 16 raw vault ID
+  bytes as salt and ASCII info `foundry/collection-key-id/v1`. The collection key itself
+  stays random. Names that start with `foundry:` are reserved. The rule finds only
+  collections whose keys it allocated under the current MK: after a `rekeyAll`, bindings
+  made under the old MK are no longer found, while a profile without collection entries
+  can still get its first keys under the new MK; a
+  marker entry (the ID derived from `foundry:collection-key-id-rule/v1`) turns a profile
+  with collections but no active marker into a `KEY` failure. See
+  [A-41 in DECISIONS.md](DECISIONS.md).
 - The working device keeps a register of every keyring copy Foundry has written: which
   second copy, which keyring version, when. `foundry erase` prints the copies that still
   hold the old key.
@@ -780,9 +793,9 @@ from the process's own peak-usage counter. A ceiling may be raised only by a rec
 |---|---|---|
 | Facts ledger, any subcommand | 96 MiB | Step Zero |
 | `vault verify` (no key) | 128 MiB | Streaming hashes |
-| Any command that runs the passphrase KDF | 256 MiB | scrypt needs about 128 MiB for under two seconds |
+| Any command that runs the passphrase KDF | 256 MiB | scrypt needs about 128 MiB for under two seconds (applies to `init`, `vault reset-passphrase`, and any passphrase-unlocked command including `search`) |
 | `import` | 256 MiB | Independent of archive size |
-| `search` | 192 MiB | Full text; vectors scanned in batches |
+| `search` (recovery key / no passphrase KDF) | 192 MiB | Full text; vectors scanned in batches (passphrase-unlocked `search` falls under the 256 MiB passphrase-KDF row above; see A-39) |
 | Wizard server | 192 MiB | Exits when the wizard closes |
 | Mode A receiver | 96 MiB | |
 

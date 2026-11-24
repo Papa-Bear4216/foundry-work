@@ -1,11 +1,15 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { existsSync, mkdtempDisposableSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
-import { openVaultReplay, retireIndexKey } from '../../vault/codec/dist/index.js';
-import { applyIncremental, initializeSchema, openSqlDriver, rebuildIndex, search, searchIndex, updateIndex } from '../dist/index.js';
+import { decodeKeyring, openVaultReplay, retireIndexKey, UnlockSession, unlockVault } from 'vault';
+import {
+  applyIncremental, initializeSchema, openItemKeyLookup, openSqlDriver, rebuildIndex, search, searchIndex, updateIndex,
+} from '../dist/index.js';
 import { ids, note, syntheticVault, systemEvent, tombstone } from './fixture.mjs';
 
 const scratchKey = () => Buffer.alloc(32, 234);
@@ -313,4 +317,145 @@ test('a deriver-version rebuild reports hiddenChanged false', t => {
   assert.equal(updateIndex(next).hiddenChanged, false);
   assert.notEqual(catalog(options).active, first);
   assert.equal(searchIndex(next, 'amber').length, 1);
+});
+
+// A-42: the index unlocks once per call. These tests instrument scryptSync via node:module's syncBuiltinESMExports and
+// record every UnlockSession the index disposes by wrapping UnlockSession.prototype.dispose in this test process only.
+function instrumentUnlock(t) {
+  const originalDispose = UnlockSession.prototype.dispose;
+  const originalScryptSync = crypto.scryptSync;
+  const disposed = [];
+  let kdfCalls = 0;
+  UnlockSession.prototype.dispose = function dispose() {
+    disposed.push(this);
+    return originalDispose.call(this);
+  };
+  crypto.scryptSync = function countedScryptSync(...args) {
+    kdfCalls += 1;
+    return originalScryptSync.apply(this, args);
+  };
+  syncBuiltinESMExports();
+  t.after(() => {
+    UnlockSession.prototype.dispose = originalDispose;
+    crypto.scryptSync = originalScryptSync;
+    syncBuiltinESMExports();
+  });
+  return {
+    counted(work) {
+      const before = disposed.length;
+      kdfCalls = 0;
+      work();
+      return { kdf: kdfCalls, sessions: disposed.slice(before) };
+    },
+  };
+}
+
+function assertSessionDisposed(vault, session, label) {
+  assert.equal(session.disposed, true, `${label}: session.disposed is true`);
+  assert.throws(
+    () => decodeKeyring(readFileSync(vault.keyring), { session }, vault.vaultId),
+    { name: 'VaultFormatError', code: 'KEY' },
+    `${label}: disposed session cannot decode keyring`,
+  );
+}
+
+function lookupOnce(options) {
+  const lookup = openItemKeyLookup(options);
+  lookup.close();
+}
+
+test('A-42: one KDF run per call with a passphrase, none with a recovery key or a caller session', t => {
+  const { vault, options } = fixture(t);
+  const { counted } = instrumentUnlock(t);
+  vault.write(writer => note(writer, 'initial', 'TEST ONLY unlock-once garnet'));
+
+  // Positive control: the counter instrumented here observes scryptSync runs inside the vault package.
+  const control = counted(() => unlockVault(vault.keyring, vault.vaultId, vault.passphraseCredential).dispose());
+  assert.equal(control.kdf, 1);
+
+  const passphrase = { ...options, credential: vault.passphraseCredential };
+  const recovery = { ...options, credential: vault.credential };
+  const calls = [
+    ['updateIndex', o => updateIndex(o)],
+    ['rebuildIndex', o => rebuildIndex(o)],
+    ['searchIndex', o => assert.equal(searchIndex(o, 'garnet').length, 1)],
+    ['openItemKeyLookup', o => lookupOnce(o)],
+  ];
+  for (const [name, call] of calls) {
+    const withPassphrase = counted(() => call(passphrase));
+    assert.equal(withPassphrase.kdf, 1, `${name} with a passphrase`);
+    assert.equal(withPassphrase.sessions.length, 1, `${name} disposes one session`);
+    assertSessionDisposed(vault, withPassphrase.sessions[0], `${name} passphrase session`);
+
+    const withRecovery = counted(() => call(recovery));
+    assert.equal(withRecovery.kdf, 0, `${name} with a recovery key`);
+    assert.equal(withRecovery.sessions.length, 1, `${name} disposes one recovery session`);
+    assertSessionDisposed(vault, withRecovery.sessions[0], `${name} recovery session`);
+  }
+
+  const session = unlockVault(vault.keyring, vault.vaultId, vault.passphraseCredential);
+  t.after(() => session.dispose());
+  const caller = { ...options, credential: { session } };
+  for (const [name, call] of calls) {
+    const withSession = counted(() => call(caller));
+    assert.equal(withSession.kdf, 0, `${name} with a caller session`);
+    assert.deepEqual(withSession.sessions, [], `${name} never disposes the caller session`);
+    assert.equal(session.disposed, false, `${name} leaves the caller session open`);
+  }
+  // The caller's session is still usable afterwards.
+  const ring = decodeKeyring(readFileSync(vault.keyring), { session }, vault.vaultId);
+  ring.masterKey.fill(0);
+  for (const key of ring.keys.values()) key.fill(0);
+  assert.equal(session.disposed, false);
+});
+
+test('A-42: the internal session is disposed when a call fails with a typed or a thrown error', t => {
+  const { vault, options } = fixture(t);
+  const { counted } = instrumentUnlock(t);
+  vault.write(writer => note(writer, 'initial', 'TEST ONLY disposal garnet'));
+  updateIndex(options);
+  const passphrase = { ...options, credential: vault.passphraseCredential };
+
+  // A thrown (non-index) error from inside the rebuild.
+  const thrown = counted(() => assert.throws(() => rebuildIndex({ ...passphrase, projection: {
+    checkpoint() { throw new Error('TEST ONLY stop'); },
+  } }), /TEST ONLY stop/));
+  assert.equal(thrown.sessions.length, 1);
+  assertSessionDisposed(vault, thrown.sessions[0], 'rebuild thrown error');
+
+  // A typed error: the stale search (the interrupted rebuild left a staged generation).
+  const stale = counted(() => assert.throws(() => searchIndex(passphrase, 'garnet'), { code: 'PROJECTION' }));
+  assert.equal(stale.sessions.length, 1);
+  assertSessionDisposed(vault, stale.sessions[0], 'stale search error');
+  updateIndex(options);
+
+  // A typed error after unlock: a tampered catalog.
+  const db = new DatabaseSync(join(options.directory, 'generations.sqlite'));
+  try { db.exec("UPDATE catalog SET retiring='TEST ONLY not a key id' WHERE singleton=1"); } finally { db.close(); }
+  for (const call of [() => updateIndex(passphrase), () => searchIndex(passphrase, 'garnet'), () => lookupOnce(passphrase)]) {
+    const tampered = counted(() => assert.throws(call, { name: 'IndexError', code: 'FORMAT' }));
+    assert.equal(tampered.sessions.length, 1);
+    assertSessionDisposed(vault, tampered.sessions[0], 'tampered catalog error');
+  }
+});
+
+test('A-42: a wrong passphrase fails with AUTH and a keyring changed during the call still fails', t => {
+  const { vault, options } = fixture(t);
+  vault.write(writer => note(writer, 'initial', 'TEST ONLY wrong-passphrase garnet'));
+  updateIndex(options);
+  const wrong = { ...options, credential: { passphrase: 'TEST ONLY not the passphrase' } };
+  for (const call of [() => updateIndex(wrong), () => rebuildIndex(wrong), () => searchIndex(wrong, 'garnet'),
+    () => lookupOnce(wrong)]) {
+    assert.throws(call, { name: 'VaultFormatError', code: 'AUTH' });
+  }
+
+  let changed = false;
+  assert.throws(() => rebuildIndex({ ...options, credential: vault.passphraseCredential, projection: {
+    checkpoint() {
+      if (changed) return;
+      changed = true;
+      vault.destroyCollection();
+    },
+  } }), { name: 'IndexError', code: 'PROJECTION', message: /changed during indexing/ });
+  assert.ok(changed);
 });

@@ -1,7 +1,7 @@
 import { createHmac, hkdfSync } from 'node:crypto';
 import { chmodSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { blobId, collectionIdKey, decodeKeyring, encodeKeyring, initializeVault, signingPublicKey, VaultWriter } from '../../vault/codec/dist/index.js';
+import { blobId, collectionIdKey, decodeKeyring, encodeKeyring, initializeVault, signingPublicKey, VaultWriter } from 'vault';
 
 const vaultId = 'f1'.repeat(16);
 const date = '2026-01-01T00:00:00Z';

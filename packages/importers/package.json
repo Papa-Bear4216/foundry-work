@@ -11,7 +11,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test --test-concurrency=1 test/zip-reader.test.mjs test/importers.test.mjs test/pipeline.test.mjs",
+    "test": "npm run build && node --test --test-concurrency=1 test/zip-reader.test.mjs test/importers.test.mjs test/pipeline.test.mjs test/item-keys.test.mjs test/mail-limits.test.mjs",
     "budgets": "npm run build && node test/budget/import-budget.mjs"
   }
 }

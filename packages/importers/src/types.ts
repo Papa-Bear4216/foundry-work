@@ -152,6 +152,15 @@ export interface UnlockedKeyringLike {
   readonly keys: ReadonlyMap<string, Buffer>;
 }
 
+/**
+ * Durable lookup of item keys already stored in the vault (for example backed by the working index).
+ * `importArchive` calls `add` only after the batch holding that item is durably appended to the vault.
+ */
+export interface ItemKeyLookup {
+  has(itemKey: string): boolean;
+  add(itemKey: string): void;
+}
+
 /** Injectable crash checkpoints for resumability tests. */
 export type ImportCrashPoint =
   | 'after-blob-before-event'
@@ -183,6 +192,10 @@ export interface ImportResult {
   totalItemsImported: number;
   totalItemsSkipped: number;
   totalItemsErrored: number;
+  /** Items not stored because the collection resolver returned `undefined` (A-41). */
+  totalItemsDeferred: number;
+  /** Collection names the resolver had no key for, unique and sorted (A-41). */
+  missingCollections: string[];
   totalBlobsWritten: number;
   totalBlobsDeduplicated: number;
   totalEventsWritten: number;

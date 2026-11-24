@@ -5,7 +5,7 @@
   "engines": {
     "node": "24.22.3"
   },
-  "workspaces": ["packages/*"],
+  "workspaces": ["packages/vault/codec", "packages/*"],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
