@@ -757,6 +757,27 @@ async function profileAddCommand(ctx: Context): Promise<void> {
   });
 }
 
+/** The matcher fields of a sensitivity rule; their values are user-written text. */
+const RULE_MATCHER_FIELDS = ['sourcePrefix', 'pathContains', 'tag', 'keyword'] as const;
+
+/**
+ * C1: a sensitivity rule without its user-written matcher text: the generic `id`, `tier`, scope (`profile`, when set)
+ * and the names of the matcher fields that are set.
+ */
+function redactRule(rule: UserSensitivityRule): {
+  id: string;
+  tier: UserSensitivityRule['tier'];
+  profile?: ProfileId;
+  matchers: string[];
+} {
+  return {
+    id: rule.id,
+    tier: rule.tier,
+    ...(rule.profile !== undefined ? { profile: rule.profile } : {}),
+    matchers: RULE_MATCHER_FIELDS.filter(field => rule[field] !== undefined),
+  };
+}
+
 async function profileListCommand(ctx: Context): Promise<void> {
   const profiles = await import('foundry-profiles');
   await keyed(ctx, async (session, id) => {
@@ -764,12 +785,14 @@ async function profileListCommand(ctx: Context): Promise<void> {
     stall(ctx.hooks);
     const { profiles: items, destroyedProfileCount } = profiles.listProfiles(ctx.paths.vault, { session });
     // B7: the display name is decrypted user text; it is printed only with --reveal.
+    // C1: so is the matcher text of a sensitivity rule (keyword, pathContains, tag, sourcePrefix).
     const reveal = ctx.request.reveal === true;
     if (ctx.request.json) {
-      const shown = items.map(({ displayName, ...rest }) => ({
+      const shown = items.map(({ displayName, sensitivityRules, ...rest }) => ({
         ...rest,
         displayNameSet: displayName !== undefined,
         ...(reveal && displayName !== undefined ? { displayName } : {}),
+        sensitivityRules: reveal ? sensitivityRules : sensitivityRules.map(redactRule),
       }));
       ctx.out({ profiles: shown, erasedProfileKeys: destroyedProfileCount });
       return;

@@ -287,13 +287,14 @@ export function loadVaultProfileState(
           }
         }
         if (Array.isArray(body?.sensitivity_rules)) {
-          // `profile.created` replaces this profile's SCOPED rules only. A rule without `profile` in the body
-          // is a global rule that a build before P-1 fix round 1 copied in by mistake: it stays global.
+          // `profile.created` replaces this profile's SCOPED rules only. P-1 fix round 1 (C2): a rule without
+          // `profile` in the body of profile P's event is scoped to P; it is never global. Only an
+          // `annotation.added` rule without `profile`, held under `me`'s key, is global.
           p.rulesById.clear();
           for (const rawRule of body.sensitivity_rules) {
             try {
               const valid = assertUserSensitivityRule(rawRule);
-              if (valid.profile === undefined) globalRulesById.set(valid.id, valid);
+              if (valid.profile === undefined) p.rulesById.set(valid.id, { ...valid, profile: candidateProfile });
               else if (valid.profile === candidateProfile) p.rulesById.set(valid.id, valid);
               // A rule scoped to another profile does not belong in this body: ignored.
             } catch {

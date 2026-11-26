@@ -365,6 +365,62 @@ test('B7: display names and consent notes are printed only by profile list / con
   assert.match((await runInline(dir, ['consent', 'record', '--help'])).stdout, /Do not write names or other identifying details in the note\./u);
 });
 
+// --- C1 (session C): sensitivity-rule matcher text is printed only with --reveal ---
+
+test('C1: rule keyword, pathContains, tag and sourcePrefix are printed only by profile list --reveal', async t => {
+  const dir = scratch(t);
+  const { home, recoveryKey } = await initVault(dir);
+  const vaultDir = join(home, 'vault');
+  const credential = { recoveryKey: decodeRecoveryKey(recoveryKey) };
+  const marker = field => ['Planted', 'Rule', field, '5521'].join('-');
+  const markers = ['Keyword', 'Path', 'Tag', 'Source'].map(marker);
+  addSensitivityRule(vaultDir, credential, { id: 'me-rule', tier: 'clinical', profile: 'me', keyword: marker('Keyword'), tag: marker('Tag') });
+  addSensitivityRule(vaultDir, credential, { id: 'partner-rule', tier: 'secret', profile: 'partner', pathContains: marker('Path'), sourcePrefix: marker('Source') });
+  // A global rule is not printed by any command; its text must not leak either.
+  addSensitivityRule(vaultDir, credential, { id: 'global-rule', tier: 'secret', keyword: marker('Keyword') });
+  const archive = await mailArchive(dir, 'c1.zip', [['2024', 'Synthetic c1', 'Plain words.']]);
+  const leaked = res => markers.filter(m => res.stdout.includes(m) || res.stderr.includes(m));
+  const run = async argv => {
+    const res = await runInline(dir, [...argv, ...keyed(home, recoveryKey)], { stdin: recoveryKey + '\n' });
+    assert.deepEqual(leaked(res), [], `rule text leaked: ${argv.join(' ')}`);
+    return res;
+  };
+
+  for (const extra of [[], ['--json'], ['--debug'], ['--json', '--debug']]) {
+    for (const argv of [
+      ['profile', 'add', 'partner', '--display-name', 'Synthetic Label'],
+      ['consent', 'record', 'partner', '--basis', 'exported-by-them'],
+      ['profile', 'list'],
+      ['consent', 'list'],
+      ['collection', 'list'],
+      ['collection', 'prompt-policy', 'partner/x', '--child-prompts', 'off'],
+      ['import', archive, '--profile', 'partner'],
+      ['search', 'Synthetic'],
+      ['index', 'rebuild'],
+    ]) {
+      const res = await run([...argv, ...extra]);
+      assert.equal(res.code, 0, `${argv.join(' ')} ${extra.join(' ')}: ${res.stderr}`);
+    }
+  }
+
+  const listed = JSON.parse((await run(['profile', 'list', '--json'])).stdout).profiles;
+  assert.deepEqual(
+    listed.map(p => [p.profile, p.sensitivityRules]),
+    [
+      ['me', [{ id: 'me-rule', tier: 'clinical', profile: 'me', matchers: ['tag', 'keyword'] }]],
+      ['partner', [{ id: 'partner-rule', tier: 'secret', profile: 'partner', matchers: ['sourcePrefix', 'pathContains'] }]],
+    ],
+  );
+
+  const revealed = await runInline(dir, ['profile', 'list', '--reveal', '--json', ...keyed(home, recoveryKey)], { stdin: recoveryKey + '\n' });
+  assert.equal(revealed.code, 0, revealed.stderr);
+  assert.deepEqual(leaked(revealed).sort(), [...markers].sort());
+  const revealedRules = JSON.parse(revealed.stdout).profiles.flatMap(p => p.sensitivityRules);
+  assert.deepEqual(revealedRules.map(r => r.id), ['me-rule', 'partner-rule']);
+  assert.equal(revealedRules[0].keyword, marker('Keyword'));
+  assert.equal(revealedRules[1].sourcePrefix, marker('Source'));
+});
+
 // --- B8 (item 13) ---
 
 test('B8-13: consent record --basis other without a note fails INVALID_CONSENT_NOTE before any KDF', async t => {

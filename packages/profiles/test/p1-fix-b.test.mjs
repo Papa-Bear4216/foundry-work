@@ -302,7 +302,9 @@ test('B6: a global rule still covers partner and other after profile add me', t 
   assert.equal(partnerMeRule.sensitivity, 'personal', 'a me-scoped rule does not cover partner');
 });
 
-test('B6: an unscoped rule that an older build copied into profile.created replays as global', t => {
+// P-1 fix round 1 session C (C2) replaced the session B ruling: an unscoped rule inside a
+// `profile.created` body of profile P is scoped to P, never global.
+test('C2: an unscoped rule inside profile.created of me is scoped to me', t => {
   const { vaultDir, credential } = scratchVault(t);
   appendRawEvents(vaultDir, credential, 'me', 'system', [
     {
@@ -311,12 +313,42 @@ test('B6: an unscoped rule that an older build copied into profile.created repla
       profile: 'me',
       collection: 'system',
       sensitivity: 'personal',
-      body: { profile: 'me', sensitivity_rules: [{ id: 'copied-global', tier: 'secret', keyword: 'synthetic-copied' }] },
+      body: { profile: 'me', sensitivity_rules: [{ id: 'copied-unscoped', tier: 'secret', keyword: 'synthetic-copied' }] },
     },
   ]);
   const state = profiles.loadVaultProfileState(vaultDir, credential);
-  assert.deepEqual(state.sensitivityRules, [{ id: 'copied-global', tier: 'secret', keyword: 'synthetic-copied' }]);
-  assert.deepEqual(state.profiles.get('me').sensitivityRules, []);
+  const scoped = { id: 'copied-unscoped', tier: 'secret', keyword: 'synthetic-copied', profile: 'me' };
+  assert.deepEqual(state.sensitivityRules, [scoped]);
+  assert.deepEqual(state.profiles.get('me').sensitivityRules, [scoped]);
+});
+
+test('C2: an unscoped rule inside profile.created of partner does not apply to me or other', t => {
+  const { vaultDir, credential } = scratchVault(t);
+  const keyword = ['synthetic', 'partner', 'body', 'keyword'].join('-');
+  appendRawEvents(vaultDir, credential, 'partner', 'system', [
+    {
+      ts: '2026-01-01T00:00:00Z',
+      kind: 'profile.created',
+      profile: 'partner',
+      collection: 'system',
+      sensitivity: 'personal',
+      body: { profile: 'partner', sensitivity_rules: [{ id: 'partner-unscoped', tier: 'secret', keyword }] },
+    },
+  ]);
+  const state = profiles.loadVaultProfileState(vaultDir, credential);
+  assert.deepEqual(state.sensitivityRules, [{ id: 'partner-unscoped', tier: 'secret', keyword, profile: 'partner' }]);
+  assert.deepEqual(state.profiles.get('partner').sensitivityRules.map(r => r.profile), ['partner']);
+  const tierFor = profile =>
+    profiles.classifySensitivity({
+      profile,
+      collection: `${profile}/google-takeout/mail/2024`,
+      source: 'google-takeout/mail',
+      text: `Notes with ${keyword} inside.`,
+      userRules: state.sensitivityRules,
+    }).sensitivity;
+  assert.equal(tierFor('partner'), 'secret');
+  assert.equal(tierFor('me'), 'personal');
+  assert.equal(tierFor('other'), 'personal');
 });
 
 // --- B8 (items 13, 14, 15) ---
