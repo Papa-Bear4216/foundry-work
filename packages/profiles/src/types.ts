@@ -44,6 +44,11 @@ export interface ClassificationInput {
   readonly path?: string;
   readonly text?: string;
   readonly plaintext?: Uint8Array;
+  /**
+   * Text derived from the item by its source's deriver (for example a decoded base64 or
+   * quoted-printable mail body). Scanned in addition to `plaintext`, through the same windows.
+   */
+  readonly derivedTexts?: readonly string[];
   readonly mime?: string;
   readonly tags?: readonly string[];
   readonly explicitTier?: SensitivityTier;

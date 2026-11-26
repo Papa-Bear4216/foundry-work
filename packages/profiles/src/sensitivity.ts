@@ -2,8 +2,10 @@
  * Rule-only generic sensitivity classification (Product Spec section 9, Extraction Plan section 2).
  *
  * Zero network calls, zero model calls, zero household-specific identifiers.
- * Plaintext byte buffers are inspected through bounded head/tail UTF-8 slices so 64 MiB items
- * allocate at most 80 KiB of temporary text and stay well inside the 256 MiB import budget.
+ * The whole item is scanned through overlapping windows: at most `SCAN_WINDOW_BYTES` of bytes (or
+ * UTF-16 code units for string input) are decoded or sliced at a time, and each window overlaps the
+ * previous one by `SCAN_OVERLAP_BYTES`. Every shipped pattern has a bounded longest match shorter than
+ * the overlap, so a match that crosses a window edge lies whole inside the next window.
  */
 import type {
   ClassificationInput,
@@ -13,10 +15,10 @@ import type {
 } from './types.ts';
 import { assertSensitivityTier, assertUserSensitivityRule } from './validation.ts';
 
-/** Maximum leading bytes decoded from `plaintext` during write-time classification (64 KiB). */
-export const HEAD_SCAN_BYTES = 64 * 1024;
-/** Maximum trailing bytes decoded from `plaintext` when item length exceeds head + tail (16 KiB). */
-export const TAIL_SCAN_BYTES = 16 * 1024;
+/** Maximum bytes (or UTF-16 code units for string input) decoded or sliced per scan window (64 KiB). */
+export const SCAN_WINDOW_BYTES = 64 * 1024;
+/** Minimum overlap between two consecutive scan windows (4 KiB). Longer than every shipped match. */
+export const SCAN_OVERLAP_BYTES = 4 * 1024;
 
 const utf8Decoder = new TextDecoder('utf-8', { fatal: false });
 
@@ -61,49 +63,53 @@ function trimUtf8End(bytes: Uint8Array, limit: number): number {
   return (bytes[lead]! & 0xc0) === 0xc0 ? lead : end;
 }
 
-function skipUtf8Continuation(bytes: Uint8Array, start: number): number {
-  let idx = Math.max(0, start);
-  const cap = Math.min(bytes.byteLength, idx + 4);
-  while (idx < cap && (bytes[idx]! & 0xc0) === 0x80) {
-    idx++;
+/**
+ * Yields the decoded windows of `bytes`, one at a time (never the whole item as one string).
+ *
+ * A window is at most `SCAN_WINDOW_BYTES` bytes, its end moved back to a UTF-8 character start. The next
+ * window starts at least `SCAN_OVERLAP_BYTES` before the previous end, moved back to a character start. So
+ * every byte span of at most `SCAN_OVERLAP_BYTES` bytes lies whole inside one window. Each window starts
+ * more than 60 KiB after the previous start, so the loop always advances.
+ */
+export function* byteScanWindows(bytes: Uint8Array): Generator<string, void, undefined> {
+  const total = bytes.byteLength;
+  let start = 0;
+  while (start < total) {
+    if (total - start <= SCAN_WINDOW_BYTES) {
+      yield utf8Decoder.decode(bytes.subarray(start, total));
+      return;
+    }
+    const end = trimUtf8End(bytes, start + SCAN_WINDOW_BYTES);
+    yield utf8Decoder.decode(bytes.subarray(start, end));
+    let next = end - SCAN_OVERLAP_BYTES;
+    for (let back = 0; back < 3 && (bytes[next]! & 0xc0) === 0x80; back++) next--;
+    start = next;
   }
-  return idx;
 }
 
+const isHighSurrogate = (code: number): boolean => code >= 0xd800 && code <= 0xdbff;
+const isLowSurrogate = (code: number): boolean => code >= 0xdc00 && code <= 0xdfff;
+
 /**
- * Extracts bounded UTF-8 text slices from `plaintext` and/or `text` without copying raw `Uint8Array` bytes.
+ * Yields windows of `text` of at most `SCAN_WINDOW_BYTES` UTF-16 code units, overlapping by at least
+ * `SCAN_OVERLAP_BYTES` code units, never cutting a surrogate pair. Windows are `slice`s, not copies of
+ * the whole string. A match of B UTF-8 bytes is at most B code units, so the byte bound covers strings.
  */
-export function extractBoundedScanSlices(
-  plaintext?: Uint8Array,
-  text?: string,
-): readonly string[] {
-  const slices: string[] = [];
-
-  if (typeof text === 'string' && text.length > 0) {
-    const maxChars = HEAD_SCAN_BYTES + TAIL_SCAN_BYTES;
-    if (text.length <= maxChars) {
-      slices.push(text);
-    } else {
-      slices.push(text.slice(0, HEAD_SCAN_BYTES));
-      slices.push(text.slice(text.length - TAIL_SCAN_BYTES));
+export function* stringScanWindows(text: string): Generator<string, void, undefined> {
+  const total = text.length;
+  let start = 0;
+  while (start < total) {
+    if (total - start <= SCAN_WINDOW_BYTES) {
+      yield start === 0 ? text : text.slice(start);
+      return;
     }
+    let end = start + SCAN_WINDOW_BYTES;
+    if (isHighSurrogate(text.charCodeAt(end - 1))) end--;
+    yield text.slice(start, end);
+    let next = end - SCAN_OVERLAP_BYTES;
+    if (isLowSurrogate(text.charCodeAt(next))) next--;
+    start = next;
   }
-
-  if (plaintext && plaintext.byteLength > 0) {
-    const total = plaintext.byteLength;
-    if (total <= HEAD_SCAN_BYTES + TAIL_SCAN_BYTES) {
-      slices.push(utf8Decoder.decode(plaintext));
-    } else {
-      const headEnd = trimUtf8End(plaintext, HEAD_SCAN_BYTES);
-      const tailStart = skipUtf8Continuation(plaintext, total - TAIL_SCAN_BYTES);
-      slices.push(utf8Decoder.decode(plaintext.subarray(0, headEnd)));
-      if (tailStart < total) {
-        slices.push(utf8Decoder.decode(plaintext.subarray(tailStart, total)));
-      }
-    }
-  }
-
-  return slices;
 }
 
 const PLACEHOLDER_VALUES = new Set([
@@ -165,29 +171,45 @@ function characterClassCount(value: string): number {
   return upper + lower + digit + symbol;
 }
 
+// Every whitespace / separator run below is bounded (`{0,16}`, `{1,16}`, `{1,32}`) so that the longest
+// possible match of every shipped pattern stays below `SCAN_OVERLAP_BYTES` (A1, P-1 fix round 1).
 const PRIVATE_KEY_RE =
-  /-----BEGIN[ \t]+(?:[A-Z0-9-]+[ \t]+){0,5}PRIVATE[ \t]+KEY(?:[ \t]+BLOCK)?-----|PuTTY-User-Key-File-[23]:/iu;
+  /-----BEGIN[ \t]{1,16}(?:[A-Z0-9-]{1,32}[ \t]{1,16}){0,5}PRIVATE[ \t]{1,16}KEY(?:[ \t]{1,16}BLOCK)?-----|PuTTY-User-Key-File-[23]:/iu;
 
+// Global: every match is checked, so a placeholder in an early match cannot hide a later credential (A3).
 const BEARER_HEADER_RE =
-  /\bAuthorization[ \t]*:[ \t]*Bearer[ \t]+([A-Za-z0-9._~+/=-]{16,512})/iu;
+  /\bAuthorization[ \t]{0,16}:[ \t]{0,16}Bearer[ \t]{1,16}([A-Za-z0-9._~+/=-]{16,512})/giu;
 
 const KNOWN_TOKEN_PREFIX_RE =
   /\b(?:sk-(?:proj-|live-|test-)?[A-Za-z0-9_-]{20,256}|gh[pousr]_[A-Za-z0-9]{20,255}|github_pat_[A-Za-z0-9_]{20,255}|xox[baprs]-[A-Za-z0-9-]{16,255}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{10,512}\.eyJ[A-Za-z0-9_-]{10,512}\.[A-Za-z0-9_-]{10,512})\b/u;
 
 const TOKEN_ASSIGNMENT_RE =
-  /\b(?:oauth|access|refresh|bearer|api|client|auth)[ _-]*(?:token|secret|key)[ \t]*[:=][ \t]*['"]?([A-Za-z0-9._~+/=-]{16,512})/giu;
+  /\b(?:oauth|access|refresh|bearer|api|client|auth)[ _-]{0,16}(?:token|secret|key)[ \t]{0,16}[:=][ \t]{0,16}['"]?([A-Za-z0-9._~+/=-]{16,512})/giu;
 
+// Global, like the bearer pattern (A3).
 const DB_CONNECTION_URI_RE =
-  /\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqp|amqps|mssql):\/\/[^/\s:@]{1,128}:([^/\s@]{1,256})@[^\s'"]{1,256}/iu;
+  /\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqp|amqps|mssql):\/\/[^/\s:@]{1,128}:([^/\s@]{1,256})@[^\s'"]{1,256}/giu;
 
 const CREDENTIAL_ASSIGNMENT_RE =
-  /\b(password|passwd|pwd|passphrase|secret|secret[_-]?key|private[_-]?key|api[_-]?key|credential)[ \t]*[:=][ \t]*['"]?([^\s'"\r\n;,]{8,256})/giu;
+  /\b(password|passwd|pwd|passphrase|secret|secret[_-]?key|private[_-]?key|api[_-]?key|credential)[ \t]{0,16}[:=][ \t]{0,16}['"]?([^\s'"\r\n;,]{8,256})/giu;
+
+/** True when some match of the global `pattern` has a capture group `group` that is not a placeholder. */
+function hasRealCredentialMatch(pattern: RegExp, field: string, group: number): boolean {
+  pattern.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(field)) !== null) {
+    if (!isPlaceholderCredential(match[group]!)) {
+      pattern.lastIndex = 0;
+      return true;
+    }
+  }
+  return false;
+}
 
 function detectSecretRule(field: string): string | undefined {
   if (PRIVATE_KEY_RE.test(field)) return 'private-key';
 
-  const bearerMatch = BEARER_HEADER_RE.exec(field);
-  if (bearerMatch && !isPlaceholderCredential(bearerMatch[1]!)) {
+  if (hasRealCredentialMatch(BEARER_HEADER_RE, field, 1)) {
     return 'bearer-token';
   }
 
@@ -204,8 +226,7 @@ function detectSecretRule(field: string): string | undefined {
     }
   }
 
-  const dbMatch = DB_CONNECTION_URI_RE.exec(field);
-  if (dbMatch && !isPlaceholderCredential(dbMatch[1]!)) {
+  if (hasRealCredentialMatch(DB_CONNECTION_URI_RE, field, 1)) {
     return 'database-credentials';
   }
 
@@ -238,19 +259,19 @@ function detectSecretRule(field: string): string | undefined {
 const CLINICAL_RULES: ReadonlyArray<readonly [string, RegExp]> = [
   [
     'clinical-code',
-    /\bICD-(?:9|10)(?:-[A-Z]{2})?(?:[ \t:#-]+[A-TV-Z][0-9][0-9AB](?:\.[0-9A-Z]{1,4})?)?\b|\b(?:diagnosis|diagnostic)[ \t]+code[ \t:#-]*[A-TV-Z][0-9][0-9AB]\.[0-9A-Z]{1,4}\b|\bCPT(?:[ \t]+code)?[ \t:#-]+\d{5}\b/iu,
+    /\bICD-(?:9|10)(?:-[A-Z]{2})?(?:[ \t:#-]{1,16}[A-TV-Z][0-9][0-9AB](?:\.[0-9A-Z]{1,4})?)?\b|\b(?:diagnosis|diagnostic)[ \t]{1,16}code[ \t:#-]{0,16}[A-TV-Z][0-9][0-9AB]\.[0-9A-Z]{1,4}\b|\bCPT(?:[ \t]{1,16}code)?[ \t:#-]{1,16}\d{5}\b/iu,
   ],
   [
     'clinical-lab',
-    /\b(?:laboratory|lab)[ \t]+(?:result|report)s?\b|\breference[ \t]+range\b|\b(?:comprehensive[ \t]+metabolic[ \t]+panel|complete[ \t]+blood[ \t]+count|hemoglobin[ \t]+a1c)\b/iu,
+    /\b(?:laboratory|lab)[ \t]{1,16}(?:result|report)s?\b|\breference[ \t]{1,16}range\b|\b(?:comprehensive[ \t]{1,16}metabolic[ \t]{1,16}panel|complete[ \t]{1,16}blood[ \t]{1,16}count|hemoglobin[ \t]{1,16}a1c)\b/iu,
   ],
   [
     'clinical-record',
-    /\bdischarge[ \t]+(?:summary|instructions|diagnosis)\b|\bmedical[ \t]+record[ \t]+(?:number|no\.?|#)\b|\bMRN[ \t:#-]+[A-Z0-9-]{4,32}\b|"resourceType"[ \t]*:[ \t]*"(?:Patient|Observation|DiagnosticReport|MedicationRequest|Condition|Immunization)"/iu,
+    /\bdischarge[ \t]{1,16}(?:summary|instructions|diagnosis)\b|\bmedical[ \t]{1,16}record[ \t]{1,16}(?:number|no\.?|#)\b|\bMRN[ \t:#-]{1,16}[A-Z0-9-]{4,32}\b|"resourceType"[ \t]{0,16}:[ \t]{0,16}"(?:Patient|Observation|DiagnosticReport|MedicationRequest|Condition|Immunization)"/iu,
   ],
   [
     'clinical-prescription',
-    /\b(?:prescription|rx)[ \t]*(?:number|no\.?|#|id|fill)\b|\bNDC[ \t:#-]+\d{4,5}-\d{3,4}-\d{1,2}\b/iu,
+    /\b(?:prescription|rx)[ \t]{0,16}(?:number|no\.?|#|id|fill)\b|\bNDC[ \t:#-]{1,16}\d{4,5}-\d{3,4}-\d{1,2}\b/iu,
   ],
 ];
 
@@ -259,21 +280,36 @@ const CLINICAL_RULES: ReadonlyArray<readonly [string, RegExp]> = [
 const PRIVATE_RULES: ReadonlyArray<readonly [string, RegExp]> = [
   [
     'national-id',
-    /\b(?:social[ \t_-]*security[ \t_-]*(?:number|no\.?|card)|employer[ \t_-]*identification[ \t_-]*number|national[ \t_-]*id(?:entity)?[ \t_-]*number)\b|(?:^|[^a-z0-9])(?:ssn|ein|tin|fein)[ \t]*[:#-][ \t]*[0-9-]{9,11}\b|(?<![0-9A-Za-z+-])(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}(?![0-9A-Za-z-])/iu,
+    /\b(?:social[ \t_-]{0,16}security[ \t_-]{0,16}(?:number|no\.?|card)|employer[ \t_-]{0,16}identification[ \t_-]{0,16}number|national[ \t_-]{0,16}id(?:entity)?[ \t_-]{0,16}number)\b|(?:^|[^a-z0-9])(?:ssn|ein|tin|fein)[ \t]{0,16}[:#-][ \t]{0,16}[0-9-]{9,11}\b|(?<![0-9A-Za-z+-])(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}(?![0-9A-Za-z-])/iu,
   ],
   [
     'tax-document',
-    /\b(?:form[ \t_-]*(?:1040(?:[ -]?(?:sr|nr|es|x))?|1099(?:-[a-z]{1,4})?|w-?[249])|w-2[ \t]+(?:wage|form|tax)|1099-(?:int|div|misc|nec|b|r|k)|tax[ \t_-]*return|wage[ \t]+and[ \t]+tax[ \t]+statement)\b/iu,
+    /\b(?:form[ \t_-]{0,16}(?:1040(?:[ -]?(?:sr|nr|es|x))?|1099(?:-[a-z]{1,4})?|w-?[249])|w-2[ \t]{1,16}(?:wage|form|tax)|1099-(?:int|div|misc|nec|b|r|k)|tax[ \t_-]{0,16}return|wage[ \t]{1,16}and[ \t]{1,16}tax[ \t]{1,16}statement)\b/iu,
   ],
   [
     'financial-account',
-    /\b(?:routing|aba)[ \t_-]*(?:number|no\.?|#)[ \t:#_-]*\d{9}\b|\b(?:bank|checking|savings|brokerage)[ \t_-]*account[ \t_-]*(?:number|no\.?|#)[ \t:#_-]*[A-Z0-9*-]{4,34}\b|\bIBAN[ \t:#_-]*[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b/iu,
+    /\b(?:routing|aba)[ \t_-]{0,16}(?:number|no\.?|#)[ \t:#_-]{0,16}\d{9}\b|\b(?:bank|checking|savings|brokerage)[ \t_-]{0,16}account[ \t_-]{0,16}(?:number|no\.?|#)[ \t:#_-]{0,16}[A-Z0-9*-]{4,34}\b|\bIBAN[ \t:#_-]{0,16}[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b/iu,
   ],
   [
     'insurance-document',
-    /\binsurance[ \t_-]*(?:card|policy|claim)\b|\bexplanation[ \t_-]*of[ \t_-]*benefits\b|\b(?:subscriber|policy|claim)[ \t_-]*(?:id|number|no\.?)[ \t:#_-]*[A-Z0-9-]{4,32}\b|\bmember[ \t_-]*id[ \t:#_-]*[A-Z0-9-]{5,32}\b/iu,
+    /\binsurance[ \t_-]{0,16}(?:card|policy|claim)\b|\bexplanation[ \t_-]{0,16}of[ \t_-]{0,16}benefits\b|\b(?:subscriber|policy|claim)[ \t_-]{0,16}(?:id|number|no\.?)[ \t:#_-]{0,16}[A-Z0-9-]{4,32}\b|\bmember[ \t_-]{0,16}id[ \t:#_-]{0,16}[A-Z0-9-]{5,32}\b/iu,
   ],
 ];
+
+/**
+ * Every shipped pattern with its rule id, for the overlap-bound test. Each longest match is shorter than
+ * `SCAN_OVERLAP_BYTES`. The two credential-assignment rule ids share one pattern.
+ */
+export const SHIPPED_SCAN_PATTERNS: ReadonlyArray<{ readonly id: string; readonly pattern: RegExp }> = Object.freeze([
+  { id: 'private-key', pattern: PRIVATE_KEY_RE },
+  { id: 'bearer-token', pattern: BEARER_HEADER_RE },
+  { id: 'api-token', pattern: KNOWN_TOKEN_PREFIX_RE },
+  { id: 'oauth-or-api-token', pattern: TOKEN_ASSIGNMENT_RE },
+  { id: 'database-credentials', pattern: DB_CONNECTION_URI_RE },
+  { id: 'credential-assignment', pattern: CREDENTIAL_ASSIGNMENT_RE },
+  ...CLINICAL_RULES.map(([id, pattern]) => ({ id, pattern })),
+  ...PRIVATE_RULES.map(([id, pattern]) => ({ id, pattern })),
+].map(entry => Object.freeze(entry)));
 
 function isChildScoped(profile?: string, collection?: string): boolean {
   if (profile === 'child') return true;
@@ -283,13 +319,13 @@ function isChildScoped(profile?: string, collection?: string): boolean {
   return false;
 }
 
-function matchesUserRule(
+/** The rule's non-keyword matchers (scope, source, path, tag). The keyword is matched per scan window. */
+function matchesUserRuleMetadata(
   rule: UserSensitivityRule,
   source: string,
   profile: string | undefined,
   normalizedPathLower: string,
   lowerTags: ReadonlySet<string>,
-  lowerFields: readonly string[],
 ): boolean {
   if (rule.profile !== undefined && rule.profile !== profile) return false;
   if (rule.sourcePrefix !== undefined) {
@@ -303,11 +339,24 @@ function matchesUserRule(
   if (rule.tag !== undefined) {
     if (!lowerTags.has(rule.tag.toLowerCase())) return false;
   }
-  if (rule.keyword !== undefined) {
-    const needle = rule.keyword.toLowerCase();
-    if (!lowerFields.some(f => f.includes(needle))) return false;
-  }
   return true;
+}
+
+/**
+ * Every text field of the item as scan windows, in a fixed order: title, path, `text`, `plaintext`, then
+ * each of `derivedTexts`. Lazy: only one window is alive at a time.
+ */
+function* scanWindows(
+  input: ClassificationInput,
+  normalizedPath: string,
+): Generator<string, void, undefined> {
+  if (input.title) yield* stringScanWindows(input.title);
+  if (normalizedPath) yield* stringScanWindows(normalizedPath);
+  if (typeof input.text === 'string' && input.text.length > 0) yield* stringScanWindows(input.text);
+  if (input.plaintext && input.plaintext.byteLength > 0) yield* byteScanWindows(input.plaintext);
+  for (const derived of input.derivedTexts ?? []) {
+    if (typeof derived === 'string' && derived.length > 0) yield* stringScanWindows(derived);
+  }
 }
 
 /**
@@ -325,17 +374,40 @@ export function classifySensitivity(input: ClassificationInput): ClassificationR
   const validatedRules = input.userRules?.map(rule => assertUserSensitivityRule(rule)) ?? [];
 
   const normalizedPath = (input.path ?? '').replaceAll('\\', '/');
-  const textSlices = extractBoundedScanSlices(input.plaintext, input.text);
-  const fields: string[] = [];
-  if (input.title) fields.push(input.title);
-  if (normalizedPath) fields.push(normalizedPath);
-  for (const slice of textSlices) fields.push(slice);
+  const tags = input.tags ?? [];
+  const childScoped = isChildScoped(input.profile, input.collection);
 
-  // 1. Shipped `secret` rules always win immediately (highest possible tier).
-  for (const field of fields) {
+  // User rules: the non-keyword matchers are decided once; a keyword is searched in every window.
+  const normalizedPathLower = normalizedPath.toLowerCase();
+  const lowerTags = new Set(tags.map(t => t.toLowerCase()));
+  const ruleMetadataMatch = validatedRules.map(rule =>
+    matchesUserRuleMetadata(rule, input.source, input.profile, normalizedPathLower, lowerTags),
+  );
+  const keywordNeedles = validatedRules.map(rule => rule.keyword?.toLowerCase());
+  const keywordHit = validatedRules.map(rule => rule.keyword === undefined);
+  const clinicalHit = CLINICAL_RULES.map(() => false);
+  const privateHit = PRIVATE_RULES.map(() => false);
+
+  // 1. One pass over the whole item, one window at a time. Shipped `secret` rules win immediately
+  //    (highest possible tier); every other rule records its first hit and is then skipped.
+  for (const field of scanWindows(input, normalizedPath)) {
     const secretRule = detectSecretRule(field);
     if (secretRule !== undefined) {
       return { sensitivity: 'secret', rule: secretRule };
+    }
+    if (!childScoped) {
+      for (let i = 0; i < CLINICAL_RULES.length; i++) {
+        if (!clinicalHit[i] && CLINICAL_RULES[i]![1].test(field)) clinicalHit[i] = true;
+      }
+      for (let i = 0; i < PRIVATE_RULES.length; i++) {
+        if (!privateHit[i] && PRIVATE_RULES[i]![1].test(field)) privateHit[i] = true;
+      }
+    }
+    let lowerField: string | undefined;
+    for (let i = 0; i < validatedRules.length; i++) {
+      if (keywordHit[i] || !ruleMetadataMatch[i]) continue;
+      lowerField ??= field.toLowerCase();
+      if (lowerField.includes(keywordNeedles[i]!)) keywordHit[i] = true;
     }
   }
 
@@ -350,7 +422,6 @@ export function classifySensitivity(input: ClassificationInput): ClassificationR
   if (input.explicitTier !== undefined) {
     consider({ sensitivity: input.explicitTier, rule: 'explicit' });
   }
-  const tags = input.tags ?? [];
   for (const rawTag of tags) {
     const lower = rawTag.trim().toLowerCase();
     if (lower === 'sensitivity:public') {
@@ -370,23 +441,10 @@ export function classifySensitivity(input: ClassificationInput): ClassificationR
   }
 
   // 3. Vault-stored user rules (may elevate to `secret` or assign `public` when nothing higher matches).
-  if (validatedRules.length > 0) {
-    const normalizedPathLower = normalizedPath.toLowerCase();
-    const lowerTags = new Set(tags.map(t => t.toLowerCase()));
-    const lowerFields = fields.map(f => f.toLowerCase());
-    for (const rule of validatedRules) {
-      if (
-        matchesUserRule(
-          rule,
-          input.source,
-          input.profile,
-          normalizedPathLower,
-          lowerTags,
-          lowerFields,
-        )
-      ) {
-        consider({ sensitivity: rule.tier, rule: `user:${rule.id}` });
-      }
+  for (let i = 0; i < validatedRules.length; i++) {
+    if (ruleMetadataMatch[i] && keywordHit[i]) {
+      const rule = validatedRules[i]!;
+      consider({ sensitivity: rule.tier, rule: `user:${rule.id}` });
     }
   }
 
@@ -395,26 +453,22 @@ export function classifySensitivity(input: ClassificationInput): ClassificationR
   }
 
   // 4. `child` profile or `child/...` collection floor (outranked only by `secret`).
-  if (isChildScoped(input.profile, input.collection)) {
+  if (childScoped) {
     consider({ sensitivity: 'child', rule: 'child-profile' });
     return best!;
   }
 
-  // 5. Shipped generic `clinical` rules.
-  for (const [ruleId, pattern] of CLINICAL_RULES) {
-    if (fields.some(field => pattern.test(field))) {
-      consider({ sensitivity: 'clinical', rule: ruleId });
-      break;
-    }
+  // 5. Shipped generic `clinical` rules (first matching rule in list order).
+  const clinicalIndex = clinicalHit.indexOf(true);
+  if (clinicalIndex !== -1) {
+    consider({ sensitivity: 'clinical', rule: CLINICAL_RULES[clinicalIndex]![0] });
   }
 
   // 6. Shipped generic `private` rules (only needed if nothing >= `private` matched yet).
   if (!best || compareSensitivity(best.sensitivity, 'private') < 0) {
-    for (const [ruleId, pattern] of PRIVATE_RULES) {
-      if (fields.some(field => pattern.test(field))) {
-        consider({ sensitivity: 'private', rule: ruleId });
-        break;
-      }
+    const privateIndex = privateHit.indexOf(true);
+    if (privateIndex !== -1) {
+      consider({ sensitivity: 'private', rule: PRIVATE_RULES[privateIndex]![0] });
     }
   }
 

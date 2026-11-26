@@ -54,15 +54,17 @@ export {
 } from './validation.ts';
 
 export {
+  byteScanWindows,
   classifySensitivity,
   compareSensitivity,
   DEFAULT_SENSITIVITY_BY_SOURCE,
   defaultSensitivityForSource,
-  extractBoundedScanSlices,
-  HEAD_SCAN_BYTES,
   maxSensitivity,
+  SCAN_OVERLAP_BYTES,
+  SCAN_WINDOW_BYTES,
   SENSITIVITY_PRECEDENCE,
-  TAIL_SCAN_BYTES,
+  SHIPPED_SCAN_PATTERNS,
+  stringScanWindows,
 } from './sensitivity.ts';
 
 export { filterItemsForModelPrompt, isPromptEligible } from './prompt-policy.ts';

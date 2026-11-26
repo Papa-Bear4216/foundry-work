@@ -85,8 +85,15 @@ export interface ImportArchiveOptions {
   profile?: string;
   /** Override logical collection assignment per item (defaults to A-36 `<source>/<year>` or `<source>/undated`). */
   resolveCollection?: (info: ResolveCollectionInput) => string;
-  /** Override sensitivity resolution per source/item (defaults to A-36 fixed table). */
-  resolveSensitivity?: (source: string, path: string, item?: ResolveSensitivityItem) => SensitivityTier;
+  /**
+   * Override sensitivity resolution per source/item (defaults to A-36 fixed table). May return a promise
+   * (P-1: the command line runs the source's deriver first); a synchronous result is used directly.
+   */
+  resolveSensitivity?: (
+    source: string,
+    path: string,
+    item?: ResolveSensitivityItem,
+  ) => SensitivityTier | Promise<SensitivityTier>;
   /** Optional clock override for deterministic tests. */
   now?: () => Date;
   /** Maximum plaintext byte size per individual item before skipping. Default: 64 MiB. */
@@ -471,7 +478,7 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
           missingCollections.add(collection);
           continue;
         }
-        const sensitivity = resolveSensitivity(importer.id, rawItem.path, {
+        const resolved = resolveSensitivity(importer.id, rawItem.path, {
           plaintext,
           mime: rawItem.mime,
           tags: rawItem.tags,
@@ -479,6 +486,11 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
           collection,
           sourceTs: rawItem.sourceTs,
         });
+        // A synchronous resolver takes the same path as before; only a promise is awaited.
+        const sensitivity: SensitivityTier =
+          typeof (resolved as Promise<SensitivityTier> | undefined)?.then === 'function'
+            ? await resolved
+            : (resolved as SensitivityTier);
         const idKey = getIdKey(keyId);
         const blobId = computeBlobId(idKey, plaintext);
         const itemKey = computeItemKey(profile, collection, importer.id, rawItem.path, blobId);

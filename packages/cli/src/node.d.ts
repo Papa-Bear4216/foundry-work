@@ -116,6 +116,9 @@ declare module 'node:stream' {
     off(event: 'error', listener: (error: Error) => void): this;
     pause(): this;
   }
+  export const Readable: {
+    from(iterable: Iterable<unknown> | AsyncIterable<unknown>): Readable;
+  };
 }
 
 declare module 'node:sqlite' {

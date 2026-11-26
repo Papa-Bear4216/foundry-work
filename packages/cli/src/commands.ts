@@ -549,6 +549,7 @@ async function importRun(
   const importers = await import('importers');
   const profiles = await import('foundry-profiles');
   const { openItemKeyLookup } = await import('foundry-index');
+  const { classifyImportItem } = await import('./classify.ts');
   const unlocked = vault.decodeKeyring(readKeyring(ctx), { session }, id);
   let writer: ReturnType<typeof vault.VaultWriter.open> | undefined;
   let lookup: ReturnType<typeof openItemKeyLookup> | undefined;
@@ -577,8 +578,9 @@ async function importRun(
       resolveCollection: ({ profile: itemProfile, source, sourceTs }) =>
         explicitCollection ?? profiles.defaultCollectionForItem(itemProfile as ProfileId, source, sourceTs),
       resolveCollectionKeyId: name => vault.collectionKeyId(unlocked, profile, name),
-      resolveSensitivity: (source, itemPath, item) =>
-        profiles.classifySensitivity({
+      // P-1 fix round 1 (item 6): raw bytes AND the source deriver's decoded text are classified.
+      resolveSensitivity: async (source, itemPath, item) => {
+        const input = {
           profile,
           collection:
             item?.collection ??
@@ -586,11 +588,12 @@ async function importRun(
             profiles.defaultCollectionForItem(profile, source, item?.sourceTs),
           source,
           path: itemPath,
-          plaintext: item?.plaintext,
-          mime: item?.mime,
-          tags: item?.tags,
           userRules: sensitivityRules,
-        }).sensitivity,
+        };
+        if (item === undefined) return profiles.classifySensitivity(input).sensitivity;
+        const result = await classifyImportItem(profiles.classifySensitivity, importers.DEFAULT_DERIVERS, input, item);
+        return result.sensitivity;
+      },
       vaultDir: ctx.paths.vault,
       unlocked,
       itemKeys: lookup,

@@ -422,3 +422,117 @@ test('child profile import, sensitivity floor vs secret elevation, --collection 
   const stateDisabled = loadVaultProfileState(vaultDir, credential);
   assert.equal(filterItemsForModelPrompt(childEvents, stateDisabled).length, 0);
 });
+
+// --- P-1 fix round 1 session A (item 6): classify the decoded text, not only the raw bytes ---
+
+/** Wrap at 76 characters with CRLF, as MIME bodies are. */
+function wrap76(text) {
+  const lines = [];
+  for (let i = 0; i < text.length; i += 76) lines.push(text.slice(i, i + 76));
+  return lines.join('\r\n');
+}
+
+/** Quoted-printable with EVERY byte hex-encoded (`=XX`), so no credential text is readable in the raw bytes. */
+function quotedPrintableAllHex(text) {
+  const encoded = [...Buffer.from(text, 'utf8')].map(b => `=${b.toString(16).toUpperCase().padStart(2, '0')}`);
+  const lines = [];
+  for (let i = 0; i < encoded.length; i += 24) lines.push(encoded.slice(i, i + 24).join(''));
+  return lines.join('=\r\n');
+}
+
+async function buildEncodedCredentialMailArchive(dir, name, encoding) {
+  const secretBody = `Synthetic restore notes.\n${buildSyntheticPem()}\nEnd of notes.\n`;
+  const encodedBody =
+    encoding === 'base64' ? wrap76(Buffer.from(secretBody, 'utf8').toString('base64')) : quotedPrintableAllHex(secretBody);
+  const message = [
+    'From 2001@xxx Mon Mar 04 10:00:00 +0000 2024',
+    `From: <${syntheticEmail('sender-enc')}>`,
+    `To: <${syntheticEmail('recipient-enc')}>`,
+    'Date: Mon, 04 Mar 2024 10:00:00 +0000',
+    'Subject: Synthetic encoded notes',
+    'MIME-Version: 1.0',
+    'Content-Type: multipart/mixed; boundary="synthetic-boundary"',
+    '',
+    '--synthetic-boundary',
+    'Content-Type: text/plain; charset="utf-8"',
+    `Content-Transfer-Encoding: ${encoding}`,
+    '',
+    encodedBody,
+    '--synthetic-boundary--',
+    '',
+  ].join('\r\n');
+  // The raw bytes alone must not reveal the credential (otherwise the test proves nothing).
+  assert.ok(!message.includes('PRIVATE'), `${encoding} fixture leaks the marker into the raw bytes`);
+  const zipPath = join(dir, name);
+  await writeZipArchive(zipPath, [
+    { path: 'Takeout/Mail/All mail Including Spam and Trash.mbox', data: Buffer.from(message, 'utf8'), compression: 'deflate' },
+  ]);
+  return zipPath;
+}
+
+for (const encoding of ['base64', 'quoted-printable']) {
+  test(`A2: a mail whose only credential sits inside a ${encoding} text/plain part is secret after import`, async t => {
+    const dir = scratch(t);
+    const { home, recoveryKey } = await initVault(dir);
+    const archive = await buildEncodedCredentialMailArchive(dir, `${encoding}-mail.zip`, encoding);
+    const imp = await runInline(dir, ['import', archive, '--vault', home, '--recovery-key-stdin', '--json'], {
+      stdin: recoveryKey + '\n',
+    });
+    assert.equal(imp.code, 0, imp.stderr);
+    assert.equal(JSON.parse(imp.stdout).itemsAdded, 1);
+    const events = readImportedEvents(home, recoveryKey);
+    assert.deepEqual(
+      events.map(e => [e.profile, e.collection, e.sensitivity]),
+      [['me', 'me/google-takeout/mail/2024', 'secret']],
+    );
+  });
+}
+
+test('A2: classifyImportItem classifies derived text, and falls back to raw bytes with rule derive-failed', async () => {
+  const { classifyImportItem } = await import('../dist/classify.js');
+  const { classifySensitivity } = await import('foundry-profiles');
+  const { DEFAULT_DERIVERS } = await import('importers');
+  const secretBody = `Notes\n${buildSyntheticPem()}\n`;
+  const fromLine = `From: <${syntheticEmail('derive-unit')}>`;
+  const mail = Buffer.from(
+    [
+      fromLine,
+      'Subject: Synthetic',
+      'Content-Type: text/plain; charset="utf-8"',
+      'Content-Transfer-Encoding: base64',
+      '',
+      wrap76(Buffer.from(secretBody, 'utf8').toString('base64')),
+      '',
+    ].join('\r\n'),
+    'utf8',
+  );
+  const input = { profile: 'me', collection: 'me/google-takeout/mail/2024', source: 'google-takeout/mail', path: 'm/1' };
+  const item = { plaintext: mail, mime: 'message/rfc822', tags: [], profile: 'me', collection: input.collection };
+
+  const ok = await classifyImportItem(classifySensitivity, DEFAULT_DERIVERS, input, item);
+  assert.deepEqual(ok, { sensitivity: 'secret', rule: 'private-key' });
+
+  const throwing = [
+    {
+      id: 'google-takeout/mail',
+      version: 1,
+      // eslint-disable-next-line require-yield
+      async *derive() {
+        throw new Error('synthetic deriver failure');
+      },
+    },
+  ];
+  const failed = await classifyImportItem(classifySensitivity, throwing, input, item);
+  assert.deepEqual(failed, { sensitivity: 'personal', rule: 'derive-failed' });
+  // A derive failure never assigns `secret` by itself, and raw-byte rules still apply.
+  const rawPrivate = { ...item, plaintext: Buffer.from('Taxpayer SSN: 123-45-6789 on file.', 'utf8') };
+  assert.deepEqual(await classifyImportItem(classifySensitivity, throwing, input, rawPrivate), {
+    sensitivity: 'private',
+    rule: 'derive-failed',
+  });
+  // The pipeline's plaintext is left untouched by the derive step.
+  assert.ok(mail.toString('utf8').startsWith(fromLine));
+  // A source with no deriver classifies the raw bytes only, with its normal rule id.
+  const other = await classifyImportItem(classifySensitivity, DEFAULT_DERIVERS, { ...input, source: 'custom/none' }, rawPrivate);
+  assert.deepEqual(other, { sensitivity: 'private', rule: 'national-id' });
+});

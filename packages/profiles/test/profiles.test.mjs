@@ -38,11 +38,10 @@ import {
   classifySensitivity,
   compareSensitivity,
   CONSENT_BASES,
+  byteScanWindows,
   defaultCollectionForItem,
-  extractBoundedScanSlices,
   filterItemsForModelPrompt,
   hasActiveConsent,
-  HEAD_SCAN_BYTES,
   isProfileId,
   isPromptEligible,
   isSensitivityTier,
@@ -54,10 +53,11 @@ import {
   PROFILE_IDS,
   ProfileError,
   recordConsent,
+  SCAN_OVERLAP_BYTES,
+  SCAN_WINDOW_BYTES,
   SENSITIVITY_PRECEDENCE,
   SENSITIVITY_TIERS,
   setCollectionPromptPolicy,
-  TAIL_SCAN_BYTES,
   validateCollectionName,
 } from '../dist/index.js';
 
@@ -475,12 +475,19 @@ test('shipped generic sensitivity rules, precedence order, user vault rules, and
     'private',
   );
 
-  // 7. Bounded low-memory scan on a 16 MiB buffer (proves head + tail slices work and total slice length <= 80 KiB)
+  // 7. Bounded low-memory windowed scan on a 16 MiB buffer (P-1 fix round 1: every byte is covered, one
+  //    window of at most SCAN_WINDOW_BYTES is decoded at a time, consecutive windows overlap by SCAN_OVERLAP_BYTES)
   const big = Buffer.alloc(16 * 1024 * 1024, 0x61); // 'a'
-  const slicesPlain = extractBoundedScanSlices(big);
-  assert.equal(slicesPlain.length, 2);
-  const decodedChars = slicesPlain.reduce((acc, s) => acc + s.length, 0);
-  assert.ok(decodedChars <= HEAD_SCAN_BYTES + TAIL_SCAN_BYTES);
+  let windowCount = 0;
+  let coveredChars = 0;
+  for (const window of byteScanWindows(big)) {
+    assert.ok(window.length <= SCAN_WINDOW_BYTES);
+    windowCount++;
+    coveredChars += window.length;
+  }
+  const step = SCAN_WINDOW_BYTES - SCAN_OVERLAP_BYTES;
+  assert.equal(windowCount, Math.ceil((big.length - SCAN_OVERLAP_BYTES) / step));
+  assert.equal(coveredChars - (windowCount - 1) * SCAN_OVERLAP_BYTES, big.length);
 
   // Secret placed near the end (in the last 16 KiB tail) of a 16 MiB buffer is still caught!
   const tailMarker = Buffer.from(`\n${buildPemHeader('OPENSSH')}\n`, 'utf8');
