@@ -70,6 +70,8 @@ export {
 } from './sensitivity.ts';
 export type { ShippedScanPattern } from './sensitivity.ts';
 
+export { isDefaultCollectionName } from './default-collection.ts';
+
 export { filterItemsForModelPrompt, isPromptEligible } from './prompt-policy.ts';
 
 export {

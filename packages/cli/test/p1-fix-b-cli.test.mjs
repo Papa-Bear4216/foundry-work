@@ -94,7 +94,8 @@ test('B1: child/shared and me/shared are separate collections with separate poli
     assert.equal(res.code, 0, res.stderr);
     assert.equal(JSON.parse(res.stdout).kind, 'collection.created');
   }
-  const list = await runInline(dir, ['collection', 'list', ...keyed(home, recoveryKey), '--json'], { stdin: recoveryKey + '\n' });
+  // Fix round 3 (blocker 6): custom names are listed only with --reveal.
+  const list = await runInline(dir, ['collection', 'list', '--reveal', ...keyed(home, recoveryKey), '--json'], { stdin: recoveryKey + '\n' });
   assert.deepEqual(
     JSON.parse(list.stdout).collections.map(c => [c.collection, c.profile, c.allowChildModelPrompts]),
     [
@@ -346,12 +347,11 @@ test('B7: display names and consent notes are printed only by profile list / con
   assert.equal(extraPositional.code, 1);
   assert.ok(!extraPositional.stderr.includes('extra'));
 
-  // Mutation commands do not take --reveal.
+  // Mutation commands do not take --reveal (fix round 3: `collection list` now does, see R3-6).
   for (const argv of [
     ['profile', 'add', 'partner', '--display-name', nameMarker, '--reveal'],
     ['consent', 'record', 'partner', '--basis', 'other', '--note', noteMarker, '--reveal'],
     ['collection', 'prompt-policy', 'partner/x', '--child-prompts', 'on', '--reveal'],
-    ['collection', 'list', '--reveal'],
     ['import', archive, '--reveal'],
   ]) {
     const res = await runInline(dir, [...argv, ...keyed(home, recoveryKey)], { stdin: recoveryKey + '\n' });
@@ -421,6 +421,87 @@ test('C1/G2: rule id, keyword, pathContains, tag and sourcePrefix are printed on
   assert.deepEqual(revealedRules.map(r => r.id), [marker('IdMe'), marker('IdPartner')]);
   assert.equal(revealedRules[0].keyword, marker('Keyword'));
   assert.equal(revealedRules[1].sourcePrefix, marker('Source'));
+});
+
+// --- Fix round 3, blocker 6: custom collection names are user text ---
+
+test('R3-6: a custom collection name is printed by collection list only with --reveal and never by prompt-policy', async t => {
+  const dir = scratch(t);
+  const { home, recoveryKey } = await initVault(dir);
+  const marker = ['Planted', 'Collection', 'Marker', '9031'].join('-');
+  const custom = `me/${marker}`;
+  const defaultName = 'me/google-takeout/mail/2024';
+  const archive = await mailArchive(dir, 'r3.zip', [['2024', 'Synthetic r3', 'Plain words.']]);
+  const run = argv => runInline(dir, [...argv, ...keyed(home, recoveryKey)], { stdin: recoveryKey + '\n' });
+  const noMarker = (res, argv) =>
+    assert.ok(!res.stdout.includes(marker) && !res.stderr.includes(marker), `custom name leaked: ${argv.join(' ')}`);
+
+  const imported = await run(['import', archive, '--json']);
+  assert.equal(imported.code, 0, imported.stderr);
+
+  // prompt-policy on a custom name: text and JSON never echo it.
+  for (const extra of [[], ['--debug']]) {
+    const argv = ['collection', 'prompt-policy', custom, '--child-prompts', 'on', ...extra];
+    const res = await run(argv);
+    assert.equal(res.code, 0, res.stderr);
+    noMarker(res, argv);
+    assert.match(res.stdout, /^Collection \(custom\) child model prompts: on \(event \d+\)\.\n$/u);
+  }
+  for (const extra of [['--json'], ['--json', '--debug']]) {
+    const argv = ['collection', 'prompt-policy', custom, '--child-prompts', 'off', ...extra];
+    const res = await run(argv);
+    assert.equal(res.code, 0, res.stderr);
+    noMarker(res, argv);
+    const body = JSON.parse(res.stdout);
+    assert.equal(body.customCollection, true);
+    assert.ok(!('collection' in body));
+    assert.equal(body.allowChildModelPrompts, false);
+  }
+  // A default name is echoed as before.
+  const defText = await run(['collection', 'prompt-policy', defaultName, '--child-prompts', 'off']);
+  assert.match(defText.stdout, /^Collection "me\/google-takeout\/mail\/2024" child model prompts: off \(event \d+\)\.\n$/u);
+  const defJson = JSON.parse((await run(['collection', 'prompt-policy', defaultName, '--child-prompts', 'off', '--json'])).stdout);
+  assert.equal(defJson.collection, defaultName);
+  assert.ok(!('customCollection' in defJson));
+
+  // collection list with --reveal prints every name (the order is the listed order).
+  const revealedJson = await run(['collection', 'list', '--reveal', '--json']);
+  assert.equal(revealedJson.code, 0, revealedJson.stderr);
+  const revealedNames = JSON.parse(revealedJson.stdout).collections.map(c => c.collection);
+  assert.deepEqual([...revealedNames].sort(), [custom, defaultName].sort());
+  const position = revealedNames.indexOf(custom) + 1;
+  const revealedText = await run(['collection', 'list', '--reveal']);
+  assert.equal(revealedText.code, 0, revealedText.stderr);
+  assert.ok(revealedText.stdout.includes(marker));
+
+  // Without --reveal: the custom name is `custom collection N`; the default name prints as before.
+  for (const extra of [[], ['--debug']]) {
+    const argv = ['collection', 'list', ...extra];
+    const res = await run(argv);
+    assert.equal(res.code, 0, res.stderr);
+    noMarker(res, argv);
+    assert.match(res.stdout, new RegExp(`^custom collection ${position} {2}profile=me {2}items=0 {2}child-prompts=off$`, 'mu'));
+    assert.match(res.stdout, /^me\/google-takeout\/mail\/2024 {2}profile=me {2}items=1 {2}child-prompts=off$/mu);
+  }
+  for (const extra of [['--json'], ['--json', '--debug']]) {
+    const argv = ['collection', 'list', ...extra];
+    const res = await run(argv);
+    assert.equal(res.code, 0, res.stderr);
+    noMarker(res, argv);
+    const listed = JSON.parse(res.stdout).collections;
+    assert.equal(listed.length, 2);
+    const hidden = listed[position - 1];
+    assert.ok(!('collection' in hidden));
+    assert.equal(hidden.customCollection, position);
+    assert.equal(hidden.profile, 'me');
+    assert.equal(hidden.itemCount, 0);
+    assert.equal(hidden.allowChildModelPrompts, false);
+    const shown = listed.find(c => c.collection === defaultName);
+    assert.ok(shown && !('customCollection' in shown));
+    assert.equal(shown.itemCount, 1);
+  }
+  // Help names --reveal.
+  assert.match((await runInline(dir, ['collection', 'list', '--help'])).stdout, /--reveal/u);
 });
 
 // --- B8 (item 13) ---

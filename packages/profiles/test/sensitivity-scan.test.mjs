@@ -388,6 +388,131 @@ test('C2 (round 2): JSON and quoted keys are recognised; placeholders in the sam
   }
 });
 
+// --- P-1 fix round 3 ---
+
+const DB_RESULT = { sensitivity: 'secret', rule: 'database-credentials' };
+
+test('R3-1: a placeholder URI glued to a real one by parentheses, brackets or no separator is secret', () => {
+  const real = ['R3al', 'Pw', 'x77'].join('');
+  const p = bareDatabaseUri;
+  const shapes = [
+    ['parentheses', (a, b) => `(${a})(${b})`],
+    ['brackets', (a, b) => `[${a}][${b}]`],
+    ['braces', (a, b) => `{${a}}{${b}}`],
+    ['no separator', (a, b) => `${a}${b}`],
+  ];
+  for (const [name, join2] of shapes) {
+    // Placeholder first, real password second (and the reverse order).
+    assert.deepEqual(profiles.classifySensitivity({ ...BASE, text: join2(p('changeme', 'h1'), p(real, 'h2')) }), DB_RESULT, `${name}: placeholder first`);
+    assert.deepEqual(profiles.classifySensitivity({ ...BASE, text: join2(p(real, 'h1'), p('changeme', 'h2')) }), DB_RESULT, `${name}: real first`);
+    // Control: two placeholders stay the source default.
+    assert.equal(
+      profiles.classifySensitivity({ ...BASE, text: join2(p('changeme', 'h1'), p('<password>', 'h2')) }).sensitivity,
+      'personal',
+      `${name}: control`,
+    );
+  }
+  // Three URIs with no separator: the real password is the last one.
+  const three = `${p('changeme', 'h1')}${p('<password>', 'h2')}${p(real, 'h3')}`;
+  assert.deepEqual(profiles.classifySensitivity({ ...BASE, text: three }), DB_RESULT);
+});
+
+test('R3-2: a quoted password with spaces is checked whole; escaped quotes stay inside; unterminated falls back', () => {
+  const q = '"';
+  const s = "'";
+  const spaced = ['abc', 'def', 'ghi', 'jkl'].join(' ');
+  const cases = [
+    `{${q}password${q}: ${q}${spaced}${q}}`,
+    `password = ${s}${spaced}${s}`,
+    `${s}passphrase${s}: ${s}${['my', 'long', 'pass', 'phrase'].join(' ')}${s}`,
+    // An escaped quote inside the value: the first word alone is too short.
+    `{${q}password${q}: ${q}ab\\${q}cd efgh${q}}`,
+  ];
+  for (const field of cases) {
+    assert.deepEqual(
+      profiles.classifySensitivity({ ...BASE, text: field }),
+      { sensitivity: 'secret', rule: 'credential-assignment' },
+      field.slice(0, 14),
+    );
+  }
+  // A quoted placeholder with spaces stays non-secret.
+  for (const field of [
+    `{${q}password${q}: ${q}<your password here>${q}}`,
+    `password = ${s}\${SECRET VALUE}${s}`,
+  ]) {
+    assert.equal(profiles.classifySensitivity({ ...BASE, text: field }).sensitivity, 'personal', field.slice(0, 14));
+  }
+  // An unterminated quote: no crash, the unquoted rule decides.
+  assert.equal(profiles.classifySensitivity({ ...BASE, text: `password = ${q}abc def ghi jkl` }).sensitivity, 'personal');
+  assert.deepEqual(
+    profiles.classifySensitivity({ ...BASE, text: `password = ${q}${['Unterminated', 'Pass9'].join('')} and more` }),
+    { sensitivity: 'secret', rule: 'credential-assignment' },
+  );
+  // A quoted value longer than the bound does not hang and keeps the unquoted rule on its first word.
+  const long = `password = ${q}${'ab '.repeat(2000)}${q}`;
+  assert.equal(profiles.classifySensitivity({ ...BASE, text: long }).sensitivity, 'personal');
+});
+
+/** A JWT-shaped string built at run time: header segment, payload segment of `payloadLength`, signature. */
+function jwtShape(payloadLength) {
+  const head = ['ey', 'J'].join('');
+  const header = `${head}${'hbGciOiJIUzI1NiJ9'}`;
+  const payload = `${head}${'x'.repeat(payloadLength)}`;
+  return [header, payload, 'S1gnatureSegment_abc'].join('.');
+}
+
+test('R3-3: a JWT with a long payload is secret; an eyJ word with no second segment is not', () => {
+  for (const length of [600, 5000]) {
+    assert.deepEqual(
+      profiles.classifySensitivity({ ...BASE, text: `token ${jwtShape(length)} end` }),
+      { sensitivity: 'secret', rule: 'api-token' },
+      `payload ${length}`,
+    );
+  }
+  assert.deepEqual(profiles.classifySensitivity({ ...BASE, text: `token ${jwtShape(20)} end` }), { sensitivity: 'secret', rule: 'api-token' });
+  const lone = `${['ey', 'J'].join('')}${'abcdefghijklmnop'}`;
+  assert.equal(profiles.classifySensitivity({ ...BASE, text: `word ${lone} and ${lone}.other` }).sensitivity, 'personal');
+});
+
+test('R3-6: isDefaultCollectionName accepts only <profile>/<shipped source>/<4-digit year|undated>', () => {
+  const fn = profiles.isDefaultCollectionName;
+  assert.equal(typeof fn, 'function');
+  for (const name of [
+    'me/google-takeout/mail/2024',
+    'child/google-takeout/contacts/undated',
+    'partner/google-takeout/calendar/0001',
+    'other/google-takeout/mail/9999',
+  ]) {
+    assert.equal(fn(name), true, name);
+  }
+  for (const name of [
+    'me/custom-curated/2024',
+    'me/shared',
+    'child/shared',
+    'me/google-takeout/mail/24',
+    'me/google-takeout/mail/0000',
+    'me/google-takeout/mail/2024/extra',
+    'me/google-takeout/mail/Undated',
+    'google-takeout/mail/2019',
+    'mee/google-takeout/mail/2024',
+    'me/google-takeout/photos/2024',
+    'me/google-takeout/mail/2024 ',
+    '',
+    undefined,
+    42,
+  ]) {
+    assert.equal(fn(name), false, String(name));
+  }
+  // Every name defaultCollectionForItem builds is a default name.
+  for (const profile of ['me', 'partner', 'child', 'other']) {
+    for (const source of Object.keys(profiles.DEFAULT_SENSITIVITY_BY_SOURCE)) {
+      for (const ts of ['2024-03-04T10:00:00Z', undefined, '2024-garbage']) {
+        assert.equal(fn(profiles.defaultCollectionForItem(profile, source, ts)), true, `${profile} ${source} ${ts}`);
+      }
+    }
+  }
+});
+
 test('C3 (round 2): archive tags may raise the tier but never choose public', () => {
   // A Gmail label `sensitivity:public` (an archive tag) is ignored: the mail stays personal.
   assert.deepEqual(

@@ -180,8 +180,10 @@ const PRIVATE_KEY_RE =
 const BEARER_HEADER_RE =
   /\bAuthorization[ \t]{0,16}:[ \t]{0,16}Bearer[ \t]{1,16}([A-Za-z0-9._~+/=-]{16,512})/giu;
 
+// P-1 fix round 3 (blocker 3): a JWT is recognised by a bounded prefix (header plus the start of the payload),
+// outside the trailing `\b`, so a token whose payload is longer than any bound still matches.
 const KNOWN_TOKEN_PREFIX_RE =
-  /\b(?:sk-(?:proj-|live-|test-)?[A-Za-z0-9_-]{20,256}|gh[pousr]_[A-Za-z0-9]{20,255}|github_pat_[A-Za-z0-9_]{20,255}|xox[baprs]-[A-Za-z0-9-]{16,255}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{10,512}\.eyJ[A-Za-z0-9_-]{10,512}\.[A-Za-z0-9_-]{10,512})\b/u;
+  /\b(?:(?:sk-(?:proj-|live-|test-)?[A-Za-z0-9_-]{20,256}|gh[pousr]_[A-Za-z0-9]{20,255}|github_pat_[A-Za-z0-9_]{20,255}|xox[baprs]-[A-Za-z0-9-]{16,255}|AKIA[0-9A-Z]{16})\b|eyJ[A-Za-z0-9_-]{10,512}\.eyJ[A-Za-z0-9_-]{10})/u;
 
 // P-1 fix round 2 (C2): an optional closing quote after the key name, so JSON / quoted keys
 // (`"api_key": "..."`, `'secret' = '...'`) are recognised.
@@ -190,12 +192,18 @@ const TOKEN_ASSIGNMENT_RE =
 
 // Global, like the bearer pattern (A3). P-1 fix round 2 (C1): the host part stops at `,`, `;`, `/`,
 // whitespace, quotes, `<` and `>`, so adjacent URIs are separate matches and a placeholder password in the
-// first cannot hide a real password in the next.
+// first cannot hide a real password in the next. P-1 fix round 3 (blocker 1): the host part also stops at
+// `(`, `)`, `[`, `]`, `{` and `}`, the scan resumes after the `@` of a placeholder match (see
+// `hasRealDatabaseUriMatch`), and the pattern has no leading `\b`, so a URI glued to the previous host
+// (`...@h1postgres://...`) is still found.
 const DB_CONNECTION_URI_RE =
-  /\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqp|amqps|mssql):\/\/[^/\s:@]{1,128}:([^/\s@]{1,256})@[^\s'",;/<>]{1,256}/giu;
+  /(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqp|amqps|mssql):\/\/[^/\s:@]{1,128}:([^/\s@]{1,256})@[^\s'",;/<>()\[\]{}]{1,256}/giu;
 
+// P-1 fix round 3 (blocker 2): a value that starts with a quote is captured up to the matching closing quote of
+// the same kind on the same line (group 2 or 3; a backslash-escaped character stays inside). Otherwise
+// (no quote, or no closing quote within the bound) today's unquoted rule applies (group 4).
 const CREDENTIAL_ASSIGNMENT_RE =
-  /\b(password|passwd|pwd|passphrase|secret|secret[_-]?key|private[_-]?key|api[_-]?key|credential)['"]?[ \t]{0,16}[:=][ \t]{0,16}['"]?([^\s'"\r\n;,]{8,256})/giu;
+  /\b(password|passwd|pwd|passphrase|secret|secret[_-]?key|private[_-]?key|api[_-]?key|credential)['"]?[ \t]{0,16}[:=][ \t]{0,16}(?:"((?:[^"\\\r\n]|\\.){8,256})"|'((?:[^'\\\r\n]|\\.){8,256})'|['"]?([^\s'"\r\n;,]{8,256}))/giu;
 
 /** True when some match of the global `pattern` has a capture group `group` that is not a placeholder. */
 function hasRealCredentialMatch(pattern: RegExp, field: string, group: number): boolean {
@@ -206,6 +214,26 @@ function hasRealCredentialMatch(pattern: RegExp, field: string, group: number): 
       pattern.lastIndex = 0;
       return true;
     }
+  }
+  return false;
+}
+
+/**
+ * P-1 fix round 3 (blocker 1): like `hasRealCredentialMatch` for the database-URI pattern, but after a
+ * placeholder match the scan resumes at the character after that match's `@`, not after the whole match. The
+ * user part excludes `:`, `/` and `@` and the password part excludes `/` and `@`, so the first `@` of a match is
+ * its separator and no later URI can start before it; the host is nonempty, so the scan always advances.
+ */
+function hasRealDatabaseUriMatch(field: string): boolean {
+  const pattern = DB_CONNECTION_URI_RE;
+  pattern.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(field)) !== null) {
+    if (!isPlaceholderCredential(match[1]!)) {
+      pattern.lastIndex = 0;
+      return true;
+    }
+    pattern.lastIndex = match.index + match[0].indexOf('@') + 1;
   }
   return false;
 }
@@ -230,7 +258,7 @@ function detectSecretRule(field: string): string | undefined {
     }
   }
 
-  if (hasRealCredentialMatch(DB_CONNECTION_URI_RE, field, 1)) {
+  if (hasRealDatabaseUriMatch(field)) {
     return 'database-credentials';
   }
 
@@ -238,7 +266,8 @@ function detectSecretRule(field: string): string | undefined {
   let credMatch: RegExpExecArray | null;
   while ((credMatch = CREDENTIAL_ASSIGNMENT_RE.exec(field)) !== null) {
     const keyName = credMatch[1]!.toLowerCase();
-    const candidate = credMatch[2]!;
+    // Whichever value group matched: double-quoted, single-quoted, or unquoted.
+    const candidate = (credMatch[2] ?? credMatch[3] ?? credMatch[4])!;
     if (isPlaceholderCredential(candidate)) continue;
     if (
       keyName === 'password' ||

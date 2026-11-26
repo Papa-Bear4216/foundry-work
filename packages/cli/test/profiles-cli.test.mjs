@@ -410,13 +410,24 @@ test('child profile import, sensitivity floor vs secret elevation, --collection 
     { stdin: recoveryKey + '\n' },
   );
   assert.equal(colListJson.code, 0, colListJson.stderr);
+  // Fix round 3 (blocker 6): the custom name `me/custom-curated/2024` is hidden without --reveal.
   assert.deepEqual(
-    JSON.parse(colListJson.stdout).collections.map(c => [c.collection, c.itemCount, c.allowChildModelPrompts]),
+    JSON.parse(colListJson.stdout).collections.map(c => [c.collection ?? `custom ${c.customCollection}`, c.itemCount, c.allowChildModelPrompts]),
     [
       ['child/google-takeout/mail/2023', 1, false],
       ['child/google-takeout/mail/2024', 3, true],
-      ['me/custom-curated/2024', 4, false],
+      ['custom 3', 4, false],
     ],
+  );
+  const colListRevealed = await runInline(
+    dir,
+    ['collection', 'list', '--reveal', '--vault', home, '--recovery-key-stdin', '--json'],
+    { stdin: recoveryKey + '\n' },
+  );
+  assert.equal(colListRevealed.code, 0, colListRevealed.stderr);
+  assert.deepEqual(
+    JSON.parse(colListRevealed.stdout).collections.map(c => c.collection),
+    ['child/google-takeout/mail/2023', 'child/google-takeout/mail/2024', 'me/custom-curated/2024'],
   );
 
   const colListText = await runInline(dir, ['collection', 'list', '--vault', home, '--recovery-key-stdin'], {

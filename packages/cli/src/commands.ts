@@ -887,19 +887,23 @@ async function collectionPromptPolicyCommand(ctx: Context): Promise<void> {
       collection,
       allowChildModelPrompts,
     });
+    // Fix round 3 (blocker 6): a custom collection name is user text; the output never echoes it. A default name
+    // (`<profile>/<shipped source>/<year|undated>`) is generic and is echoed.
+    const isDefault = profiles.isDefaultCollectionName(result.collection);
+    const onOff = result.allowChildModelPrompts ? 'on' : 'off';
     if (ctx.request.json) {
       ctx.out({
         ok: true,
-        collection: result.collection,
+        ...(isDefault ? { collection: result.collection } : { customCollection: true }),
         allowChildModelPrompts: result.allowChildModelPrompts,
         kind: result.kind,
         ts: result.ts,
         eventSeq: result.eventSeq,
       });
+    } else if (isDefault) {
+      ctx.out(`Collection "${result.collection}" child model prompts: ${onOff} (event ${result.eventSeq}).\n`);
     } else {
-      ctx.out(
-        `Collection "${result.collection}" child model prompts: ${result.allowChildModelPrompts ? 'on' : 'off'} (event ${result.eventSeq}).\n`,
-      );
+      ctx.out(`Collection (custom) child model prompts: ${onOff} (event ${result.eventSeq}).\n`);
     }
   });
 }
@@ -910,16 +914,25 @@ async function collectionListCommand(ctx: Context): Promise<void> {
     await recoverVaultWriter(ctx, session, id);
     stall(ctx.hooks);
     const { collections } = profiles.listCollections(ctx.paths.vault, { session });
+    // Fix round 3 (blocker 6, rule R14): a custom collection name is user text, printed only with --reveal.
+    // Without it, a custom name is `custom collection N` (N = its 1-based position in the listed order); a
+    // default name (`<profile>/<shipped source>/<year|undated>`) is generic and prints as before.
+    const reveal = ctx.request.reveal === true;
+    const hidden = (name: string) => !reveal && !profiles.isDefaultCollectionName(name);
     if (ctx.request.json) {
-      ctx.out({ collections });
+      ctx.out({
+        collections: collections.map(({ collection, ...rest }, index) =>
+          hidden(collection) ? { customCollection: index + 1, ...rest } : { collection, ...rest },
+        ),
+      });
       return;
     }
     if (collections.length === 0) {
       ctx.out('No collections.\n');
       return;
     }
-    const lines = collections.map(c =>
-      `${c.collection}  profile=${c.profile ?? 'unknown'}  items=${c.itemCount}  child-prompts=${c.allowChildModelPrompts ? 'on' : 'off'}\n`,
+    const lines = collections.map((c, index) =>
+      `${hidden(c.collection) ? `custom collection ${index + 1}` : c.collection}  profile=${c.profile ?? 'unknown'}  items=${c.itemCount}  child-prompts=${c.allowChildModelPrompts ? 'on' : 'off'}\n`,
     );
     ctx.out(lines.join(''));
   });

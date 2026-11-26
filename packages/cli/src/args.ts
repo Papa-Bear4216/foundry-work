@@ -65,7 +65,7 @@ const COMMANDS: Readonly<Record<CommandName, CommandSpec>> = {
   'consent record': { words: 2, positional: 'profile', options: [...COMMON, ...CREDENTIAL, 'json', 'basis', 'note'], keyed: true },
   'consent list': { words: 2, options: [...COMMON, ...CREDENTIAL, 'json', 'reveal'], keyed: true },
   'collection prompt-policy': { words: 2, positional: 'collection', options: [...COMMON, ...CREDENTIAL, 'json', 'child-prompts'], keyed: true },
-  'collection list': { words: 2, options: [...COMMON, ...CREDENTIAL, 'json'], keyed: true },
+  'collection list': { words: 2, options: [...COMMON, ...CREDENTIAL, 'json', 'reveal'], keyed: true },
 };
 
 const STRING_OPTIONS = new Set(['vault', 'timeout', ...FILTERS, ...P1_STRING_OPTIONS]);
@@ -302,6 +302,8 @@ terminal prompt, or from stdin with --passphrase-stdin / --recovery-key-stdin.
   'consent list': 'Usage: foundry consent list [--reveal] [--json] [--passphrase-stdin | --recovery-key-stdin]\n'
     + '  Consent notes are shown as "(note set)" unless you give --reveal.\n',
   'collection prompt-policy': 'Usage: foundry collection prompt-policy <profile>/<collection> --child-prompts <on|off> [--json]\n'
-    + '       [--passphrase-stdin | --recovery-key-stdin]\n',
-  'collection list': 'Usage: foundry collection list [--json] [--passphrase-stdin | --recovery-key-stdin]\n',
+    + '       [--passphrase-stdin | --recovery-key-stdin]\n'
+    + '  The output names a default collection (<profile>/<source>/<year>); a custom name is shown as "(custom)".\n',
+  'collection list': 'Usage: foundry collection list [--reveal] [--json] [--passphrase-stdin | --recovery-key-stdin]\n'
+    + '  Custom collection names are shown as "custom collection N" unless you give --reveal.\n',
 };
