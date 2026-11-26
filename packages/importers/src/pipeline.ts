@@ -18,6 +18,8 @@ import type {
   ImportResult,
   ItemErrorInfo,
   ItemKeyLookup,
+  ResolveCollectionInput,
+  ResolveSensitivityItem,
   SensitivityTier,
   SourceImportCounts,
   UnlockedKeyringLike,
@@ -81,8 +83,10 @@ export interface ImportArchiveOptions {
   itemKeys?: ItemKeyLookup;
   /** Profile name stamped on imported events (defaults to `me`, per A-36). */
   profile?: string;
+  /** Override logical collection assignment per item (defaults to A-36 `<source>/<year>` or `<source>/undated`). */
+  resolveCollection?: (info: ResolveCollectionInput) => string;
   /** Override sensitivity resolution per source/item (defaults to A-36 fixed table). */
-  resolveSensitivity?: (source: string, path: string) => SensitivityTier;
+  resolveSensitivity?: (source: string, path: string, item?: ResolveSensitivityItem) => SensitivityTier;
   /** Optional clock override for deterministic tests. */
   now?: () => Date;
   /** Maximum plaintext byte size per individual item before skipping. Default: 64 MiB. */
@@ -451,7 +455,14 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
         }
 
         const plaintext = read.buffer;
-        const collection = defaultCollectionName(importer.id, rawItem.sourceTs);
+        const collection = options.resolveCollection
+          ? options.resolveCollection({
+              profile,
+              source: importer.id,
+              sourceTs: rawItem.sourceTs,
+              path: rawItem.path,
+            })
+          : defaultCollectionName(importer.id, rawItem.sourceTs);
         const keyId = options.resolveCollectionKeyId(collection);
         if (keyId === undefined) {
           // A-41: no key for this collection yet. Not stored, not an error; the caller creates the key and imports again.
@@ -460,7 +471,14 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
           missingCollections.add(collection);
           continue;
         }
-        const sensitivity = resolveSensitivity(importer.id, rawItem.path);
+        const sensitivity = resolveSensitivity(importer.id, rawItem.path, {
+          plaintext,
+          mime: rawItem.mime,
+          tags: rawItem.tags,
+          profile,
+          collection,
+          sourceTs: rawItem.sourceTs,
+        });
         const idKey = getIdKey(keyId);
         const blobId = computeBlobId(idKey, plaintext);
         const itemKey = computeItemKey(profile, collection, importer.id, rawItem.path, blobId);

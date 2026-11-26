@@ -1,0 +1,424 @@
+// TEST ONLY: end-to-end CLI tests for Work Package P-1 (`profile`, `consent`, `collection`, and `import` wiring).
+// All data, labels, emails, and test credentials are synthetic and dynamically assembled.
+import assert from 'node:assert/strict';
+import { Buffer } from 'node:buffer';
+import { join } from 'node:path';
+import { test } from 'node:test';
+import { filterItemsForModelPrompt, isPromptEligible, loadVaultProfileState } from 'foundry-profiles';
+import { syntheticEmail, writeZipArchive } from 'importers';
+import { decodeRecoveryKey, openVaultReplay } from 'vault';
+import { initVault, PASSPHRASE, runInline, scratch } from './helpers.mjs';
+
+function readImportedEvents(home, recoveryKey) {
+  const vaultDir = join(home, 'vault');
+  const replay = openVaultReplay(vaultDir, { recoveryKey: decodeRecoveryKey(recoveryKey) });
+  try {
+    const out = [];
+    for (const entry of replay.replay()) {
+      if (entry.type === 'blob') break;
+      if (entry.type === 'event' && entry.event.kind === 'item.imported') {
+        out.push(entry.event);
+      }
+    }
+    return out;
+  } finally {
+    replay.close();
+  }
+}
+
+function buildSyntheticPem() {
+  return ['-----BEGIN', 'OPENSSH', 'PRIVATE', 'KEY-----'].join(' ');
+}
+
+async function buildClassifiedMailArchive(dir, name = 'classified-mail.zip') {
+  const fromAddr = syntheticEmail('sender-a');
+  const toAddr = syntheticEmail('recipient-b');
+  const messages = [
+    // 1. Standard personal email in 2024
+    [
+      'From 1001@xxx Mon Mar 04 10:00:00 +0000 2024',
+      `From: <${fromAddr}>`,
+      `To: <${toAddr}>`,
+      'Date: Mon, 04 Mar 2024 10:00:00 +0000',
+      'Subject: Synthetic project update',
+      'Content-Type: text/plain; charset="utf-8"',
+      '',
+      'Routine quarterly planning notes.',
+      '',
+    ].join('\r\n'),
+    // 2. Private tax email in 2023
+    [
+      'From 1002@xxx Tue Apr 11 14:30:00 +0000 2023',
+      `From: <${fromAddr}>`,
+      `To: <${toAddr}>`,
+      'Date: Tue, 11 Apr 2023 14:30:00 +0000',
+      'Subject: Synthetic tax filing summary',
+      'Content-Type: text/plain; charset="utf-8"',
+      '',
+      'Attached Form W-2 Wage and Tax Statement and SSN: 123-45-6789.',
+      '',
+    ].join('\r\n'),
+    // 3. Clinical lab email in 2024
+    [
+      'From 1003@xxx Wed May 15 09:15:00 +0000 2024',
+      `From: <${fromAddr}>`,
+      `To: <${toAddr}>`,
+      'Date: Wed, 15 May 2024 09:15:00 +0000',
+      'Subject: Synthetic clinic portal notice',
+      'Content-Type: text/plain; charset="utf-8"',
+      '',
+      'Laboratory Results ready: Hemoglobin A1c 5.2%, Reference Range 4.0-5.6%, ICD-10-CM Z00.00.',
+      '',
+    ].join('\r\n'),
+    // 4. Secret key email in 2024
+    [
+      'From 1004@xxx Thu Jun 20 16:45:00 +0000 2024',
+      `From: <${fromAddr}>`,
+      `To: <${toAddr}>`,
+      'Date: Thu, 20 Jun 2024 16:45:00 +0000',
+      'Subject: Synthetic backup key material',
+      'Content-Type: text/plain; charset="utf-8"',
+      '',
+      `Key backup header:\r\n${buildSyntheticPem()}\r\n`,
+      '',
+    ].join('\r\n'),
+  ];
+
+  const zipPath = join(dir, name);
+  await writeZipArchive(zipPath, [
+    {
+      path: 'Takeout/Mail/All mail Including Spam and Trash.mbox',
+      data: Buffer.from(messages.join(''), 'utf8'),
+      compression: 'deflate',
+    },
+  ]);
+  return zipPath;
+}
+
+test('profile, consent, and collection --help take no lock and exit 0', async t => {
+  const dir = scratch(t);
+  for (const argv of [
+    ['profile', 'add', '--help'],
+    ['profile', 'list', '--help'],
+    ['consent', 'record', '--help'],
+    ['consent', 'list', '--help'],
+    ['collection', 'prompt-policy', '--help'],
+    ['collection', 'list', '--help'],
+    ['import', '--help'],
+  ]) {
+    const res = await runInline(dir, argv);
+    assert.equal(res.code, 0, argv.join(' '));
+    assert.match(res.stdout, /^Usage: foundry /u);
+    assert.equal(res.kdf, 0);
+  }
+});
+
+test('pre-KDF validation: invalid profiles, personal names, consent for me, and invalid collections fail with 0 KDFs and never echo input', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const planted = 'PLANTED-PERSONAL-TOKEN-9912';
+
+  const invalidRuns = [
+    [['profile', 'add', planted, '--vault', home, '--passphrase-stdin'], 'INVALID_PROFILE'],
+    [['profile', 'add', 'Me', '--vault', home, '--passphrase-stdin'], 'INVALID_PROFILE'],
+    [['profile', 'add', 'partner', '--display-name', `   `, '--vault', home, '--passphrase-stdin'], 'INVALID_DISPLAY_NAME'],
+    [['consent', 'record', 'me', '--basis', 'other', '--vault', home, '--passphrase-stdin'], 'CONSENT_NOT_APPLICABLE'],
+    [['consent', 'record', planted, '--basis', 'other', '--vault', home, '--passphrase-stdin'], 'INVALID_PROFILE'],
+    [['consent', 'record', 'partner', '--basis', planted, '--vault', home, '--passphrase-stdin'], 'INVALID_CONSENT_BASIS'],
+    [['consent', 'record', 'partner', '--basis', 'other', '--note', '  ', '--vault', home, '--passphrase-stdin'], 'INVALID_CONSENT_NOTE'],
+    [['collection', 'prompt-policy', `foundry:${planted}`, '--child-prompts', 'on', '--vault', home, '--passphrase-stdin'], 'INVALID_COLLECTION'],
+    [['collection', 'prompt-policy', 'system', '--child-prompts', 'on', '--vault', home, '--passphrase-stdin'], 'INVALID_COLLECTION'],
+    [['collection', 'prompt-policy', `../${planted}`, '--child-prompts', 'on', '--vault', home, '--passphrase-stdin'], 'INVALID_COLLECTION'],
+    [['import', 'x.zip', '--profile', planted, '--vault', home, '--passphrase-stdin'], 'INVALID_PROFILE'],
+    [['import', 'x.zip', '--collection', `foundry:${planted}`, '--vault', home, '--passphrase-stdin'], 'INVALID_COLLECTION'],
+    [['import', 'x.zip', '--collection', 'system', '--vault', home, '--passphrase-stdin'], 'INVALID_COLLECTION'],
+  ];
+
+  for (const [argv, expectedCode] of invalidRuns) {
+    for (const debugFlag of [[], ['--debug']]) {
+      const res = await runInline(dir, [...argv, ...debugFlag], { stdin: PASSPHRASE + '\n' });
+      assert.equal(res.code, 2, `${argv.join(' ')}: ${res.stderr}`);
+      assert.equal(res.kdf, 0, `${argv.join(' ')} ran KDF before validation`);
+      assert.match(res.stderr, new RegExp(`\\[${expectedCode}\\]\\n$`, 'u'), res.stderr);
+      assert.ok(!res.stderr.includes(planted), `leaked planted input in stderr: ${res.stderr}`);
+      assert.ok(!res.stdout.includes(planted), `leaked planted input in stdout: ${res.stdout}`);
+    }
+  }
+});
+
+test('consent guard on foundry import: non-me profiles fail closed with CONSENT_REQUIRED and zero writes until consent is recorded', async t => {
+  const dir = scratch(t);
+  const { home, recoveryKey } = await initVault(dir);
+  const archive = await buildClassifiedMailArchive(dir);
+
+  // 1. Attempt import under `--profile partner` BEFORE consent -> exit 2 CONSENT_REQUIRED, 0 items stored
+  const denied = await runInline(
+    dir,
+    ['import', archive, '--profile', 'partner', '--vault', home, '--passphrase-stdin'],
+    { stdin: PASSPHRASE + '\n' },
+  );
+  assert.equal(denied.code, 2);
+  assert.equal(denied.kdf, 1);
+  assert.match(denied.stderr, /^foundry: [^\n]+ \[CONSENT_REQUIRED\]\n$/u);
+  assert.doesNotMatch(denied.stderr, /repeating the import is safe|stored so far/u);
+  assert.equal(readImportedEvents(home, recoveryKey).length, 0);
+
+  // 2. Add partner profile + record consent (1 KDF with passphrase, 0 with recovery key)
+  const profAdd = await runInline(
+    dir,
+    ['profile', 'add', 'partner', '--display-name', 'Household Partner', '--vault', home, '--passphrase-stdin', '--json'],
+    { stdin: PASSPHRASE + '\n' },
+  );
+  assert.equal(profAdd.code, 0, profAdd.stderr);
+  assert.equal(profAdd.kdf, 1);
+  assert.equal(JSON.parse(profAdd.stdout).displayName, 'Household Partner');
+
+  const consentRec = await runInline(
+    dir,
+    [
+      'consent',
+      'record',
+      'partner',
+      '--basis',
+      'exported-by-them',
+      '--note',
+      'Provided Takeout archive directly',
+      '--vault',
+      home,
+      '--recovery-key-stdin',
+      '--json',
+    ],
+    { stdin: recoveryKey + '\n' },
+  );
+  assert.equal(consentRec.code, 0, consentRec.stderr);
+  assert.equal(consentRec.kdf, 0);
+  const consentJson = JSON.parse(consentRec.stdout);
+  assert.equal(consentJson.profile, 'partner');
+  assert.equal(consentJson.basis, 'exported-by-them');
+
+  // 3. Import under `--profile partner` now succeeds, assigns `<profile>/<source>/<year>` collections and write-time sensitivity!
+  const allowed = await runInline(
+    dir,
+    ['import', archive, '--profile', 'partner', '--vault', home, '--passphrase-stdin', '--json'],
+    { stdin: PASSPHRASE + '\n' },
+  );
+  assert.equal(allowed.code, 0, allowed.stderr);
+  assert.equal(allowed.kdf, 1);
+  assert.equal(JSON.parse(allowed.stdout).itemsAdded, 4);
+
+  const events = readImportedEvents(home, recoveryKey);
+  assert.equal(events.length, 4);
+  const byCollectionAndTier = events.map(e => [e.profile, e.collection, e.sensitivity]);
+  assert.deepEqual(byCollectionAndTier, [
+    ['partner', 'partner/google-takeout/mail/2024', 'personal'],
+    ['partner', 'partner/google-takeout/mail/2023', 'private'],
+    ['partner', 'partner/google-takeout/mail/2024', 'clinical'],
+    ['partner', 'partner/google-takeout/mail/2024', 'secret'],
+  ]);
+
+  // 4. `profile list`, `consent list`, `collection list`, `search` with filters, `index rebuild`, `vault verify`
+  const pList = await runInline(dir, ['profile', 'list', '--vault', home, '--recovery-key-stdin', '--json'], {
+    stdin: recoveryKey + '\n',
+  });
+  assert.equal(pList.code, 0, pList.stderr);
+  assert.equal(pList.kdf, 0);
+  const profilesOut = JSON.parse(pList.stdout).profiles;
+  assert.deepEqual(
+    profilesOut.map(p => [p.profile, p.displayName, p.consentRecorded]),
+    [
+      ['me', undefined, true],
+      ['partner', 'Household Partner', true],
+    ],
+  );
+
+  const pListText = await runInline(dir, ['profile', 'list', '--vault', home, '--recovery-key-stdin'], {
+    stdin: recoveryKey + '\n',
+  });
+  assert.equal(pListText.code, 0);
+  assert.match(pListText.stdout, /partner \(Household Partner\) {2}\[consent:exported-by-them\]/u);
+
+  const cList = await runInline(dir, ['consent', 'list', '--vault', home, '--recovery-key-stdin'], {
+    stdin: recoveryKey + '\n',
+  });
+  assert.equal(cList.code, 0);
+  assert.match(cList.stdout, /partner {2}exported-by-them {2}Provided Takeout archive directly/u);
+
+  // Search filtered by `--profile partner` finds partner items; `--profile me` finds 0
+  const searchPartner = await runInline(
+    dir,
+    ['search', 'Synthetic', '--profile', 'partner', '--vault', home, '--recovery-key-stdin', '--json'],
+    { stdin: recoveryKey + '\n' },
+  );
+  assert.equal(searchPartner.code, 0, searchPartner.stderr);
+  assert.equal(JSON.parse(searchPartner.stdout).results.length, 4);
+
+  const searchMe = await runInline(
+    dir,
+    ['search', 'Synthetic', '--profile', 'me', '--vault', home, '--recovery-key-stdin', '--json'],
+    { stdin: recoveryKey + '\n' },
+  );
+  assert.equal(searchMe.code, 0, searchMe.stderr);
+  assert.equal(JSON.parse(searchMe.stdout).results.length, 0);
+
+  // Rebuild index and verify vault chain + signatures
+  const rebuilt = await runInline(dir, ['index', 'rebuild', '--vault', home, '--passphrase-stdin'], {
+    stdin: PASSPHRASE + '\n',
+  });
+  assert.equal(rebuilt.code, 0, rebuilt.stderr);
+  assert.equal(rebuilt.kdf, 1);
+
+  const verified = await runInline(dir, ['vault', 'verify', '--vault', home, '--json']);
+  assert.equal(verified.code, 0, verified.stderr);
+  assert.equal(JSON.parse(verified.stdout).ok, true);
+});
+
+test('child profile import, sensitivity floor vs secret elevation, --collection override, and per-collection prompt-policy CLI switch', async t => {
+  const dir = scratch(t);
+  const { home, recoveryKey } = await initVault(dir);
+  const archive = await buildClassifiedMailArchive(dir, 'child-mail.zip');
+
+  // Record guardian consent for `child`
+  const consentRes = await runInline(
+    dir,
+    ['consent', 'record', 'child', '--basis', 'parent-or-guardian', '--vault', home, '--passphrase-stdin'],
+    { stdin: PASSPHRASE + '\n' },
+  );
+  assert.equal(consentRes.code, 0, consentRes.stderr);
+  assert.equal(consentRes.kdf, 1);
+
+  // Import archive under `--profile child` (default collection grain `child/google-takeout/mail/<year>`)
+  const imp = await runInline(
+    dir,
+    ['import', archive, '--profile', 'child', '--vault', home, '--recovery-key-stdin', '--json'],
+    { stdin: recoveryKey + '\n' },
+  );
+  assert.equal(imp.code, 0, imp.stderr);
+  assert.equal(imp.kdf, 0);
+  assert.equal(JSON.parse(imp.stdout).itemsAdded, 4);
+
+  // Also test explicit `--collection` override on `import`
+  const overrideImp = await runInline(
+    dir,
+    [
+      'import',
+      archive,
+      '--profile',
+      'me',
+      '--collection',
+      'me/custom-curated/2024',
+      '--vault',
+      home,
+      '--recovery-key-stdin',
+      '--json',
+    ],
+    { stdin: recoveryKey + '\n' },
+  );
+  assert.equal(overrideImp.code, 0, overrideImp.stderr);
+  assert.equal(JSON.parse(overrideImp.stdout).itemsAdded, 4);
+
+  const events = readImportedEvents(home, recoveryKey);
+  const childEvents = events.filter(e => e.profile === 'child');
+  assert.equal(childEvents.length, 4);
+  // Under `child`, personal/private/clinical items are elevated to `child`, while `secret` stays `secret`!
+  assert.deepEqual(
+    childEvents.map(e => [e.collection, e.sensitivity]),
+    [
+      ['child/google-takeout/mail/2024', 'child'],
+      ['child/google-takeout/mail/2023', 'child'],
+      ['child/google-takeout/mail/2024', 'child'],
+      ['child/google-takeout/mail/2024', 'secret'],
+    ],
+  );
+
+  const meOverrideEvents = events.filter(e => e.profile === 'me');
+  assert.equal(meOverrideEvents.length, 4);
+  assert.ok(meOverrideEvents.every(e => e.collection === 'me/custom-curated/2024'));
+
+  // By default, ALL child items are excluded from model prompts (`CHILD_TIER_EXCLUDED` / `SECRET_TIER_EXCLUDED`)
+  const vaultDir = join(home, 'vault');
+  const credential = { recoveryKey: decodeRecoveryKey(recoveryKey) };
+  const stateDefault = loadVaultProfileState(vaultDir, credential);
+  assert.equal(filterItemsForModelPrompt(childEvents, stateDefault).length, 0);
+  assert.deepEqual(isPromptEligible(childEvents[0], stateDefault), {
+    eligible: false,
+    reason: 'CHILD_TIER_EXCLUDED',
+  });
+  assert.deepEqual(isPromptEligible(childEvents[3], stateDefault), {
+    eligible: false,
+    reason: 'SECRET_TIER_EXCLUDED',
+  });
+
+  // Enable child prompts ONLY on `child/google-takeout/mail/2024` via CLI
+  const enable2024 = await runInline(
+    dir,
+    [
+      'collection',
+      'prompt-policy',
+      'child/google-takeout/mail/2024',
+      '--child-prompts',
+      'on',
+      '--vault',
+      home,
+      '--passphrase-stdin',
+      '--json',
+    ],
+    { stdin: PASSPHRASE + '\n' },
+  );
+  assert.equal(enable2024.code, 0, enable2024.stderr);
+  assert.equal(enable2024.kdf, 1);
+  assert.equal(JSON.parse(enable2024.stdout).allowChildModelPrompts, true);
+  assert.equal(JSON.parse(enable2024.stdout).kind, 'collection.created');
+
+  const stateEnabled = loadVaultProfileState(vaultDir, credential);
+  const eligibleNow = filterItemsForModelPrompt(childEvents, stateEnabled);
+  // The 2 non-secret 2024 items in `child/google-takeout/mail/2024` become eligible;
+  // the 2023 collection item and the 2024 `secret` item remain excluded!
+  assert.equal(eligibleNow.length, 2);
+  assert.ok(eligibleNow.every(e => e.collection === 'child/google-takeout/mail/2024' && e.sensitivity === 'child'));
+
+  // Verify `collection list` (JSON + text)
+  const colListJson = await runInline(
+    dir,
+    ['collection', 'list', '--vault', home, '--recovery-key-stdin', '--json'],
+    { stdin: recoveryKey + '\n' },
+  );
+  assert.equal(colListJson.code, 0, colListJson.stderr);
+  assert.deepEqual(
+    JSON.parse(colListJson.stdout).collections.map(c => [c.collection, c.itemCount, c.allowChildModelPrompts]),
+    [
+      ['child/google-takeout/mail/2023', 1, false],
+      ['child/google-takeout/mail/2024', 3, true],
+      ['me/custom-curated/2024', 4, false],
+    ],
+  );
+
+  const colListText = await runInline(dir, ['collection', 'list', '--vault', home, '--recovery-key-stdin'], {
+    stdin: recoveryKey + '\n',
+  });
+  assert.equal(colListText.code, 0);
+  assert.match(colListText.stdout, /child\/google-takeout\/mail\/2024 {2}profile=child {2}items=3 {2}child-prompts=on/u);
+
+  // Switch `child/google-takeout/mail/2024` back OFF via CLI -> appends `annotation.added` and excludes child items again!
+  const disable2024 = await runInline(
+    dir,
+    [
+      'collection',
+      'prompt-policy',
+      'child/google-takeout/mail/2024',
+      '--child-prompts',
+      'off',
+      '--vault',
+      home,
+      '--recovery-key-stdin',
+      '--json',
+    ],
+    { stdin: recoveryKey + '\n' },
+  );
+  assert.equal(disable2024.code, 0, disable2024.stderr);
+  assert.equal(disable2024.kdf, 0);
+  assert.equal(JSON.parse(disable2024.stdout).allowChildModelPrompts, false);
+  assert.equal(JSON.parse(disable2024.stdout).kind, 'annotation.added');
+
+  const stateDisabled = loadVaultProfileState(vaultDir, credential);
+  assert.equal(filterItemsForModelPrompt(childEvents, stateDisabled).length, 0);
+});

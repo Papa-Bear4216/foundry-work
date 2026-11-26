@@ -1,5 +1,5 @@
 /**
- * Command table and argument parsing (design 4.2, 4.3, 4.4).
+ * Command table and argument parsing (design 4.2, 4.3, 4.4; P-1 profile/consent/collection commands).
  *
  * Order: a loose parse finds the command words, `guardSecretInput` runs on the tokens and the environment, and only
  * then the strict parse runs. Usage errors never quote argv text (an argument could be a mistyped secret).
@@ -9,13 +9,31 @@ import type { ParseArgsOptionConfig } from 'node:util';
 import { guardSecretInput } from 'vault';
 import { usage } from './errors.ts';
 
-export type CommandName = 'init' | 'import' | 'search' | 'vault verify' | 'index rebuild' | 'vault reset-passphrase';
+export type CommandName =
+  | 'init'
+  | 'import'
+  | 'search'
+  | 'vault verify'
+  | 'index rebuild'
+  | 'vault reset-passphrase'
+  | 'profile add'
+  | 'profile list'
+  | 'consent record'
+  | 'consent list'
+  | 'collection prompt-policy'
+  | 'collection list';
 
 /** Seconds (design 4.8). */
 export const DEFAULT_TIMEOUTS: Readonly<Record<CommandName, number>> = {
   'init': 120,
   'vault reset-passphrase': 120,
   'search': 120,
+  'profile add': 120,
+  'profile list': 120,
+  'consent record': 120,
+  'consent list': 120,
+  'collection prompt-policy': 120,
+  'collection list': 120,
   'vault verify': 3600,
   'import': 21600,
   'index rebuild': 21600,
@@ -25,7 +43,7 @@ export const MAX_TIMEOUT_SECONDS = 604800;
 
 interface CommandSpec {
   words: number;
-  positional?: 'path' | 'query';
+  positional?: 'path' | 'query' | 'profile' | 'collection';
   options: readonly string[];
   keyed: boolean;
 }
@@ -33,19 +51,26 @@ interface CommandSpec {
 const COMMON = ['vault', 'timeout', 'debug', 'help'] as const;
 const CREDENTIAL = ['passphrase-stdin', 'recovery-key-stdin'] as const;
 const FILTERS = ['from', 'until', 'source', 'profile', 'collection', 'tier', 'limit'] as const;
+const P1_STRING_OPTIONS = ['display-name', 'basis', 'note', 'child-prompts'] as const;
 
 const COMMANDS: Readonly<Record<CommandName, CommandSpec>> = {
   'init': { words: 1, options: [...COMMON, 'passphrase-stdin'], keyed: false },
-  'import': { words: 1, positional: 'path', options: [...COMMON, ...CREDENTIAL, 'json'], keyed: true },
+  'import': { words: 1, positional: 'path', options: [...COMMON, ...CREDENTIAL, 'json', 'profile', 'collection'], keyed: true },
   'search': { words: 1, positional: 'query', options: [...COMMON, ...CREDENTIAL, 'json', ...FILTERS], keyed: true },
   'vault verify': { words: 2, options: [...COMMON, 'json'], keyed: false },
   'index rebuild': { words: 2, options: [...COMMON, ...CREDENTIAL, 'json'], keyed: true },
   'vault reset-passphrase': { words: 2, options: [...COMMON, ...CREDENTIAL], keyed: false },
+  'profile add': { words: 2, positional: 'profile', options: [...COMMON, ...CREDENTIAL, 'json', 'display-name'], keyed: true },
+  'profile list': { words: 2, options: [...COMMON, ...CREDENTIAL, 'json'], keyed: true },
+  'consent record': { words: 2, positional: 'profile', options: [...COMMON, ...CREDENTIAL, 'json', 'basis', 'note'], keyed: true },
+  'consent list': { words: 2, options: [...COMMON, ...CREDENTIAL, 'json'], keyed: true },
+  'collection prompt-policy': { words: 2, positional: 'collection', options: [...COMMON, ...CREDENTIAL, 'json', 'child-prompts'], keyed: true },
+  'collection list': { words: 2, options: [...COMMON, ...CREDENTIAL, 'json'], keyed: true },
 };
 
-const STRING_OPTIONS = new Set(['vault', 'timeout', ...FILTERS]);
+const STRING_OPTIONS = new Set(['vault', 'timeout', ...FILTERS, ...P1_STRING_OPTIONS]);
 const ALL_OPTIONS: Record<string, ParseArgsOptionConfig> = Object.fromEntries(
-  [...new Set([...COMMON, ...CREDENTIAL, ...FILTERS, 'json', 'version'])]
+  [...new Set([...COMMON, ...CREDENTIAL, ...FILTERS, ...P1_STRING_OPTIONS, 'json', 'version'])]
     .map(name => [name, { type: STRING_OPTIONS.has(name) ? 'string' : 'boolean' } as ParseArgsOptionConfig]),
 );
 ALL_OPTIONS.help = { type: 'boolean', short: 'h' };
@@ -74,6 +99,14 @@ export type ParsedCommand =
     recoveryKeyStdin: boolean;
     path?: string;
     query?: string;
+    targetProfile?: string;
+    targetCollection?: string;
+    importProfile?: string;
+    importCollection?: string;
+    displayName?: string;
+    basis?: string;
+    note?: string;
+    childPrompts?: boolean;
     filters: SearchFilters;
   };
 
@@ -82,6 +115,9 @@ function commandOf(positionals: readonly string[]): CommandName | undefined {
   if (first === 'init' || first === 'import' || first === 'search') return first;
   if (first === 'vault' && (second === 'verify' || second === 'reset-passphrase')) return `vault ${second}`;
   if (first === 'index' && second === 'rebuild') return 'index rebuild';
+  if (first === 'profile' && (second === 'add' || second === 'list')) return `profile ${second}`;
+  if (first === 'consent' && (second === 'record' || second === 'list')) return `consent ${second}`;
+  if (first === 'collection' && (second === 'prompt-policy' || second === 'list')) return `collection ${second}`;
   return undefined;
 }
 
@@ -103,6 +139,25 @@ function dateOption(raw: string | boolean | undefined, name: string): string | u
 
 function textOption(raw: string | boolean | undefined): string | undefined {
   return typeof raw === 'string' ? raw : undefined;
+}
+
+function childPromptsOption(raw: string | boolean | undefined): boolean {
+  if (raw === 'on') return true;
+  if (raw === 'off') return false;
+  throw usage('--child-prompts needs on or off');
+}
+
+function missingPositionalMessage(kind: NonNullable<CommandSpec['positional']>): string {
+  switch (kind) {
+    case 'path':
+      return 'name the archive file or folder to import';
+    case 'query':
+      return 'give a search query';
+    case 'profile':
+      return 'give a profile identifier (me, partner, child or other)';
+    case 'collection':
+      return 'give a collection name';
+  }
 }
 
 /** Parse argv (without the node and script paths). Throws `CliError` (exit 1) or the guard's plain `Error`. */
@@ -137,8 +192,11 @@ export function parseCommandLine(argv: readonly string[], env: Readonly<Record<s
   const { values, positionals } = parsed;
   if (values.help === true) return { kind: 'help', command };
   const operand = positionals[spec.words];
-  if (spec.positional && (operand === undefined || operand === '')) {
-    throw usage(spec.positional === 'path' ? 'name the archive file or folder to import' : 'give a search query');
+  if (spec.positional) {
+    const missing =
+      operand === undefined ||
+      ((spec.positional === 'path' || spec.positional === 'query') && operand === '');
+    if (missing) throw usage(missingPositionalMessage(spec.positional));
   }
   if (positionals.length > spec.words + (spec.positional ? 1 : 0)) throw usage('too many arguments');
   const passphraseStdin = values['passphrase-stdin'] === true;
@@ -148,6 +206,13 @@ export function parseCommandLine(argv: readonly string[], env: Readonly<Record<s
   }
   const vault = textOption(values.vault);
   if (values.vault !== undefined && !vault) throw usage('--vault needs a folder');
+
+  const basis = command === 'consent record' ? textOption(values.basis) : undefined;
+  if (command === 'consent record' && basis === undefined) {
+    throw usage('--basis is required; see `foundry consent record --help`');
+  }
+  const childPrompts =
+    command === 'collection prompt-policy' ? childPromptsOption(values['child-prompts']) : undefined;
 
   return {
     kind: 'run',
@@ -160,6 +225,14 @@ export function parseCommandLine(argv: readonly string[], env: Readonly<Record<s
     recoveryKeyStdin,
     path: spec.positional === 'path' ? operand : undefined,
     query: spec.positional === 'query' ? operand : undefined,
+    targetProfile: spec.positional === 'profile' ? operand : undefined,
+    targetCollection: spec.positional === 'collection' ? operand : undefined,
+    importProfile: command === 'import' ? textOption(values.profile) : undefined,
+    importCollection: command === 'import' ? textOption(values.collection) : undefined,
+    displayName: command === 'profile add' ? textOption(values['display-name']) : undefined,
+    basis,
+    note: command === 'consent record' ? textOption(values.note) : undefined,
+    childPrompts,
     filters: command !== 'search' ? {} : {
       from: dateOption(values.from, 'from'),
       until: dateOption(values.until, 'until'),
@@ -180,29 +253,45 @@ export const HELP: Readonly<Record<CommandName | 'main', string>> = {
   main: `Usage: foundry <command> [options]
 
 Commands:
-  init                     Create a new vault (asks for a new passphrase).
-  import <archive|folder>  Import a Takeout archive, then update the index.
-  search <query>           Search the index.
-  vault verify             Check the vault without a key.
-  vault reset-passphrase   Set a new passphrase with the recovery key.
-  index rebuild            Build a new index from the vault.
+  init                                      Create a new vault (asks for a new passphrase).
+  import <archive|folder>                   Import a Takeout archive, then update the index.
+  search <query>                            Search the index.
+  profile add <me|partner|child|other>      Add or update a generic profile in the vault.
+  profile list                              List profiles recorded in the vault.
+  consent record <partner|child|other>      Record consent for storing another person's data.
+  consent list                              List active and historical consent records.
+  collection prompt-policy <collection>     Switch child-tier model prompt inclusion on or off.
+  collection list                           List collections and their prompt policies.
+  vault verify                              Check the vault without a key.
+  vault reset-passphrase                    Set a new passphrase with the recovery key.
+  index rebuild                             Build a new index from the vault.
 
 Global options:
   --vault <dir>      Foundry home folder. Default: $FOUNDRY_HOME, else <home>/Foundry.
   --timeout <s>      Wall-clock limit in seconds (1 to 604800).
   --debug            Show error details (never secrets).
-  --json             Machine output (import, search, vault verify, index rebuild).
+  --json             Machine output.
   --help, --version
 
 Secrets are never read from arguments or environment variables. They come from a
 terminal prompt, or from stdin with --passphrase-stdin / --recovery-key-stdin.
 `,
   'init': 'Usage: foundry init [--vault <dir>] [--passphrase-stdin]\n',
-  'import': 'Usage: foundry import <archive.zip|first-part.zip|folder> [--json] [--passphrase-stdin | --recovery-key-stdin]\n',
+  'import': 'Usage: foundry import <archive.zip|first-part.zip|folder> [--profile <me|partner|child|other>] [--collection <name>]\n'
+    + '       [--json] [--passphrase-stdin | --recovery-key-stdin]\n',
   'search': 'Usage: foundry search <query> [--from <date>] [--until <date>] [--source <s>] [--profile <p>]\n'
     + '       [--collection <c>] [--tier <t>] [--limit <1-1000>] [--json] [--passphrase-stdin | --recovery-key-stdin]\n',
   'vault verify': 'Usage: foundry vault verify [--json]\n',
   'index rebuild': 'Usage: foundry index rebuild [--json] [--passphrase-stdin | --recovery-key-stdin]\n',
   'vault reset-passphrase': 'Usage: foundry vault reset-passphrase [--recovery-key-stdin] [--passphrase-stdin]\n'
     + '  With both flags, stdin line 1 is the recovery key and line 2 the new passphrase.\n',
+  'profile add': 'Usage: foundry profile add <me|partner|child|other> [--display-name <name>] [--json]\n'
+    + '       [--passphrase-stdin | --recovery-key-stdin]\n',
+  'profile list': 'Usage: foundry profile list [--json] [--passphrase-stdin | --recovery-key-stdin]\n',
+  'consent record': 'Usage: foundry consent record <partner|child|other> --basis <exported-by-them|parent-or-guardian|shared-conversation|other>\n'
+    + '       [--note <text>] [--json] [--passphrase-stdin | --recovery-key-stdin]\n',
+  'consent list': 'Usage: foundry consent list [--json] [--passphrase-stdin | --recovery-key-stdin]\n',
+  'collection prompt-policy': 'Usage: foundry collection prompt-policy <collection> --child-prompts <on|off> [--json]\n'
+    + '       [--passphrase-stdin | --recovery-key-stdin]\n',
+  'collection list': 'Usage: foundry collection list [--json] [--passphrase-stdin | --recovery-key-stdin]\n',
 };

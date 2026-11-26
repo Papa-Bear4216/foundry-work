@@ -32,15 +32,54 @@ test('location rule: --vault, then FOUNDRY_HOME, then <home>/Foundry', () => {
 
 test('commands, default timeouts, --timeout bounds and filters', () => {
   assert.deepEqual(DEFAULT_TIMEOUTS, {
-    'init': 120, 'vault reset-passphrase': 120, 'search': 120, 'vault verify': 3600, 'import': 21600, 'index rebuild': 21600,
+    'init': 120,
+    'vault reset-passphrase': 120,
+    'search': 120,
+    'profile add': 120,
+    'profile list': 120,
+    'consent record': 120,
+    'consent list': 120,
+    'collection prompt-policy': 120,
+    'collection list': 120,
+    'vault verify': 3600,
+    'import': 21600,
+    'index rebuild': 21600,
   });
-  for (const [argv, command] of [[['init'], 'init'], [['import', 'a.zip'], 'import'], [['search', 'q'], 'search'],
-    [['vault', 'verify'], 'vault verify'], [['index', 'rebuild'], 'index rebuild'],
-    [['vault', 'reset-passphrase'], 'vault reset-passphrase']]) {
+  for (const [argv, command] of [
+    [['init'], 'init'],
+    [['import', 'a.zip'], 'import'],
+    [['search', 'q'], 'search'],
+    [['vault', 'verify'], 'vault verify'],
+    [['index', 'rebuild'], 'index rebuild'],
+    [['vault', 'reset-passphrase'], 'vault reset-passphrase'],
+    [['profile', 'add', 'me'], 'profile add'],
+    [['profile', 'list'], 'profile list'],
+    [['consent', 'record', 'partner', '--basis', 'exported-by-them'], 'consent record'],
+    [['consent', 'list'], 'consent list'],
+    [['collection', 'prompt-policy', 'child/google-takeout/mail/2024', '--child-prompts', 'on'], 'collection prompt-policy'],
+    [['collection', 'list'], 'collection list'],
+  ]) {
     const parsed = parse(argv);
     assert.equal(parsed.command, command);
     assert.equal(parsed.timeoutSeconds, DEFAULT_TIMEOUTS[command]);
   }
+  const pAdd = parse(['profile', 'add', 'partner', '--display-name', 'Partner Label', '--json']);
+  assert.equal(pAdd.targetProfile, 'partner');
+  assert.equal(pAdd.displayName, 'Partner Label');
+  assert.equal(pAdd.json, true);
+
+  const cRec = parse(['consent', 'record', 'child', '--basis', 'parent-or-guardian', '--note', 'Guardian export']);
+  assert.equal(cRec.targetProfile, 'child');
+  assert.equal(cRec.basis, 'parent-or-guardian');
+  assert.equal(cRec.note, 'Guardian export');
+
+  const pol = parse(['collection', 'prompt-policy', 'child/google-takeout/mail/2024', '--child-prompts', 'off']);
+  assert.equal(pol.targetCollection, 'child/google-takeout/mail/2024');
+  assert.equal(pol.childPrompts, false);
+
+  const imp = parse(['import', 'archive.zip', '--profile', 'partner', '--collection', 'partner/custom/2024']);
+  assert.equal(imp.importProfile, 'partner');
+  assert.equal(imp.importCollection, 'partner/custom/2024');
   assert.equal(parse(['vault', 'verify', '--timeout', '1']).timeoutSeconds, 1);
   assert.equal(parse(['vault', 'verify', '--timeout', '604800']).timeoutSeconds, 604800);
   for (const bad of ['0', '604801', '1.5', '-3', 'abc']) {
@@ -64,6 +103,9 @@ test('usage errors exit 1 and never quote argv text', () => {
     [], ['frobnicate'], ['search'], ['import'], ['vault', 'verify', '--json', `--x${marker}`],
     ['search', 'q', '--limit', '0'], ['search', 'q', '--limit', '1001'], ['search', 'q', '--from', marker],
     ['import', 'a', '--passphrase-stdin', '--recovery-key-stdin'], ['init', '--json'], ['vault', 'verify', '--timeout'],
+    ['profile'], ['profile', 'add'], ['consent', 'record'], ['consent', 'record', 'partner'],
+    ['collection', 'prompt-policy'], ['collection', 'prompt-policy', 'child/a/2024'],
+    ['collection', 'prompt-policy', 'child/a/2024', '--child-prompts', marker],
   ];
   for (const argv of cases) {
     assert.throws(() => parse(argv), error => {
@@ -77,7 +119,12 @@ test('usage errors exit 1 and never quote argv text', () => {
 
 test('the secret guard runs first: secret options, extra positionals and secret environment names are refused', () => {
   for (const argv of [['init', '--passphrase', 'x'], ['search', 'q', '--recovery-key=x'], ['import', '--password', 'x', 'a'],
-    ['vault', 'verify', 'surplus'], ['search', 'q', 'extra'], ['init', '--secret']]) {
+    ['vault', 'verify', 'surplus'], ['search', 'q', 'extra'], ['init', '--secret'],
+    ['profile', 'add', 'me', 'surplus-secret'], ['profile', 'list', 'surplus-secret'],
+    ['consent', 'record', 'partner', 'surplus-secret', '--basis', 'other'],
+    ['consent', 'list', 'surplus-secret'],
+    ['collection', 'prompt-policy', 'child/a/2024', 'surplus-secret', '--child-prompts', 'on'],
+    ['collection', 'list', 'surplus-secret']]) {
     assert.throws(() => parse(argv), error => !(error instanceof CliError) && /secrets/iu.test(error.message));
   }
   for (const name of ['FOUNDRY_PASSPHRASE', 'FOUNDRY_RECOVERY_KEY', 'VAULT_TOKEN']) {
@@ -133,7 +180,12 @@ test('error mapping: typed codes give one fixed line; messages of library errors
   const cases = [
     [typed('VaultFormatError', 'AUTH'), 'AUTH'], [typed('VaultFormatError', 'INVENTORY'), 'INVENTORY'],
     [typed('IndexError', 'PROJECTION'), 'PROJECTION'], [typed('ArchiveError', 'CRC_MISMATCH'), 'CRC_MISMATCH'],
-    [typed('ImportError', 'BUSY'), 'BUSY'], [Object.assign(new Error(marker), { code: 'ENOSPC' }), 'IO'],
+    [typed('ImportError', 'BUSY'), 'BUSY'],
+    [typed('ProfileError', 'INVALID_PROFILE'), 'INVALID_PROFILE'],
+    [typed('ProfileError', 'CONSENT_REQUIRED'), 'CONSENT_REQUIRED'],
+    [typed('ProfileError', 'CONSENT_NOT_APPLICABLE'), 'CONSENT_NOT_APPLICABLE'],
+    [typed('ProfileError', 'INVALID_COLLECTION'), 'INVALID_COLLECTION'],
+    [Object.assign(new Error(marker), { code: 'ENOSPC' }), 'IO'],
     [new Error('Invalid recovery key format.'), 'RECOVERY_KEY_FORMAT'], [new TypeError(marker), 'INTERNAL'],
     [new CliError('TIMEOUT', 'passed its limit'), 'TIMEOUT'],
   ];

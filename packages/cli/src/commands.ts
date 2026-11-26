@@ -12,13 +12,14 @@ import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import type { IndexStoreOptions } from 'foundry-index';
+import type { ProfileId, UserSensitivityRule } from 'foundry-profiles';
 import type { ImportResult } from 'importers';
 import type { UnlockSession } from 'vault';
 import type { CommandName, SearchFilters } from './args.ts';
 import { CliError, debugText, errorLine, isRecoveryFormatError, mapError } from './errors.ts';
 import { homeSystemError, withFixedFileErrors, withHomeSystemErrors } from './files.ts';
 
-export const PROFILE = 'me';
+export const PROFILE: ProfileId = 'me';
 /** `ensureCollectionKeys` accepts at most this many distinct names per call. */
 export const MAX_NAMES_PER_CALL = 4096;
 
@@ -35,6 +36,14 @@ export interface CommandRequest {
   json: boolean;
   path?: string;
   query?: string;
+  targetProfile?: string;
+  targetCollection?: string;
+  importProfile?: string;
+  importCollection?: string;
+  displayName?: string;
+  basis?: string;
+  note?: string;
+  childPrompts?: boolean;
   filters: SearchFilters;
   /** Keyed commands: which secret unlocks the vault. */
   credential?: 'passphrase' | 'recovery';
@@ -526,9 +535,19 @@ const IMPORT_BATCH_MAX_BYTES = 1024 * 1024;
 const IMPORT_BATCH_MAX_ITEMS = 8;
 const IMPORT_GC_EVERY_BATCHES = 32;
 
-async function importRun(ctx: Context, session: UnlockSession, id: string, options: IndexStoreOptions, parts: ArchiveParts) {
+async function importRun(
+  ctx: Context,
+  session: UnlockSession,
+  id: string,
+  options: IndexStoreOptions,
+  parts: ArchiveParts,
+  profile: ProfileId,
+  explicitCollection: string | undefined,
+  sensitivityRules: readonly UserSensitivityRule[],
+) {
   const vault = await import('vault');
   const importers = await import('importers');
+  const profiles = await import('foundry-profiles');
   const { openItemKeyLookup } = await import('foundry-index');
   const unlocked = vault.decodeKeyring(readKeyring(ctx), { session }, id);
   let writer: ReturnType<typeof vault.VaultWriter.open> | undefined;
@@ -551,10 +570,32 @@ async function importRun(ctx: Context, session: UnlockSession, id: string, optio
     lookup = openItemKeyLookup(options);
     stall(ctx.hooks);
     return await importers.importArchive({
-      archive, writer: counting, importers: importers.DEFAULT_IMPORTERS, profile: PROFILE,
-      resolveCollectionKeyId: name => vault.collectionKeyId(unlocked, PROFILE, name),
-      vaultDir: ctx.paths.vault, unlocked, itemKeys: lookup,
-      batchMaxBytes: IMPORT_BATCH_MAX_BYTES, batchMaxItems: IMPORT_BATCH_MAX_ITEMS,
+      archive,
+      writer: counting,
+      importers: importers.DEFAULT_IMPORTERS,
+      profile,
+      resolveCollection: ({ profile: itemProfile, source, sourceTs }) =>
+        explicitCollection ?? profiles.defaultCollectionForItem(itemProfile as ProfileId, source, sourceTs),
+      resolveCollectionKeyId: name => vault.collectionKeyId(unlocked, profile, name),
+      resolveSensitivity: (source, itemPath, item) =>
+        profiles.classifySensitivity({
+          profile,
+          collection:
+            item?.collection ??
+            explicitCollection ??
+            profiles.defaultCollectionForItem(profile, source, item?.sourceTs),
+          source,
+          path: itemPath,
+          plaintext: item?.plaintext,
+          mime: item?.mime,
+          tags: item?.tags,
+          userRules: sensitivityRules,
+        }).sensitivity,
+      vaultDir: ctx.paths.vault,
+      unlocked,
+      itemKeys: lookup,
+      batchMaxBytes: IMPORT_BATCH_MAX_BYTES,
+      batchMaxItems: IMPORT_BATCH_MAX_ITEMS,
       // Not called while `itemKeys` is given; bound to this run's unlocked keyring for type safety.
       readVaultRecord: (directory, location) => vault.readVaultRecord(directory, location, unlocked),
     });
@@ -578,25 +619,47 @@ async function importRun(ctx: Context, session: UnlockSession, id: string, optio
 }
 
 async function importCommand(ctx: Context): Promise<void> {
+  const profiles = await import('foundry-profiles');
+  const profile: ProfileId =
+    ctx.request.importProfile === undefined
+      ? PROFILE
+      : profiles.assertProfileId(ctx.request.importProfile);
+  const explicitCollection =
+    ctx.request.importCollection === undefined
+      ? undefined
+      : profiles.assertUserCollectionName(ctx.request.importCollection);
+
   await keyed(ctx, async (session, id) => {
+    // An earlier command may have stopped inside a segment seal (a pending HEAD). The read-only replay of the index
+    // update or profile state refuses that state; only the vault writer recovers it. So: writer first.
+    await recoverVaultWriter(ctx, session, id);
+    const profileState = profiles.loadVaultProfileState(ctx.paths.vault, { session });
+    profiles.assertImportConsent(profileState, profile);
+
     const options = await indexOptions(ctx, session);
     const { updateIndex } = await import('foundry-index');
     const { ensureCollectionKeys } = await import('vault');
-    // An earlier command may have stopped inside a segment seal (a pending HEAD). The read-only replay of the index
-    // update refuses that state; only the vault writer recovers it. So: writer first, then the catch-up update.
-    await recoverVaultWriter(ctx, session, id);
     updateIndex(options); // catch-up after an earlier crash: the item-key lookup needs a current index
     const path = ctx.request.path!;
     const parts = await resolveArchiveParts(path);
     const stamps = await stampParts(parts);
     ctx.importStage = 'runA';
-    const runA = await importRun(ctx, session, id, options, parts);
+    const runA = await importRun(
+      ctx,
+      session,
+      id,
+      options,
+      parts,
+      profile,
+      explicitCollection,
+      profileState.sensitivityRules,
+    );
     let runB: ImportResult | undefined;
     let collectionsCreated = 0;
     if (runA.missingCollections.length > 0) {
       ctx.importStage = 'between';
       for (const slice of nameSlices(runA.missingCollections)) {
-        collectionsCreated += ensureCollectionKeys(ctx.paths.keyring, id, { session }, PROFILE, slice).created;
+        collectionsCreated += ensureCollectionKeys(ctx.paths.keyring, id, { session }, profile, slice).created;
       }
       if (ctx.hooks.failBetweenRunsUpdate) throw hookError('index update between runs', secretTexts(ctx.request.secrets));
       updateIndex(options);
@@ -604,7 +667,16 @@ async function importCommand(ctx: Context): Promise<void> {
       await checkArchiveUnchanged(path, stamps); // before Run B opens or stores anything
       ctx.importStage = 'runB';
       if (ctx.hooks.failRunB) throw hookError('run B', secretTexts(ctx.request.secrets));
-      runB = await importRun(ctx, session, id, options, parts);
+      runB = await importRun(
+        ctx,
+        session,
+        id,
+        options,
+        parts,
+        profile,
+        explicitCollection,
+        profileState.sensitivityRules,
+      );
       if (runB.missingCollections.length > 0) {
         throw new CliError('INTERNAL', 'internal error: the second import run still found collections without a key');
       }
@@ -629,6 +701,157 @@ async function importCommand(ctx: Context): Promise<void> {
   });
 }
 
+async function profileAddCommand(ctx: Context): Promise<void> {
+  const profiles = await import('foundry-profiles');
+  const profile = profiles.assertProfileId(ctx.request.targetProfile);
+  const displayName =
+    ctx.request.displayName === undefined
+      ? undefined
+      : profiles.assertDisplayName(ctx.request.displayName);
+
+  await keyed(ctx, async (session, id) => {
+    await recoverVaultWriter(ctx, session, id);
+    stall(ctx.hooks);
+    const result = profiles.addProfile(ctx.paths.vault, { session }, { profile, displayName });
+    if (ctx.request.json) {
+      ctx.out({
+        ok: true,
+        profile: result.profile,
+        ...(result.displayName !== undefined ? { displayName: result.displayName } : {}),
+        ts: result.ts,
+        eventSeq: result.eventSeq,
+      });
+    } else {
+      ctx.out(`Profile "${result.profile}" saved (event ${result.eventSeq}).\n`);
+    }
+  });
+}
+
+async function profileListCommand(ctx: Context): Promise<void> {
+  const profiles = await import('foundry-profiles');
+  await keyed(ctx, async (session, id) => {
+    await recoverVaultWriter(ctx, session, id);
+    stall(ctx.hooks);
+    const { profiles: items, destroyedProfileCount } = profiles.listProfiles(ctx.paths.vault, { session });
+    if (ctx.request.json) {
+      ctx.out({ profiles: items, erasedProfileKeys: destroyedProfileCount });
+      return;
+    }
+    if (items.length === 0) {
+      ctx.out('No profiles recorded.\n');
+      return;
+    }
+    const lines = items.map(p => {
+      const label = p.displayName !== undefined ? ` (${p.displayName})` : '';
+      const consent =
+        p.profile === 'me'
+          ? 'owner'
+          : p.consentRecorded
+            ? `consent:${p.consentBasis ?? 'recorded'}`
+            : 'consent:missing';
+      return `${p.profile}${label}  [${consent}]\n`;
+    });
+    ctx.out(lines.join(''));
+  });
+}
+
+async function consentRecordCommand(ctx: Context): Promise<void> {
+  const profiles = await import('foundry-profiles');
+  const profile = profiles.assertConsentSubjectProfile(ctx.request.targetProfile);
+  const basis = profiles.assertConsentBasis(ctx.request.basis);
+  const note =
+    ctx.request.note === undefined ? undefined : profiles.assertConsentNote(ctx.request.note);
+
+  await keyed(ctx, async (session, id) => {
+    await recoverVaultWriter(ctx, session, id);
+    stall(ctx.hooks);
+    const result = profiles.recordConsent(ctx.paths.vault, { session }, { profile, basis, note });
+    if (ctx.request.json) {
+      ctx.out({
+        ok: true,
+        profile: result.profile,
+        basis: result.basis,
+        ...(result.note !== undefined ? { note: result.note } : {}),
+        ts: result.ts,
+        eventSeq: result.eventSeq,
+      });
+    } else {
+      ctx.out(`Recorded consent for profile "${result.profile}" (${result.basis}, event ${result.eventSeq}).\n`);
+    }
+  });
+}
+
+async function consentListCommand(ctx: Context): Promise<void> {
+  const profiles = await import('foundry-profiles');
+  await keyed(ctx, async (session, id) => {
+    await recoverVaultWriter(ctx, session, id);
+    stall(ctx.hooks);
+    const result = profiles.listConsents(ctx.paths.vault, { session });
+    if (ctx.request.json) {
+      ctx.out({ consents: result.consents, history: result.history });
+      return;
+    }
+    if (result.consents.length === 0) {
+      ctx.out('No consent records.\n');
+      return;
+    }
+    const lines = result.consents.map(c =>
+      `${c.ts}  ${c.profile}  ${c.basis}${c.note !== undefined ? `  ${c.note}` : ''}  (event ${c.eventSeq})\n`,
+    );
+    ctx.out(lines.join(''));
+  });
+}
+
+async function collectionPromptPolicyCommand(ctx: Context): Promise<void> {
+  const profiles = await import('foundry-profiles');
+  const collection = profiles.assertUserCollectionName(ctx.request.targetCollection);
+  const allowChildModelPrompts = Boolean(ctx.request.childPrompts);
+
+  await keyed(ctx, async (session, id) => {
+    await recoverVaultWriter(ctx, session, id);
+    stall(ctx.hooks);
+    const result = profiles.setCollectionPromptPolicy(ctx.paths.vault, { session }, {
+      collection,
+      allowChildModelPrompts,
+    });
+    if (ctx.request.json) {
+      ctx.out({
+        ok: true,
+        collection: result.collection,
+        allowChildModelPrompts: result.allowChildModelPrompts,
+        kind: result.kind,
+        ts: result.ts,
+        eventSeq: result.eventSeq,
+      });
+    } else {
+      ctx.out(
+        `Collection "${result.collection}" child model prompts: ${result.allowChildModelPrompts ? 'on' : 'off'} (event ${result.eventSeq}).\n`,
+      );
+    }
+  });
+}
+
+async function collectionListCommand(ctx: Context): Promise<void> {
+  const profiles = await import('foundry-profiles');
+  await keyed(ctx, async (session, id) => {
+    await recoverVaultWriter(ctx, session, id);
+    stall(ctx.hooks);
+    const { collections } = profiles.listCollections(ctx.paths.vault, { session });
+    if (ctx.request.json) {
+      ctx.out({ collections });
+      return;
+    }
+    if (collections.length === 0) {
+      ctx.out('No collections.\n');
+      return;
+    }
+    const lines = collections.map(c =>
+      `${c.collection}  profile=${c.profile ?? 'unknown'}  items=${c.itemCount}  child-prompts=${c.allowChildModelPrompts ? 'on' : 'off'}\n`,
+    );
+    ctx.out(lines.join(''));
+  });
+}
+
 const BODIES: Readonly<Record<CommandName, (ctx: Context) => Promise<void>>> = {
   'init': init,
   'import': importCommand,
@@ -636,6 +859,12 @@ const BODIES: Readonly<Record<CommandName, (ctx: Context) => Promise<void>>> = {
   'vault verify': verify,
   'index rebuild': rebuild,
   'vault reset-passphrase': resetPassphraseCommand,
+  'profile add': profileAddCommand,
+  'profile list': profileListCommand,
+  'consent record': consentRecordCommand,
+  'consent list': consentListCommand,
+  'collection prompt-policy': collectionPromptPolicyCommand,
+  'collection list': collectionListCommand,
 };
 
 function secretTexts(secrets: CommandSecrets): string[] {
