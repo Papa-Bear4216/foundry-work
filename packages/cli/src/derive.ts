@@ -25,7 +25,25 @@ export const MAX_TEXT_BYTES = 1024 * 1024;
 const MAX_CHUNKS = 1024;
 const CHUNK_CHARS = 800;
 
-type Parsers = Pick<typeof import('importers'), 'parseEmailMessage' | 'parseVcard' | 'formatContactText' | 'parseIcalendar'>;
+export type Parsers = Pick<typeof import('importers'), 'parseEmailMessage' | 'parseVcard' | 'formatContactText' | 'parseIcalendar'>;
+
+/** The importers' synchronous parsers, as the projection and the write-time classifier use them. */
+export async function loadParsers(): Promise<Parsers> {
+  const { parseEmailMessage, parseVcard, formatContactText, parseIcalendar } = await import('importers');
+  return { parseEmailMessage, parseVcard, formatContactText, parseIcalendar };
+}
+
+/**
+ * The search text of one item from its whole plaintext, with the projection's limits: the first
+ * `MAX_DERIVE_BYTES` are parsed (`truncated` when the item has more), and the text is at most
+ * `MAX_TEXT_BYTES`. The input is read through a view, never copied or changed. The write-time classifier
+ * (`classify.ts`) uses this, so it sees the same text the index stores.
+ */
+export function itemTextOfPlaintext(parsers: Parsers, mime: string | null, plaintext: Uint8Array): string | undefined {
+  const take = Math.min(plaintext.byteLength, MAX_DERIVE_BYTES);
+  const view = Buffer.from(plaintext.buffer as ArrayBuffer, plaintext.byteOffset, take);
+  return itemText(parsers, mime, view, plaintext.byteLength > MAX_DERIVE_BYTES);
+}
 
 /** Split text into chunks of at most 800 characters (cut at whitespace when possible), at most 1,024 chunks. */
 export function chunkPlainText(text: string): string[] {
@@ -216,8 +234,7 @@ export function capChunks(chunks: readonly string[]): string[] {
 
 /** Build the projection options every index call of the command line uses. */
 export async function loadProjection(): Promise<ProjectionOptions> {
-  const { parseEmailMessage, parseVcard, formatContactText, parseIcalendar } = await import('importers');
-  const parsers: Parsers = { parseEmailMessage, parseVcard, formatContactText, parseIcalendar };
+  const parsers = await loadParsers();
   return {
     version: DERIVER_VERSION,
     derive(item: DeriveItem, frames: Iterable<Uint8Array>): Iterable<string> {

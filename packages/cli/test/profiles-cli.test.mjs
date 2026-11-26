@@ -171,7 +171,9 @@ test('consent guard on foundry import: non-me profiles fail closed with CONSENT_
   );
   assert.equal(profAdd.code, 0, profAdd.stderr);
   assert.equal(profAdd.kdf, 1);
-  assert.equal(JSON.parse(profAdd.stdout).displayName, 'Household Partner');
+  // B7: a mutation command never prints the display name.
+  assert.equal(JSON.parse(profAdd.stdout).displayNameSet, true);
+  assert.ok(!profAdd.stdout.includes('Household Partner'));
 
   const consentRec = await runInline(
     dir,
@@ -224,10 +226,21 @@ test('consent guard on foundry import: non-me profiles fail closed with CONSENT_
   assert.equal(pList.kdf, 0);
   const profilesOut = JSON.parse(pList.stdout).profiles;
   assert.deepEqual(
-    profilesOut.map(p => [p.profile, p.displayName, p.consentRecorded]),
+    profilesOut.map(p => [p.profile, p.displayName, p.displayNameSet, p.consentRecorded]),
     [
-      ['me', undefined, true],
-      ['partner', 'Household Partner', true],
+      ['me', undefined, false, true],
+      ['partner', undefined, true, true],
+    ],
+  );
+  const pListRevealed = await runInline(dir, ['profile', 'list', '--reveal', '--vault', home, '--recovery-key-stdin', '--json'], {
+    stdin: recoveryKey + '\n',
+  });
+  assert.equal(pListRevealed.code, 0, pListRevealed.stderr);
+  assert.deepEqual(
+    JSON.parse(pListRevealed.stdout).profiles.map(p => [p.profile, p.displayName]),
+    [
+      ['me', undefined],
+      ['partner', 'Household Partner'],
     ],
   );
 
@@ -235,13 +248,21 @@ test('consent guard on foundry import: non-me profiles fail closed with CONSENT_
     stdin: recoveryKey + '\n',
   });
   assert.equal(pListText.code, 0);
-  assert.match(pListText.stdout, /partner \(Household Partner\) {2}\[consent:exported-by-them\]/u);
+  assert.match(pListText.stdout, /partner \(name set\) {2}\[consent:exported-by-them\]/u);
+  const pListTextRevealed = await runInline(dir, ['profile', 'list', '--reveal', '--vault', home, '--recovery-key-stdin'], {
+    stdin: recoveryKey + '\n',
+  });
+  assert.match(pListTextRevealed.stdout, /partner \(Household Partner\) {2}\[consent:exported-by-them\]/u);
 
   const cList = await runInline(dir, ['consent', 'list', '--vault', home, '--recovery-key-stdin'], {
     stdin: recoveryKey + '\n',
   });
   assert.equal(cList.code, 0);
-  assert.match(cList.stdout, /partner {2}exported-by-them {2}Provided Takeout archive directly/u);
+  assert.match(cList.stdout, /partner {2}exported-by-them {2}\(note set\)/u);
+  const cListRevealed = await runInline(dir, ['consent', 'list', '--reveal', '--vault', home, '--recovery-key-stdin'], {
+    stdin: recoveryKey + '\n',
+  });
+  assert.match(cListRevealed.stdout, /partner {2}exported-by-them {2}Provided Takeout archive directly/u);
 
   // Search filtered by `--profile partner` finds partner items; `--profile me` finds 0
   const searchPartner = await runInline(
@@ -367,7 +388,8 @@ test('child profile import, sensitivity floor vs secret elevation, --collection 
   assert.equal(enable2024.code, 0, enable2024.stderr);
   assert.equal(enable2024.kdf, 1);
   assert.equal(JSON.parse(enable2024.stdout).allowChildModelPrompts, true);
-  assert.equal(JSON.parse(enable2024.stdout).kind, 'collection.created');
+  // B3: the import already recorded `collection.created` (the binding) before it created the key.
+  assert.equal(JSON.parse(enable2024.stdout).kind, 'annotation.added');
 
   const stateEnabled = loadVaultProfileState(vaultDir, credential);
   const eligibleNow = filterItemsForModelPrompt(childEvents, stateEnabled);
@@ -488,10 +510,12 @@ for (const encoding of ['base64', 'quoted-printable']) {
   });
 }
 
-test('A2: classifyImportItem classifies derived text, and falls back to raw bytes with rule derive-failed', async () => {
+test('A2/B0: classifyImportItem classifies the index text, and falls back to raw bytes with rule derive-failed', async () => {
   const { classifyImportItem } = await import('../dist/classify.js');
   const { classifySensitivity } = await import('foundry-profiles');
-  const { DEFAULT_DERIVERS } = await import('importers');
+  const { itemTextOfPlaintext, loadParsers } = await import('../dist/derive.js');
+  const parsers = await loadParsers();
+  const indexText = (mime, plaintext) => itemTextOfPlaintext(parsers, mime, plaintext);
   const secretBody = `Notes\n${buildSyntheticPem()}\n`;
   const fromLine = `From: <${syntheticEmail('derive-unit')}>`;
   const mail = Buffer.from(
@@ -509,30 +533,50 @@ test('A2: classifyImportItem classifies derived text, and falls back to raw byte
   const input = { profile: 'me', collection: 'me/google-takeout/mail/2024', source: 'google-takeout/mail', path: 'm/1' };
   const item = { plaintext: mail, mime: 'message/rfc822', tags: [], profile: 'me', collection: input.collection };
 
-  const ok = await classifyImportItem(classifySensitivity, DEFAULT_DERIVERS, input, item);
+  const ok = classifyImportItem(classifySensitivity, indexText, input, item);
   assert.deepEqual(ok, { sensitivity: 'secret', rule: 'private-key' });
+  // B0: the classifier sees exactly the text the index stores for the item.
+  assert.ok(indexText('message/rfc822', mail).includes(buildSyntheticPem()));
 
-  const throwing = [
-    {
-      id: 'google-takeout/mail',
-      version: 1,
-      // eslint-disable-next-line require-yield
-      async *derive() {
-        throw new Error('synthetic deriver failure');
-      },
-    },
-  ];
-  const failed = await classifyImportItem(classifySensitivity, throwing, input, item);
+  const throwing = () => {
+    throw new Error('synthetic derive failure');
+  };
+  const failed = classifyImportItem(classifySensitivity, throwing, input, item);
   assert.deepEqual(failed, { sensitivity: 'personal', rule: 'derive-failed' });
   // A derive failure never assigns `secret` by itself, and raw-byte rules still apply.
   const rawPrivate = { ...item, plaintext: Buffer.from('Taxpayer SSN: 123-45-6789 on file.', 'utf8') };
-  assert.deepEqual(await classifyImportItem(classifySensitivity, throwing, input, rawPrivate), {
+  assert.deepEqual(classifyImportItem(classifySensitivity, throwing, input, rawPrivate), {
     sensitivity: 'private',
     rule: 'derive-failed',
   });
   // The pipeline's plaintext is left untouched by the derive step.
   assert.ok(mail.toString('utf8').startsWith(fromLine));
-  // A source with no deriver classifies the raw bytes only, with its normal rule id.
-  const other = await classifyImportItem(classifySensitivity, DEFAULT_DERIVERS, { ...input, source: 'custom/none' }, rawPrivate);
+  // A type with no index text classifies the raw bytes only, with its normal rule id.
+  const other = classifyImportItem(classifySensitivity, indexText, input, { ...rawPrivate, mime: 'application/octet-stream' });
   assert.deepEqual(other, { sensitivity: 'private', rule: 'national-id' });
+});
+
+test('B0: the classifier uses the projection limits (8 MiB input slice, truncated flag, 1 MiB text cap)', async () => {
+  const { itemTextOfPlaintext, loadParsers, MAX_DERIVE_BYTES, MAX_TEXT_BYTES } = await import('../dist/derive.js');
+  const { classifyImportItem } = await import('../dist/classify.js');
+  const { classifySensitivity } = await import('foundry-profiles');
+  const parsers = await loadParsers();
+  // A plain-text item larger than 8 MiB: the text is the first bytes only, capped at 1 MiB.
+  const big = Buffer.alloc(MAX_DERIVE_BYTES + 4096, 0x61);
+  const text = itemTextOfPlaintext(parsers, 'text/plain', big);
+  assert.equal(Buffer.byteLength(text), MAX_TEXT_BYTES);
+  // The input is read through a view and never changed.
+  assert.ok(big.every(b => b === 0x61));
+  // A marker after the 8 MiB slice is not in the index text, but the raw-byte scan of the whole item still finds it.
+  const marker = Buffer.from(`\n${buildSyntheticPem()}\n`, 'utf8');
+  marker.copy(big, MAX_DERIVE_BYTES + 100);
+  assert.ok(!itemTextOfPlaintext(parsers, 'text/plain', big).includes('PRIVATE'));
+  const input = { profile: 'me', collection: 'me/custom/2024', source: 'custom/plain', path: 'p/1' };
+  const res = classifyImportItem(
+    classifySensitivity,
+    (mime, plaintext) => itemTextOfPlaintext(parsers, mime, plaintext),
+    input,
+    { plaintext: big, mime: 'text/plain', tags: [], profile: 'me', collection: input.collection },
+  );
+  assert.deepEqual(res, { sensitivity: 'secret', rule: 'private-key' });
 });

@@ -42,7 +42,13 @@ import { MAIL_SOURCE_ID } from './importers/mail.js';
 const DEFAULT_BATCH_MAX_ITEMS = 16;
 const DEFAULT_BATCH_MAX_BYTES = 4 * 1024 * 1024;
 
-export type ImportErrorCode = 'BUSY';
+export type ImportErrorCode = 'BUSY' | 'INVALID_PROFILE';
+
+/**
+ * The generic profile identifiers (Architecture 5.3, P-1 fix round 1 B4). A local copy: `importers`
+ * must not depend on `foundry-profiles` (Architecture section 2).
+ */
+const GENERIC_PROFILES: ReadonlySet<string> = new Set(['me', 'partner', 'child', 'other']);
 
 export class ImportError extends Error {
   readonly code: ImportErrorCode;
@@ -81,13 +87,19 @@ export interface ImportArchiveOptions {
    * into an in-memory set: for tests and small vaults only, because it grows with the vault.
    */
   itemKeys?: ItemKeyLookup;
-  /** Profile name stamped on imported events (defaults to `me`, per A-36). */
+  /**
+   * Profile name stamped on imported events (defaults to `me`, per A-36). Must be one of `me`, `partner`,
+   * `child`, `other` (else `ImportError('INVALID_PROFILE')` before anything is read or written). The
+   * caller must check consent for a non-`me` profile first (A-43 caller duty).
+   */
   profile?: string;
   /** Override logical collection assignment per item (defaults to A-36 `<source>/<year>` or `<source>/undated`). */
   resolveCollection?: (info: ResolveCollectionInput) => string;
   /**
    * Override sensitivity resolution per source/item (defaults to A-36 fixed table). May return a promise
-   * (P-1: the command line runs the source's deriver first); a synchronous result is used directly.
+   * (P-1: the command line derives the item's text first); a synchronous result is used directly.
+   * Called only for items that will be written: never for an item whose key is already in the vault or
+   * in the pending batch, and never for an item deferred for a missing collection key.
    */
   resolveSensitivity?: (
     source: string,
@@ -181,6 +193,11 @@ export async function importArchive(options: ImportArchiveOptions): Promise<Impo
   }
   if (typeof options.readVaultRecord !== 'function') {
     throw new TypeError('importArchive requires readVaultRecord to derive durable item identity state.');
+  }
+  // P-1 fix round 1 (B4): only generic profiles, checked before the archive is read or anything is written.
+  // Consent is NOT checked here; the supported ingest boundary (`foundry import`) checks it first.
+  if (options.profile !== undefined && !GENERIC_PROFILES.has(options.profile)) {
+    throw new ImportError('INVALID_PROFILE', 'Profile must be one of the generic identifiers: me, partner, child, other.');
   }
 
   // Round 2 Finding 8: Reject concurrent imports sharing one VaultWriter instance.
@@ -478,19 +495,6 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
           missingCollections.add(collection);
           continue;
         }
-        const resolved = resolveSensitivity(importer.id, rawItem.path, {
-          plaintext,
-          mime: rawItem.mime,
-          tags: rawItem.tags,
-          profile,
-          collection,
-          sourceTs: rawItem.sourceTs,
-        });
-        // A synchronous resolver takes the same path as before; only a promise is awaited.
-        const sensitivity: SensitivityTier =
-          typeof (resolved as Promise<SensitivityTier> | undefined)?.then === 'function'
-            ? await resolved
-            : (resolved as SensitivityTier);
         const idKey = getIdKey(keyId);
         const blobId = computeBlobId(idKey, plaintext);
         const itemKey = computeItemKey(profile, collection, importer.id, rawItem.path, blobId);
@@ -501,6 +505,28 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
           counts.itemsSkipped++;
           totalItemsSkipped++;
           continue;
+        }
+
+        // P-1 fix round 1 (B11): classify only items that will be written. The item key does not include the
+        // tier, so the duplicate check above does not need it.
+        let sensitivity: SensitivityTier;
+        try {
+          const resolved = resolveSensitivity(importer.id, rawItem.path, {
+            plaintext,
+            mime: rawItem.mime,
+            tags: rawItem.tags,
+            profile,
+            collection,
+            sourceTs: rawItem.sourceTs,
+          });
+          // A synchronous resolver takes the same path as before; only a promise is awaited.
+          sensitivity =
+            typeof (resolved as Promise<SensitivityTier> | undefined)?.then === 'function'
+              ? await resolved
+              : (resolved as SensitivityTier);
+        } catch (error) {
+          plaintext.fill(0);
+          throw error;
         }
 
         pendingKeys.add(itemKey);

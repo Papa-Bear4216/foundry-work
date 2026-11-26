@@ -118,6 +118,142 @@ test('P-1 hook: an async resolveSensitivity result is awaited and stored', async
   }
 });
 
+test('B4: importArchive rejects a non-generic profile with INVALID_PROFILE before reading or writing anything', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'foundry-p1-hooks-'));
+  t.after(() => removeTree(root));
+  const vaultDir = join(root, 'vault');
+  const { vaultId, collectionKeyId } = createTestVault(vaultDir);
+  const unlocked = unlockByPassphrase(join(vaultDir, 'keyring', 'keyring.json'), vaultId, PASSPHRASE);
+  let writes = 0;
+  let reads = 0;
+  const writer = {
+    appendBatch() {
+      writes++;
+      throw new Error('must not write');
+    },
+    closeSegment() {
+      writes++;
+    },
+  };
+  const archive = {
+    get entries() {
+      reads++;
+      throw new Error('must not read the archive');
+    },
+    parts: ['synthetic.zip'],
+    async close() {},
+  };
+  const collectionCalls = [];
+  for (const profile of ['Someone', 'ME', '', 'me/child']) {
+    await assert.rejects(
+      importArchive({
+        archive,
+        writer,
+        importers: DEFAULT_IMPORTERS,
+        profile,
+        resolveCollectionKeyId: name => {
+          collectionCalls.push(name);
+          return collectionKeyId;
+        },
+        vaultDir,
+        unlocked,
+        readVaultRecord,
+      }),
+      err => err.name === 'ImportError' && err.code === 'INVALID_PROFILE' && !String(err.message).includes('Someone'),
+      JSON.stringify(profile),
+    );
+  }
+  assert.equal(writes, 0);
+  assert.equal(reads, 0);
+  assert.equal(collectionCalls.length, 0);
+  // Every generic profile still passes the check (it then reads the archive and fails on the stub).
+  for (const profile of ['me', 'partner', 'child', 'other']) {
+    await assert.rejects(
+      importArchive({ archive, writer, importers: DEFAULT_IMPORTERS, profile, resolveCollectionKeyId: () => collectionKeyId, vaultDir, unlocked, readVaultRecord }),
+      /must not read the archive/u,
+    );
+  }
+  assert.equal(writes, 0);
+});
+
+test('B11: an item already in the vault does not call resolveSensitivity on re-import', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'foundry-p1-hooks-'));
+  t.after(() => removeTree(root));
+  const archiveDir = join(root, 'takeout');
+  const vaultDir = join(root, 'vault');
+  await writeMultiPartTakeoutFolder(archiveDir, { seed: 93, contactsCount: 2, calendarEvents: 1, mailMessages: 2 });
+  const { vaultId, collectionKeyId, recoveryKey } = createTestVault(vaultDir);
+  const unlocked = unlockByPassphrase(join(vaultDir, 'keyring', 'keyring.json'), vaultId, PASSPHRASE);
+
+  const runOnce = async calls => {
+    const archive = await openArchive(archiveDir);
+    const writer = VaultWriter.open(vaultDir, unlocked);
+    try {
+      return await importArchive({
+        archive,
+        writer,
+        importers: DEFAULT_IMPORTERS,
+        resolveCollectionKeyId: () => collectionKeyId,
+        resolveSensitivity: async (source, path) => {
+          calls.push(`${source} ${path}`);
+          return 'personal';
+        },
+        vaultDir,
+        unlocked,
+        readVaultRecord,
+      });
+    } finally {
+      writer.release();
+      await archive.close();
+    }
+  };
+
+  const first = [];
+  const r1 = await runOnce(first);
+  assert.equal(r1.totalItemsImported, 5);
+  assert.equal(first.length, 5);
+  const second = [];
+  const r2 = await runOnce(second);
+  assert.equal(r2.totalItemsImported, 0);
+  assert.equal(r2.totalItemsSkipped, 5);
+  assert.deepEqual(second, [], 'the resolver ran for items that were already stored');
+  assert.equal(importedEvents(vaultDir, recoveryKey).length, 5);
+});
+
+test('B11: a deferred item (no collection key yet) does not call resolveSensitivity', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'foundry-p1-hooks-'));
+  t.after(() => removeTree(root));
+  const archiveDir = join(root, 'takeout');
+  const vaultDir = join(root, 'vault');
+  await writeMultiPartTakeoutFolder(archiveDir, { seed: 94, contactsCount: 1, calendarEvents: 1, mailMessages: 1 });
+  const { vaultId } = createTestVault(vaultDir);
+  const unlocked = unlockByPassphrase(join(vaultDir, 'keyring', 'keyring.json'), vaultId, PASSPHRASE);
+  const archive = await openArchive(archiveDir);
+  const writer = VaultWriter.open(vaultDir, unlocked);
+  const calls = [];
+  let result;
+  try {
+    result = await importArchive({
+      archive,
+      writer,
+      importers: DEFAULT_IMPORTERS,
+      resolveCollectionKeyId: () => undefined,
+      resolveSensitivity: () => {
+        calls.push(1);
+        return 'personal';
+      },
+      vaultDir,
+      unlocked,
+      readVaultRecord,
+    });
+  } finally {
+    writer.release();
+    await archive.close();
+  }
+  assert.equal(result.totalItemsDeferred, 3);
+  assert.equal(calls.length, 0);
+});
+
 test('P-1 hook: a synchronous resolveSensitivity result is stored as before', async t => {
   const root = mkdtempSync(join(tmpdir(), 'foundry-p1-hooks-'));
   t.after(() => removeTree(root));

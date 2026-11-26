@@ -96,10 +96,20 @@ export interface VaultProfileState {
   readonly consents: ReadonlyMap<ConsentSubjectProfileId, ConsentRecord>;
   readonly consentHistory: readonly ConsentRecord[];
   readonly collections: ReadonlyMap<string, CollectionState>;
+  /**
+   * Global rules (no `profile`) plus every profile's scoped rules, each with its true scope
+   * (P-1 fix round 1, item 8).
+   */
   readonly sensitivityRules: readonly UserSensitivityRule[];
   readonly destroyedProfileCount: number;
   readonly skippedEvents: number;
   readonly lastEventSeq: number;
+  /**
+   * Readable `item.imported` events whose collection does not start with `<their profile>/` (written by
+   * builds before P-1, or with a missing or unknown profile). Nonzero: `foundry import` refuses the vault
+   * (`PRE_PROFILE_VAULT`).
+   */
+  readonly preProfileItemEvents: number;
 }
 
 export interface PromptCandidateItem {
@@ -108,17 +118,11 @@ export interface PromptCandidateItem {
   readonly sensitivity: SensitivityTier;
 }
 
-export type PromptExclusionReason = 'SECRET_TIER_EXCLUDED' | 'CHILD_TIER_EXCLUDED';
+export type PromptExclusionReason =
+  | 'SECRET_TIER_EXCLUDED'
+  | 'COLLECTION_PROFILE_MISMATCH'
+  | 'CHILD_TIER_EXCLUDED';
 
 export type PromptEligibility =
   | { readonly eligible: true }
   | { readonly eligible: false; readonly reason: PromptExclusionReason };
-
-export type CollectionPolicyEntry =
-  | boolean
-  | { readonly allowChildModelPrompts: boolean };
-
-export type CollectionPolicyLookup =
-  | Pick<VaultProfileState, 'collections'>
-  | ReadonlyMap<string, CollectionPolicyEntry>
-  | Readonly<Record<string, CollectionPolicyEntry>>;

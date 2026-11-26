@@ -64,14 +64,20 @@ const ARCHIVE_MESSAGES: Readonly<Record<string, string>> = {
 const PROFILE_MESSAGES: Readonly<Record<string, string>> = {
   INVALID_PROFILE: 'profile must be one of the generic identifiers: me, partner, child or other',
   INVALID_DISPLAY_NAME: 'display name must be nonempty well-formed UTF-8 (at most 128 bytes, no control characters)',
-  INVALID_COLLECTION: 'collection name is invalid, reserved, or uses unsafe path segments',
+  INVALID_COLLECTION: 'collection name must start with its profile and a slash (for example me/holidays), and must not be reserved or use unsafe path segments',
   INVALID_SOURCE: 'source identifier is invalid or produces an oversized collection name',
   INVALID_CONSENT_BASIS: 'consent basis must be one of: exported-by-them, parent-or-guardian, shared-conversation or other',
   CONSENT_NOT_APPLICABLE: 'profile "me" is the vault owner and does not need a consent note',
   CONSENT_REQUIRED: 'consent must be recorded for this profile before importing; run `foundry consent record`',
-  INVALID_CONSENT_NOTE: 'consent note must be nonempty well-formed UTF-8 (at most 2048 bytes, no control characters)',
+  INVALID_CONSENT_NOTE: 'consent note must be nonempty well-formed UTF-8 (at most 2048 bytes, no control characters); basis "other" needs a --note',
   INVALID_SENSITIVITY: 'sensitivity tier must be one of: public, personal, private, secret, clinical or child',
   INVALID_SENSITIVITY_RULE: 'user sensitivity rule is invalid',
+  PRE_PROFILE_VAULT: 'this vault holds items from before profiles existed; create a new Foundry folder and import again',
+};
+
+const IMPORT_MESSAGES: Readonly<Record<string, string>> = {
+  BUSY: 'another import is already running on this vault writer',
+  INVALID_PROFILE: 'profile must be one of the generic identifiers: me, partner, child or other',
 };
 
 const RECOVERY_FORMAT = new Set([
@@ -112,7 +118,7 @@ export function mapError(error: unknown, context: { erasedInImport?: boolean } =
     return { code: error.code, message: PROFILE_MESSAGES[error.code] ?? 'profile or consent validation failed', exit: 2 };
   }
   if (named(error, 'ImportError')) {
-    return { code: error.code, message: 'another import is already running on this vault writer', exit: 2 };
+    return { code: error.code, message: IMPORT_MESSAGES[error.code] ?? 'the import reported an error', exit: 2 };
   }
   if (isRecoveryFormatError(error)) {
     return { code: 'RECOVERY_KEY_FORMAT', message: 'the recovery key is not in the expected format', exit: 2 };

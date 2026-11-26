@@ -712,12 +712,16 @@ test('vault persistence & replay: profiles, display names, consent events, user 
     reason: 'CHILD_TIER_EXCLUDED',
   });
 
-  // Prototype-pollution safety on plain record lookup (`toString` / `constructor` must not count as enabled!)
+  // P-1 fix round 1 (B2): a plain object is never a policy source, and an unprefixed name fails closed.
   assert.deepEqual(
     isPromptEligible(
       { profile: 'child', collection: 'toString', sensitivity: 'child' },
       {},
     ),
+    { eligible: false, reason: 'COLLECTION_PROFILE_MISMATCH' },
+  );
+  assert.deepEqual(
+    isPromptEligible({ profile: 'child', collection: 'child/toString', sensitivity: 'child' }, { 'child/toString': true }),
     { eligible: false, reason: 'CHILD_TIER_EXCLUDED' },
   );
 

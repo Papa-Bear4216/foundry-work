@@ -32,18 +32,22 @@ import type {
   UserSensitivityRule,
   VaultProfileState,
 } from './types.ts';
+import { recordReplayedPolicy } from './policy-registry.ts';
 import {
+  assertCollectionForProfile,
   assertConsentBasis,
   assertConsentNote,
+  assertConsentNoteForBasis,
   assertConsentSubjectProfile,
   assertDisplayName,
+  assertProfileCollectionName,
   assertProfileId,
-  assertUserCollectionName,
   assertUserSensitivityRule,
   formatUtcTimestamp,
   isConsentBasis,
   isConsentSubjectProfile,
   isProfileId,
+  profileOfCollection,
   SYSTEM_COLLECTION,
   validateCollectionName,
 } from './validation.ts';
@@ -85,12 +89,26 @@ function vaultPaths(vaultDir: string) {
   };
 }
 
+/** Events per `appendBatch` call when many structure events are appended in one writer session. */
+const SYSTEM_EVENTS_PER_BATCH = 1024;
+
 function appendSystemEvent(
   vaultDir: string,
   credential: Unlock,
   encryptUnderProfile: ProfileId,
   event: Readonly<Record<string, unknown>>,
 ): { sequence: number; createdKey: boolean } {
+  const { sequences, createdKey } = appendSystemEvents(vaultDir, credential, encryptUnderProfile, [event]);
+  return { sequence: sequences[0]!, createdKey };
+}
+
+/** Append `events` under `<profile>`'s `'system'` key in ONE writer session (batches of 1,024 events). */
+function appendSystemEvents(
+  vaultDir: string,
+  credential: Unlock,
+  encryptUnderProfile: ProfileId,
+  events: readonly Readonly<Record<string, unknown>>[],
+): { sequences: number[]; createdKey: boolean } {
   const { metadataPath, keyringPath } = vaultPaths(vaultDir);
   const vaultId = decodeVaultMetadata(readFileSync(metadataPath)).vault_id;
   const ensured = ensureCollectionKeys(
@@ -109,11 +127,18 @@ function appendSystemEvent(
   let writer: VaultWriter | undefined;
   try {
     writer = VaultWriter.open(vaultDir, unlocked);
-    const [res] = writer.appendBatch([{ type: 'event', keyId, event }]);
-    if (!res || res.type !== 'event') {
-      throw new Error('Expected event append result from VaultWriter.');
+    const sequences: number[] = [];
+    for (let start = 0; start < events.length; start += SYSTEM_EVENTS_PER_BATCH) {
+      const slice = events.slice(start, start + SYSTEM_EVENTS_PER_BATCH);
+      const results = writer.appendBatch(slice.map(event => ({ type: 'event' as const, keyId, event })));
+      for (const res of results) {
+        if (!res || res.type !== 'event') {
+          throw new Error('Expected event append result from VaultWriter.');
+        }
+        sequences.push(res.sequence);
+      }
     }
-    return { sequence: res.sequence, createdKey: ensured.created > 0 };
+    return { sequences, createdKey: ensured.created > 0 };
   } finally {
     try {
       writer?.release();
@@ -127,6 +152,12 @@ function inferProfileFromCollection(collection: string): ProfileId | undefined {
   const slash = collection.indexOf('/');
   const head = slash === -1 ? collection : collection.slice(0, slash);
   return isProfileId(head) ? head : undefined;
+}
+
+/** True for an `item.imported` event that does not follow the P-1 rule `<profile>/...` (fail closed). */
+function isPreProfileItem(profile: unknown, collection: unknown): boolean {
+  if (!isProfileId(profile) || typeof collection !== 'string') return true;
+  return !collection.startsWith(`${profile}/`);
 }
 
 /**
@@ -184,8 +215,19 @@ export function loadVaultProfileState(
   const erasedProfiles = new Set<ProfileId>();
   const activeConsents = new Map<ConsentSubjectProfileId, ConsentRecord>();
   const consentHistory: ConsentRecord[] = [];
+  // P-1 fix round 1 (item 14): event sequence -> position in `consentHistory`, so replay stays linear.
+  const historyPositionBySeq = new Map<number, number>();
+  const deactivateConsent = (record: ConsentRecord): void => {
+    const position = historyPositionBySeq.get(record.eventSeq);
+    if (position !== undefined) {
+      consentHistory[position] = { ...consentHistory[position]!, active: false };
+    }
+  };
+  // P-1 fix round 1 (item 8): global rules (no `profile`) are kept apart from every profile's scoped rules.
+  const globalRulesById = new Map<string, UserSensitivityRule>();
   const collectionsMap = new Map<string, MutableCollectionState>();
   let skippedEvents = 0;
+  let preProfileItemEvents = 0;
 
   const ensureMutableCollection = (
     collection: string,
@@ -245,13 +287,15 @@ export function loadVaultProfileState(
           }
         }
         if (Array.isArray(body?.sensitivity_rules)) {
+          // `profile.created` replaces this profile's SCOPED rules only. A rule without `profile` in the body
+          // is a global rule that a build before P-1 fix round 1 copied in by mistake: it stays global.
           p.rulesById.clear();
           for (const rawRule of body.sensitivity_rules) {
             try {
               const valid = assertUserSensitivityRule(rawRule);
-              const scoped: UserSensitivityRule =
-                valid.profile === undefined ? { ...valid, profile: candidateProfile } : valid;
-              p.rulesById.set(scoped.id, scoped);
+              if (valid.profile === undefined) globalRulesById.set(valid.id, valid);
+              else if (valid.profile === candidateProfile) p.rulesById.set(valid.id, valid);
+              // A rule scoped to another profile does not belong in this body: ignored.
             } catch {
               // Ignore malformed rules safely.
             }
@@ -269,13 +313,11 @@ export function loadVaultProfileState(
             note = undefined;
           }
         }
+        // P-1 fix round 1 (item 13): basis `other` without a valid note is not consent. The event is
+        // skipped whole: it neither becomes active nor replaces an earlier active consent.
+        if (basis === 'other' && note === undefined) continue;
         const previous = activeConsents.get(subject);
-        if (previous) {
-          const prevIdx = consentHistory.findIndex(c => c.eventSeq === previous.eventSeq);
-          if (prevIdx !== -1) {
-            consentHistory[prevIdx] = { ...consentHistory[prevIdx]!, active: false };
-          }
-        }
+        if (previous) deactivateConsent(previous);
         const record: ConsentRecord = {
           profile: subject,
           basis,
@@ -285,6 +327,7 @@ export function loadVaultProfileState(
           active: true,
         };
         activeConsents.set(subject, record);
+        historyPositionBySeq.set(seq, consentHistory.length);
         consentHistory.push(record);
       } else if (kind === 'consent.withdrawn') {
         const isNarrow =
@@ -297,10 +340,7 @@ export function loadVaultProfileState(
           const prev = activeConsents.get(withdrawnProfile);
           if (prev) {
             activeConsents.delete(withdrawnProfile);
-            const prevIdx = consentHistory.findIndex(c => c.eventSeq === prev.eventSeq);
-            if (prevIdx !== -1) {
-              consentHistory[prevIdx] = { ...consentHistory[prevIdx]!, active: false };
-            }
+            deactivateConsent(prev);
           }
         }
       } else if (kind === 'key.destroyed') {
@@ -308,14 +348,13 @@ export function loadVaultProfileState(
         if (isProfileId(targetProfile)) {
           erasedProfiles.add(targetProfile);
           profilesMap.delete(targetProfile);
+          // Global rules live under `me`'s key: erasing `me` erases them too.
+          if (targetProfile === OWNER_PROFILE) globalRulesById.clear();
           if (isConsentSubjectProfile(targetProfile)) {
             const prev = activeConsents.get(targetProfile);
             if (prev) {
               activeConsents.delete(targetProfile);
-              const prevIdx = consentHistory.findIndex(c => c.eventSeq === prev.eventSeq);
-              if (prevIdx !== -1) {
-                consentHistory[prevIdx] = { ...consentHistory[prevIdx]!, active: false };
-              }
+              deactivateConsent(prev);
             }
           }
         }
@@ -328,11 +367,14 @@ export function loadVaultProfileState(
         ) {
           continue;
         }
-        const owner = isProfileId(body?.owner_profile)
-          ? body.owner_profile
-          : isProfileId(body?.profile)
-            ? body.profile
-            : inferProfileFromCollection(rawCollection);
+        // P-1 fix round 1 (B1): a prefixed name belongs to its prefix; a body owner cannot override it.
+        const owner =
+          profileOfCollection(rawCollection) ??
+          (isProfileId(body?.owner_profile)
+            ? body.owner_profile
+            : isProfileId(body?.profile)
+              ? body.profile
+              : inferProfileFromCollection(rawCollection));
         const col = ensureMutableCollection(rawCollection, owner);
         col.createdEventSeen = true;
         if (typeof body?.allow_child_model_prompts === 'boolean') {
@@ -358,10 +400,18 @@ export function loadVaultProfileState(
         } else if (targetKind === 'sensitivity_rule' && body?.rule !== undefined) {
           try {
             const rule = assertUserSensitivityRule(body.rule);
-            const holderProfile = rule.profile ?? (isProfileId(event.profile) ? event.profile : OWNER_PROFILE);
-            if (!erasedProfiles.has(holderProfile)) {
-              const p = ensureMutableProfile(holderProfile);
-              p.rulesById.set(rule.id, rule);
+            const eventProfile = isProfileId(event.profile) ? event.profile : OWNER_PROFILE;
+            if (rule.profile === undefined && eventProfile === OWNER_PROFILE) {
+              // A global rule (written under `me`'s key by `addSensitivityRule`): it covers every profile.
+              if (!erasedProfiles.has(OWNER_PROFILE)) globalRulesById.set(rule.id, rule);
+            } else {
+              const holderProfile = rule.profile ?? eventProfile;
+              const scoped: UserSensitivityRule =
+                rule.profile === undefined ? { ...rule, profile: holderProfile } : rule;
+              if (!erasedProfiles.has(holderProfile)) {
+                const p = ensureMutableProfile(holderProfile);
+                p.rulesById.set(scoped.id, scoped);
+              }
             }
           } catch {
             // Ignore invalid non-Foundry annotation rules safely.
@@ -370,6 +420,7 @@ export function loadVaultProfileState(
       } else if (kind === 'item.imported') {
         const rawCollection = event.collection;
         const itemProfile = isProfileId(event.profile) ? event.profile : undefined;
+        if (isPreProfileItem(event.profile, rawCollection)) preProfileItemEvents++;
         if (
           typeof rawCollection === 'string' &&
           rawCollection !== SYSTEM_COLLECTION &&
@@ -388,7 +439,8 @@ export function loadVaultProfileState(
   }
 
   const orderedProfiles = new Map<ProfileId, ProfileRecord>();
-  const allSensitivityRules: UserSensitivityRule[] = [];
+  // Global rules first (no `profile`), then every profile's scoped rules, each with its true scope.
+  const allSensitivityRules: UserSensitivityRule[] = [...globalRulesById.values()];
 
   for (const id of PROFILE_IDS) {
     const p = profilesMap.get(id);
@@ -432,7 +484,7 @@ export function loadVaultProfileState(
     });
   }
 
-  return {
+  const state: VaultProfileState = {
     profiles: orderedProfiles,
     consents: orderedConsents,
     consentHistory,
@@ -441,7 +493,29 @@ export function loadVaultProfileState(
     destroyedProfileCount,
     skippedEvents,
     lastEventSeq,
+    preProfileItemEvents,
   };
+  // P-1 fix round 1 (B2): the prompt gate reads only this private copy, taken now.
+  recordReplayedPolicy(
+    state,
+    [...collectionsMap.values()].map(c => [c.collection, c.allowChildModelPrompts] as const),
+  );
+  return state;
+}
+
+/**
+ * P-1 fix round 1 (B5): `foundry import` refuses a vault that holds items from before profiles existed
+ * (`item.imported` events whose collection does not start with `<their profile>/`). No migration in P-1:
+ * such a vault can still be searched and verified, but takes no new imports.
+ * Throws `ProfileError('PRE_PROFILE_VAULT')`.
+ */
+export function assertProfileVault(state: VaultProfileState): void {
+  if (state.preProfileItemEvents > 0) {
+    throw new ProfileError(
+      'PRE_PROFILE_VAULT',
+      'This vault holds items from before profiles existed. Create a new Foundry folder and import again.',
+    );
+  }
 }
 
 export interface AddProfileInput {
@@ -486,7 +560,10 @@ export function addProfile(
   const current = loadVaultProfileState(vaultDir, credential);
   const existing = current.profiles.get(profile);
   const effectiveDisplayName = displayName ?? existing?.displayName;
-  const effectiveRules = suppliedRules ?? [...(existing?.sensitivityRules ?? [])];
+  // P-1 fix round 1 (item 8): only rules scoped to THIS profile go into its `profile.created` body.
+  // `ProfileRecord.sensitivityRules` holds scoped rules only; global rules stay in their own events.
+  const effectiveRules =
+    suppliedRules ?? (existing?.sensitivityRules ?? []).filter(rule => rule.profile === profile);
   const ts = formatUtcTimestamp(input.now?.() ?? new Date());
 
   const body: Record<string, unknown> = { profile };
@@ -549,7 +626,8 @@ export function recordConsent(
 ): RecordConsentResult {
   const profile = assertConsentSubjectProfile(input.profile);
   const basis = assertConsentBasis(input.basis);
-  const note = input.note === undefined ? undefined : assertConsentNote(input.note);
+  // Basis `other` requires a nonempty note (P-1 fix round 1, item 13).
+  const note = assertConsentNoteForBasis(basis, input.note);
   const ts = formatUtcTimestamp(input.now?.() ?? new Date());
 
   const body: Record<string, unknown> = { profile, basis };
@@ -620,7 +698,9 @@ export interface SetCollectionPromptPolicyResult {
   readonly eventSeq: number;
 }
 
-function hasCollectionCreatedEvent(vaultDir: string, credential: Unlock, collection: string): boolean {
+/** Every collection name that has a readable `collection.created` event (one replay of the event streams). */
+function collectionCreatedNames(vaultDir: string, credential: Unlock): Set<string> {
+  const names = new Set<string>();
   const replaySource = openVaultReplay(vaultDir, credential);
   try {
     for (const entry of replaySource.replay()) {
@@ -634,12 +714,70 @@ function hasCollectionCreatedEvent(vaultDir: string, credential: Unlock, collect
           ? (entry.event.body as Record<string, unknown>)
           : undefined;
       const candidate = body?.collection ?? entry.event.collection;
-      if (candidate === collection) return true;
+      if (typeof candidate === 'string') names.add(candidate);
     }
-    return false;
+    return names;
   } finally {
     replaySource.close();
   }
+}
+
+function hasCollectionCreatedEvent(vaultDir: string, credential: Unlock, collection: string): boolean {
+  return collectionCreatedNames(vaultDir, credential).has(collection);
+}
+
+export interface RecordCollectionBindingsResult {
+  /** Names that got a new `collection.created` event, in the order given. */
+  readonly appended: readonly string[];
+  readonly eventSeqs: readonly number[];
+  /** True when this call created `'me'`'s `'system'` collection key (the first structure event of the vault). */
+  readonly createdSystemKey: boolean;
+}
+
+/**
+ * P-1 fix round 1 (B3, A-41 limits 1 and 5): record the binding of each collection name to its owner
+ * profile durably, BEFORE its key is created. For every name without a `collection.created` event yet
+ * (one replay), appends `collection.created` with body `{ collection, owner_profile }` under `'me'`'s
+ * `'system'` key, all in one writer session. No `allow_child_model_prompts` field: the policy stays at its
+ * default (`false`). Every name must be `<profile>/...` (`INVALID_COLLECTION` otherwise, before any write).
+ * Event first, key second: a crash between them leaves an event without a key, which is harmless.
+ */
+export function recordCollectionBindings(
+  vaultDir: string,
+  credential: Unlock,
+  profile: ProfileId,
+  collections: readonly string[],
+  options: { now?: () => Date } = {},
+): RecordCollectionBindingsResult {
+  const owner = assertProfileId(profile);
+  const wanted: string[] = [];
+  const seen = new Set<string>();
+  for (const name of collections) {
+    const valid = assertCollectionForProfile(owner, name);
+    if (!seen.has(valid)) {
+      seen.add(valid);
+      wanted.push(valid);
+    }
+  }
+  if (wanted.length === 0) return { appended: [], eventSeqs: [], createdSystemKey: false };
+  const existing = collectionCreatedNames(vaultDir, credential);
+  const missing = wanted.filter(name => !existing.has(name));
+  if (missing.length === 0) return { appended: [], eventSeqs: [], createdSystemKey: false };
+  const ts = formatUtcTimestamp(options.now?.() ?? new Date());
+  const { sequences, createdKey } = appendSystemEvents(
+    vaultDir,
+    credential,
+    OWNER_PROFILE,
+    missing.map(collection => ({
+      ts,
+      kind: 'collection.created',
+      profile: OWNER_PROFILE,
+      collection: SYSTEM_COLLECTION,
+      sensitivity: 'personal',
+      body: { collection, owner_profile: owner },
+    })),
+  );
+  return { appended: missing, eventSeqs: sequences, createdSystemKey: createdKey };
 }
 
 /**
@@ -652,14 +790,14 @@ export function setCollectionPromptPolicy(
   credential: Unlock,
   input: SetCollectionPromptPolicyInput,
 ): SetCollectionPromptPolicyResult {
-  const collection = assertUserCollectionName(input.collection);
+  // P-1 fix round 1 (B1): only a name with a valid profile prefix; that prefix is the owner profile.
+  const { collection, profile: ownerProfile } = assertProfileCollectionName(input.collection);
+  if (input.ownerProfile !== undefined && assertProfileId(input.ownerProfile) !== ownerProfile) {
+    throw new ProfileError('INVALID_COLLECTION', 'Collection owner profile must equal the collection name prefix.');
+  }
   if (typeof input.allowChildModelPrompts !== 'boolean') {
     throw new TypeError('allowChildModelPrompts must be a boolean.');
   }
-  const ownerProfile =
-    input.ownerProfile !== undefined
-      ? assertProfileId(input.ownerProfile)
-      : inferProfileFromCollection(collection);
   const ts = formatUtcTimestamp(input.now?.() ?? new Date());
   const alreadyCreated = hasCollectionCreatedEvent(vaultDir, credential, collection);
   const kind: 'collection.created' | 'annotation.added' = alreadyCreated
@@ -670,7 +808,7 @@ export function setCollectionPromptPolicy(
     kind === 'collection.created'
       ? {
           collection,
-          ...(ownerProfile !== undefined ? { owner_profile: ownerProfile } : {}),
+          owner_profile: ownerProfile,
           allow_child_model_prompts: input.allowChildModelPrompts,
         }
       : {

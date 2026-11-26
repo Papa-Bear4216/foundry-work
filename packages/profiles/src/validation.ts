@@ -111,6 +111,21 @@ export function assertConsentNote(value: unknown): string {
   return value;
 }
 
+/**
+ * P-1 fix round 1 (item 13): basis `other` needs a nonempty note that says what the basis is.
+ * Returns the validated note (or undefined when none is given for another basis).
+ * Throws `ProfileError('INVALID_CONSENT_NOTE')`.
+ */
+export function assertConsentNoteForBasis(basis: ConsentBasis, note: unknown): string | undefined {
+  if (note === undefined) {
+    if (basis === 'other') {
+      throw new ProfileError('INVALID_CONSENT_NOTE', 'Consent basis "other" requires a nonempty note.');
+    }
+    return undefined;
+  }
+  return assertConsentNote(note);
+}
+
 export function isSensitivityTier(value: unknown): value is SensitivityTier {
   return typeof value === 'string' && SENSITIVITY_SET.has(value);
 }
@@ -173,6 +188,52 @@ export function assertUserCollectionName(value: unknown): string {
   return name;
 }
 
+/**
+ * The profile a collection name belongs to: its first segment, when that is a generic profile and at
+ * least one segment follows (`<profile>/...`). Otherwise undefined (for example a pre-P-1
+ * `<source>/<year>` name, a bare profile name, or `shared`).
+ */
+export function profileOfCollection(value: unknown): ProfileId | undefined {
+  if (!validateCollectionName(value)) return undefined;
+  const slash = value.indexOf('/');
+  if (slash <= 0 || slash === value.length - 1) return undefined;
+  const head = value.slice(0, slash);
+  return isProfileId(head) ? head : undefined;
+}
+
+/**
+ * P-1 fix round 1 (B1): a collection name used for items of profile `P` must be `P/...` (at least one
+ * segment after the prefix), so every collection name belongs to exactly one profile.
+ * Throws `ProfileError('INVALID_COLLECTION')`.
+ */
+export function assertCollectionForProfile(profile: unknown, value: unknown): string {
+  const owner = assertProfileId(profile);
+  const name = assertUserCollectionName(value);
+  if (profileOfCollection(name) !== owner) {
+    throw new ProfileError(
+      'INVALID_COLLECTION',
+      'Collection name must start with its profile followed by a slash and at least one more segment.',
+    );
+  }
+  return name;
+}
+
+/**
+ * A collection name with a valid profile prefix (`me/...`, `partner/...`, `child/...`, `other/...`).
+ * Returns the name and its owner profile. Throws `ProfileError('INVALID_COLLECTION')`.
+ */
+export function assertProfileCollectionName(value: unknown): { collection: string; profile: ProfileId } {
+  const name = assertUserCollectionName(value);
+  const profile = profileOfCollection(name);
+  if (profile === undefined) {
+    throw new ProfileError(
+      'INVALID_COLLECTION',
+      'Collection name must start with a profile (me, partner, child or other) followed by a slash and at least one more segment.',
+    );
+  }
+  return { collection: name, profile };
+}
+
 export function assertSourceId(value: unknown): string {
   if (
     typeof value !== 'string' ||
@@ -191,10 +252,37 @@ export function assertSourceId(value: unknown): string {
   return value;
 }
 
+const CANONICAL_UTC_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{3})?Z$/u;
+
+/**
+ * The 4-digit year of a canonical UTC timestamp `YYYY-MM-DDTHH:MM:SS(.fff)Z` with a real calendar date
+ * and time (year 0001-9999), else undefined. Validated field by field with `setUTCFullYear`, never
+ * `Date.UTC` (which maps years 0-99 to 1900-1999) or `Date.parse`.
+ */
+function canonicalUtcYear(value: string): string | undefined {
+  const match = CANONICAL_UTC_RE.exec(value);
+  if (!match) return undefined;
+  const [, y, mo, d, h, mi, s] = match;
+  const year = Number.parseInt(y!, 10);
+  const month = Number.parseInt(mo!, 10);
+  const day = Number.parseInt(d!, 10);
+  const hour = Number.parseInt(h!, 10);
+  const minute = Number.parseInt(mi!, 10);
+  const second = Number.parseInt(s!, 10);
+  if (year < 1 || month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59 || second > 59) return undefined;
+  const date = new Date(0);
+  date.setUTCFullYear(year, month - 1, day);
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) {
+    return undefined;
+  }
+  return y!;
+}
+
 /**
  * Default collection grain (Product 9, Architecture 5.4, Decisions A-5):
- * `${profile}/${source}/${year}` for 4-digit UTC years `0001`–`9999` when `sourceTs`
- * starts with `YYYY-`, else `${profile}/${source}/undated`.
+ * `${profile}/${source}/${year}` when `sourceTs` is a canonical UTC timestamp
+ * `YYYY-MM-DDTHH:MM:SS(.fff)Z` with a valid date and time (years `0001`–`9999`), else
+ * `${profile}/${source}/undated` (P-1 fix round 1, item 15: `'2024-garbage'` is undated).
  */
 export function defaultCollectionForItem(
   profile: ProfileId,
@@ -203,16 +291,7 @@ export function defaultCollectionForItem(
 ): string {
   const validProfile = assertProfileId(profile);
   const validSource = assertSourceId(source);
-  let year = 'undated';
-  if (typeof sourceTs === 'string') {
-    const match = /^(\d{4})-/u.exec(sourceTs);
-    if (match) {
-      const numericYear = Number.parseInt(match[1]!, 10);
-      if (numericYear >= 1 && numericYear <= 9999) {
-        year = match[1]!;
-      }
-    }
-  }
+  const year = (typeof sourceTs === 'string' ? canonicalUtcYear(sourceTs) : undefined) ?? 'undated';
   const collection = `${validProfile}/${validSource}/${year}`;
   if (Buffer.byteLength(collection, 'utf8') > MAX_COLLECTION_BYTES) {
     throw new ProfileError(

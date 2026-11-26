@@ -296,20 +296,33 @@ const PRIVATE_RULES: ReadonlyArray<readonly [string, RegExp]> = [
   ],
 ];
 
+/** A frozen description of one shipped pattern: its rule id, `RegExp.source` and `RegExp.flags`. */
+export interface ShippedScanPattern {
+  readonly id: string;
+  readonly source: string;
+  readonly flags: string;
+}
+
 /**
  * Every shipped pattern with its rule id, for the overlap-bound test. Each longest match is shorter than
  * `SCAN_OVERLAP_BYTES`. The two credential-assignment rule ids share one pattern.
+ * P-1 fix round 1 (B12): frozen `{ id, source, flags }` records, never the live `RegExp` objects, so no
+ * caller can change a pattern (or its `lastIndex`) that the classifier uses.
  */
-export const SHIPPED_SCAN_PATTERNS: ReadonlyArray<{ readonly id: string; readonly pattern: RegExp }> = Object.freeze([
-  { id: 'private-key', pattern: PRIVATE_KEY_RE },
-  { id: 'bearer-token', pattern: BEARER_HEADER_RE },
-  { id: 'api-token', pattern: KNOWN_TOKEN_PREFIX_RE },
-  { id: 'oauth-or-api-token', pattern: TOKEN_ASSIGNMENT_RE },
-  { id: 'database-credentials', pattern: DB_CONNECTION_URI_RE },
-  { id: 'credential-assignment', pattern: CREDENTIAL_ASSIGNMENT_RE },
-  ...CLINICAL_RULES.map(([id, pattern]) => ({ id, pattern })),
-  ...PRIVATE_RULES.map(([id, pattern]) => ({ id, pattern })),
-].map(entry => Object.freeze(entry)));
+export const SHIPPED_SCAN_PATTERNS: ReadonlyArray<ShippedScanPattern> = Object.freeze(
+  ([
+    ['private-key', PRIVATE_KEY_RE],
+    ['bearer-token', BEARER_HEADER_RE],
+    ['api-token', KNOWN_TOKEN_PREFIX_RE],
+    ['oauth-or-api-token', TOKEN_ASSIGNMENT_RE],
+    ['database-credentials', DB_CONNECTION_URI_RE],
+    ['credential-assignment', CREDENTIAL_ASSIGNMENT_RE],
+    ...CLINICAL_RULES,
+    ...PRIVATE_RULES,
+  ] as ReadonlyArray<readonly [string, RegExp]>).map(([id, pattern]) =>
+    Object.freeze({ id, source: pattern.source, flags: pattern.flags }),
+  ),
+);
 
 function isChildScoped(profile?: string, collection?: string): boolean {
   if (profile === 'child') return true;

@@ -202,8 +202,8 @@ test('A1: every shipped pattern has a bounded longest match shorter than SCAN_OV
   assert.equal(profiles.SCAN_OVERLAP_BYTES, 4096);
   assert.equal(profiles.SCAN_WINDOW_BYTES, 65536);
   const ids = new Set();
-  for (const { id, pattern } of patterns) {
-    assert.ok(pattern instanceof RegExp, id);
+  for (const { id, source, flags } of patterns) {
+    const pattern = new RegExp(source, flags);
     ids.add(id);
     const { bytes, units } = maxMatchLength(pattern);
     t.diagnostic(`longest match ${id}: ${bytes} bytes, ${units} code units`);
@@ -312,6 +312,26 @@ test('A3: a placeholder database URI before a real-looking one is secret', () =>
       .sensitivity,
     'personal',
   );
+});
+
+test('B12: SHIPPED_SCAN_PATTERNS exports frozen { id, source, flags } records, never the live RegExp objects', () => {
+  const patterns = profiles.SHIPPED_SCAN_PATTERNS;
+  assert.ok(Object.isFrozen(patterns));
+  for (const entry of patterns) {
+    assert.ok(Object.isFrozen(entry), entry.id);
+    assert.deepEqual(Object.keys(entry).sort(), ['flags', 'id', 'source'], entry.id);
+    assert.equal(typeof entry.source, 'string');
+    assert.equal(typeof entry.flags, 'string');
+    for (const value of Object.values(entry)) assert.ok(!(value instanceof RegExp), entry.id);
+  }
+  // A caller cannot change what the classifier matches through the export.
+  const bearer = patterns.find(p => p.id === 'bearer-token');
+  assert.throws(() => {
+    'use strict';
+    bearer.source = 'never';
+  }, TypeError);
+  const field = bearerHeader(realLookingTokenValue());
+  assert.equal(profiles.classifySensitivity({ ...BASE, text: field }).sensitivity, 'secret');
 });
 
 test('A3: repeated calls give the same result (global patterns reset their position)', () => {

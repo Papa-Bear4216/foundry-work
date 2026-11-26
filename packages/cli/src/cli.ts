@@ -354,6 +354,7 @@ export async function runCli(argv: readonly string[], options: RunOptions = {}):
       basis: run.basis,
       note: run.note,
       childPrompts: run.childPrompts,
+      reveal: run.reveal,
       filters: run.filters,
       credential: isKeyed(run.command) ? credential : undefined,
       secrets,

@@ -1,49 +1,28 @@
-import type {
-  CollectionPolicyEntry,
-  CollectionPolicyLookup,
-  PromptCandidateItem,
-  PromptEligibility,
-} from './types.ts';
+import { replayedChildPromptsAllowed } from './policy-registry.ts';
+import type { PromptCandidateItem, PromptEligibility, VaultProfileState } from './types.ts';
 import {
   assertProfileId,
   assertSensitivityTier,
   assertUserCollectionName,
 } from './validation.ts';
 
-function readAllowChildModelPrompts(
-  collection: string,
-  policySource?: CollectionPolicyLookup,
-): boolean {
-  if (!policySource) return false;
-
-  if ('collections' in policySource && policySource.collections instanceof Map) {
-    const state = policySource.collections.get(collection);
-    return state?.allowChildModelPrompts === true;
-  }
-
-  if (policySource instanceof Map) {
-    const entry = policySource.get(collection) as CollectionPolicyEntry | undefined;
-    if (typeof entry === 'boolean') return entry;
-    return entry?.allowChildModelPrompts === true;
-  }
-
-  const record = policySource as Readonly<Record<string, CollectionPolicyEntry>>;
-  if (!Object.hasOwn(record, collection)) return false;
-  const entry = record[collection];
-  if (typeof entry === 'boolean') return entry;
-  return entry?.allowChildModelPrompts === true;
-}
-
 /**
- * Deterministic model-prompt gating check (Product Spec section 9, Roadmap P-1):
- * - `sensitivity === 'secret'` is NEVER eligible (cannot be overridden).
- * - `sensitivity === 'child'`, `profile === 'child'`, or a `child/...` collection is excluded
- *   by default (`reason: 'CHILD_TIER_EXCLUDED'`) and becomes eligible ONLY when the item's
- *   exact `collection` has `allowChildModelPrompts === true` in the replayed vault policy state.
+ * Deterministic model-prompt gating check (Product Spec section 9, Roadmap P-1). Checks, in this order:
+ * 1. `sensitivity === 'secret'` is NEVER eligible (`SECRET_TIER_EXCLUDED`, cannot be overridden).
+ * 2. `item.collection` must start with `item.profile + '/'`, otherwise `COLLECTION_PROFILE_MISMATCH`
+ *    (fail closed; this also shuts out records written before P-1, whose names are `<source>/<year>`).
+ * 3. `sensitivity === 'child'`, `profile === 'child'`, or a `child/...` collection is excluded
+ *    (`CHILD_TIER_EXCLUDED`) unless the item's exact `collection` is switched on in the PRIVATE copy of
+ *    the policy that `loadVaultProfileState` took at replay time for this `state` object. Any other
+ *    value (a hand-built object, a `Map`, `undefined`, or a state changed after replay) cannot switch
+ *    child data on.
+ *
+ * Caller duty (A-43, ruling R14): the gate trusts the candidate's `profile`, `collection` and
+ * `sensitivity`. Pass items read from authenticated vault or index records, never caller-supplied metadata.
  */
 export function isPromptEligible(
   item: PromptCandidateItem,
-  policySource?: CollectionPolicyLookup,
+  state?: VaultProfileState,
 ): PromptEligibility {
   const profile = assertProfileId(item.profile);
   const collection = assertUserCollectionName(item.collection);
@@ -53,6 +32,10 @@ export function isPromptEligible(
     return { eligible: false, reason: 'SECRET_TIER_EXCLUDED' };
   }
 
+  if (!collection.startsWith(`${profile}/`)) {
+    return { eligible: false, reason: 'COLLECTION_PROFILE_MISMATCH' };
+  }
+
   const isChildData =
     sensitivity === 'child' ||
     profile === 'child' ||
@@ -60,7 +43,7 @@ export function isPromptEligible(
     collection.startsWith('child/');
 
   if (isChildData) {
-    if (readAllowChildModelPrompts(collection, policySource)) {
+    if (replayedChildPromptsAllowed(state, collection)) {
       return { eligible: true };
     }
     return { eligible: false, reason: 'CHILD_TIER_EXCLUDED' };
@@ -74,7 +57,7 @@ export function isPromptEligible(
  */
 export function filterItemsForModelPrompt<T extends PromptCandidateItem>(
   items: readonly T[],
-  policySource?: CollectionPolicyLookup,
+  state?: VaultProfileState,
 ): T[] {
-  return items.filter(item => isPromptEligible(item, policySource).eligible);
+  return items.filter(item => isPromptEligible(item, state).eligible);
 }

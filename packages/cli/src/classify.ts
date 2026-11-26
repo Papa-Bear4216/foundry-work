@@ -1,18 +1,22 @@
 /**
- * Write-time sensitivity of one imported item (P-1 fix round 1, item 6).
+ * Write-time sensitivity of one imported item (P-1 fix round 1, items 6 and B0).
  *
- * The classifier sees the raw item bytes AND the text the source's deriver produces from them (for
- * example a base64 or quoted-printable mail body, decoded). Both go through the windowed scan of
- * `classifySensitivity`. When the deriver throws, the raw bytes alone decide the tier and the result
- * carries the rule id `derive-failed`; the failure itself never raises the tier and never fails the import.
+ * The classifier sees the raw item bytes AND the search text the index stores for the item. That text
+ * comes from `derive.ts` `itemTextOfPlaintext`, which applies the projection's own limits: the first
+ * `MAX_DERIVE_BYTES` (8 MiB) of the item are parsed, with the same `truncated` flag, and the text is at
+ * most `MAX_TEXT_BYTES` (1 MiB). For mail this is the decoded body (base64 and quoted-printable parts).
+ * The raw bytes of the WHOLE item go through the windowed scan of `classifySensitivity` as well, and so
+ * does the derived text. When deriving the text throws, the raw bytes alone decide the tier and the
+ * result carries the rule id `derive-failed`; the failure itself never raises the tier and never fails
+ * the import.
  *
- * Memory: while this runs, the pipeline's plaintext buffer, the deriver's own copy of it (its
- * `Buffer.concat`), the deriver's decoded strings, and the collected derived texts are alive. All of them
- * are released when this function returns, before the item is written.
+ * Memory: the item's plaintext is the pipeline's own buffer (at most the 64 MiB item cap); the parser
+ * reads at most its first 8 MiB through a view (no copy). While this runs, the parser's decoded strings
+ * (bounded by the 8 MiB input) and the rendered text (at most 1 MiB) are alive. All of them are released
+ * when this function returns, before the item is written.
  */
-import { Readable } from 'node:stream';
 import type { ClassificationInput, ClassificationResult } from 'foundry-profiles';
-import type { Deriver, ImportArchiveOptions, StoredItem } from 'importers';
+import type { ImportArchiveOptions } from 'importers';
 
 /** The pipeline's item payload (the third argument of `resolveSensitivity`). */
 export type ResolveSensitivityItem = NonNullable<
@@ -21,60 +25,33 @@ export type ResolveSensitivityItem = NonNullable<
 
 export type Classify = (input: ClassificationInput) => ClassificationResult;
 
+/** The item's search text (as the index stores it), or undefined when its type has none. */
+export type DeriveText = (mime: string | null, plaintext: Uint8Array) => string | undefined;
+
 /** Rule id of a result whose derived text could not be produced. */
 export const DERIVE_FAILED_RULE = 'derive-failed';
 
-/** Every derived `title` and `text` of the item, or undefined when the source has no deriver. Throws when the deriver throws. */
-async function derivedTexts(
-  derivers: readonly Deriver[],
-  input: ClassificationInput,
-  item: ResolveSensitivityItem,
-): Promise<string[] | undefined> {
-  const deriver = derivers.find(candidate => candidate.id === input.source);
-  if (deriver === undefined) return undefined;
-  const stored: StoredItem = {
-    source: input.source,
-    path: input.path ?? '',
-    mime: item.mime,
-    size: item.plaintext.byteLength,
-    blobId: '', // not known before the write; no deriver reads it
-    profile: item.profile,
-    collection: item.collection,
-    sensitivity: 'personal', // placeholder; no deriver reads it
-    ...(item.sourceTs !== undefined ? { sourceTs: item.sourceTs } : {}),
-    tags: [...item.tags],
-  };
-  const texts: string[] = [];
-  // One chunk: the pipeline's own buffer (a Buffer, so the deriver does not wrap it again). Not modified.
-  for await (const derived of deriver.derive(stored, Readable.from([item.plaintext]))) {
-    if (derived.kind !== 'text') continue;
-    if (derived.title) texts.push(derived.title);
-    if (derived.text) texts.push(derived.text);
-  }
-  return texts;
-}
-
 /**
- * Classify one item from its raw bytes plus its derived text. `input` carries the item metadata (profile,
- * collection, source, path, user rules); `item` is the pipeline's item payload.
+ * Classify one item from its raw bytes plus its derived search text. `input` carries the item metadata
+ * (profile, collection, source, path, user rules); `item` is the pipeline's item payload.
  */
-export async function classifyImportItem(
+export function classifyImportItem(
   classify: Classify,
-  derivers: readonly Deriver[],
+  deriveText: DeriveText,
   input: Omit<ClassificationInput, 'plaintext' | 'derivedTexts'>,
   item: ResolveSensitivityItem,
-): Promise<ClassificationResult> {
+): ClassificationResult {
   const base: ClassificationInput = {
     ...input,
     plaintext: item.plaintext,
     mime: item.mime,
     tags: item.tags,
   };
-  let texts: string[] | undefined;
+  let text: string | undefined;
   try {
-    texts = await derivedTexts(derivers, input, item);
+    text = deriveText(item.mime, item.plaintext);
   } catch {
     return { sensitivity: classify(base).sensitivity, rule: DERIVE_FAILED_RULE };
   }
-  return classify(texts === undefined ? base : { ...base, derivedTexts: texts });
+  return classify(text ? { ...base, derivedTexts: [text] } : base);
 }

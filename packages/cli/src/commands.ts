@@ -12,7 +12,7 @@ import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import type { IndexStoreOptions } from 'foundry-index';
-import type { ProfileId, UserSensitivityRule } from 'foundry-profiles';
+import type { ConsentRecord, ProfileId, UserSensitivityRule } from 'foundry-profiles';
 import type { ImportResult } from 'importers';
 import type { UnlockSession } from 'vault';
 import type { CommandName, SearchFilters } from './args.ts';
@@ -44,6 +44,8 @@ export interface CommandRequest {
   basis?: string;
   note?: string;
   childPrompts?: boolean;
+  /** `profile list` / `consent list` only: print display names and consent notes (P-1 fix round 1, B7). */
+  reveal?: boolean;
   filters: SearchFilters;
   /** Keyed commands: which secret unlocks the vault. */
   credential?: 'passphrase' | 'recovery';
@@ -76,6 +78,11 @@ export interface TestHooks {
   failRunB?: boolean;
   /** `import`: the index update between Run A and Run B throws an errno-style error whose message quotes every secret. */
   failBetweenRunsUpdate?: boolean;
+  /**
+   * `import`: throws an errno-style error after the `collection.created` binding events are appended and before
+   * any collection key is created (P-1 fix round 1, B3).
+   */
+  failAfterCollectionBinding?: boolean;
   /**
    * `import`: called with the archive path after Run A has closed the archive, before Run B (it may change a part).
    * A function: it cannot cross into the worker thread, so only the inline path (`runCli` with `inline`) can use it.
@@ -550,6 +557,9 @@ async function importRun(
   const profiles = await import('foundry-profiles');
   const { openItemKeyLookup } = await import('foundry-index');
   const { classifyImportItem } = await import('./classify.ts');
+  const { itemTextOfPlaintext, loadParsers } = await import('./derive.ts');
+  const parsers = await loadParsers();
+  const deriveText = (mime: string | null, plaintext: Uint8Array) => itemTextOfPlaintext(parsers, mime, plaintext);
   const unlocked = vault.decodeKeyring(readKeyring(ctx), { session }, id);
   let writer: ReturnType<typeof vault.VaultWriter.open> | undefined;
   let lookup: ReturnType<typeof openItemKeyLookup> | undefined;
@@ -575,11 +585,15 @@ async function importRun(
       writer: counting,
       importers: importers.DEFAULT_IMPORTERS,
       profile,
+      // P-1 fix round 1 (B1): every name, explicit or default, must be `<profile>/...`.
       resolveCollection: ({ profile: itemProfile, source, sourceTs }) =>
-        explicitCollection ?? profiles.defaultCollectionForItem(itemProfile as ProfileId, source, sourceTs),
+        profiles.assertCollectionForProfile(
+          itemProfile,
+          explicitCollection ?? profiles.defaultCollectionForItem(itemProfile as ProfileId, source, sourceTs),
+        ),
       resolveCollectionKeyId: name => vault.collectionKeyId(unlocked, profile, name),
-      // P-1 fix round 1 (item 6): raw bytes AND the source deriver's decoded text are classified.
-      resolveSensitivity: async (source, itemPath, item) => {
+      // P-1 fix round 1 (items 6 and B0): the raw bytes AND the search text the index stores are classified.
+      resolveSensitivity: (source, itemPath, item) => {
         const input = {
           profile,
           collection:
@@ -591,8 +605,7 @@ async function importRun(
           userRules: sensitivityRules,
         };
         if (item === undefined) return profiles.classifySensitivity(input).sensitivity;
-        const result = await classifyImportItem(profiles.classifySensitivity, importers.DEFAULT_DERIVERS, input, item);
-        return result.sensitivity;
+        return classifyImportItem(profiles.classifySensitivity, deriveText, input, item).sensitivity;
       },
       vaultDir: ctx.paths.vault,
       unlocked,
@@ -627,16 +640,20 @@ async function importCommand(ctx: Context): Promise<void> {
     ctx.request.importProfile === undefined
       ? PROFILE
       : profiles.assertProfileId(ctx.request.importProfile);
+  // P-1 fix round 1 (B1): a custom collection must be `<profile>/...` (checked before any key derivation).
   const explicitCollection =
     ctx.request.importCollection === undefined
       ? undefined
-      : profiles.assertUserCollectionName(ctx.request.importCollection);
+      : profiles.assertCollectionForProfile(profile, ctx.request.importCollection);
 
   await keyed(ctx, async (session, id) => {
     // An earlier command may have stopped inside a segment seal (a pending HEAD). The read-only replay of the index
-    // update or profile state refuses that state; only the vault writer recovers it. So: writer first.
+    // update or profile state refuses that state; only the vault writer recovers it. So: writer first. (It completes
+    // or rolls back an EARLIER command's seal and stores no imported item.)
     await recoverVaultWriter(ctx, session, id);
+    // One replay for both checks, before any write of this import.
     const profileState = profiles.loadVaultProfileState(ctx.paths.vault, { session });
+    profiles.assertProfileVault(profileState); // B5: PRE_PROFILE_VAULT
     profiles.assertImportConsent(profileState, profile);
 
     const options = await indexOptions(ctx, session);
@@ -661,6 +678,15 @@ async function importCommand(ctx: Context): Promise<void> {
     let collectionsCreated = 0;
     if (runA.missingCollections.length > 0) {
       ctx.importStage = 'between';
+      // B3 (A-41 limits 1 and 5): record each new name's owner profile durably BEFORE its key exists. Event first,
+      // key second: a crash between them leaves an event without a key (harmless; the next import creates the key
+      // with the same derived ID).
+      const bindings = profiles.recordCollectionBindings(ctx.paths.vault, { session }, profile, runA.missingCollections);
+      // The first binding of a vault creates `me`'s `system` key: it is a new collection key too.
+      if (bindings.createdSystemKey) collectionsCreated++;
+      if (ctx.hooks.failAfterCollectionBinding) {
+        throw hookError('after the collection binding', secretTexts(ctx.request.secrets));
+      }
       for (const slice of nameSlices(runA.missingCollections)) {
         collectionsCreated += ensureCollectionKeys(ctx.paths.keyring, id, { session }, profile, slice).created;
       }
@@ -716,11 +742,12 @@ async function profileAddCommand(ctx: Context): Promise<void> {
     await recoverVaultWriter(ctx, session, id);
     stall(ctx.hooks);
     const result = profiles.addProfile(ctx.paths.vault, { session }, { profile, displayName });
+    // B7: a mutation command never prints decrypted user text (and takes no --reveal).
     if (ctx.request.json) {
       ctx.out({
         ok: true,
         profile: result.profile,
-        ...(result.displayName !== undefined ? { displayName: result.displayName } : {}),
+        displayNameSet: result.displayName !== undefined,
         ts: result.ts,
         eventSeq: result.eventSeq,
       });
@@ -736,8 +763,15 @@ async function profileListCommand(ctx: Context): Promise<void> {
     await recoverVaultWriter(ctx, session, id);
     stall(ctx.hooks);
     const { profiles: items, destroyedProfileCount } = profiles.listProfiles(ctx.paths.vault, { session });
+    // B7: the display name is decrypted user text; it is printed only with --reveal.
+    const reveal = ctx.request.reveal === true;
     if (ctx.request.json) {
-      ctx.out({ profiles: items, erasedProfileKeys: destroyedProfileCount });
+      const shown = items.map(({ displayName, ...rest }) => ({
+        ...rest,
+        displayNameSet: displayName !== undefined,
+        ...(reveal && displayName !== undefined ? { displayName } : {}),
+      }));
+      ctx.out({ profiles: shown, erasedProfileKeys: destroyedProfileCount });
       return;
     }
     if (items.length === 0) {
@@ -745,7 +779,7 @@ async function profileListCommand(ctx: Context): Promise<void> {
       return;
     }
     const lines = items.map(p => {
-      const label = p.displayName !== undefined ? ` (${p.displayName})` : '';
+      const label = p.displayName === undefined ? '' : reveal ? ` (${p.displayName})` : ' (name set)';
       const consent =
         p.profile === 'me'
           ? 'owner'
@@ -762,19 +796,20 @@ async function consentRecordCommand(ctx: Context): Promise<void> {
   const profiles = await import('foundry-profiles');
   const profile = profiles.assertConsentSubjectProfile(ctx.request.targetProfile);
   const basis = profiles.assertConsentBasis(ctx.request.basis);
-  const note =
-    ctx.request.note === undefined ? undefined : profiles.assertConsentNote(ctx.request.note);
+  // Item 13: basis `other` needs a nonempty --note (checked before any key derivation).
+  const note = profiles.assertConsentNoteForBasis(basis, ctx.request.note);
 
   await keyed(ctx, async (session, id) => {
     await recoverVaultWriter(ctx, session, id);
     stall(ctx.hooks);
     const result = profiles.recordConsent(ctx.paths.vault, { session }, { profile, basis, note });
+    // B7: a mutation command never prints the note.
     if (ctx.request.json) {
       ctx.out({
         ok: true,
         profile: result.profile,
         basis: result.basis,
-        ...(result.note !== undefined ? { note: result.note } : {}),
+        noteSet: result.note !== undefined,
         ts: result.ts,
         eventSeq: result.eventSeq,
       });
@@ -790,16 +825,25 @@ async function consentListCommand(ctx: Context): Promise<void> {
     await recoverVaultWriter(ctx, session, id);
     stall(ctx.hooks);
     const result = profiles.listConsents(ctx.paths.vault, { session });
+    // B7: the note is decrypted user text; it is printed only with --reveal.
+    const reveal = ctx.request.reveal === true;
+    const shown = (records: readonly ConsentRecord[]) =>
+      records.map(({ note, ...rest }) => ({
+        ...rest,
+        noteSet: note !== undefined,
+        ...(reveal && note !== undefined ? { note } : {}),
+      }));
     if (ctx.request.json) {
-      ctx.out({ consents: result.consents, history: result.history });
+      ctx.out({ consents: shown(result.consents), history: shown(result.history) });
       return;
     }
     if (result.consents.length === 0) {
       ctx.out('No consent records.\n');
       return;
     }
+    const noteText = (note: string | undefined) => (note === undefined ? '' : reveal ? `  ${note}` : '  (note set)');
     const lines = result.consents.map(c =>
-      `${c.ts}  ${c.profile}  ${c.basis}${c.note !== undefined ? `  ${c.note}` : ''}  (event ${c.eventSeq})\n`,
+      `${c.ts}  ${c.profile}  ${c.basis}${noteText(c.note)}  (event ${c.eventSeq})\n`,
     );
     ctx.out(lines.join(''));
   });
@@ -807,7 +851,8 @@ async function consentListCommand(ctx: Context): Promise<void> {
 
 async function collectionPromptPolicyCommand(ctx: Context): Promise<void> {
   const profiles = await import('foundry-profiles');
-  const collection = profiles.assertUserCollectionName(ctx.request.targetCollection);
+  // B1: only a name with a valid profile prefix; that prefix is the policy's owner profile.
+  const { collection } = profiles.assertProfileCollectionName(ctx.request.targetCollection);
   const allowChildModelPrompts = Boolean(ctx.request.childPrompts);
 
   await keyed(ctx, async (session, id) => {

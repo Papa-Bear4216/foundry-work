@@ -10,8 +10,6 @@ export {
 export type {
   ClassificationInput,
   ClassificationResult,
-  CollectionPolicyEntry,
-  CollectionPolicyLookup,
   CollectionState,
   ConsentBasis,
   ConsentRecord,
@@ -27,11 +25,14 @@ export type {
 } from './types.ts';
 
 export {
+  assertCollectionForProfile,
   assertCollectionName,
   assertConsentBasis,
   assertConsentNote,
+  assertConsentNoteForBasis,
   assertConsentSubjectProfile,
   assertDisplayName,
+  assertProfileCollectionName,
   assertProfileId,
   assertSensitivityTier,
   assertSourceId,
@@ -48,6 +49,7 @@ export {
   MAX_DISPLAY_NAME_BYTES,
   MAX_RULE_ID_BYTES,
   MAX_RULE_PATTERN_BYTES,
+  profileOfCollection,
   RESERVED_COLLECTION_PREFIX,
   SYSTEM_COLLECTION,
   validateCollectionName,
@@ -66,6 +68,7 @@ export {
   SHIPPED_SCAN_PATTERNS,
   stringScanWindows,
 } from './sensitivity.ts';
+export type { ShippedScanPattern } from './sensitivity.ts';
 
 export { filterItemsForModelPrompt, isPromptEligible } from './prompt-policy.ts';
 
@@ -73,11 +76,13 @@ export {
   addProfile,
   addSensitivityRule,
   assertImportConsent,
+  assertProfileVault,
   hasActiveConsent,
   listCollections,
   listConsents,
   listProfiles,
   loadVaultProfileState,
+  recordCollectionBindings,
   recordConsent,
   setCollectionPromptPolicy,
 } from './store.ts';
@@ -85,6 +90,7 @@ export type {
   AddProfileInput,
   AddProfileResult,
   AddSensitivityRuleResult,
+  RecordCollectionBindingsResult,
   RecordConsentInput,
   RecordConsentResult,
   SetCollectionPromptPolicyInput,

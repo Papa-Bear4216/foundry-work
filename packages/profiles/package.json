@@ -11,7 +11,7 @@
   "scripts": {
     "build": "npm --prefix ../vault/codec run build && tsc -p tsconfig.json",
     "typecheck": "npm --prefix ../vault/codec run build && tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test --test-concurrency=1 test/profiles.test.mjs test/sensitivity-scan.test.mjs"
+    "test": "npm run build && node --test --test-concurrency=1 test/profiles.test.mjs test/sensitivity-scan.test.mjs test/p1-fix-b.test.mjs"
   },
   "dependencies": {
     "vault": "0.0.0"

@@ -61,16 +61,18 @@ const COMMANDS: Readonly<Record<CommandName, CommandSpec>> = {
   'index rebuild': { words: 2, options: [...COMMON, ...CREDENTIAL, 'json'], keyed: true },
   'vault reset-passphrase': { words: 2, options: [...COMMON, ...CREDENTIAL], keyed: false },
   'profile add': { words: 2, positional: 'profile', options: [...COMMON, ...CREDENTIAL, 'json', 'display-name'], keyed: true },
-  'profile list': { words: 2, options: [...COMMON, ...CREDENTIAL, 'json'], keyed: true },
+  'profile list': { words: 2, options: [...COMMON, ...CREDENTIAL, 'json', 'reveal'], keyed: true },
   'consent record': { words: 2, positional: 'profile', options: [...COMMON, ...CREDENTIAL, 'json', 'basis', 'note'], keyed: true },
-  'consent list': { words: 2, options: [...COMMON, ...CREDENTIAL, 'json'], keyed: true },
+  'consent list': { words: 2, options: [...COMMON, ...CREDENTIAL, 'json', 'reveal'], keyed: true },
   'collection prompt-policy': { words: 2, positional: 'collection', options: [...COMMON, ...CREDENTIAL, 'json', 'child-prompts'], keyed: true },
   'collection list': { words: 2, options: [...COMMON, ...CREDENTIAL, 'json'], keyed: true },
 };
 
 const STRING_OPTIONS = new Set(['vault', 'timeout', ...FILTERS, ...P1_STRING_OPTIONS]);
+// `reveal` is a boolean (it takes no value), so the loose parse and `guardSecretInput` never count the token after
+// it as its value: that token stays a positional and is counted against the declared positionals.
 const ALL_OPTIONS: Record<string, ParseArgsOptionConfig> = Object.fromEntries(
-  [...new Set([...COMMON, ...CREDENTIAL, ...FILTERS, ...P1_STRING_OPTIONS, 'json', 'version'])]
+  [...new Set([...COMMON, ...CREDENTIAL, ...FILTERS, ...P1_STRING_OPTIONS, 'json', 'reveal', 'version'])]
     .map(name => [name, { type: STRING_OPTIONS.has(name) ? 'string' : 'boolean' } as ParseArgsOptionConfig]),
 );
 ALL_OPTIONS.help = { type: 'boolean', short: 'h' };
@@ -107,6 +109,7 @@ export type ParsedCommand =
     basis?: string;
     note?: string;
     childPrompts?: boolean;
+    reveal: boolean;
     filters: SearchFilters;
   };
 
@@ -233,6 +236,7 @@ export function parseCommandLine(argv: readonly string[], env: Readonly<Record<s
     basis,
     note: command === 'consent record' ? textOption(values.note) : undefined,
     childPrompts,
+    reveal: values.reveal === true,
     filters: command !== 'search' ? {} : {
       from: dateOption(values.from, 'from'),
       until: dateOption(values.until, 'until'),
@@ -277,8 +281,9 @@ Secrets are never read from arguments or environment variables. They come from a
 terminal prompt, or from stdin with --passphrase-stdin / --recovery-key-stdin.
 `,
   'init': 'Usage: foundry init [--vault <dir>] [--passphrase-stdin]\n',
-  'import': 'Usage: foundry import <archive.zip|first-part.zip|folder> [--profile <me|partner|child|other>] [--collection <name>]\n'
-    + '       [--json] [--passphrase-stdin | --recovery-key-stdin]\n',
+  'import': 'Usage: foundry import <archive.zip|first-part.zip|folder> [--profile <me|partner|child|other>] [--collection <profile>/<name>]\n'
+    + '       [--json] [--passphrase-stdin | --recovery-key-stdin]\n'
+    + '  A --collection name must start with the import profile and a slash, for example me/holidays.\n',
   'search': 'Usage: foundry search <query> [--from <date>] [--until <date>] [--source <s>] [--profile <p>]\n'
     + '       [--collection <c>] [--tier <t>] [--limit <1-1000>] [--json] [--passphrase-stdin | --recovery-key-stdin]\n',
   'vault verify': 'Usage: foundry vault verify [--json]\n',
@@ -287,11 +292,16 @@ terminal prompt, or from stdin with --passphrase-stdin / --recovery-key-stdin.
     + '  With both flags, stdin line 1 is the recovery key and line 2 the new passphrase.\n',
   'profile add': 'Usage: foundry profile add <me|partner|child|other> [--display-name <name>] [--json]\n'
     + '       [--passphrase-stdin | --recovery-key-stdin]\n',
-  'profile list': 'Usage: foundry profile list [--json] [--passphrase-stdin | --recovery-key-stdin]\n',
+  'profile list': 'Usage: foundry profile list [--reveal] [--json] [--passphrase-stdin | --recovery-key-stdin]\n'
+    + '  Display names are shown as "(name set)" unless you give --reveal.\n',
   'consent record': 'Usage: foundry consent record <partner|child|other> --basis <exported-by-them|parent-or-guardian|shared-conversation|other>\n'
-    + '       [--note <text>] [--json] [--passphrase-stdin | --recovery-key-stdin]\n',
-  'consent list': 'Usage: foundry consent list [--json] [--passphrase-stdin | --recovery-key-stdin]\n',
-  'collection prompt-policy': 'Usage: foundry collection prompt-policy <collection> --child-prompts <on|off> [--json]\n'
+    + '       [--note <text>] [--json] [--passphrase-stdin | --recovery-key-stdin]\n'
+    + '  --basis other needs a --note that says what the basis is.\n'
+    + '  The note is free text, stored under the owner\'s (me) key, and it stays after the other person\'s data is erased.\n'
+    + '  Do not write names or other identifying details in the note.\n',
+  'consent list': 'Usage: foundry consent list [--reveal] [--json] [--passphrase-stdin | --recovery-key-stdin]\n'
+    + '  Consent notes are shown as "(note set)" unless you give --reveal.\n',
+  'collection prompt-policy': 'Usage: foundry collection prompt-policy <profile>/<collection> --child-prompts <on|off> [--json]\n'
     + '       [--passphrase-stdin | --recovery-key-stdin]\n',
   'collection list': 'Usage: foundry collection list [--json] [--passphrase-stdin | --recovery-key-stdin]\n',
 };

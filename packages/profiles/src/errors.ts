@@ -8,7 +8,8 @@ export type ProfileErrorCode =
   | 'CONSENT_REQUIRED'
   | 'INVALID_CONSENT_NOTE'
   | 'INVALID_SENSITIVITY'
-  | 'INVALID_SENSITIVITY_RULE';
+  | 'INVALID_SENSITIVITY_RULE'
+  | 'PRE_PROFILE_VAULT';
 
 /**
  * Typed domain error for profile, collection, sensitivity, and consent invariants.
