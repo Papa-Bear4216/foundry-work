@@ -687,7 +687,7 @@ test('vault persistence & replay: profiles, display names, consent events, user 
     { id: 'child-toggled-off', profile: 'child', collection: childColB, sensitivity: 'child' },
     { id: 'child-unconfigured', profile: 'child', collection: 'child/google-takeout/contacts/2024', sensitivity: 'child' },
     { id: 'me-child-tier', profile: 'me', collection: 'me/shared-school/2024', sensitivity: 'child' },
-  ];
+  ].map(c => ({ ...c, vaultId: state.vaultId })); // Round 2 (G1): items carry their vault ID.
 
   assert.deepEqual(isPromptEligible(candidates[0], state), { eligible: true });
   assert.deepEqual(isPromptEligible(candidates[1], state), {
@@ -713,15 +713,24 @@ test('vault persistence & replay: profiles, display names, consent events, user 
   });
 
   // P-1 fix round 1 (B2): a plain object is never a policy source, and an unprefixed name fails closed.
+  // Round 2 (G1): a plain object has no recorded vault snapshot, so it gives VAULT_MISMATCH first.
   assert.deepEqual(
     isPromptEligible(
-      { profile: 'child', collection: 'toString', sensitivity: 'child' },
+      { vaultId: state.vaultId, profile: 'child', collection: 'toString', sensitivity: 'child' },
       {},
     ),
+    { eligible: false, reason: 'VAULT_MISMATCH' },
+  );
+  assert.deepEqual(
+    isPromptEligible({ vaultId: state.vaultId, profile: 'child', collection: 'toString', sensitivity: 'child' }, state),
     { eligible: false, reason: 'COLLECTION_PROFILE_MISMATCH' },
   );
   assert.deepEqual(
-    isPromptEligible({ profile: 'child', collection: 'child/toString', sensitivity: 'child' }, { 'child/toString': true }),
+    isPromptEligible({ vaultId: state.vaultId, profile: 'child', collection: 'child/toString', sensitivity: 'child' }, { 'child/toString': true }),
+    { eligible: false, reason: 'VAULT_MISMATCH' },
+  );
+  assert.deepEqual(
+    isPromptEligible({ vaultId: state.vaultId, profile: 'child', collection: 'child/toString', sensitivity: 'child' }, state),
     { eligible: false, reason: 'CHILD_TIER_EXCLUDED' },
   );
 

@@ -45,7 +45,9 @@ export function classifyImportItem(
     ...input,
     plaintext: item.plaintext,
     mime: item.mime,
-    tags: item.tags,
+    // Archive tags (for example Gmail labels) are untrusted: they may raise the tier, never lower it
+    // (P-1 fix round 2, C3).
+    archiveTags: item.tags,
   };
   let text: string | undefined;
   try {

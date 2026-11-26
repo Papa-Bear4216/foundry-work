@@ -359,12 +359,15 @@ test('child profile import, sensitivity floor vs secret elevation, --collection 
   const vaultDir = join(home, 'vault');
   const credential = { recoveryKey: decodeRecoveryKey(recoveryKey) };
   const stateDefault = loadVaultProfileState(vaultDir, credential);
+  // Round 2 (G1): prompt candidates carry the vault ID of the vault they were read from.
+  const childItems = childEvents.map(e => ({ ...e, vaultId: stateDefault.vaultId }));
+  assert.equal(filterItemsForModelPrompt(childItems, stateDefault).length, 0);
   assert.equal(filterItemsForModelPrompt(childEvents, stateDefault).length, 0);
-  assert.deepEqual(isPromptEligible(childEvents[0], stateDefault), {
+  assert.deepEqual(isPromptEligible(childItems[0], stateDefault), {
     eligible: false,
     reason: 'CHILD_TIER_EXCLUDED',
   });
-  assert.deepEqual(isPromptEligible(childEvents[3], stateDefault), {
+  assert.deepEqual(isPromptEligible(childItems[3], stateDefault), {
     eligible: false,
     reason: 'SECRET_TIER_EXCLUDED',
   });
@@ -392,7 +395,9 @@ test('child profile import, sensitivity floor vs secret elevation, --collection 
   assert.equal(JSON.parse(enable2024.stdout).kind, 'annotation.added');
 
   const stateEnabled = loadVaultProfileState(vaultDir, credential);
-  const eligibleNow = filterItemsForModelPrompt(childEvents, stateEnabled);
+  const eligibleNow = filterItemsForModelPrompt(childItems, stateEnabled);
+  // Without a vault ID nothing is eligible, even with the switch on.
+  assert.equal(filterItemsForModelPrompt(childEvents, stateEnabled).length, 0);
   // The 2 non-secret 2024 items in `child/google-takeout/mail/2024` become eligible;
   // the 2023 collection item and the 2024 `secret` item remain excluded!
   assert.equal(eligibleNow.length, 2);
@@ -442,7 +447,7 @@ test('child profile import, sensitivity floor vs secret elevation, --collection 
   assert.equal(JSON.parse(disable2024.stdout).kind, 'annotation.added');
 
   const stateDisabled = loadVaultProfileState(vaultDir, credential);
-  assert.equal(filterItemsForModelPrompt(childEvents, stateDisabled).length, 0);
+  assert.equal(filterItemsForModelPrompt(childItems, stateDisabled).length, 0);
 });
 
 // --- P-1 fix round 1 session A (item 6): classify the decoded text, not only the raw bytes ---
@@ -579,4 +584,21 @@ test('B0: the classifier uses the projection limits (8 MiB input slice, truncate
     { plaintext: big, mime: 'text/plain', tags: [], profile: 'me', collection: input.collection },
   );
   assert.deepEqual(res, { sensitivity: 'secret', rule: 'private-key' });
+});
+
+test('C3 (round 2): a mail whose archive label is sensitivity:public is personal on import; a higher label raises', async () => {
+  const { classifyImportItem } = await import('../dist/classify.js');
+  const { classifySensitivity } = await import('foundry-profiles');
+  const { itemTextOfPlaintext, loadParsers } = await import('../dist/derive.js');
+  const parsers = await loadParsers();
+  const indexText = (mime, plaintext) => itemTextOfPlaintext(parsers, mime, plaintext);
+  const mail = Buffer.from(
+    [`From: <${syntheticEmail('c3-label')}>`, 'Subject: Synthetic weekly words', '', 'TEST ONLY body', ''].join('\r\n'),
+    'utf8',
+  );
+  const input = { profile: 'me', collection: 'me/google-takeout/mail/2024', source: 'google-takeout/mail', path: 'm/c3' };
+  const item = { plaintext: mail, mime: 'message/rfc822', tags: ['sensitivity:public'], profile: 'me', collection: input.collection };
+  assert.deepEqual(classifyImportItem(classifySensitivity, indexText, input, item), { sensitivity: 'personal', rule: 'default' });
+  const raised = classifyImportItem(classifySensitivity, indexText, input, { ...item, tags: ['sensitivity:private'] });
+  assert.deepEqual(raised, { sensitivity: 'private', rule: 'archive-tag:private' });
 });

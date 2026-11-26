@@ -486,6 +486,7 @@ export function loadVaultProfileState(
   }
 
   const state: VaultProfileState = {
+    vaultId,
     profiles: orderedProfiles,
     consents: orderedConsents,
     consentHistory,
@@ -496,9 +497,11 @@ export function loadVaultProfileState(
     lastEventSeq,
     preProfileItemEvents,
   };
-  // P-1 fix round 1 (B2): the prompt gate reads only this private copy, taken now.
+  // P-1 fix round 1 (B2): the prompt gate reads only this private copy, taken now. Round 2 (G1): with the
+  // vault ID read from `VAULT.json` above.
   recordReplayedPolicy(
     state,
+    vaultId,
     [...collectionsMap.values()].map(c => [c.collection, c.allowChildModelPrompts] as const),
   );
   return state;
@@ -569,7 +572,9 @@ export function addProfile(
 
   const body: Record<string, unknown> = { profile };
   if (effectiveDisplayName !== undefined) body.display_name = effectiveDisplayName;
-  if (effectiveRules.length > 0) body.sensitivity_rules = effectiveRules;
+  // P-1 fix round 2 (S1): an explicitly supplied empty list is written (`sensitivity_rules: []`), so replay
+  // clears this profile's earlier scoped rules. Omitting the field keeps them (they are carried over above).
+  if (suppliedRules !== undefined || effectiveRules.length > 0) body.sensitivity_rules = effectiveRules;
 
   const appended = appendSystemEvent(vaultDir, credential, profile, {
     ts,

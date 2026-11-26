@@ -94,7 +94,7 @@ test('B1: assertCollectionForProfile accepts only <profile>/... names', () => {
 });
 
 test('B1: prompt-policy needs a profile prefix, and child/shared and me/shared are separate policies', t => {
-  const { vaultDir, credential } = scratchVault(t);
+  const { vaultDir, vaultId, credential } = scratchVault(t);
   assert.throws(
     () => profiles.setCollectionPromptPolicy(vaultDir, credential, { collection: 'shared', allowChildModelPrompts: true }),
     isCode('INVALID_COLLECTION'),
@@ -122,11 +122,11 @@ test('B1: prompt-policy needs a profile prefix, and child/shared and me/shared a
   );
   const state = profiles.loadVaultProfileState(vaultDir, credential);
   assert.deepEqual(
-    profiles.isPromptEligible({ profile: 'child', collection: 'child/shared', sensitivity: 'child' }, state),
+    profiles.isPromptEligible({ vaultId, profile: 'child', collection: 'child/shared', sensitivity: 'child' }, state),
     { eligible: true },
   );
   assert.deepEqual(
-    profiles.isPromptEligible({ profile: 'me', collection: 'me/shared', sensitivity: 'child' }, state),
+    profiles.isPromptEligible({ vaultId, profile: 'me', collection: 'me/shared', sensitivity: 'child' }, state),
     { eligible: false, reason: 'CHILD_TIER_EXCLUDED' },
   );
 });
@@ -134,16 +134,18 @@ test('B1: prompt-policy needs a profile prefix, and child/shared and me/shared a
 // --- B2 (item 4): the prompt gate reads only a private copy of the replayed policy ---
 
 test('B2: a hand-built Map, a plain object, undefined and a mutated genuine state cannot switch child data on', t => {
-  const { vaultDir, credential } = scratchVault(t);
-  const item = { profile: 'child', collection: 'child/x', sensitivity: 'child' };
+  const { vaultDir, vaultId, credential } = scratchVault(t);
+  const item = { vaultId, profile: 'child', collection: 'child/x', sensitivity: 'child' };
   const excluded = { eligible: false, reason: 'CHILD_TIER_EXCLUDED' };
+  // Round 2 (G1): a state with no recorded snapshot has no vault ID, so every item is VAULT_MISMATCH.
+  const noSnapshot = { eligible: false, reason: 'VAULT_MISMATCH' };
 
-  assert.deepEqual(profiles.isPromptEligible(item, new Map([['child/x', true]])), excluded);
-  assert.deepEqual(profiles.isPromptEligible(item, new Map([['child/x', { allowChildModelPrompts: true }]])), excluded);
-  assert.deepEqual(profiles.isPromptEligible(item, { 'child/x': true }), excluded);
-  assert.deepEqual(profiles.isPromptEligible(item, { collections: new Map([['child/x', { allowChildModelPrompts: true }]]) }), excluded);
-  assert.deepEqual(profiles.isPromptEligible(item, undefined), excluded);
-  assert.deepEqual(profiles.isPromptEligible(item), excluded);
+  assert.deepEqual(profiles.isPromptEligible(item, new Map([['child/x', true]])), noSnapshot);
+  assert.deepEqual(profiles.isPromptEligible(item, new Map([['child/x', { allowChildModelPrompts: true }]])), noSnapshot);
+  assert.deepEqual(profiles.isPromptEligible(item, { 'child/x': true }), noSnapshot);
+  assert.deepEqual(profiles.isPromptEligible(item, { collections: new Map([['child/x', { allowChildModelPrompts: true }]]) }), noSnapshot);
+  assert.deepEqual(profiles.isPromptEligible(item, undefined), noSnapshot);
+  assert.deepEqual(profiles.isPromptEligible(item), noSnapshot);
   assert.equal(profiles.filterItemsForModelPrompt([item], new Map([['child/x', true]])).length, 0);
 
   // A genuine replayed state with no switch event, changed after replay, stays closed.
@@ -152,7 +154,7 @@ test('B2: a hand-built Map, a plain object, undefined and a mutated genuine stat
   assert.deepEqual(profiles.isPromptEligible(item, state), excluded);
   // A copy of a genuine state (same fields, different object) is not genuine.
   const copy = { ...state, collections: new Map([['child/x', { allowChildModelPrompts: true }]]) };
-  assert.deepEqual(profiles.isPromptEligible(item, copy), excluded);
+  assert.deepEqual(profiles.isPromptEligible(item, copy), noSnapshot);
 
   // A genuine switch event opens exactly that collection; turning it off in the state afterwards does not matter.
   profiles.setCollectionPromptPolicy(vaultDir, credential, { collection: 'child/x', allowChildModelPrompts: true });
@@ -164,28 +166,28 @@ test('B2: a hand-built Map, a plain object, undefined and a mutated genuine stat
 });
 
 test('B2: an item whose collection does not start with its profile is COLLECTION_PROFILE_MISMATCH', t => {
-  const { vaultDir, credential } = scratchVault(t);
+  const { vaultDir, vaultId, credential } = scratchVault(t);
   const state = profiles.loadVaultProfileState(vaultDir, credential);
   const mismatch = { eligible: false, reason: 'COLLECTION_PROFILE_MISMATCH' };
   assert.deepEqual(
-    profiles.isPromptEligible({ profile: 'me', collection: 'google-takeout/mail/2019', sensitivity: 'personal' }, state),
+    profiles.isPromptEligible({ vaultId, profile: 'me', collection: 'google-takeout/mail/2019', sensitivity: 'personal' }, state),
     mismatch,
   );
   assert.deepEqual(
-    profiles.isPromptEligible({ profile: 'me', collection: 'child/google-takeout/mail/2019', sensitivity: 'personal' }, state),
+    profiles.isPromptEligible({ vaultId, profile: 'me', collection: 'child/google-takeout/mail/2019', sensitivity: 'personal' }, state),
     mismatch,
   );
   assert.deepEqual(
-    profiles.isPromptEligible({ profile: 'partner', collection: 'me/x', sensitivity: 'public' }, state),
+    profiles.isPromptEligible({ vaultId, profile: 'partner', collection: 'me/x', sensitivity: 'public' }, state),
     mismatch,
   );
   // Secret is checked first and keeps its own reason.
   assert.deepEqual(
-    profiles.isPromptEligible({ profile: 'me', collection: 'google-takeout/mail/2019', sensitivity: 'secret' }, state),
+    profiles.isPromptEligible({ vaultId, profile: 'me', collection: 'google-takeout/mail/2019', sensitivity: 'secret' }, state),
     { eligible: false, reason: 'SECRET_TIER_EXCLUDED' },
   );
   assert.deepEqual(
-    profiles.isPromptEligible({ profile: 'me', collection: 'me/google-takeout/mail/2019', sensitivity: 'personal' }, state),
+    profiles.isPromptEligible({ vaultId, profile: 'me', collection: 'me/google-takeout/mail/2019', sensitivity: 'personal' }, state),
     { eligible: true },
   );
 });
@@ -453,4 +455,64 @@ test('B8-15: defaultCollectionForItem takes the year only from a canonical UTC t
   ]) {
     assert.equal(year(bad), 'undated', bad);
   }
+});
+
+// --- G1 (round 2): the policy snapshot is bound to its vault ---
+
+test('G1 (round 2): vault A state never approves a vault B item, even with the same collection name', t => {
+  const a = scratchVault(t);
+  const b = scratchVault(t);
+  assert.notEqual(a.vaultId, b.vaultId);
+  for (const v of [a, b]) {
+    profiles.setCollectionPromptPolicy(v.vaultDir, v.credential, { collection: 'child/shared', allowChildModelPrompts: true });
+  }
+  const stateA = profiles.loadVaultProfileState(a.vaultDir, a.credential);
+  const stateB = profiles.loadVaultProfileState(b.vaultDir, b.credential);
+  assert.equal(stateA.vaultId, a.vaultId);
+  const mismatch = { eligible: false, reason: 'VAULT_MISMATCH' };
+  const childOf = vaultId => ({ vaultId, profile: 'child', collection: 'child/shared', sensitivity: 'child' });
+  const meOf = vaultId => ({ vaultId, profile: 'me', collection: 'me/shared', sensitivity: 'personal' });
+  const secretOf = vaultId => ({ vaultId, profile: 'me', collection: 'me/shared', sensitivity: 'secret' });
+  // Positive control: each vault approves its own items.
+  assert.deepEqual(profiles.isPromptEligible(childOf(a.vaultId), stateA), { eligible: true });
+  assert.deepEqual(profiles.isPromptEligible(meOf(a.vaultId), stateA), { eligible: true });
+  assert.deepEqual(profiles.isPromptEligible(childOf(b.vaultId), stateB), { eligible: true });
+  // Vault A's state refuses every vault B item: child, me, and secret alike.
+  assert.deepEqual(profiles.isPromptEligible(childOf(b.vaultId), stateA), mismatch);
+  assert.deepEqual(profiles.isPromptEligible(meOf(b.vaultId), stateA), mismatch);
+  assert.deepEqual(profiles.isPromptEligible(secretOf(b.vaultId), stateA), mismatch);
+  // A missing, empty or non-string vault ID is refused too.
+  for (const vaultId of [undefined, '', 42, null]) {
+    assert.deepEqual(profiles.isPromptEligible({ ...meOf(a.vaultId), vaultId }, stateA), mismatch, String(vaultId));
+  }
+  const { vaultId: _dropped, ...noVault } = meOf(a.vaultId);
+  assert.deepEqual(profiles.isPromptEligible(noVault, stateA), mismatch);
+  // The public `vaultId` field is informational: changing it does not move the snapshot.
+  stateA.vaultId = b.vaultId;
+  assert.deepEqual(profiles.isPromptEligible(childOf(b.vaultId), stateA), mismatch);
+  assert.deepEqual(profiles.isPromptEligible(childOf(a.vaultId), stateA), { eligible: true });
+  assert.deepEqual(
+    profiles.filterItemsForModelPrompt([childOf(a.vaultId), childOf(b.vaultId), meOf(b.vaultId)], stateA),
+    [childOf(a.vaultId)],
+  );
+});
+
+// --- S1 (round 2): an explicit empty rule list is persisted ---
+
+test('S1 (round 2): addProfile with sensitivityRules [] clears earlier scoped rules after replay; omitting the field keeps them', t => {
+  const { vaultDir, credential } = scratchVault(t);
+  const rule = { id: 'synthetic-rule-1', tier: 'clinical', keyword: 'synthetic-keyword' };
+  profiles.addProfile(vaultDir, credential, { profile: 'me', sensitivityRules: [rule] });
+  const scoped = () => profiles.loadVaultProfileState(vaultDir, credential).profiles.get('me').sensitivityRules.map(r => r.id);
+  assert.deepEqual(scoped(), ['synthetic-rule-1']);
+  // Omitted: the rules stay.
+  profiles.addProfile(vaultDir, credential, { profile: 'me', displayName: 'Synthetic Owner Label' });
+  assert.deepEqual(scoped(), ['synthetic-rule-1']);
+  // Explicit empty list: the rules are cleared, and stay cleared after a later omitted update.
+  const cleared = profiles.addProfile(vaultDir, credential, { profile: 'me', sensitivityRules: [] });
+  assert.deepEqual(cleared.sensitivityRules, []);
+  assert.deepEqual(scoped(), []);
+  assert.deepEqual(profiles.loadVaultProfileState(vaultDir, credential).sensitivityRules, []);
+  profiles.addProfile(vaultDir, credential, { profile: 'me', displayName: 'Synthetic Owner Label 2' });
+  assert.deepEqual(scoped(), []);
 });

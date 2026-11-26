@@ -50,7 +50,15 @@ export interface ClassificationInput {
    */
   readonly derivedTexts?: readonly string[];
   readonly mime?: string;
+  /** Trusted tags (set by the caller). `sensitivity:<tier>` here may also choose `public`. */
   readonly tags?: readonly string[];
+  /**
+   * Tags that come from the archive (for example Gmail labels): untrusted input (P-1 fix round 2, C3).
+   * They match user-rule `tag` matchers like `tags`, but a `sensitivity:<tier>` archive tag only RAISES
+   * the tier: it applies only when it is higher than what the rules give (and than the source default),
+   * and `sensitivity:public` from the archive is ignored.
+   */
+  readonly archiveTags?: readonly string[];
   readonly explicitTier?: SensitivityTier;
   readonly userRules?: readonly UserSensitivityRule[];
 }
@@ -92,6 +100,11 @@ export interface CollectionState {
 }
 
 export interface VaultProfileState {
+  /**
+   * The vault ID from `VAULT.json` (informational, for callers that label prompt candidates). The prompt
+   * gate never reads this field: it uses the private copy taken at replay time (P-1 fix round 2, G1).
+   */
+  readonly vaultId: string;
   readonly profiles: ReadonlyMap<ProfileId, ProfileRecord>;
   readonly consents: ReadonlyMap<ConsentSubjectProfileId, ConsentRecord>;
   readonly consentHistory: readonly ConsentRecord[];
@@ -113,12 +126,15 @@ export interface VaultProfileState {
 }
 
 export interface PromptCandidateItem {
+  /** The vault the item was read from (its `VAULT.json` `vault_id`). Required (P-1 fix round 2, G1). */
+  readonly vaultId: string;
   readonly profile: string;
   readonly collection: string;
   readonly sensitivity: SensitivityTier;
 }
 
 export type PromptExclusionReason =
+  | 'VAULT_MISMATCH'
   | 'SECRET_TIER_EXCLUDED'
   | 'COLLECTION_PROFILE_MISMATCH'
   | 'CHILD_TIER_EXCLUDED';

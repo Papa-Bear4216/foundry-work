@@ -761,17 +761,18 @@ async function profileAddCommand(ctx: Context): Promise<void> {
 const RULE_MATCHER_FIELDS = ['sourcePrefix', 'pathContains', 'tag', 'keyword'] as const;
 
 /**
- * C1: a sensitivity rule without its user-written matcher text: the generic `id`, `tier`, scope (`profile`, when set)
- * and the names of the matcher fields that are set.
+ * C1: a sensitivity rule without its user-written text: its position (`rule 1`, `rule 2`, in replay order), `tier`,
+ * scope (`profile`, when set) and the names of the matcher fields that are set. Round 2 (G2): the rule `id` is free
+ * text too, so it is printed only with --reveal.
  */
-function redactRule(rule: UserSensitivityRule): {
-  id: string;
+function redactRule(rule: UserSensitivityRule, index: number): {
+  rule: string;
   tier: UserSensitivityRule['tier'];
   profile?: ProfileId;
   matchers: string[];
 } {
   return {
-    id: rule.id,
+    rule: `rule ${index + 1}`,
     tier: rule.tier,
     ...(rule.profile !== undefined ? { profile: rule.profile } : {}),
     matchers: RULE_MATCHER_FIELDS.filter(field => rule[field] !== undefined),
@@ -785,7 +786,8 @@ async function profileListCommand(ctx: Context): Promise<void> {
     stall(ctx.hooks);
     const { profiles: items, destroyedProfileCount } = profiles.listProfiles(ctx.paths.vault, { session });
     // B7: the display name is decrypted user text; it is printed only with --reveal.
-    // C1: so is the matcher text of a sensitivity rule (keyword, pathContains, tag, sourcePrefix).
+    // C1: so is the matcher text of a sensitivity rule (keyword, pathContains, tag, sourcePrefix); round 2 (G2): and
+    // its `id`.
     const reveal = ctx.request.reveal === true;
     if (ctx.request.json) {
       const shown = items.map(({ displayName, sensitivityRules, ...rest }) => ({

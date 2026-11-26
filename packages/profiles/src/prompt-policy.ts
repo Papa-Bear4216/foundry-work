@@ -1,4 +1,4 @@
-import { replayedChildPromptsAllowed } from './policy-registry.ts';
+import { replayedChildPromptsAllowed, replayedVaultId } from './policy-registry.ts';
 import type { PromptCandidateItem, PromptEligibility, VaultProfileState } from './types.ts';
 import {
   assertProfileId,
@@ -8,6 +8,10 @@ import {
 
 /**
  * Deterministic model-prompt gating check (Product Spec section 9, Roadmap P-1). Checks, in this order:
+ * 0. `item.vaultId` must equal the vault ID that `loadVaultProfileState` recorded for this `state` object
+ *    (read from `VAULT.json` at replay time). A missing or different vault ID, or a state with no recorded
+ *    snapshot, gives `VAULT_MISMATCH` for EVERY item, also non-child and `me` items (P-1 fix round 2, G1).
+ *    The public `state.vaultId` field is never read here.
  * 1. `sensitivity === 'secret'` is NEVER eligible (`SECRET_TIER_EXCLUDED`, cannot be overridden).
  * 2. `item.collection` must start with `item.profile + '/'`, otherwise `COLLECTION_PROFILE_MISMATCH`
  *    (fail closed; this also shuts out records written before P-1, whose names are `<source>/<year>`).
@@ -27,6 +31,17 @@ export function isPromptEligible(
   const profile = assertProfileId(item.profile);
   const collection = assertUserCollectionName(item.collection);
   const sensitivity = assertSensitivityTier(item.sensitivity);
+
+  const recordedVaultId = replayedVaultId(state);
+  const itemVaultId: unknown = (item as { vaultId?: unknown }).vaultId;
+  if (
+    recordedVaultId === undefined ||
+    typeof itemVaultId !== 'string' ||
+    itemVaultId.length === 0 ||
+    itemVaultId !== recordedVaultId
+  ) {
+    return { eligible: false, reason: 'VAULT_MISMATCH' };
+  }
 
   if (sensitivity === 'secret') {
     return { eligible: false, reason: 'SECRET_TIER_EXCLUDED' };

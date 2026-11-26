@@ -367,19 +367,21 @@ test('B7: display names and consent notes are printed only by profile list / con
 
 // --- C1 (session C): sensitivity-rule matcher text is printed only with --reveal ---
 
-test('C1: rule keyword, pathContains, tag and sourcePrefix are printed only by profile list --reveal', async t => {
+test('C1/G2: rule id, keyword, pathContains, tag and sourcePrefix are printed only by profile list --reveal', async t => {
   const dir = scratch(t);
   const { home, recoveryKey } = await initVault(dir);
   const vaultDir = join(home, 'vault');
   const credential = { recoveryKey: decodeRecoveryKey(recoveryKey) };
   const marker = field => ['Planted', 'Rule', field, '5521'].join('-');
-  const markers = ['Keyword', 'Path', 'Tag', 'Source'].map(marker);
-  addSensitivityRule(vaultDir, credential, { id: 'me-rule', tier: 'clinical', profile: 'me', keyword: marker('Keyword'), tag: marker('Tag') });
-  addSensitivityRule(vaultDir, credential, { id: 'partner-rule', tier: 'secret', profile: 'partner', pathContains: marker('Path'), sourcePrefix: marker('Source') });
+  // Round 2 (G2): the rule ids are planted markers too.
+  const markers = ['Keyword', 'Path', 'Tag', 'Source', 'IdMe', 'IdPartner'].map(marker);
+  const globalIdMarker = marker('IdGlobal');
+  addSensitivityRule(vaultDir, credential, { id: marker('IdMe'), tier: 'clinical', profile: 'me', keyword: marker('Keyword'), tag: marker('Tag') });
+  addSensitivityRule(vaultDir, credential, { id: marker('IdPartner'), tier: 'secret', profile: 'partner', pathContains: marker('Path'), sourcePrefix: marker('Source') });
   // A global rule is not printed by any command; its text must not leak either.
-  addSensitivityRule(vaultDir, credential, { id: 'global-rule', tier: 'secret', keyword: marker('Keyword') });
+  addSensitivityRule(vaultDir, credential, { id: globalIdMarker, tier: 'secret', keyword: marker('Keyword') });
   const archive = await mailArchive(dir, 'c1.zip', [['2024', 'Synthetic c1', 'Plain words.']]);
-  const leaked = res => markers.filter(m => res.stdout.includes(m) || res.stderr.includes(m));
+  const leaked = res => [...markers, globalIdMarker].filter(m => res.stdout.includes(m) || res.stderr.includes(m));
   const run = async argv => {
     const res = await runInline(dir, [...argv, ...keyed(home, recoveryKey)], { stdin: recoveryKey + '\n' });
     assert.deepEqual(leaked(res), [], `rule text leaked: ${argv.join(' ')}`);
@@ -407,8 +409,8 @@ test('C1: rule keyword, pathContains, tag and sourcePrefix are printed only by p
   assert.deepEqual(
     listed.map(p => [p.profile, p.sensitivityRules]),
     [
-      ['me', [{ id: 'me-rule', tier: 'clinical', profile: 'me', matchers: ['tag', 'keyword'] }]],
-      ['partner', [{ id: 'partner-rule', tier: 'secret', profile: 'partner', matchers: ['sourcePrefix', 'pathContains'] }]],
+      ['me', [{ rule: 'rule 1', tier: 'clinical', profile: 'me', matchers: ['tag', 'keyword'] }]],
+      ['partner', [{ rule: 'rule 1', tier: 'secret', profile: 'partner', matchers: ['sourcePrefix', 'pathContains'] }]],
     ],
   );
 
@@ -416,7 +418,7 @@ test('C1: rule keyword, pathContains, tag and sourcePrefix are printed only by p
   assert.equal(revealed.code, 0, revealed.stderr);
   assert.deepEqual(leaked(revealed).sort(), [...markers].sort());
   const revealedRules = JSON.parse(revealed.stdout).profiles.flatMap(p => p.sensitivityRules);
-  assert.deepEqual(revealedRules.map(r => r.id), ['me-rule', 'partner-rule']);
+  assert.deepEqual(revealedRules.map(r => r.id), [marker('IdMe'), marker('IdPartner')]);
   assert.equal(revealedRules[0].keyword, marker('Keyword'));
   assert.equal(revealedRules[1].sourcePrefix, marker('Source'));
 });
@@ -438,4 +440,41 @@ test('B8-13: consent record --basis other without a note fails INVALID_CONSENT_N
     stdin: recoveryKey + '\n',
   });
   assert.equal(ok.code, 0, ok.stderr);
+});
+
+// --- C3 (round 2): archive labels are untrusted; they never choose public ---
+
+test('C3 (round 2): foundry import stores a mail with Gmail label sensitivity:public as personal; a higher label raises', async t => {
+  const dir = scratch(t);
+  const { home, recoveryKey } = await initVault(dir);
+  const message = (i, labels) =>
+    [
+      `From ${4000 + i}@xxx Mon Mar 04 10:00:00 +0000 2024`,
+      `From: <${syntheticEmail(`c3-sender-${i}`)}>`,
+      `To: <${syntheticEmail(`c3-recipient-${i}`)}>`,
+      'Date: Mon, 04 Mar 2024 10:00:00 +0000',
+      `Subject: Synthetic c3 ${i}`,
+      `X-Gmail-Labels: ${labels}`,
+      'Content-Type: text/plain; charset="utf-8"',
+      '',
+      'Plain words.',
+      '',
+    ].join('\r\n');
+  const zipPath = join(dir, 'c3.zip');
+  await writeZipArchive(zipPath, [
+    {
+      path: 'Takeout/Mail/All mail Including Spam and Trash.mbox',
+      data: Buffer.from([message(0, 'Inbox,sensitivity:public'), message(1, 'Inbox,sensitivity:private')].join(''), 'utf8'),
+      compression: 'deflate',
+    },
+  ]);
+  const res = await runInline(dir, ['import', zipPath, ...keyed(home, recoveryKey)], { stdin: recoveryKey + '\n' });
+  assert.equal(res.code, 0, res.stderr);
+  const imported = allEvents(home, recoveryKey).filter(e => e.kind === 'item.imported');
+  assert.equal(imported.length, 2);
+  const bySubjectLabel = imported.map(e => [e.tags.includes('sensitivity:public') ? 'public-label' : 'private-label', e.sensitivity]).sort();
+  assert.deepEqual(bySubjectLabel, [
+    ['private-label', 'private'],
+    ['public-label', 'personal'],
+  ]);
 });

@@ -284,3 +284,50 @@ test('P-1 hook: a synchronous resolveSensitivity result is stored as before', as
   assert.equal(events.length, 3);
   assert.ok(events.every(ev => ev.sensitivity === 'clinical'));
 });
+
+test('H1 (round 2): a resolver that changes one byte of the item fails the import with RESOLVER_MODIFIED_ITEM and writes nothing', async t => {
+  // The first item: nothing was flushed before it, so "zero new events" is exact.
+  for (const flipAt of [1]) {
+    const root = mkdtempSync(join(tmpdir(), 'foundry-p1-hooks-'));
+    t.after(() => removeTree(root));
+    const archiveDir = join(root, 'takeout');
+    const vaultDir = join(root, 'vault');
+    await writeMultiPartTakeoutFolder(archiveDir, { seed: 95, contactsCount: 2, calendarEvents: 1, mailMessages: 2 });
+    const { vaultId, collectionKeyId, recoveryKey } = createTestVault(vaultDir);
+    const unlocked = unlockByPassphrase(join(vaultDir, 'keyring', 'keyring.json'), vaultId, PASSPHRASE);
+    const archive = await openArchive(archiveDir);
+    const writer = VaultWriter.open(vaultDir, unlocked);
+    let calls = 0;
+    let changed;
+    try {
+      await assert.rejects(
+        importArchive({
+          archive,
+          writer,
+          importers: DEFAULT_IMPORTERS,
+          resolveCollectionKeyId: () => collectionKeyId,
+          resolveSensitivity: (source, path, item) => {
+            calls++;
+            if (calls === flipAt) {
+              changed = item.plaintext;
+              changed[0] ^= 0x01;
+            }
+            return 'personal';
+          },
+          vaultDir,
+          unlocked,
+          readVaultRecord,
+          closeSegmentOnFinish: true,
+        }),
+        err => err.name === 'ImportError' && err.code === 'RESOLVER_MODIFIED_ITEM',
+        `flip at item ${flipAt}`,
+      );
+    } finally {
+      writer.release();
+      await archive.close();
+    }
+    assert.equal(calls, flipAt, 'no later item is classified');
+    assert.ok(changed.every(b => b === 0), 'the changed buffer is zeroed');
+    assert.equal(importedEvents(vaultDir, recoveryKey).length, 0, `flip at item ${flipAt}: zero new events`);
+  }
+});

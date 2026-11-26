@@ -119,6 +119,8 @@ class TextBudget {
   }
 
   text(): string {
+    // One piece is returned as it is (no copy); the output is the same as the join.
+    if (this.#pieces.length === 1) return this.#pieces[0]!;
     return this.#pieces.join('');
   }
 }
@@ -177,11 +179,6 @@ export function itemText(parsers: Parsers, mime: string | null, bytes: Buffer, t
 function renderItem(parsers: Parsers, mime: string | null, bytes: Buffer, truncated: boolean, budget: TextBudget): boolean {
   const type = (mime ?? '').split(';', 1)[0]!.trim().toLowerCase();
   if (!['message/rfc822', 'text/vcard', 'text/calendar', 'text/plain'].includes(type)) return false;
-  const lines = (values: readonly string[]) => {
-    values.forEach((line, i) => {
-      if (!budget.full) budget.add((i > 0 ? '\n' : '') + line);
-    });
-  };
   try {
     if (type === 'message/rfc822') {
       const mail = parsers.parseEmailMessage(bytes);
@@ -193,7 +190,9 @@ function renderItem(parsers: Parsers, mime: string | null, bytes: Buffer, trunca
       if (mail.labels.length > 0) head.push(`Labels: ${mail.labels.join(', ')}`);
       if (mail.attachments.length > 0) head.push(`Attachments: ${mail.attachments.map(a => a.filename).join(', ')}`);
       if (mail.bodyText) head.push('', mail.bodyText);
-      lines(head);
+      // ONE piece: the same text (and the same cut at the cap) as adding each line, without building a new
+      // concatenated string per line (that cost the 1 GiB import its memory headroom).
+      budget.add(head.join('\n'));
     } else if (type === 'text/vcard') {
       const contact = parsers.parseVcard(bytes.toString('utf8'));
       if (contact) budget.add(parsers.formatContactText(contact));

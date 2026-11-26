@@ -183,15 +183,19 @@ const BEARER_HEADER_RE =
 const KNOWN_TOKEN_PREFIX_RE =
   /\b(?:sk-(?:proj-|live-|test-)?[A-Za-z0-9_-]{20,256}|gh[pousr]_[A-Za-z0-9]{20,255}|github_pat_[A-Za-z0-9_]{20,255}|xox[baprs]-[A-Za-z0-9-]{16,255}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{10,512}\.eyJ[A-Za-z0-9_-]{10,512}\.[A-Za-z0-9_-]{10,512})\b/u;
 
+// P-1 fix round 2 (C2): an optional closing quote after the key name, so JSON / quoted keys
+// (`"api_key": "..."`, `'secret' = '...'`) are recognised.
 const TOKEN_ASSIGNMENT_RE =
-  /\b(?:oauth|access|refresh|bearer|api|client|auth)[ _-]{0,16}(?:token|secret|key)[ \t]{0,16}[:=][ \t]{0,16}['"]?([A-Za-z0-9._~+/=-]{16,512})/giu;
+  /\b(?:oauth|access|refresh|bearer|api|client|auth)[ _-]{0,16}(?:token|secret|key)['"]?[ \t]{0,16}[:=][ \t]{0,16}['"]?([A-Za-z0-9._~+/=-]{16,512})/giu;
 
-// Global, like the bearer pattern (A3).
+// Global, like the bearer pattern (A3). P-1 fix round 2 (C1): the host part stops at `,`, `;`, `/`,
+// whitespace, quotes, `<` and `>`, so adjacent URIs are separate matches and a placeholder password in the
+// first cannot hide a real password in the next.
 const DB_CONNECTION_URI_RE =
-  /\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqp|amqps|mssql):\/\/[^/\s:@]{1,128}:([^/\s@]{1,256})@[^\s'"]{1,256}/giu;
+  /\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqp|amqps|mssql):\/\/[^/\s:@]{1,128}:([^/\s@]{1,256})@[^\s'",;/<>]{1,256}/giu;
 
 const CREDENTIAL_ASSIGNMENT_RE =
-  /\b(password|passwd|pwd|passphrase|secret|secret[_-]?key|private[_-]?key|api[_-]?key|credential)[ \t]{0,16}[:=][ \t]{0,16}['"]?([^\s'"\r\n;,]{8,256})/giu;
+  /\b(password|passwd|pwd|passphrase|secret|secret[_-]?key|private[_-]?key|api[_-]?key|credential)['"]?[ \t]{0,16}[:=][ \t]{0,16}['"]?([^\s'"\r\n;,]{8,256})/giu;
 
 /** True when some match of the global `pattern` has a capture group `group` that is not a placeholder. */
 function hasRealCredentialMatch(pattern: RegExp, field: string, group: number): boolean {
@@ -378,7 +382,8 @@ function* scanWindows(
  *
  * Precedence (highest wins): `'secret' > 'child' > 'clinical' > 'private' > 'personal' > 'public'`.
  * `'public'` is chosen only when explicitly set by a matching user rule, `'sensitivity:public'` tag,
- * or `explicitTier: 'public'`, and never overrides a higher matched rule.
+ * or `explicitTier: 'public'`, and never overrides a higher matched rule. `archiveTags` (untrusted) never
+ * choose `public` and only raise the tier above what the rules give.
  */
 export function classifySensitivity(input: ClassificationInput): ClassificationResult {
   if (input.explicitTier !== undefined) {
@@ -388,11 +393,13 @@ export function classifySensitivity(input: ClassificationInput): ClassificationR
 
   const normalizedPath = (input.path ?? '').replaceAll('\\', '/');
   const tags = input.tags ?? [];
+  const archiveTags = input.archiveTags ?? [];
   const childScoped = isChildScoped(input.profile, input.collection);
 
   // User rules: the non-keyword matchers are decided once; a keyword is searched in every window.
+  // A user rule's `tag` matcher matches trusted and archive tags alike.
   const normalizedPathLower = normalizedPath.toLowerCase();
-  const lowerTags = new Set(tags.map(t => t.toLowerCase()));
+  const lowerTags = new Set([...tags, ...archiveTags].map(t => t.toLowerCase()));
   const ruleMetadataMatch = validatedRules.map(rule =>
     matchesUserRuleMetadata(rule, input.source, input.profile, normalizedPathLower, lowerTags),
   );
@@ -461,6 +468,28 @@ export function classifySensitivity(input: ClassificationInput): ClassificationR
     }
   }
 
+  // Archive tags (untrusted, C3): the highest `sensitivity:<tier>` among them, never `public`. It is applied
+  // only when it is higher than what the rules give (the source default when no rule matched).
+  let archiveTier: SensitivityTier | undefined;
+  for (const rawTag of archiveTags) {
+    const lower = rawTag.trim().toLowerCase();
+    if (!lower.startsWith('sensitivity:')) continue;
+    const tagTier = lower.slice('sensitivity:'.length);
+    if (
+      tagTier === 'personal' ||
+      tagTier === 'private' ||
+      tagTier === 'clinical' ||
+      tagTier === 'child' ||
+      tagTier === 'secret'
+    ) {
+      archiveTier = archiveTier === undefined ? tagTier : maxSensitivity(archiveTier, tagTier);
+    }
+  }
+  const raisedByArchive = (ruled: ClassificationResult): ClassificationResult =>
+    archiveTier !== undefined && compareSensitivity(archiveTier, ruled.sensitivity) > 0
+      ? { sensitivity: archiveTier, rule: `archive-tag:${archiveTier}` }
+      : ruled;
+
   if (best?.sensitivity === 'secret') {
     return best;
   }
@@ -468,7 +497,7 @@ export function classifySensitivity(input: ClassificationInput): ClassificationR
   // 4. `child` profile or `child/...` collection floor (outranked only by `secret`).
   if (childScoped) {
     consider({ sensitivity: 'child', rule: 'child-profile' });
-    return best!;
+    return raisedByArchive(best!);
   }
 
   // 5. Shipped generic `clinical` rules (first matching rule in list order).
@@ -486,6 +515,5 @@ export function classifySensitivity(input: ClassificationInput): ClassificationR
   }
 
   // 7. Return matched tier (including explicit/user `public`), or source default (`personal`).
-  if (best) return best;
-  return { sensitivity: defaultSensitivityForSource(input.source), rule: 'default' };
+  return raisedByArchive(best ?? { sensitivity: defaultSensitivityForSource(input.source), rule: 'default' });
 }

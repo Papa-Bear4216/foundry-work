@@ -42,7 +42,12 @@ import { MAIL_SOURCE_ID } from './importers/mail.js';
 const DEFAULT_BATCH_MAX_ITEMS = 16;
 const DEFAULT_BATCH_MAX_BYTES = 4 * 1024 * 1024;
 
-export type ImportErrorCode = 'BUSY' | 'INVALID_PROFILE';
+/**
+ * `RESOLVER_MODIFIED_ITEM` (P-1 fix round 2, H1): the `resolveSensitivity` hook changed `item.plaintext`.
+ * The pipeline detects this (it recomputes the blob ID after the hook) and writes nothing for that item or
+ * any later item.
+ */
+export type ImportErrorCode = 'BUSY' | 'INVALID_PROFILE' | 'RESOLVER_MODIFIED_ITEM';
 
 /**
  * The generic profile identifiers (Architecture 5.3, P-1 fix round 1 B4). A local copy: `importers`
@@ -527,6 +532,13 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
         } catch (error) {
           plaintext.fill(0);
           throw error;
+        }
+        // P-1 fix round 2 (H1): the hook gets the live write buffer (a copy would double item memory). A hook
+        // must not change it: recompute the blob ID over the same buffer and refuse a mismatch, so the writer
+        // never stores other bytes than the blob ID and item key describe.
+        if (computeBlobId(idKey, plaintext) !== blobId) {
+          plaintext.fill(0);
+          throw new ImportError('RESOLVER_MODIFIED_ITEM', 'The sensitivity resolver changed the item bytes.');
         }
 
         pendingKeys.add(itemKey);

@@ -341,3 +341,85 @@ test('A3: repeated calls give the same result (global patterns reset their posit
     assert.equal(profiles.classifySensitivity({ ...BASE, text: databaseUri('Qw3rty!Pass77') }).sensitivity, 'secret');
   }
 });
+
+/** A database URI with no port or path: the host is followed directly by the next character. */
+function bareDatabaseUri(password, host) {
+  const proto = ['post', 'gres', '://'].join('');
+  return `${proto}u:${password}${AT_CHAR}${host}`;
+}
+
+test('C1 (round 2): a placeholder URI directly followed by a real one (comma, semicolon, space) is secret', () => {
+  const real = ['R3al', 'Pw', 'x77'].join('');
+  for (const sep of [',', ', ', ';', ' ', '<', '>']) {
+    const field = `${bareDatabaseUri('changeme', 'h1')}${sep}${bareDatabaseUri(real, 'h2')}`;
+    assert.deepEqual(
+      profiles.classifySensitivity({ ...BASE, text: field }),
+      { sensitivity: 'secret', rule: 'database-credentials' },
+      `separator ${JSON.stringify(sep)}`,
+    );
+    // Control: two placeholders stay the source default.
+    const placeholders = `${bareDatabaseUri('changeme', 'h1')}${sep}${bareDatabaseUri('<password>', 'h2')}`;
+    assert.equal(profiles.classifySensitivity({ ...BASE, text: placeholders }).sensitivity, 'personal', `control ${JSON.stringify(sep)}`);
+  }
+});
+
+test('C2 (round 2): JSON and quoted keys are recognised; placeholders in the same forms stay non-secret', () => {
+  const pw = ['Plain', 'Pass', 'word9'].join('');
+  const highEntropy = ['Zq8', 'Lm2', 'Xv7', 'Rt4', 'Nb6', 'Kp1'].join('');
+  const q = '"';
+  const s = "'";
+  const cases = [
+    [`{${q}password${q}: ${q}${pw}${q}}`, 'credential-assignment'],
+    [`{${q}api_key${q}:${q}${highEntropy}${q}}`, 'oauth-or-api-token'],
+    [`${s}secret${s} = ${s}${highEntropy}${s}`, 'high-entropy-credential'],
+    [`{${q}access_token${q}: ${q}${highEntropy}${q}}`, 'oauth-or-api-token'],
+  ];
+  for (const [field, rule] of cases) {
+    assert.deepEqual(profiles.classifySensitivity({ ...BASE, text: field }), { sensitivity: 'secret', rule }, field.slice(0, 12));
+  }
+  for (const placeholder of ['changeme', 'your_api_key_here', '<password>', 'xxxxxxxxxxxxxxxx']) {
+    for (const field of [
+      `{${q}password${q}: ${q}${placeholder}${q}}`,
+      `{${q}api_key${q}:${q}${placeholder}${q}}`,
+      `${s}secret${s} = ${s}${placeholder}${s}`,
+    ]) {
+      assert.equal(profiles.classifySensitivity({ ...BASE, text: field }).sensitivity, 'personal', `placeholder ${placeholder}`);
+    }
+  }
+});
+
+test('C3 (round 2): archive tags may raise the tier but never choose public', () => {
+  // A Gmail label `sensitivity:public` (an archive tag) is ignored: the mail stays personal.
+  assert.deepEqual(
+    profiles.classifySensitivity({ ...BASE, text: 'plain words', archiveTags: ['sensitivity:public'] }),
+    { sensitivity: 'personal', rule: 'default' },
+  );
+  // A higher archive tier raises; an equal one changes nothing.
+  assert.deepEqual(
+    profiles.classifySensitivity({ ...BASE, text: 'plain words', archiveTags: ['Inbox', 'sensitivity:private'] }),
+    { sensitivity: 'private', rule: 'archive-tag:private' },
+  );
+  assert.deepEqual(
+    profiles.classifySensitivity({ ...BASE, text: 'plain words', archiveTags: ['sensitivity:personal'] }),
+    { sensitivity: 'personal', rule: 'default' },
+  );
+  // A shipped rule above the archive tag wins; an archive tag above it raises.
+  const lab = 'laboratory results enclosed';
+  assert.equal(profiles.classifySensitivity({ ...BASE, text: lab, archiveTags: ['sensitivity:private'] }).sensitivity, 'clinical');
+  assert.deepEqual(
+    profiles.classifySensitivity({ ...BASE, text: lab, archiveTags: ['sensitivity:secret'] }),
+    { sensitivity: 'secret', rule: 'archive-tag:secret' },
+  );
+  // A child-scoped item: secret from the archive still outranks the child floor; public never lowers it.
+  const child = { ...BASE, profile: 'child', collection: 'child/google-takeout/mail/2024' };
+  assert.equal(profiles.classifySensitivity({ ...child, archiveTags: ['sensitivity:public'] }).sensitivity, 'child');
+  assert.equal(profiles.classifySensitivity({ ...child, archiveTags: ['sensitivity:secret'] }).sensitivity, 'secret');
+  // A user rule (vault-stored) may still choose public, also matched by an archive tag.
+  const rule = { id: 'r-public', tier: 'public', tag: 'Newsletters' };
+  assert.deepEqual(
+    profiles.classifySensitivity({ ...BASE, archiveTags: ['newsletters', 'sensitivity:public'], userRules: [rule] }),
+    { sensitivity: 'public', rule: 'user:r-public' },
+  );
+  // A trusted caller tag `sensitivity:public` keeps its old meaning.
+  assert.equal(profiles.classifySensitivity({ ...BASE, tags: ['sensitivity:public'] }).sensitivity, 'public');
+});

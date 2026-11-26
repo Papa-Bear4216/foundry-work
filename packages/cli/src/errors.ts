@@ -78,6 +78,7 @@ const PROFILE_MESSAGES: Readonly<Record<string, string>> = {
 const IMPORT_MESSAGES: Readonly<Record<string, string>> = {
   BUSY: 'another import is already running on this vault writer',
   INVALID_PROFILE: 'profile must be one of the generic identifiers: me, partner, child or other',
+  RESOLVER_MODIFIED_ITEM: 'an item changed while it was classified; nothing more was imported',
 };
 
 const RECOVERY_FORMAT = new Set([
