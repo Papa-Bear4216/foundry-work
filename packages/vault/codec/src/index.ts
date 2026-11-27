@@ -36,4 +36,6 @@ export type {
 } from './second-copy.ts';
 export { anchorPayload, anchorQr, anchorQrSvg, anchorQrText, anchorText, chainAnchor, parseAnchor } from './anchor.ts';
 export { encodeQr, renderQrSvg, renderQrText } from './qr.ts';
+export { exportVaultIso, MAX_EXTENT_BYTES, writeIsoImage } from './iso9660.ts';
+export type { ExportIsoResult, IsoEntryInput, WriteIsoOptions } from './iso9660.ts';
 export type { QrCode, QrErrorCorrection, QrOptions } from './qr.ts';

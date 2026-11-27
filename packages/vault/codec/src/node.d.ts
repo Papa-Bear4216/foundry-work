@@ -101,7 +101,7 @@ declare module 'node:fs' {
   export function statSync(path: string, options: { bigint: true }): { dev: bigint };
   export function statfsSync(path: string): { type: number };
   export const realpathSync: { (path: string): string; native(path: string): string };
-  export function openSync(path: string, flags: 'w' | 'wx' | 'r', mode?: number): number;
+  export function openSync(path: string, flags: 'w' | 'wx' | 'wx+' | 'r', mode?: number): number;
 }
 
 declare module 'node:path' {
