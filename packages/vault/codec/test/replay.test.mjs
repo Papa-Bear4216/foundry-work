@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { encodeRecord, FRAME_BYTES, openVaultReplay, VaultFormatError, VaultWriter, verifyVaultDeep } from '../src/index.ts';
-import { setFrameKeyObserverForTest, StreamScanner } from '../src/record-file.ts';
+import { setFrameKeyObserverForTest } from '../src/record-file.ts';
 import { activeReplayIteratorCountForTest } from '../src/vault-replay.ts';
 import { blob, cases, event, fixture, identity, keyId, keyringPath, writable } from './vault-fixture.mjs';
 
@@ -473,14 +473,27 @@ test('P-3 (V-3b item 1): streamBlob refuses a sealed pack whose size changed aft
   assert.throws(() => source.streamBlob(item.location).next(), { code: 'FILE_SIZE' });
 });
 
-test('P-3 (V-3b item 3): a stream scanner sized to one record reads small and empty blobs', t => {
-  assert.throws(() => new StreamScanner(19), { code: 'LENGTH' });
-  assert.throws(() => new StreamScanner(FRAME_BYTES + 21), { code: 'LENGTH' });
+test('streamBlob reads empty, small and multi-frame blobs, and two interleaved iterators never share a scanner', t => {
   const vault = setup(t);
   vault.write(writer => {
-    writer.appendBatch([blob(''), blob('TEST ONLY small'), blob('x'.repeat(FRAME_BYTES + 5))]);
+    writer.appendBatch([blob(''), blob('TEST ONLY small'), blob('x'.repeat(FRAME_BYTES + 5)), blob('y'.repeat(FRAME_BYTES * 2 + 7))]);
   });
   const source = vault.capture();
   const blobs = consume(source.replay()).items.filter(entry => entry.type === 'blob');
-  assert.deepEqual(blobs.map(entry => Buffer.concat([...source.streamBlob(entry.location)]).length), [0, 15, FRAME_BYTES + 5]);
+  assert.deepEqual(blobs.map(entry => Buffer.concat([...source.streamBlob(entry.location)]).length),
+    [0, 15, FRAME_BYTES + 5, FRAME_BYTES * 2 + 7]);
+  // Interleave two multi-frame iterators: a chunk of `a` (not copied) must survive a read of `b`. With one shared
+  // frame buffer, `b`'s read would overwrite it.
+  const a = source.streamBlob(blobs[2].location);
+  const b = source.streamBlob(blobs[3].location);
+  const got = { a: [], b: [] };
+  for (let done = { a: false, b: false }; !done.a || !done.b;) {
+    const nextA = done.a ? { done: true } : a.next();
+    const nextB = done.b ? { done: true } : b.next();
+    if (nextA.done) done.a = true; else got.a.push(Buffer.from(nextA.value.toString()));
+    if (!nextA.done) assert.ok(nextA.value.every(byte => byte === 0x78), 'a chunk of a is intact after a read of b');
+    if (nextB.done) done.b = true; else got.b.push(Buffer.from(nextB.value));
+  }
+  assert.equal(Buffer.concat(got.a).toString(), 'x'.repeat(FRAME_BYTES + 5));
+  assert.equal(Buffer.concat(got.b).toString(), 'y'.repeat(FRAME_BYTES * 2 + 7));
 });

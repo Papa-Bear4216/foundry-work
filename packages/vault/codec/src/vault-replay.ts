@@ -9,7 +9,7 @@ import { streamOrdinal } from './manifest.ts';
 import type { ManifestFile } from './manifest.ts';
 import { diskRecord, StreamScanner } from './record-file.ts';
 import type { UnlockedKeyring } from './record-file.ts';
-import { FRAME_BYTES, FRAME_OVERHEAD, HEADER_BYTES } from './record.ts';
+import { FRAME_OVERHEAD, HEADER_BYTES } from './record.ts';
 import {
   checkRootInventory, checkVerifiedHead, metadata, OPEN_ARTIFACTS, readHead, scanOpen, scanSealed, segmentName,
   statIfPresent, streamNames, streamType,
@@ -305,9 +305,9 @@ export function openVaultReplay(directory: string, credential: Unlock, { anchor 
         check(!closed, 'KEY');
         const key = unlocked.collectionEncryptionKey(record.keyId);
         try {
-          // V-3b review item 3: no frame of this record is larger than its body, so a small blob gets a small buffer.
-          const capacity = Math.min(FRAME_BYTES + FRAME_OVERHEAD, record.end - record.offset - HEADER_BYTES);
-          const frames = new StreamScanner(capacity).frameChunks(fd, record, undefined, { vaultId: vault.vault_id, key });
+          // One scanner per call (never shared between two iterators), with main's full-size frame buffer: V-3b item 3
+          // (a buffer sized to the record) measured worse on Linux and was undone (R18-8, D1).
+          const frames = new StreamScanner().frameChunks(fd, record, undefined, { vaultId: vault.vault_id, key });
           for (const chunk of frames) {
             check(!closed, 'KEY');
             yield chunk;
