@@ -263,3 +263,41 @@ jobs:
         run: npm run gate:memory --workspace foundry-cli
       - name: CLI 1 GiB end-to-end gate (command line only)
         run: npm run gate:e2e --workspace foundry-cli
+
+  # P-3 (A-44): Mode B second copy and write-once export. The unit tests run in vault-format and cli.
+  second-copy:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          package-manager-cache: false
+      - name: Install workspace
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Build vault codec
+        run: npm --prefix packages/vault/codec run build
+      - name: Second-copy seal and ISO export peak RSS (pinned runtime)
+        run: npm --prefix packages/vault/codec run second-copy-budgets
+      - name: Mount the exported image with the Linux ISO 9660 driver and verify it keylessly
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/iso-check"
+          mkdir -p "$work/joliet" "$work/primary"
+          head=$(node packages/vault/codec/test/iso-mount-check.mjs make "$work")
+          sudo mount -o loop,ro -t iso9660 "$work/export.iso" "$work/joliet"
+          node packages/vault/codec/test/iso-mount-check.mjs verify "$work/joliet" "$head"
+          sudo umount "$work/joliet"
+          # Without Joliet the kernel reads the Level 2 primary tree (upper-case names, mapped to lower case).
+          sudo mount -o loop,ro,nojoliet,norock -t iso9660 "$work/export.iso" "$work/primary"
+          test -f "$work/primary/segments/000002/pack_0001.fvr"
+          sudo umount "$work/primary"

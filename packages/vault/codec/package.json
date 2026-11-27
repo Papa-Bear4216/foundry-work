@@ -14,6 +14,7 @@
     "vault-budgets": "node test/vault-budgets.mjs",
     "replay-budgets": "node test/replay-budgets.mjs",
     "session-budgets": "node test/session-budgets.mjs",
+    "second-copy-budgets": "node test/second-copy-budgets.mjs",
     "vectors": "node test/generate-vectors.ts"
   }
 }
