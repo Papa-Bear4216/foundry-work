@@ -39,3 +39,11 @@ export { encodeQr, renderQrSvg, renderQrText } from './qr.ts';
 export { exportVaultIso, MAX_EXTENT_BYTES, writeIsoImage } from './iso9660.ts';
 export type { ExportIsoResult, IsoEntryInput, WriteIsoOptions } from './iso9660.ts';
 export type { QrCode, QrErrorCorrection, QrOptions } from './qr.ts';
+export {
+  cronLine, installReminder, reminderArgs, reminderName, reminderStatus, removeReminder, runReminder, systemdUnits,
+  windowsTaskXml,
+} from './schedule.ts';
+export type {
+  ReminderInstallResult, ReminderJob, ReminderJobStatus, ReminderRemoveResult, ReminderResult, ScheduledCadence,
+  SchedulerEnvironment, SchedulerMethod,
+} from './schedule.ts';

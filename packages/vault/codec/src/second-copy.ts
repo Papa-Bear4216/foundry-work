@@ -51,7 +51,8 @@ import { initializeVault, VaultWriter } from './vault-writer.ts';
 export type SecondCopyErrorCode =
   | 'FILESYSTEM_UNSUPPORTED' | 'WRITE_PROTECTED' | 'ROLLBACK_DETECTED' | 'TAMPER_DETECTED' | 'VAULT_MISMATCH'
   | 'NOT_A_COPY' | 'TARGET_NOT_EMPTY' | 'TARGET_UNSUITABLE' | 'COPY_BUSY' | 'COPY_VERIFY_FAILED'
-  | 'WORKING_VAULT_DAMAGED' | 'OUTPUT_EXISTS' | 'REGISTER' | 'COPY_UNKNOWN' | 'COPY_AMBIGUOUS' | 'INVALID_LABEL' | 'INVALID_CADENCE';
+  | 'WORKING_VAULT_DAMAGED' | 'OUTPUT_EXISTS' | 'REGISTER' | 'COPY_UNKNOWN' | 'COPY_AMBIGUOUS' | 'INVALID_LABEL' | 'INVALID_CADENCE'
+  | 'SCHEDULER_UNSUPPORTED' | 'SCHEDULER_FAILED';
 
 /** A typed second-copy failure. `reason` is a fixed token (never a path or user text). */
 export class SecondCopyError extends Error {
