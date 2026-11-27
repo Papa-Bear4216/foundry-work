@@ -9,12 +9,13 @@
 import { Buffer } from 'node:buffer';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import process from 'node:process';
 import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import type { IndexStoreOptions } from 'foundry-index';
 import type { ConsentRecord, ProfileId, UserSensitivityRule } from 'foundry-profiles';
 import type { ImportResult } from 'importers';
-import type { UnlockSession } from 'vault';
+import type { CommandRunner, CopyCheckpoint, FileSystemProbe, UnlockSession } from 'vault';
 import type { CommandName, SearchFilters } from './args.ts';
 import { CliError, debugText, errorLine, isRecoveryFormatError, mapError } from './errors.ts';
 import { homeSystemError, withFixedFileErrors, withHomeSystemErrors } from './files.ts';
@@ -47,6 +48,16 @@ export interface CommandRequest {
   /** `profile list` / `consent list` only: print display names and consent notes (P-1 fix round 1, B7). */
   reveal?: boolean;
   filters: SearchFilters;
+  /** P-3 second-copy commands (see `args.ts`). */
+  target?: string;
+  output?: string;
+  label?: string;
+  copyLabel?: string;
+  anchorSvg?: string;
+  qrInvert?: boolean;
+  includeKeyring?: boolean;
+  cadence?: string;
+  verifyChain?: boolean;
   /** Keyed commands: which secret unlocks the vault. */
   credential?: 'passphrase' | 'recovery';
   secrets: CommandSecrets;
@@ -88,6 +99,17 @@ export interface TestHooks {
    * A function: it cannot cross into the worker thread, so only the inline path (`runCli` with `inline`) can use it.
    */
   betweenRuns?: (archivePath: string) => void;
+  /** P-3, inline only: replaces the drive's file-system probe (so FAT refusal is testable on any OS). */
+  secondCopyProbe?: FileSystemProbe;
+  /** P-3, inline only: a crash point inside the copy (`vault seal`), like a pulled drive. */
+  copyCheckpoint?: (point: CopyCheckpoint, segment: number) => void;
+  /** P-3, inline only: records scheduler argv instead of running `schtasks`, `systemctl` or `crontab`. */
+  schedulerRunner?: CommandRunner;
+  /** P-3: the scheduler platform and Linux config folder to use (default: this OS and `$XDG_CONFIG_HOME`). */
+  schedulerPlatform?: string;
+  schedulerConfigHome?: string;
+  /** P-3: the current time as an ISO string (status, reminder). */
+  now?: string;
 }
 
 /** An errno-style error (maps to `IO`) whose message quotes the given secrets: test hooks only. */
@@ -938,7 +960,294 @@ async function collectionListCommand(ctx: Context): Promise<void> {
   });
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// P-3: Mode B second copy, write-once export and reminders (Architecture 8.1, A-44).
+// Output never echoes the drive path or the home path (either could hold a pasted secret).
+
+/** The working-device register of second copies, in the Foundry home next to `vault/` and `index/`. */
+export const REGISTER_NAME = 'second-copies.json';
+
+function registerPath(ctx: Context): string {
+  return join(ctx.request.home, REGISTER_NAME);
+}
+
+function nowOf(ctx: Context): Date {
+  return ctx.hooks.now === undefined ? new Date() : new Date(ctx.hooks.now);
+}
+
+function targetOptions(ctx: Context): { probe?: FileSystemProbe } {
+  return ctx.hooks.secondCopyProbe ? { probe: ctx.hooks.secondCopyProbe } : {};
+}
+
+function keyringVersionOf(ctx: Context): number | undefined {
+  try {
+    const value = (JSON.parse(readKeyring(ctx).toString('utf8')) as { version?: unknown }).version;
+    return typeof value === 'number' && Number.isSafeInteger(value) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function fileSystemNotice(ctx: Context, report: { type?: string }): void {
+  if (report.type === undefined) {
+    ctx.io.err('foundry: notice: the file system of the drive could not be detected; FAT32 drives cannot hold a second copy\n');
+  }
+}
+
+/** Architecture 8.1: a second copy on the same disk does not survive that disk. */
+function diskWarning(ctx: Context, relation: string): void {
+  if (relation === 'same-volume' || relation === 'same-disk') {
+    ctx.io.err('foundry: warning: the second copy is on the same disk as this vault, so one disk failure loses both; '
+      + 'use an external drive\n');
+  } else if (relation === 'unknown') {
+    ctx.io.err('foundry: notice: Foundry cannot tell whether the second copy is on another physical disk; '
+      + 'make sure it is an external drive\n');
+  }
+}
+
+async function copyInitCommand(ctx: Context): Promise<void> {
+  const vault = await import('vault');
+  const id = await vaultId(ctx);
+  // Read (and so validate) the register and the label before the drive is touched.
+  const register = vault.readCopyRegister(registerPath(ctx), id);
+  const added = vault.addCopyRecord(register, ctx.request.label, nowOf(ctx));
+  stall(ctx.hooks);
+  const result = vault.initSecondCopy(ctx.paths.vault, ctx.request.target!, targetOptions(ctx));
+  vault.writeCopyRegister(registerPath(ctx), added.register);
+  fileSystemNotice(ctx, result.fileSystem);
+  diskWarning(ctx, result.disk);
+  const summary = {
+    ok: true, label: added.copy.label, copyId: added.copy.copy_id, created: result.created,
+    fileSystem: result.fileSystem.type ?? null, disk: result.disk,
+  };
+  if (ctx.request.json) ctx.out(summary);
+  else {
+    ctx.out(`Second copy "${summary.label}" is ${summary.created ? 'ready' : 'registered (the folder already held a copy of this vault)'}.\n`
+      + `Next: run \`foundry vault seal <folder>\` to copy the vault to it.\n`);
+  }
+}
+
+async function sealCommand(ctx: Context): Promise<void> {
+  const vault = await import('vault');
+  const target = ctx.request.target!;
+  await keyed(ctx, async (session, id) => {
+    // An earlier command may have stopped inside a segment seal: the writer completes or rolls it back first.
+    await recoverVaultWriter(ctx, session, id);
+    const path = registerPath(ctx);
+    let register = vault.readCopyRegister(path, id);
+    const copy = vault.selectCopy(register, ctx.request.copyLabel);
+    const recorded = copy.head === null ? null : { segment: copy.head.segment, hash: copy.head.manifest_sha256 };
+    // Steps 1 to 3 (keyless): file system, write-protect, keyless check of the drive, rollback and tamper STOP.
+    const copySession = vault.openSecondCopySession(ctx.paths.vault, target, {
+      recorded, ...targetOptions(ctx), ...(ctx.hooks.copyCheckpoint ? { checkpoint: ctx.hooks.copyCheckpoint } : {}),
+    });
+    let result: ReturnType<typeof copySession.seal>;
+    let keyId: string | undefined;
+    try {
+      fileSystemNotice(ctx, copySession.report.fileSystem);
+      diskWarning(ctx, copySession.report.disk);
+      // After step 3 and before the keyring copy (step 7): `me`'s `system` key for the `copy.sealed` event exists,
+      // so the keyring on the drive already holds it.
+      keyId = vault.ensureCollectionKeys(ctx.paths.keyring, id, { session }, PROFILE, ['system']).keyIds.get('system');
+      if (keyId === undefined) throw new CliError('INTERNAL', 'internal error: the system collection key is missing');
+      const unlocked = vault.decodeKeyring(readKeyring(ctx), { session }, id);
+      try {
+        stall(ctx.hooks);
+        result = copySession.seal(unlocked);
+      } finally {
+        unlocked.masterKey.fill(0);
+        for (const key of unlocked.keys.values()) key.fill(0);
+      }
+    } finally {
+      copySession.release();
+    }
+    register = vault.recordSeal(register, copy.copy_id, result);
+    vault.writeCopyRegister(path, register);
+    // The working vault records the seal: counts and hashes only, under `me`'s `system` key.
+    const unlocked = vault.decodeKeyring(readKeyring(ctx), { session }, id);
+    try {
+      const writer = vault.VaultWriter.open(ctx.paths.vault, unlocked);
+      try {
+        writer.appendBatch([{
+          type: 'event', keyId, event: {
+            ts: result.sealedAt, kind: 'copy.sealed', profile: PROFILE, collection: 'system', sensitivity: 'personal',
+            body: {
+              copy_id: copy.copy_id, previous_segment: result.previous.segment, segment: result.head.segment,
+              manifest_sha256: result.head.hash, segments_copied: result.segmentsCopied, files_copied: result.filesCopied,
+              bytes_copied: result.bytesCopied, keyring_version: result.keyringVersion,
+            },
+          },
+        }]);
+      } finally {
+        writer.release();
+      }
+    } finally {
+      unlocked.masterKey.fill(0);
+      for (const key of unlocked.keys.values()) key.fill(0);
+    }
+    if (ctx.request.anchorSvg !== undefined) {
+      const svg = ctx.request.anchorSvg;
+      const fs = await import('node:fs');
+      withFixedFileErrors(() => {
+        const fd = fs.openSync(svg, 'wx', 0o644);
+        try {
+          fs.writeSync(fd, vault.anchorQrSvg(result.anchor));
+          fs.fsyncSync(fd);
+        } finally {
+          fs.closeSync(fd);
+        }
+      });
+    }
+    const report = copySession.report;
+    if (ctx.request.json) {
+      ctx.out({
+        ok: true, label: copy.label, copyId: copy.copy_id, previousSegment: result.previous.segment,
+        segment: result.head.segment, manifestSha256: result.head.hash, sealedAt: result.sealedAt,
+        segmentsCopied: result.segmentsCopied, filesCopied: result.filesCopied, bytesCopied: result.bytesCopied,
+        keyringVersion: result.keyringVersion, removedPartialSegment: report.removedPartialSegment ?? null,
+        completedHead: report.completedHead, anchor: vault.anchorPayload(result.anchor),
+        anchorSvgWritten: ctx.request.anchorSvg !== undefined,
+      });
+      return;
+    }
+    const notes = [
+      report.removedPartialSegment === undefined ? '' : `An unfinished segment ${report.removedPartialSegment} from an interrupted session was removed first.\n`,
+      report.completedHead ? 'An interrupted session\'s head update was completed first.\n' : '',
+    ].join('');
+    ctx.out(`${notes}Second copy "${copy.label}" sealed: segment ${result.previous.segment} -> ${result.head.segment}, `
+      + `${result.segmentsCopied} segment(s), ${result.filesCopied} file(s), ${result.bytesCopied} byte(s) copied; `
+      + `keyring version ${result.keyringVersion}.\n\n`
+      + `${vault.anchorText(result.anchor)}\n`
+      + `${vault.anchorQrText(result.anchor, { invert: ctx.request.qrInvert === true })}\n`
+      + 'Write the anchor down or print it, and keep it away from the drive. It makes a swapped or rolled-back copy\n'
+      + 'tamper-evident: `foundry vault verify` on a copy can be checked against it.\n\n'
+      + 'Now switch on the drive\'s write-protect (if it has one) and disconnect the drive.\n');
+  });
+}
+
+async function statusCommand(ctx: Context): Promise<void> {
+  const vault = await import('vault');
+  const id = await vaultId(ctx);
+  stall(ctx.hooks);
+  const register = vault.readCopyRegister(registerPath(ctx), id);
+  const status = vault.copyRegisterStatus(register, nowOf(ctx), keyringVersionOf(ctx));
+  if (ctx.request.json) {
+    ctx.out({ ...status, lastCheck: register.last_check });
+    return;
+  }
+  const lines = status.copies.map(copy => {
+    const sealed = copy.head === null ? 'never sealed' : `segment ${copy.head.segment}, sealed ${copy.head.sealed_at}`;
+    const keyring = copy.keyringCurrent === false ? '  keyring copy is OLDER (seal again)' : '';
+    return `${copy.label}  ${sealed}  ${copy.daysUnsealed} day(s) ago${copy.overdue ? '  OVERDUE' : copy.due ? '  due' : ''}${keyring}\n`;
+  });
+  const check = register.last_check === null ? '' : `Last reminder check: ${register.last_check.checked_at} (keyless check: ${register.last_check.verify}).\n`;
+  ctx.out(`Cadence: ${status.cadence}.\n${lines.join('')}${check}${status.banner ? `${status.banner}\n` : ''}`);
+}
+
+async function reminderCommand(ctx: Context): Promise<void> {
+  const { runReminder } = await import('vault');
+  stall(ctx.hooks);
+  const result = runReminder(ctx.paths.vault, registerPath(ctx), { verify: ctx.request.verifyChain === true, now: nowOf(ctx) });
+  if (ctx.request.json) ctx.out({ ...result.status, verify: result.verify, verifyError: result.verifyError ?? null });
+  else {
+    ctx.out(`${result.status.banner ?? (result.status.due ? 'A second-copy session is due.' : 'The second copy is up to date.')}\n`
+      + (result.verify === 'skipped' ? '' : `Keyless vault check: ${result.verify}${result.verifyError ? ` (${result.verifyError})` : ''}.\n`));
+  }
+  if (result.verify === 'failed') {
+    throw new CliError('VERIFY_FAILED', 'the keyless vault check failed; run `foundry vault verify`');
+  }
+}
+
+async function exportIsoCommand(ctx: Context): Promise<void> {
+  const vault = await import('vault');
+  const includeKeyring = ctx.request.includeKeyring === true;
+  if (includeKeyring) {
+    ctx.io.err('foundry: warning: --include-keyring-irreversible puts the keyring on the image. A key on a write-once disc '
+      + 'can never be destroyed: erasing a person or collection later cannot reach that disc.\n');
+  }
+  stall(ctx.hooks);
+  const result = vault.exportVaultIso(ctx.paths.vault, ctx.request.output!, { includeKeyring });
+  if (ctx.request.json) {
+    ctx.out({
+      ok: true, segment: result.head.segment, manifestSha256: result.head.hash, segments: result.segments, files: result.files,
+      imageBytes: result.imageBytes, keyringIncluded: result.keyringIncluded, openFilesNotExported: result.openFiles,
+      anchor: vault.anchorPayload(result.anchor),
+    });
+    return;
+  }
+  ctx.out(`Image written: ${result.segments} sealed segment(s), ${result.files} file(s), ${result.imageBytes} byte(s); `
+    + `keyring ${result.keyringIncluded ? 'INCLUDED' : 'not included'}.\n`
+    + (result.openFiles > 0 ? `${result.openFiles} file(s) of the open segment are not on the image; run \`foundry vault seal\` first to include them.\n` : '')
+    + 'Burn it as a single, finalised (closed) session, so nothing can be appended to the disc later.\n\n'
+    + `${vault.anchorText(result.anchor)}\n`);
+}
+
+function schedulerEnvironment(ctx: Context, env: Readonly<Record<string, string | undefined>>, home: () => string) {
+  const xdg = env.XDG_CONFIG_HOME;
+  return {
+    platform: ctx.hooks.schedulerPlatform ?? process.platform,
+    ...(ctx.hooks.schedulerRunner ? { run: ctx.hooks.schedulerRunner } : {}),
+    configHome: ctx.hooks.schedulerConfigHome ?? (xdg && xdg.startsWith('/') ? xdg : join(home(), '.config')),
+    scratch: ctx.request.home,
+    now: nowOf(ctx),
+  };
+}
+
+async function scheduleCommand(ctx: Context): Promise<void> {
+  const vault = await import('vault');
+  const { homedir } = await import('node:os');
+  const { fileURLToPath } = await import('node:url');
+  const env = schedulerEnvironment(ctx, process.env, homedir);
+  const command = ctx.request.command;
+  stall(ctx.hooks);
+  if (command === 'vault schedule status') {
+    const id = await vaultId(ctx);
+    const status = vault.reminderStatus(ctx.request.home, env);
+    const cadence = vault.readCopyRegister(registerPath(ctx), id).cadence;
+    if (ctx.request.json) ctx.out({ ...status, cadence });
+    else ctx.out(`Cadence: ${cadence}. Reminder job: ${status.installed.length === 0 ? 'none' : status.installed.join(', ')}.\n`);
+    return;
+  }
+  if (command === 'vault schedule remove') {
+    const removed = vault.removeReminder(ctx.request.home, env);
+    if (ctx.request.json) ctx.out({ ok: true, name: removed.name, removed: removed.removed });
+    else ctx.out(removed.removed.length === 0 ? 'No reminder job was installed.\n' : `Reminder removed (${removed.removed.join(', ')}).\n`);
+    return;
+  }
+  const id = await vaultId(ctx);
+  const cadence = vault.assertCadence(ctx.request.cadence);
+  const path = registerPath(ctx);
+  const register = vault.readCopyRegister(path, id);
+  let method: string;
+  if (cadence === 'manual') {
+    method = vault.removeReminder(ctx.request.home, env).removed.length > 0 ? 'removed' : 'none';
+  } else {
+    const installed = vault.installReminder({
+      home: ctx.request.home, node: process.execPath, cli: fileURLToPath(new URL('../bin/foundry.mjs', import.meta.url)),
+      cadence, verify: ctx.request.verifyChain === true,
+    }, env);
+    method = installed.method;
+  }
+  vault.writeCopyRegister(path, { ...register, cadence });
+  if (ctx.request.json) ctx.out({ ok: true, cadence, method });
+  else if (cadence === 'manual') {
+    ctx.out('Cadence: manual. No reminder job is installed; `foundry vault status` still shows the overdue banner after 14 days.\n');
+  } else {
+    ctx.out(`Reminder installed (${method}, ${cadence}). It never reads a key: it checks the seal age`
+      + `${ctx.request.verifyChain ? ' and runs the keyless vault check' : ''} and records the result for \`foundry vault status\`.\n`);
+  }
+}
+
 const BODIES: Readonly<Record<CommandName, (ctx: Context) => Promise<void>>> = {
+  'vault copy init': copyInitCommand,
+  'vault seal': sealCommand,
+  'vault session': sealCommand,
+  'vault status': statusCommand,
+  'vault reminder': reminderCommand,
+  'vault export-iso': exportIsoCommand,
+  'vault schedule set': scheduleCommand,
+  'vault schedule status': scheduleCommand,
+  'vault schedule remove': scheduleCommand,
   'init': init,
   'import': importCommand,
   'search': search,

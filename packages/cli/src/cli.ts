@@ -18,7 +18,8 @@
  * File-system errors of the home folder and the lock print a fixed message with the error code, never the path, also
  * under `--debug` (`files.ts`). `H/vault` or `H/index` as a symbolic link or junction is refused (`LINKED_FOLDER`).
  * `init` refuses any `.init-*` folder in H and never deletes a folder it did not just create (`commands.ts`).
- * No child process is started; no thread outlives the command.
+ * No child process is started, except by the P-3 second-copy commands: the file-system probe (`fsutil` on Windows)
+ * and the `vault schedule` scheduler programs, always with `shell: false`. No thread outlives the command.
  *
  * Location rule (design 4.1), first match wins: `--vault <dir>`, then `FOUNDRY_HOME`, then `<home directory>/Foundry`.
  * The home `H` holds `H/vault/`, `H/index/` and `H/foundry.lock`.
@@ -118,6 +119,14 @@ async function readSecrets(run: Run, fd: number, terminal: PromptIo, secrets: Co
   track: (read: StdinRead) => void, trackPrompt: (pending: Cancellable) => void): Promise<CommandRequest['credential']> {
   switch (run.command) {
     case 'vault verify':
+    // P-3: keyless second-copy commands (only `vault seal` and `vault session` read a key).
+    case 'vault copy init':
+    case 'vault status':
+    case 'vault reminder':
+    case 'vault export-iso':
+    case 'vault schedule set':
+    case 'vault schedule status':
+    case 'vault schedule remove':
       return undefined;
     case 'init':
       secrets.newPassphrase = run.passphraseStdin ? await readOneSecret(fd, track) : await promptNew(terminal, trackPrompt);
@@ -356,6 +365,15 @@ export async function runCli(argv: readonly string[], options: RunOptions = {}):
       childPrompts: run.childPrompts,
       reveal: run.reveal,
       filters: run.filters,
+      target: run.target,
+      output: run.output,
+      label: run.label,
+      copyLabel: run.copyLabel,
+      anchorSvg: run.anchorSvg,
+      qrInvert: run.qrInvert,
+      includeKeyring: run.includeKeyring,
+      cadence: run.cadence,
+      verifyChain: run.verifyChain,
       credential: isKeyed(run.command) ? credential : undefined,
       secrets,
     };

@@ -44,6 +44,16 @@ test('commands, default timeouts, --timeout bounds and filters', () => {
     'vault verify': 3600,
     'import': 21600,
     'index rebuild': 21600,
+    // P-3 second-copy commands.
+    'vault copy init': 120,
+    'vault status': 120,
+    'vault schedule set': 120,
+    'vault schedule status': 120,
+    'vault schedule remove': 120,
+    'vault reminder': 3600,
+    'vault seal': 21600,
+    'vault session': 21600,
+    'vault export-iso': 21600,
   });
   for (const [argv, command] of [
     [['init'], 'init'],

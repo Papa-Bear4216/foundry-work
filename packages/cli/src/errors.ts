@@ -81,6 +81,29 @@ const IMPORT_MESSAGES: Readonly<Record<string, string>> = {
   RESOLVER_MODIFIED_ITEM: 'an item changed while it was classified; nothing more was imported',
 };
 
+/** P-3 second copy, export and reminders. Fixed texts: the drive path is never echoed. */
+const SECOND_COPY_MESSAGES: Readonly<Record<string, string>> = {
+  FILESYSTEM_UNSUPPORTED: 'the drive uses FAT32 (or another FAT file system), which cannot hold a second copy; reformat it as exFAT, NTFS or ext4',
+  WRITE_PROTECTED: 'the drive is write-protected; switch the write-protect off for the session, then switch it on again',
+  ROLLBACK_DETECTED: 'STOP: the second copy is older than the last seal recorded for it, or newer than this vault (a rolled-back or swapped drive); nothing was changed',
+  TAMPER_DETECTED: 'STOP: the second copy and this vault hold different chains; nothing was changed',
+  VAULT_MISMATCH: 'the folder holds a copy of a different vault',
+  NOT_A_COPY: 'the folder is not a second copy of a vault; run `foundry vault copy init <folder>` first',
+  TARGET_NOT_EMPTY: 'the folder is not empty and is not a second copy of this vault',
+  TARGET_UNSUITABLE: 'the folder cannot hold a second copy (a drive root, or inside or around the vault)',
+  COPY_BUSY: 'another program is writing to the second copy',
+  COPY_VERIFY_FAILED: 'the second copy failed its keyless check; nothing was changed',
+  WORKING_VAULT_DAMAGED: 'this vault failed its check while it was copied; run `foundry vault verify`',
+  OUTPUT_EXISTS: 'the output file already exists; choose a new file name',
+  REGISTER: 'the second-copy register in the Foundry folder is damaged',
+  COPY_UNKNOWN: 'no registered second copy matches; run `foundry vault copy init <folder>`, or give --copy <label>',
+  COPY_AMBIGUOUS: 'more than one second copy is registered; give --copy <label>',
+  INVALID_LABEL: 'the label must be 1 to 32 letters, digits, dots, dashes or underscores, and new',
+  INVALID_CADENCE: 'the cadence must be daily, weekly, monthly or manual',
+  SCHEDULER_UNSUPPORTED: 'reminders can be scheduled on Windows and Linux only',
+  SCHEDULER_FAILED: 'the scheduler did not accept the reminder',
+};
+
 const RECOVERY_FORMAT = new Set([
   'Invalid recovery key format.', 'Recovery key checksum mismatch.', 'Invalid recovery key padding.',
 ]);
@@ -120,6 +143,14 @@ export function mapError(error: unknown, context: { erasedInImport?: boolean } =
   }
   if (named(error, 'ImportError')) {
     return { code: error.code, message: IMPORT_MESSAGES[error.code] ?? 'the import reported an error', exit: 2 };
+  }
+  if (named(error, 'SecondCopyError')) {
+    // The reason is a fixed code (for example the vault check code); it never carries input text.
+    const reason = (error as { reason?: unknown }).reason;
+    const detail = error.code === 'COPY_VERIFY_FAILED' || error.code === 'WORKING_VAULT_DAMAGED'
+      ? (typeof reason === 'string' && /^[A-Z_]{1,32}$/u.test(reason) ? ` (${reason})` : '')
+      : '';
+    return { code: error.code, message: (SECOND_COPY_MESSAGES[error.code] ?? 'the second-copy step failed') + detail, exit: 2 };
   }
   if (isRecoveryFormatError(error)) {
     return { code: 'RECOVERY_KEY_FORMAT', message: 'the recovery key is not in the expected format', exit: 2 };

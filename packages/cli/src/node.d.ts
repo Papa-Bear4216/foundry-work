@@ -195,6 +195,7 @@ declare module 'node:process' {
   }
   const process: {
     argv: string[];
+    execPath: string;
     env: Record<string, string | undefined>;
     pid: number;
     platform: string;
