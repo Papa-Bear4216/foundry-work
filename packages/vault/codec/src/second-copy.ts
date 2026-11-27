@@ -67,7 +67,8 @@ export type SecondCopyErrorCode =
   | 'FILESYSTEM_UNSUPPORTED' | 'WRITE_PROTECTED' | 'ROLLBACK_DETECTED' | 'TAMPER_DETECTED' | 'VAULT_MISMATCH'
   | 'NOT_A_COPY' | 'TARGET_NOT_EMPTY' | 'TARGET_UNSUITABLE' | 'COPY_BUSY' | 'COPY_VERIFY_FAILED'
   | 'WORKING_VAULT_DAMAGED' | 'OUTPUT_EXISTS' | 'REGISTER' | 'COPY_UNKNOWN' | 'COPY_AMBIGUOUS' | 'INVALID_LABEL' | 'INVALID_CADENCE'
-  | 'SCHEDULER_UNSUPPORTED' | 'SCHEDULER_FAILED' | 'ISO_TOO_MANY_EXTENTS' | 'COPY_MISMATCH';
+  | 'SCHEDULER_UNSUPPORTED' | 'SCHEDULER_FAILED' | 'ISO_TOO_MANY_EXTENTS' | 'COPY_MISMATCH' | 'OUTPUT_UNSUITABLE'
+  | 'KEYRING_INVALID';
 
 /** A typed second-copy failure. `reason` is a fixed token (never a path or user text). */
 export class SecondCopyError extends Error {
@@ -166,13 +167,17 @@ export function mountInfoType(path: string, mountinfo: string): string | undefin
   return best?.type.toLowerCase();
 }
 
-/** The file-system name from `fsutil fsinfo volumeinfo` output. Labels are localized, so only the value is matched. */
+/**
+ * The file-system name from `fsutil fsinfo volumeinfo` output, read by its exact key `File System Name` (R18-5).
+ * A value under any other key (for example a volume label that reads "NTFS") is never used. Localized output has
+ * another key, so the type is unknown there and the caller warns instead of claiming the drive is safe (A-44).
+ */
 export function fsutilType(output: string): string | undefined {
   for (const line of output.split(/\r?\n/u)) {
     const colon = line.indexOf(':');
-    if (colon < 0) continue;
+    if (colon < 0 || line.slice(0, colon).trim() !== 'File System Name') continue;
     const value = line.slice(colon + 1).trim();
-    if (/^(?:NTFS|FAT32|FAT16|FAT12|FAT|exFAT|ReFS|UDF|CDFS)$/iu.test(value)) return value.toLowerCase();
+    return value === '' ? undefined : value.toLowerCase();
   }
   return undefined;
 }

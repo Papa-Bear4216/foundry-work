@@ -50,6 +50,27 @@ if (command === 'prepare') {
   session.release();
   assert.equal(verifyVault(drive, { secondCopy: true }).position.segment, session.report.driveHead.segment);
   console.log(JSON.stringify({ bytes: 0, peakRssKiB: process.resourceUsage().maxRSS }));
+} else if (command === 'prepare-many') {
+  // Not measured: a long history, 50 sealed segments of one event and one 64 KiB blob each (finding 29, R18-7).
+  const many = join(root, 'many');
+  const unlocked = decodeKeyring(readFileSync(join(many, 'keyring', 'keyring.json')), credential, cases.metadata.vault_id);
+  const writer = VaultWriter.open(many, unlocked);
+  try {
+    for (let segment = 0; segment < 50; segment++) {
+      writer.appendBatch([
+        { type: 'event', keyId: cases.ids.collection, event: { kind: 'vault.created', body: { marker: `TEST ONLY ${segment}` } } },
+        { type: 'blob', keyId: cases.ids.collection, plaintext: Buffer.alloc(64 * 1024, segment) },
+      ]);
+      writer.closeSegment();
+    }
+  } finally {
+    writer.release();
+  }
+} else if (command === 'export-many') {
+  // Keyless: the export of the 50-segment history (manifests are held until the image is written).
+  const result = exportVaultIso(join(root, 'many'), join(root, 'many.iso'));
+  assert.equal(result.segments, 50);
+  console.log(JSON.stringify({ bytes: result.imageBytes, segments: result.segments, peakRssKiB: process.resourceUsage().maxRSS }));
 } else if (command === 'export-iso') {
   const result = exportVaultIso(vault, join(root, 'vault.iso'));
   assert.ok(result.imageBytes > 256 * MiB);

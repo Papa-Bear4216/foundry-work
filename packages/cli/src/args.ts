@@ -29,6 +29,7 @@ export type CommandName =
   | 'vault status'
   | 'vault reminder'
   | 'vault export-iso'
+  | 'vault verify-copy'
   | 'vault schedule set'
   | 'vault schedule status'
   | 'vault schedule remove';
@@ -36,7 +37,7 @@ export type CommandName =
 /** P-3 commands: `vault copy init`, `vault seal` and `vault session` are keyed; the others never read a key. */
 export const SECOND_COPY_COMMANDS: readonly CommandName[] = [
   'vault copy init', 'vault seal', 'vault session', 'vault status', 'vault reminder', 'vault export-iso',
-  'vault schedule set', 'vault schedule status', 'vault schedule remove',
+  'vault verify-copy', 'vault schedule set', 'vault schedule status', 'vault schedule remove',
 ];
 
 /** Seconds (design 4.8). */
@@ -62,6 +63,7 @@ export const DEFAULT_TIMEOUTS: Readonly<Record<CommandName, number>> = {
   'vault seal': 21600,
   'vault session': 21600,
   'vault export-iso': 21600,
+  'vault verify-copy': 3600,
 };
 
 export const MAX_TIMEOUT_SECONDS = 604800;
@@ -77,7 +79,7 @@ const COMMON = ['vault', 'timeout', 'debug', 'help'] as const;
 const CREDENTIAL = ['passphrase-stdin', 'recovery-key-stdin'] as const;
 const FILTERS = ['from', 'until', 'source', 'profile', 'collection', 'tier', 'limit'] as const;
 const P1_STRING_OPTIONS = ['display-name', 'basis', 'note', 'child-prompts'] as const;
-const P3_STRING_OPTIONS = ['label', 'copy', 'anchor-svg', 'cadence'] as const;
+const P3_STRING_OPTIONS = ['label', 'copy', 'anchor-svg', 'cadence', 'anchor'] as const;
 const P3_BOOLEAN_OPTIONS = ['qr-invert', 'include-keyring-irreversible', 'verify', 'adopt'] as const;
 
 const COMMANDS: Readonly<Record<CommandName, CommandSpec>> = {
@@ -100,6 +102,8 @@ const COMMANDS: Readonly<Record<CommandName, CommandSpec>> = {
   'vault status': { words: 2, options: [...COMMON, 'json'], keyed: false },
   'vault reminder': { words: 2, options: [...COMMON, 'json', 'verify'], keyed: false },
   'vault export-iso': { words: 2, positional: 'output', options: [...COMMON, 'json', 'include-keyring-irreversible'], keyed: false },
+  // Keyless check of a second copy against an anchor or the recorded seal (fix round 1, finding 32).
+  'vault verify-copy': { words: 2, positional: 'target', options: [...COMMON, 'json', 'anchor', 'copy'], keyed: false },
   'vault schedule set': { words: 3, options: [...COMMON, 'json', 'cadence', 'verify'], keyed: false },
   'vault schedule status': { words: 3, options: [...COMMON, 'json'], keyed: false },
   'vault schedule remove': { words: 3, options: [...COMMON, 'json'], keyed: false },
@@ -161,6 +165,8 @@ export type ParsedCommand =
     cadence?: string;
     verifyChain?: boolean;
     adopt?: boolean;
+    /** `vault verify-copy --anchor`: the compact anchor text. */
+    anchor?: string;
   };
 
 function commandOf(positionals: readonly string[]): CommandName | undefined {
@@ -171,7 +177,7 @@ function commandOf(positionals: readonly string[]): CommandName | undefined {
     return `vault schedule ${third}`;
   }
   if (first === 'vault' && (second === 'seal' || second === 'session' || second === 'status' || second === 'reminder'
-    || second === 'export-iso')) {
+    || second === 'export-iso' || second === 'verify-copy')) {
     return `vault ${second}`;
   }
   if (first === 'init' || first === 'import' || first === 'search') return first;
@@ -323,6 +329,7 @@ export function parseCommandLine(argv: readonly string[], env: Readonly<Record<s
       label: textOption(values.label),
       copyLabel: textOption(values.copy),
       anchorSvg: textOption(values['anchor-svg']),
+      anchor: textOption(values.anchor),
       qrInvert: values['qr-invert'] === true,
       includeKeyring: values['include-keyring-irreversible'] === true,
       cadence,
@@ -357,6 +364,7 @@ Commands:
   vault session <folder>                    The same as vault seal (the Mode B vault session).
   vault status                              Show the second copies and when each was last sealed.
   vault export-iso <file.iso>               Write the sealed vault as a disc image (no keyring).
+  vault verify-copy <folder>                Check a second copy against an anchor or the last seal (no key).
   vault schedule set --cadence <c>          Install a reminder: daily, weekly, monthly or manual.
   vault schedule status                     Show the installed reminder.
   vault schedule remove                     Remove the reminder.
@@ -421,6 +429,10 @@ terminal prompt, or from stdin with --passphrase-stdin / --recovery-key-stdin.
   'vault export-iso': 'Usage: foundry vault export-iso <file.iso> [--include-keyring-irreversible] [--json]\n'
     + '  Writes VAULT.json, HEAD.json and every sealed segment as an ISO 9660 + Joliet image. The keyring is left out:\n'
     + '  a key burned to a disc can never be erased. --include-keyring-irreversible adds it anyway.\n',
+  'vault verify-copy': 'Usage: foundry vault verify-copy <folder> [--anchor <compact anchor>] [--copy <label>] [--json]\n'
+    + '  Checks a second copy without a key. With --anchor (the "compact" line of a printed anchor), the copy must hold\n'
+    + '  that segment with that hash, so an older copy fails. Without it, the copy is compared with the last seal\n'
+    + '  recorded on this device.\n',
   'vault schedule set': 'Usage: foundry vault schedule set --cadence <daily|weekly|monthly|manual> [--verify] [--json]\n'
     + '  Windows: a per-user Task Scheduler task. Linux: a systemd --user timer, else a crontab line.\n'
     + '  manual: no reminder job; the overdue banner still shows after 14 days.\n',

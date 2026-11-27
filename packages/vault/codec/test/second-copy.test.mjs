@@ -222,10 +222,15 @@ test('the real file-system probe names the temporary folder\'s file system on th
   assert.ok(!['vfat', 'fat32'].includes(report.type));
 });
 
-test('probe parsers: fsutil values in any language and Linux mountinfo with escaped mount points', () => {
+test('probe parsers: fsutil by the exact key only, and Linux mountinfo with escaped mount points', () => {
   assert.equal(fsutilType('Volume Name : \r\nFile System Name : FAT32\r\nIs ReadWrite\r\n'), 'fat32');
-  assert.equal(fsutilType('Volumename : \nDateisystemname : exFAT\n'), 'exfat');
-  assert.equal(fsutilType('Nom du système de fichiers : NTFS\n'), 'ntfs');
+  // A volume label that reads like a file-system name never masks the real type (finding 13).
+  assert.equal(fsutilType('Volume Name : NTFS\r\nVolume Serial Number : 0x1234\r\nFile System Name : FAT32\r\n'), 'fat32');
+  assert.equal(fsutilType('Volume Name : NTFS\r\n'), undefined);
+  // Localized output has another key: the type is unknown (the caller warns; A-44 limit).
+  assert.equal(fsutilType('Volumename : \nDateisystemname : exFAT\n'), undefined);
+  assert.equal(fsutilType('Nom du système de fichiers : NTFS\n'), undefined);
+  assert.equal(fsutilType('File System Name : \r\n'), undefined);
   assert.equal(fsutilType('nothing useful'), undefined);
   const mountinfo = [
     '22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw',

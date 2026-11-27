@@ -47,6 +47,7 @@ test('commands, default timeouts, --timeout bounds and filters', () => {
     // P-3 second-copy commands.
     // Keyed since fix round 1: it may replay the vault to rebuild a missing register.
     'vault copy init': 600,
+    'vault verify-copy': 3600,
     'vault status': 120,
     'vault schedule set': 120,
     'vault schedule status': 120,

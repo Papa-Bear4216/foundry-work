@@ -123,6 +123,7 @@ async function readSecrets(run: Run, fd: number, terminal: PromptIo, secrets: Co
     case 'vault status':
     case 'vault reminder':
     case 'vault export-iso':
+    case 'vault verify-copy':
     case 'vault schedule set':
     case 'vault schedule status':
     case 'vault schedule remove':
@@ -374,6 +375,7 @@ export async function runCli(argv: readonly string[], options: RunOptions = {}):
       cadence: run.cadence,
       verifyChain: run.verifyChain,
       adopt: run.adopt,
+      anchor: run.anchor,
       credential: isKeyed(run.command) ? credential : undefined,
       secrets,
     };

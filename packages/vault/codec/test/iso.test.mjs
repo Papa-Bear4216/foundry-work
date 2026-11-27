@@ -125,12 +125,15 @@ function readIso(path) {
     assert.deepEqual(l, m);
     assert.deepEqual(new Set(l.map(row => row.extent)), new Set(directories.map(d => d.location)));
     assert.equal(l[0].parent, 1);
+    // Directory paths (for example `segments/`), so an empty directory is extracted too.
+    files.directories = directories.map(d => d.prefix).filter(prefix => prefix !== '');
     return files;
   };
   return { joliet: walk(svd, true), primary: walk(pvd, false), image, extentCounts };
 }
 
 function extract(files, folder) {
+  for (const prefix of files.directories ?? []) mkdirSync(join(folder, ...prefix.split('/').filter(Boolean)), { recursive: true });
   for (const [path, bytes] of files) {
     const target = join(folder, ...path.split('/'));
     mkdirSync(join(target, '..'), { recursive: true });
@@ -179,6 +182,46 @@ test('the keyring goes on the image only with the explicit opt-in', t => {
   const { joliet, primary } = readIso(output);
   assert.deepEqual(joliet.get('keyring/keyring.json'), readFileSync(keyringPath(s.vault)));
   assert.ok(primary.has('KEYRING/KEYRING.JSON;1'));
+});
+
+test('a damaged or other-vault keyring is refused before an irreversible export, and nothing is written (finding 31)', t => {
+  const s = setup(t);
+  s.append([event('TEST ONLY k')], true);
+  const original = readFileSync(keyringPath(s.vault));
+  const keyring = JSON.parse(original);
+  for (const bad of ['TEST ONLY not json', JSON.stringify({ ...keyring, format: 'TEST ONLY' }),
+    original.toString('utf8').replace(keyring.vault_id, 'f'.repeat(32))]) {
+    writeFileSync(keyringPath(s.vault), bad);
+    assert.throws(() => exportVaultIso(s.vault, join(s.root, 'k.iso'), { includeKeyring: true }), { code: 'KEYRING_INVALID' });
+    assert.deepEqual(readdirSync(s.root).sort(), ['vault']);
+  }
+  writeFileSync(keyringPath(s.vault), original);
+  // A keyless export does not read the keyring at all.
+  writeFileSync(keyringPath(s.vault), 'TEST ONLY not json');
+  assert.equal(exportVaultIso(s.vault, join(s.root, 'plain.iso')).keyringIncluded, false);
+  writeFileSync(keyringPath(s.vault), original);
+});
+
+test('a genesis export holds an empty segments/ directory and the extracted tree verifies (finding 19)', t => {
+  const s = setup(t);
+  const output = join(s.root, 'genesis.iso');
+  const result = exportVaultIso(s.vault, output);
+  assert.equal(result.segments, 0);
+  const { joliet, primary } = readIso(output);
+  assert.deepEqual(joliet.directories, ['segments/']);
+  assert.deepEqual(primary.directories, ['SEGMENTS/']);
+  const extracted = join(s.root, 'genesis');
+  extract(joliet, extracted);
+  assert.equal(verifyVault(extracted, { anchor: result.anchor }).position.segment, 0);
+});
+
+test('the image cannot be written inside the vault it exports (finding 17)', t => {
+  const s = setup(t);
+  s.append([event('TEST ONLY x')], true);
+  for (const output of [join(s.vault, 'v.iso'), join(s.vault, 'segments', 'v.iso')]) {
+    assert.throws(() => exportVaultIso(s.vault, output), { code: 'OUTPUT_UNSUITABLE' });
+  }
+  assert.equal(verifyVault(s.vault).position.segment, 1, 'the vault is unchanged');
 });
 
 test('files larger than one extent become consecutive multi-extent records and read back whole', t => {

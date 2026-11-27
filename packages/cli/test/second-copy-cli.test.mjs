@@ -267,9 +267,10 @@ test('schedule set, status and remove run the scheduler with explicit argv and l
   let table = '';
   const schedulerRunner = (command, args, input) => {
     calls.push([command, ...args]);
-    if (command === 'systemctl') return { status: 0, stdout: '', stderr: '' };
+    // `is-active` exits 3 for an inactive unit (the timer is stopped once `disable --now` ran).
+    if (command === 'systemctl') return { status: args[1] === 'is-active' ? 3 : 0, stdout: '', stderr: '' };
     if (command === 'crontab') {
-      if (args[0] === '-l') return { status: table ? 0 : 1, stdout: table, stderr: '' };
+      if (args[0] === '-l') return table ? { status: 0, stdout: table, stderr: '' } : { status: 1, stdout: '', stderr: 'no crontab for test-only' };
       table = input;
     }
     return { status: 0, stdout: '', stderr: '' };
@@ -303,7 +304,11 @@ test('schedule set, status and remove run the scheduler with explicit argv and l
       win.push([command, ...args]);
       if (args[0] === '/Create') task = existsSync(args[args.indexOf('/XML') + 1]);
       if (args[0] === '/Delete') task = false;
-      return { status: args[0] === '/Query' && !task ? 1 : 0, stdout: '', stderr: '' };
+      if (args[0] === '/Query') {
+        const name = /foundry-vault-reminder-[0-9a-f]{12}/u.exec(JSON.stringify(win))?.[0];
+        return { status: 0, stdout: task && name ? `"\\${name}","N/A","Ready"\r\n` : '', stderr: '' };
+      }
+      return { status: 0, stdout: '', stderr: '' };
     },
   };
   const winSet = await runInline(dir, ['vault', 'schedule', 'set', '--cadence', 'weekly', '--vault', home], { hooks: winHooks });
@@ -355,4 +360,129 @@ test('a seal before any profile or import: the next profile, import, search and 
   assert.equal(verifyVault(drive, { secondCopy: true }).position.segment, summary.segment);
   const rebuild = await runInline(dir, ['index', 'rebuild', '--vault', home, '--passphrase-stdin'], { stdin: `${PASSPHRASE}\n` });
   assert.equal(rebuild.code, 0, rebuild.stderr);
+});
+
+test('verify-copy checks a copy against the printed anchor and the recorded seal; an older copy fails (finding 32)', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const drive = join(dir, 'drive');
+  assert.equal((await copyInit(dir, home, drive)).code, 0);
+  await addEvent(dir, home);
+  const first = JSON.parse((await seal(dir, home, drive, ['--json'])).stdout);
+  const old = join(dir, 'old');
+  cpSync(drive, old, { recursive: true });
+  await addEvent(dir, home);
+  const second = JSON.parse((await seal(dir, home, drive, ['--json'])).stdout);
+  const ok = await runInline(dir, ['vault', 'verify-copy', drive, '--vault', home, '--anchor', second.anchor, '--json']);
+  assert.equal(ok.code, 0, ok.stderr);
+  assert.equal(ok.kdf, 0);
+  assert.deepEqual(JSON.parse(ok.stdout), { ok: true, segment: second.segment, manifestSha256: second.manifestSha256, anchorChecked: true, recorded: 'none' });
+  // The older copy is internally valid, but not against the newer anchor or the recorded seal.
+  const anchored = await runInline(dir, ['vault', 'verify-copy', old, '--vault', home, '--anchor', second.anchor]);
+  assert.match(anchored.stderr, /\[ANCHOR\]\n$/u);
+  assert.equal((await runInline(dir, ['vault', 'verify-copy', old, '--vault', home, '--anchor', first.anchor])).code, 0);
+  const recorded = await runInline(dir, ['vault', 'verify-copy', old, '--vault', home]);
+  assert.match(recorded.stderr, /\[ROLLBACK_DETECTED\]\n$/u);
+  const current = await runInline(dir, ['vault', 'verify-copy', drive, '--vault', home]);
+  assert.equal(current.code, 0, current.stderr);
+  assert.match(current.stdout, /^Second copy OK: segment \d+; its head is the seal recorded on this device\.\n$/u);
+  const bad = await runInline(dir, ['vault', 'verify-copy', drive, '--vault', home, '--anchor', 'TEST ONLY not an anchor']);
+  assert.match(bad.stderr, /\[ANCHOR\]\n$/u);
+  // The seal output points at the new command.
+  assert.match((await seal(dir, home, drive)).stdout, /foundry vault verify-copy <folder> --anchor/u);
+});
+
+test('anchor SVG: checked before the seal; a failed write after the seal still prints the anchor and step 9 (findings 17, 18)', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const drive = join(dir, 'drive');
+  assert.equal((await copyInit(dir, home, drive)).code, 0);
+  await addEvent(dir, home);
+  const registerBefore = readFileSync(join(home, REGISTER_NAME));
+  const existing = join(dir, 'exists.svg');
+  writeFileSync(existing, 'TEST ONLY');
+  for (const [svg, code] of [[existing, 'OUTPUT_EXISTS'], [join(drive, 'anchor.svg'), 'OUTPUT_UNSUITABLE'],
+    [join(home, 'vault', 'anchor.svg'), 'OUTPUT_UNSUITABLE'], [join(dir, 'missing', 'anchor.svg'), 'IO']]) {
+    const refused = await seal(dir, home, drive, ['--anchor-svg', svg]);
+    assert.equal(refused.code, 2, code);
+    assert.match(refused.stderr, new RegExp(`\\[${code}\\]\\n$`, 'u'));
+    assert.equal(refused.kdf, 0, 'refused before the passphrase is used');
+    assert.deepEqual(readFileSync(join(home, REGISTER_NAME)), registerBefore, 'no seal recorded');
+  }
+  assert.equal(verifyVault(drive, { secondCopy: true }).position.segment, 0);
+  const svg = join(dir, 'anchor.svg');
+  const failed = await seal(dir, home, drive, ['--anchor-svg', svg], { secondCopyProbe: ntfs, failAnchorSvgWrite: true });
+  assert.equal(failed.code, 0, failed.stderr);
+  assert.match(failed.stderr, /^foundry: warning: the seal is complete, but the anchor SVG file could not be written/mu);
+  assert.match(failed.stdout, /foundry-anchor\/1;/u);
+  assert.match(failed.stdout, /switch on the drive's write-protect .* and disconnect the drive\.\n$/u);
+  await addEvent(dir, home);
+  const json = await seal(dir, home, drive, ['--anchor-svg', join(dir, 'b.svg'), '--json'], { secondCopyProbe: ntfs, failAnchorSvgWrite: true });
+  assert.equal(JSON.parse(json.stdout).anchorSvgWritten, false);
+  assert.match(JSON.parse(json.stdout).nextSteps[0], /write-protect/u);
+  const written = await seal(dir, home, drive, ['--anchor-svg', svg, '--json']);
+  assert.equal(JSON.parse(written.stdout).anchorSvgWritten, true);
+  assert.match(readFileSync(svg, 'utf8'), /^<\?xml [^\n]*\n<svg /u);
+});
+
+test('export-iso: refuses a file inside the vault, a missing folder has fixed text, and JSON names the finalisation step', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const inside = await runInline(dir, ['vault', 'export-iso', join(home, 'vault', 'x.iso'), '--vault', home]);
+  assert.match(inside.stderr, /\[OUTPUT_UNSUITABLE\]\n$/u);
+  const marker = 'TEST-ONLY-missing-marker';
+  const missing = await runInline(dir, ['vault', 'export-iso', join(dir, marker, 'x.iso'), '--vault', home, '--debug']);
+  assert.match(missing.stderr, /\[IO\]\n$/u);
+  assert.ok(!missing.stderr.includes(marker), 'the path is not echoed, even with --debug');
+  const json = await runInline(dir, ['vault', 'export-iso', join(dir, 'genesis.iso'), '--vault', home, '--json']);
+  assert.equal(json.code, 0, json.stderr);
+  assert.deepEqual(JSON.parse(json.stdout).nextSteps, ['Burn it as a single, finalised (closed) session, so nothing can be appended to the disc later.']);
+});
+
+test('--debug never prints a P-3 path operand: a raw file-system error becomes fixed text (finding 16)', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const file = join(dir, 'TEST-ONLY-regular-file-marker');
+  writeFileSync(file, 'TEST ONLY');
+  const below = join(file, 'copy');
+  const result = await copyInit(dir, home, below, ['--debug']);
+  assert.equal(result.code, 2);
+  assert.ok(!result.stderr.includes('TEST-ONLY-regular-file-marker'), result.stderr);
+  const sealed = await seal(dir, home, below, ['--debug']);
+  assert.equal(sealed.code, 2);
+  assert.ok(!sealed.stderr.includes('TEST-ONLY-regular-file-marker'), sealed.stderr);
+  const verified = await runInline(dir, ['vault', 'verify-copy', below, '--vault', home, '--debug']);
+  assert.equal(verified.code, 2);
+  assert.ok(!verified.stderr.includes('TEST-ONLY-regular-file-marker'), verified.stderr);
+});
+
+test('Linux reminder: notify-send with explicit argv when a session bus exists, and the line is always printed (finding 21)', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const calls = [];
+  const schedulerRunner = (command, args) => { calls.push([command, ...args]); return { status: 0, stdout: '', stderr: '' }; };
+  const hooks = { schedulerPlatform: 'linux', schedulerRunner, reminderEnv: { XDG_RUNTIME_DIR: '/run/user/1000' }, reminderBusExists: () => true };
+  const shown = await runInline(dir, ['vault', 'reminder', '--vault', home, '--json'], { hooks });
+  assert.equal(shown.code, 0, shown.stderr);
+  assert.equal(JSON.parse(shown.stdout).delivered, 'notify-send');
+  assert.deepEqual(calls[0].slice(0, 4), ['notify-send', '--app-name=Foundry', '--', 'Foundry second copy']);
+  assert.match(calls[0][4], /No second copy is recorded on this device/u);
+  const noBus = await runInline(dir, ['vault', 'reminder', '--vault', home], { hooks: { ...hooks, reminderEnv: {}, reminderBusExists: () => false } });
+  assert.match(noBus.stdout, /No second copy is recorded on this device/u);
+  assert.equal(calls.length, 1, 'no notify-send without a session bus');
+});
+
+test('schedule set restores the previous cadence when the scheduler refuses the job (finding 28)', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const config = join(dir, 'config');
+  const ok = { schedulerPlatform: 'linux', schedulerConfigHome: config, schedulerRunner: () => ({ status: 0, stdout: '', stderr: '' }) };
+  assert.equal((await runInline(dir, ['vault', 'schedule', 'set', '--cadence', 'monthly', '--vault', home], { hooks: ok })).code, 0);
+  const broken = {
+    schedulerPlatform: 'linux', schedulerConfigHome: config,
+    schedulerRunner: command => (command === 'systemctl' ? { status: 1, stdout: '', stderr: '' } : { status: null, stdout: '', stderr: '' }),
+  };
+  const refused = await runInline(dir, ['vault', 'schedule', 'set', '--cadence', 'daily', '--vault', home], { hooks: broken });
+  assert.match(refused.stderr, /\[SCHEDULER_FAILED\]\n$/u);
+  assert.equal(JSON.parse(readFileSync(join(home, REGISTER_NAME), 'utf8')).cadence, 'monthly');
 });

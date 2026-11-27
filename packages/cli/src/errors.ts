@@ -105,6 +105,8 @@ const SECOND_COPY_MESSAGES: Readonly<Record<string, string>> = {
   COPY_MISMATCH: 'the folder holds a different second copy than the one selected (its copy id differs); give --copy <label>, '
     + 'or take it over with `foundry vault copy init <folder> --adopt`',
   ISO_TOO_MANY_EXTENTS: 'a vault file is too large for the disc image (more than 100 sections of 4 GiB)',
+  OUTPUT_UNSUITABLE: 'the output file cannot go inside the vault or the second copy; choose a folder outside both',
+  KEYRING_INVALID: 'the keyring is damaged or belongs to another vault, so it was not put on the image; nothing was written',
 };
 
 const RECOVERY_FORMAT = new Set([

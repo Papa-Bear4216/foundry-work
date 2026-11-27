@@ -11,13 +11,20 @@
  *
  * The job never holds a key: it runs `foundry vault reminder`, which reads the register, compares the last seal
  * time with the cadence, can run the keyless `verifyVault`, and records the result in the register so that
- * `foundry vault status` and the overdue banner show it. It does not pop up a window (Windows Home has no
- * `msg.exe`); its output goes to the scheduler's log.
+ * `foundry vault status` and the overdue banner show it.
+ *
+ * Delivery to the person (R18-4, A-44):
+ * - Windows: the task runs only while the user is logged on (interactive token, no stored password, no
+ *   administrator) and starts `cmd.exe` with a fixed argv: a visible console window prints the reminder and waits
+ *   for Enter. Paths are the only variable text; `"` and `%` (and control characters) in them are refused.
+ * - Linux: `foundry vault reminder` calls `notify-send` (explicit argv) when it exists and a session bus is
+ *   reachable, and always prints the line, which a systemd user service writes to the journal. Where neither reaches
+ *   a person (no desktop session, cron mail not read), only `foundry vault status` and its overdue banner remain.
  */
 import { Buffer } from 'node:buffer';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join, posix, resolve } from 'node:path';
 import { VaultFormatError } from './bytes.ts';
 import {
   copyRegisterStatus, defaultRunner, readCopyRegister, SecondCopyError, writeCopyRegister,
@@ -70,10 +77,19 @@ function assertCadenceScheduled(cadence: string): asserts cadence is ScheduledCa
   if (cadence !== 'daily' && cadence !== 'weekly' && cadence !== 'monthly') throw new SecondCopyError('INVALID_CADENCE');
 }
 
-/** Paths go into scheduler files; refuse the characters no quoting rule here can carry safely. */
-function assertSafeArgument(value: string): void {
+/**
+ * Windows: paths go into a `cmd.exe` command line inside the task XML. Inside double quotes cmd.exe treats every
+ * character literally except `"` and `%` (and `!` with delayed expansion, which `/v:off` switches off); those and
+ * control characters are refused (A-44 limit).
+ */
+function assertSafeWindowsArgument(value: string): void {
   // eslint-disable-next-line no-control-regex -- control characters are exactly what is refused here.
   if (value.length === 0 || /["%\u0000-\u001f\u007f]/u.test(value)) throw new SecondCopyError('SCHEDULER_FAILED', 'unsafe-path');
+}
+
+/** Linux: every byte can be carried (finding 27) except NUL, which no path holds. */
+function assertLinuxArgument(value: string): void {
+  if (value.length === 0 || value.includes('\u0000')) throw new SecondCopyError('SCHEDULER_FAILED', 'unsafe-path');
 }
 
 function xmlEscape(text: string): string {
@@ -83,11 +99,27 @@ function xmlEscape(text: string): string {
 const pad = (value: number) => String(value).padStart(2, '0');
 const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
-/** Task Scheduler 1.2 XML for a per-user, least-privilege, keyless reminder. */
+/** The fixed console program of the Windows task; Task Scheduler expands `%SystemRoot%`. */
+export const WINDOWS_CONSOLE = '%SystemRoot%\\System32\\cmd.exe';
+export const WINDOWS_PROMPT = 'Press Enter to close this window.';
+
+/**
+ * The `cmd.exe` arguments of the Windows task: run the reminder, then wait for Enter so the window stays until the
+ * person has read it. `/d` skips AutoRun commands, `/v:off` keeps `!` literal, `/s /c "..."` strips only the outer
+ * quotes. Every path is one double-quoted word.
+ */
+export function windowsConsoleArguments(job: ReminderJob): string {
+  const args = reminderArgs(job);
+  for (const value of [job.node, ...args]) assertSafeWindowsArgument(value);
+  const quoted = (value: string) => `"${value}"`;
+  const words = [quoted(job.node), quoted(args[0]!), ...args.slice(1).map(value => (/^[A-Za-z-]+$/u.test(value) ? value : quoted(value)))];
+  return `/d /v:off /s /c "${words.join(' ')} & set /p FOUNDRY_REMINDER_ENTER=${WINDOWS_PROMPT}"`;
+}
+
+/** Task Scheduler 1.2 XML for a per-user, least-privilege, keyless reminder in a visible console window. */
 export function windowsTaskXml(job: ReminderJob, now: Date = new Date()): string {
   assertCadenceScheduled(job.cadence);
-  const args = reminderArgs(job);
-  for (const value of [job.node, ...args]) assertSafeArgument(value);
+  const argumentText = windowsConsoleArguments(job);
   const start = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T09:00:00`;
   const schedule = job.cadence === 'daily'
     ? '<ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>'
@@ -95,7 +127,6 @@ export function windowsTaskXml(job: ReminderJob, now: Date = new Date()): string
       ? `<ScheduleByWeek><WeeksInterval>1</WeeksInterval><DaysOfWeek><${WEEKDAYS[now.getDay()]} /></DaysOfWeek></ScheduleByWeek>`
       : '<ScheduleByMonth><DaysOfMonth><Day>1</Day></DaysOfMonth><Months><January /><February /><March /><April /><May />'
         + '<June /><July /><August /><September /><October /><November /><December /></Months></ScheduleByMonth>';
-  const argumentText = args.map(value => `"${value}"`).join(' ');
   return [
     '<?xml version="1.0" encoding="UTF-16"?>',
     '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">',
@@ -118,7 +149,7 @@ export function windowsTaskXml(job: ReminderJob, now: Date = new Date()): string
     '    <Enabled>true</Enabled>',
     '  </Settings>',
     '  <Actions Context="Author">',
-    `    <Exec><Command>${xmlEscape(`"${job.node}"`)}</Command><Arguments>${xmlEscape(argumentText)}</Arguments></Exec>`,
+    `    <Exec><Command>${xmlEscape(WINDOWS_CONSOLE)}</Command><Arguments>${xmlEscape(argumentText)}</Arguments></Exec>`,
     '  </Actions>',
     '</Task>',
     '',
@@ -138,10 +169,25 @@ export function utf16leWithBom(text: string): Buffer {
   return out;
 }
 
-/** systemd quoting: one double-quoted word per argument; `$` and `%` are refused or doubled. */
-function systemdWord(value: string): string {
-  assertSafeArgument(value);
-  return `"${value.replace(/\\/gu, '\\\\').replace(/\$/gu, '$$$$')}"`;
+/**
+ * systemd quoting: one double-quoted word per argument (systemd.syntax "Quoting", systemd.service "Command lines").
+ * `\` and `"` are backslash-escaped, `%` (specifier) becomes `%%`, `$` (variable) becomes `$$`, and every control
+ * character becomes a C escape (`\n`, `\xNN`).
+ */
+export function systemdWord(value: string): string {
+  assertLinuxArgument(value);
+  let out = '';
+  for (const char of value) {
+    const code = char.codePointAt(0)!;
+    if (char === '\\') out += '\\\\';
+    else if (char === '"') out += '\\"';
+    else if (char === '%') out += '%%';
+    else if (char === '$') out += '$$';
+    else if (char === '\n') out += '\\n';
+    else if (code < 0x20 || code === 0x7f) out += `\\x${code.toString(16).padStart(2, '0')}`;
+    else out += char;
+  }
+  return `"${out}"`;
 }
 
 const SYSTEMD_CALENDAR: Readonly<Record<ScheduledCadence, string>> = { daily: 'daily', weekly: 'weekly', monthly: 'monthly' };
@@ -175,15 +221,27 @@ export function systemdUnits(job: ReminderJob): { service: string; timer: string
   };
 }
 
-function shellWord(value: string): string {
-  assertSafeArgument(value);
-  return `'${value.replace(/'/gu, `'\\''`)}'`;
+/**
+ * A cron-safe form of an argv (finding 27): `printf '<bytes>' | xargs -0 env --`. Every byte outside
+ * `[A-Za-z0-9/._-]` is a three-digit octal escape, and each argument ends with `\000`. So the crontab line holds no
+ * `%` (cron turns it into a newline), no quote, no newline and no shell character, yet it round-trips any path.
+ */
+export function cronCommand(argv: readonly string[]): string {
+  let format = '';
+  for (const value of argv) {
+    assertLinuxArgument(value);
+    for (const byte of Buffer.from(value, 'utf8')) {
+      const char = String.fromCharCode(byte);
+      format += /[A-Za-z0-9/._-]/u.test(char) ? char : `\\${byte.toString(8).padStart(3, '0')}`;
+    }
+    format += '\\000';
+  }
+  return `printf '${format}' | xargs -0 env --`;
 }
 
 export function cronLine(job: ReminderJob): string {
   assertCadenceScheduled(job.cadence);
-  const command = [job.node, ...reminderArgs(job)].map(shellWord).join(' ');
-  return `@${job.cadence} ${command} # ${reminderName(job.home)}`;
+  return `@${job.cadence} ${cronCommand([job.node, ...reminderArgs(job)])} # ${reminderName(job.home)}`;
 }
 
 function systemdDirectory(env: SchedulerEnvironment): string {
@@ -201,13 +259,24 @@ function removeIfPresent(path: string): boolean {
   return true;
 }
 
-/** Lines of the current crontab, or `undefined` when `crontab` cannot be run at all. */
+/**
+ * Lines of the current crontab, or `undefined` when `crontab` cannot be run at all (finding 22). Only exit 1 with
+ * "no crontab for" on stderr is a confirmed empty table; any other failure throws, so a later write never replaces
+ * a table that could not be read.
+ */
 function readCrontab(run: CommandRunner): string[] | undefined {
   const result = run('crontab', ['-l']);
   if (result.status === null) return undefined;
-  // `crontab -l` exits 1 with "no crontab for <user>" when the table is empty.
-  if (result.status !== 0) return [];
+  if (result.status === 1 && /no crontab for/iu.test(result.stderr)) return [];
+  if (result.status !== 0) throw new SecondCopyError('SCHEDULER_FAILED', 'crontab-read');
   return result.stdout.split('\n').filter(line => line.length > 0);
+}
+
+/** Windows: is the task present? From the full CSV task list, so a failed query is never read as "missing". */
+function windowsTaskPresent(run: CommandRunner, name: string): boolean {
+  const result = run('schtasks', ['/Query', '/FO', 'CSV', '/NH']);
+  if (!ok(result)) throw new SecondCopyError('SCHEDULER_FAILED', 'schtasks-query');
+  return result.stdout.split(/\r?\n/u).some(line => line.startsWith(`"\\${name}",`));
 }
 
 function writeCrontab(run: CommandRunner, lines: readonly string[]): void {
@@ -224,7 +293,16 @@ export interface ReminderInstallResult {
   commands: string[][];
 }
 
-/** Install or replace the reminder for this Foundry home. Replacing first removes any older job of the same name. */
+function readIfPresent(path: string): Buffer | undefined {
+  return statIfPresent(path) ? readFileSync(path) : undefined;
+}
+
+/**
+ * Install or replace the reminder for this Foundry home (finding 28). Everything is generated and validated first.
+ * The old job stays in place until the new one is active: systemd units are replaced in place and restored (and
+ * re-enabled) if enabling the new ones fails; a crontab line is replaced in one write of a table that was read
+ * successfully. Only after the new job is active is a job of the other Linux method removed.
+ */
 export function installReminder(job: ReminderJob, env: SchedulerEnvironment): ReminderInstallResult {
   const platform = platformOf(env);
   assertCadenceScheduled(job.cadence);
@@ -236,6 +314,7 @@ export function installReminder(job: ReminderJob, env: SchedulerEnvironment): Re
     const file = join(scratch, `.${name}-${randomBytes(8).toString('hex')}.xml`);
     writeFileSync(file, utf16leWithBom(xml));
     try {
+      // `/F` replaces an existing task of the same name in one step; on failure the old task stays.
       const result = run('schtasks', ['/Create', '/TN', name, '/XML', file, '/F']);
       if (!ok(result)) throw new SecondCopyError('SCHEDULER_FAILED', 'schtasks');
     } finally {
@@ -243,28 +322,74 @@ export function installReminder(job: ReminderJob, env: SchedulerEnvironment): Re
     }
     return { method: 'schtasks', name, files: [], commands: run.calls };
   }
-  removeLinux(name, env, run);
+  // Stage: both forms are generated (and so validated) before anything changes.
   const units = systemdUnits(job);
+  const line = cronLine(job);
   const directory = systemdDirectory(env);
   const service = join(directory, `${name}.service`);
   const timer = join(directory, `${name}.timer`);
-  const reload = run('systemctl', ['--user', 'daemon-reload']);
-  if (ok(reload)) {
+  if (ok(run('systemctl', ['--user', 'daemon-reload']))) {
+    const old = { service: readIfPresent(service), timer: readIfPresent(timer) };
     mkdirSync(directory, { recursive: true });
     writeFileSync(service, units.service);
     writeFileSync(timer, units.timer);
     const enabled = ok(run('systemctl', ['--user', 'daemon-reload']))
       && ok(run('systemctl', ['--user', 'enable', '--now', `${name}.timer`]));
-    if (enabled) return { method: 'systemd', name, files: [service, timer], commands: run.calls };
-    removeIfPresent(service);
-    removeIfPresent(timer);
+    if (enabled) {
+      removeOtherMethod(() => removeCronLine(name, run));
+      return { method: 'systemd', name, files: [service, timer], commands: run.calls };
+    }
+    // Restore the previous units (or none), so a failed replacement keeps the old reminder.
+    if (old.service) writeFileSync(service, old.service); else removeIfPresent(service);
+    if (old.timer) writeFileSync(timer, old.timer); else removeIfPresent(timer);
     run('systemctl', ['--user', 'daemon-reload']);
+    if (old.timer) {
+      if (!ok(run('systemctl', ['--user', 'enable', '--now', `${name}.timer`]))) {
+        throw new SecondCopyError('SCHEDULER_FAILED', 'systemd-restore');
+      }
+      throw new SecondCopyError('SCHEDULER_FAILED', 'systemd');
+    }
   }
   // No usable user systemd (for example a container or a session without a user manager): crontab.
   const lines = readCrontab(run);
   if (lines === undefined) throw new SecondCopyError('SCHEDULER_FAILED', 'no-scheduler');
-  writeCrontab(run, [...lines.filter(line => !line.endsWith(`# ${name}`)), cronLine(job)]);
+  writeCrontab(run, [...lines.filter(entry => !entry.endsWith(`# ${name}`)), line]);
+  removeOtherMethod(() => removeSystemdUnits(name, env, run));
   return { method: 'cron', name, files: [], commands: run.calls };
+}
+
+/**
+ * After the new job is active, a job of the other Linux method is removed. A failure there leaves a second reminder
+ * of the same home (a duplicate message, never a lost one), so it does not turn a working install into an error;
+ * `foundry vault schedule status` lists both methods.
+ */
+function removeOtherMethod(work: () => unknown): void {
+  try {
+    work();
+  } catch (error) {
+    if (!(error instanceof SecondCopyError)) throw error;
+  }
+}
+
+/** Where `foundry vault reminder` delivered its message, besides its own output. */
+export type ReminderDelivery = 'notify-send' | 'none';
+
+/**
+ * Linux (R18-4): show the reminder with `notify-send` (explicit argv, `shell: false`) when a session bus is
+ * reachable (`DBUS_SESSION_BUS_ADDRESS`, or the `bus` socket in `XDG_RUNTIME_DIR`). Missing `notify-send` or a failed
+ * call gives `none`; the caller always prints the line too (the journal of a systemd user service).
+ */
+export function notifyDesktop(
+  text: string,
+  { env, run = defaultRunner, exists = path => statIfPresent(path) !== undefined }:
+    { env: Readonly<Record<string, string | undefined>>; run?: CommandRunner; exists?: (path: string) => boolean },
+): ReminderDelivery {
+  const runtime = env.XDG_RUNTIME_DIR;
+  const bus = (env.DBUS_SESSION_BUS_ADDRESS ?? '') !== ''
+    || (runtime !== undefined && runtime.startsWith('/') && exists(posix.join(runtime, 'bus')));
+  if (!bus) return 'none';
+  const result = run('notify-send', ['--app-name=Foundry', '--', 'Foundry second copy', text]);
+  return ok(result) ? 'notify-send' : 'none';
 }
 
 type RecordingRunner = CommandRunner & { calls: string[][] };
@@ -279,23 +404,39 @@ function recording(run: CommandRunner): RecordingRunner {
   return wrapped;
 }
 
-function removeLinux(name: string, env: SchedulerEnvironment, run: CommandRunner): SchedulerMethod[] {
-  const removed: SchedulerMethod[] = [];
+/**
+ * Remove this home's systemd units (finding 23): stop and disable the timer, confirm it is no longer active, and
+ * only then delete the unit files. A failed step throws and leaves the files, so the state is never misreported.
+ */
+function removeSystemdUnits(name: string, env: SchedulerEnvironment, run: CommandRunner): boolean {
   const directory = systemdDirectory(env);
   const service = join(directory, `${name}.service`);
   const timer = join(directory, `${name}.timer`);
-  if (statIfPresent(timer) || statIfPresent(service)) {
-    run('systemctl', ['--user', 'disable', '--now', `${name}.timer`]);
-    removeIfPresent(timer);
-    removeIfPresent(service);
-    run('systemctl', ['--user', 'daemon-reload']);
-    removed.push('systemd');
+  if (!statIfPresent(timer) && !statIfPresent(service)) return false;
+  if (!ok(run('systemctl', ['--user', 'disable', '--now', `${name}.timer`]))) {
+    throw new SecondCopyError('SCHEDULER_FAILED', 'systemd-disable');
   }
+  // `is-active` exits 0 only for an active unit.
+  if (ok(run('systemctl', ['--user', 'is-active', '--quiet', `${name}.timer`]))) {
+    throw new SecondCopyError('SCHEDULER_FAILED', 'systemd-still-active');
+  }
+  removeIfPresent(timer);
+  removeIfPresent(service);
+  run('systemctl', ['--user', 'daemon-reload']);
+  return true;
+}
+
+function removeCronLine(name: string, run: CommandRunner): boolean {
   const lines = readCrontab(run);
-  if (lines !== undefined && lines.some(line => line.endsWith(`# ${name}`))) {
-    writeCrontab(run, lines.filter(line => !line.endsWith(`# ${name}`)));
-    removed.push('cron');
-  }
+  if (lines === undefined || !lines.some(line => line.endsWith(`# ${name}`))) return false;
+  writeCrontab(run, lines.filter(line => !line.endsWith(`# ${name}`)));
+  return true;
+}
+
+function removeLinux(name: string, env: SchedulerEnvironment, run: CommandRunner): SchedulerMethod[] {
+  const removed: SchedulerMethod[] = [];
+  if (removeSystemdUnits(name, env, run)) removed.push('systemd');
+  if (removeCronLine(name, run)) removed.push('cron');
   return removed;
 }
 
@@ -311,8 +452,9 @@ export function removeReminder(home: string, env: SchedulerEnvironment): Reminde
   const run = recording(env.run ?? defaultRunner);
   const name = reminderName(home);
   if (platform === 'win32') {
-    if (!ok(run('schtasks', ['/Query', '/TN', name]))) return { name, removed: [], commands: run.calls };
+    if (!windowsTaskPresent(run, name)) return { name, removed: [], commands: run.calls };
     if (!ok(run('schtasks', ['/Delete', '/TN', name, '/F']))) throw new SecondCopyError('SCHEDULER_FAILED', 'schtasks');
+    if (windowsTaskPresent(run, name)) throw new SecondCopyError('SCHEDULER_FAILED', 'schtasks-still-present');
     return { name, removed: ['schtasks'], commands: run.calls };
   }
   return { name, removed: removeLinux(name, env, run), commands: run.calls };
@@ -327,7 +469,7 @@ export function reminderStatus(home: string, env: SchedulerEnvironment): Reminde
   const platform = platformOf(env);
   const run = env.run ?? defaultRunner;
   const name = reminderName(home);
-  if (platform === 'win32') return { name, installed: ok(run('schtasks', ['/Query', '/TN', name])) ? ['schtasks'] : [] };
+  if (platform === 'win32') return { name, installed: windowsTaskPresent(run, name) ? ['schtasks'] : [] };
   const installed: SchedulerMethod[] = [];
   if (statIfPresent(join(systemdDirectory(env), `${name}.timer`))) installed.push('systemd');
   if (readCrontab(run)?.some(line => line.endsWith(`# ${name}`))) installed.push('cron');

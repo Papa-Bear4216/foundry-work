@@ -10,8 +10,9 @@
  *   with `;1`, which Windows and Linux strip. No Rock Ridge.
  * - A file of 4 GiB or more is stored as consecutive extents with the multi-extent flag (Level 3); each extent but
  *   the last is a whole number of sectors.
- * - Contents: `VAULT.json`, `HEAD.json` (the verified sealed head), `segments/<n>/` (`MANIFEST.json`,
- *   `MANIFEST.sig`, every `*.fvr`) for every sealed segment, and `keyring/keyring.json` only on explicit opt-in.
+ * - Contents: `VAULT.json`, `HEAD.json` (the verified sealed head), `segments/` (present, and empty at genesis),
+ *   `segments/<n>/` (`MANIFEST.json`, `MANIFEST.sig`, every `*.fvr`) for every sealed segment, and
+ *   `keyring/keyring.json` only on explicit opt-in, after a keyless schema and vault-id check.
  *   The open segment is not exported. The image is written under a temporary name, every file is re-hashed from the
  *   finished image, and only then is it renamed to the output name.
  */
@@ -22,8 +23,9 @@ import { dirname, join, resolve } from 'node:path';
 import { check, sha256 } from './bytes.ts';
 import { chainAnchor } from './anchor.ts';
 import { renameWithRetry, syncDirectory } from './keyring-file.ts';
+import { readKeyring } from './keyring.ts';
 import { decodeManifest } from './manifest.ts';
-import { SecondCopyError } from './second-copy.ts';
+import { pathInside, SecondCopyError } from './second-copy.ts';
 import { headBytes, MANIFEST, metadata, segmentName, SIGNATURE, statIfPresent, VAULT_METADATA } from './vault-directory.ts';
 import type { VaultAnchor } from './vault-directory.ts';
 import { verifyVault } from './vault-reader.ts';
@@ -289,12 +291,21 @@ class SequentialWriter {
   }
 }
 
-export interface IsoEntryInput {
+export interface IsoFileInput {
   /** Path components below the image root, for example `['segments', '000001', 'MANIFEST.json']`. */
   path: string[];
   size: number;
   source: Source;
+  directory?: undefined;
 }
+
+/** A directory that must exist even when it holds no file (for example `segments/` of a genesis vault). */
+export interface IsoDirectoryInput {
+  path: string[];
+  directory: true;
+}
+
+export type IsoEntryInput = IsoFileInput | IsoDirectoryInput;
 
 export interface WriteIsoOptions {
   now?: Date;
@@ -310,7 +321,7 @@ function buildTree(entries: readonly IsoEntryInput[]): { root: IsoDirectory; fil
   for (const entry of entries) {
     check(entry.path.length >= 1 && entry.path.every(part => /^[A-Za-z0-9._-]{1,64}$/u.test(part)), 'SCHEMA');
     let directory = root;
-    for (const part of entry.path.slice(0, -1)) {
+    for (const part of entry.directory ? entry.path : entry.path.slice(0, -1)) {
       let next = directory.children.find((child): child is IsoDirectory => child.kind === 'directory' && child.name === part);
       if (!next) {
         check(!directory.children.some(child => child.name === part), 'SCHEMA');
@@ -319,6 +330,7 @@ function buildTree(entries: readonly IsoEntryInput[]): { root: IsoDirectory; fil
       }
       directory = next;
     }
+    if (entry.directory) continue;
     const name = entry.path.at(-1)!;
     check(!directory.children.some(child => child.name === name), 'SCHEMA');
     check(Number.isSafeInteger(entry.size) && entry.size >= 0, 'LENGTH');
@@ -492,6 +504,8 @@ export function exportVaultIso(
   { includeKeyring = false, ...options }: { includeKeyring?: boolean } & WriteIsoOptions = {},
 ): ExportIsoResult {
   vaultDirectory = resolve(vaultDirectory);
+  // The image must not land inside the vault it exports: strict verification would reject the extra entry (finding 17).
+  if (pathInside(vaultDirectory, resolve(output))) throw new SecondCopyError('OUTPUT_UNSUITABLE', 'inside-vault');
   const verified = verifyVault(vaultDirectory);
   const meta = metadata(vaultDirectory);
   const publicKey = Buffer.from(meta.signing_public_key, 'base64');
@@ -500,6 +514,8 @@ export function exportVaultIso(
   entries.push({ path: [VAULT_METADATA], size: vaultBytes.length, source: { bytes: vaultBytes } });
   const head = headBytes(verified.position);
   entries.push({ path: ['HEAD.json'], size: head.length, source: { bytes: head } });
+  // `segments/` exists even at genesis: the verifier requires it (finding 19).
+  entries.push({ path: ['segments'], directory: true });
   let files = 2;
   for (let segment = 1; segment <= verified.position.segment; segment++) {
     const name = segmentName(segment);
@@ -516,6 +532,12 @@ export function exportVaultIso(
   }
   if (includeKeyring) {
     const keyring = readFileSync(join(vaultDirectory, 'keyring', 'keyring.json'));
+    // Keyless check before an irreversible export: the keyring's schema, canonical form and vault id (finding 31).
+    try {
+      readKeyring(keyring, meta.vault_id);
+    } catch {
+      throw new SecondCopyError('KEYRING_INVALID');
+    }
     entries.push({ path: ['keyring', 'keyring.json'], size: keyring.length, source: { bytes: keyring } });
     files++;
   }
