@@ -4,6 +4,24 @@ import type { Readable } from 'node:stream';
 /** Sensitivity tiers defined by Product Spec section 9. */
 export type SensitivityTier = 'public' | 'personal' | 'private' | 'secret' | 'clinical' | 'child';
 
+/** Item metadata passed to `ImportArchiveOptions.resolveCollection` when assigning a collection at write time. */
+export interface ResolveCollectionInput {
+  readonly profile: string;
+  readonly source: string;
+  readonly sourceTs?: string;
+  readonly path: string;
+}
+
+/** Item payload and metadata passed as the optional third argument to `ImportArchiveOptions.resolveSensitivity`. */
+export interface ResolveSensitivityItem {
+  readonly plaintext: Uint8Array;
+  readonly mime: string;
+  readonly tags: readonly string[];
+  readonly profile: string;
+  readonly collection: string;
+  readonly sourceTs?: string;
+}
+
 /** Typed per-item skip / validation error codes reported without aborting valid items. */
 export type ItemErrorCode =
   | 'ITEM_TOO_LARGE'

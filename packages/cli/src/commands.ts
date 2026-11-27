@@ -12,13 +12,14 @@ import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import type { IndexStoreOptions } from 'foundry-index';
+import type { ConsentRecord, ProfileId, UserSensitivityRule } from 'foundry-profiles';
 import type { ImportResult } from 'importers';
 import type { UnlockSession } from 'vault';
 import type { CommandName, SearchFilters } from './args.ts';
 import { CliError, debugText, errorLine, isRecoveryFormatError, mapError } from './errors.ts';
 import { homeSystemError, withFixedFileErrors, withHomeSystemErrors } from './files.ts';
 
-export const PROFILE = 'me';
+export const PROFILE: ProfileId = 'me';
 /** `ensureCollectionKeys` accepts at most this many distinct names per call. */
 export const MAX_NAMES_PER_CALL = 4096;
 
@@ -35,6 +36,16 @@ export interface CommandRequest {
   json: boolean;
   path?: string;
   query?: string;
+  targetProfile?: string;
+  targetCollection?: string;
+  importProfile?: string;
+  importCollection?: string;
+  displayName?: string;
+  basis?: string;
+  note?: string;
+  childPrompts?: boolean;
+  /** `profile list` / `consent list` only: print display names and consent notes (P-1 fix round 1, B7). */
+  reveal?: boolean;
   filters: SearchFilters;
   /** Keyed commands: which secret unlocks the vault. */
   credential?: 'passphrase' | 'recovery';
@@ -67,6 +78,11 @@ export interface TestHooks {
   failRunB?: boolean;
   /** `import`: the index update between Run A and Run B throws an errno-style error whose message quotes every secret. */
   failBetweenRunsUpdate?: boolean;
+  /**
+   * `import`: throws an errno-style error after the `collection.created` binding events are appended and before
+   * any collection key is created (P-1 fix round 1, B3).
+   */
+  failAfterCollectionBinding?: boolean;
   /**
    * `import`: called with the archive path after Run A has closed the archive, before Run B (it may change a part).
    * A function: it cannot cross into the worker thread, so only the inline path (`runCli` with `inline`) can use it.
@@ -526,10 +542,24 @@ const IMPORT_BATCH_MAX_BYTES = 1024 * 1024;
 const IMPORT_BATCH_MAX_ITEMS = 8;
 const IMPORT_GC_EVERY_BATCHES = 32;
 
-async function importRun(ctx: Context, session: UnlockSession, id: string, options: IndexStoreOptions, parts: ArchiveParts) {
+async function importRun(
+  ctx: Context,
+  session: UnlockSession,
+  id: string,
+  options: IndexStoreOptions,
+  parts: ArchiveParts,
+  profile: ProfileId,
+  explicitCollection: string | undefined,
+  sensitivityRules: readonly UserSensitivityRule[],
+) {
   const vault = await import('vault');
   const importers = await import('importers');
+  const profiles = await import('foundry-profiles');
   const { openItemKeyLookup } = await import('foundry-index');
+  const { classifyImportItem } = await import('./classify.ts');
+  const { itemTextOfPlaintext, loadParsers } = await import('./derive.ts');
+  const parsers = await loadParsers();
+  const deriveText = (mime: string | null, plaintext: Uint8Array) => itemTextOfPlaintext(parsers, mime, plaintext);
   const unlocked = vault.decodeKeyring(readKeyring(ctx), { session }, id);
   let writer: ReturnType<typeof vault.VaultWriter.open> | undefined;
   let lookup: ReturnType<typeof openItemKeyLookup> | undefined;
@@ -551,10 +581,37 @@ async function importRun(ctx: Context, session: UnlockSession, id: string, optio
     lookup = openItemKeyLookup(options);
     stall(ctx.hooks);
     return await importers.importArchive({
-      archive, writer: counting, importers: importers.DEFAULT_IMPORTERS, profile: PROFILE,
-      resolveCollectionKeyId: name => vault.collectionKeyId(unlocked, PROFILE, name),
-      vaultDir: ctx.paths.vault, unlocked, itemKeys: lookup,
-      batchMaxBytes: IMPORT_BATCH_MAX_BYTES, batchMaxItems: IMPORT_BATCH_MAX_ITEMS,
+      archive,
+      writer: counting,
+      importers: importers.DEFAULT_IMPORTERS,
+      profile,
+      // P-1 fix round 1 (B1): every name, explicit or default, must be `<profile>/...`.
+      resolveCollection: ({ profile: itemProfile, source, sourceTs }) =>
+        profiles.assertCollectionForProfile(
+          itemProfile,
+          explicitCollection ?? profiles.defaultCollectionForItem(itemProfile as ProfileId, source, sourceTs),
+        ),
+      resolveCollectionKeyId: name => vault.collectionKeyId(unlocked, profile, name),
+      // P-1 fix round 1 (items 6 and B0): the raw bytes AND the search text the index stores are classified.
+      resolveSensitivity: (source, itemPath, item) => {
+        const input = {
+          profile,
+          collection:
+            item?.collection ??
+            explicitCollection ??
+            profiles.defaultCollectionForItem(profile, source, item?.sourceTs),
+          source,
+          path: itemPath,
+          userRules: sensitivityRules,
+        };
+        if (item === undefined) return profiles.classifySensitivity(input).sensitivity;
+        return classifyImportItem(profiles.classifySensitivity, deriveText, input, item).sensitivity;
+      },
+      vaultDir: ctx.paths.vault,
+      unlocked,
+      itemKeys: lookup,
+      batchMaxBytes: IMPORT_BATCH_MAX_BYTES,
+      batchMaxItems: IMPORT_BATCH_MAX_ITEMS,
       // Not called while `itemKeys` is given; bound to this run's unlocked keyring for type safety.
       readVaultRecord: (directory, location) => vault.readVaultRecord(directory, location, unlocked),
     });
@@ -578,25 +635,60 @@ async function importRun(ctx: Context, session: UnlockSession, id: string, optio
 }
 
 async function importCommand(ctx: Context): Promise<void> {
+  const profiles = await import('foundry-profiles');
+  const profile: ProfileId =
+    ctx.request.importProfile === undefined
+      ? PROFILE
+      : profiles.assertProfileId(ctx.request.importProfile);
+  // P-1 fix round 1 (B1): a custom collection must be `<profile>/...` (checked before any key derivation).
+  const explicitCollection =
+    ctx.request.importCollection === undefined
+      ? undefined
+      : profiles.assertCollectionForProfile(profile, ctx.request.importCollection);
+
   await keyed(ctx, async (session, id) => {
+    // An earlier command may have stopped inside a segment seal (a pending HEAD). The read-only replay of the index
+    // update or profile state refuses that state; only the vault writer recovers it. So: writer first. (It completes
+    // or rolls back an EARLIER command's seal and stores no imported item.)
+    await recoverVaultWriter(ctx, session, id);
+    // One replay for both checks, before any write of this import.
+    const profileState = profiles.loadVaultProfileState(ctx.paths.vault, { session });
+    profiles.assertProfileVault(profileState); // B5: PRE_PROFILE_VAULT
+    profiles.assertImportConsent(profileState, profile);
+
     const options = await indexOptions(ctx, session);
     const { updateIndex } = await import('foundry-index');
     const { ensureCollectionKeys } = await import('vault');
-    // An earlier command may have stopped inside a segment seal (a pending HEAD). The read-only replay of the index
-    // update refuses that state; only the vault writer recovers it. So: writer first, then the catch-up update.
-    await recoverVaultWriter(ctx, session, id);
     updateIndex(options); // catch-up after an earlier crash: the item-key lookup needs a current index
     const path = ctx.request.path!;
     const parts = await resolveArchiveParts(path);
     const stamps = await stampParts(parts);
     ctx.importStage = 'runA';
-    const runA = await importRun(ctx, session, id, options, parts);
+    const runA = await importRun(
+      ctx,
+      session,
+      id,
+      options,
+      parts,
+      profile,
+      explicitCollection,
+      profileState.sensitivityRules,
+    );
     let runB: ImportResult | undefined;
     let collectionsCreated = 0;
     if (runA.missingCollections.length > 0) {
       ctx.importStage = 'between';
+      // B3 (A-41 limits 1 and 5): record each new name's owner profile durably BEFORE its key exists. Event first,
+      // key second: a crash between them leaves an event without a key (harmless; the next import creates the key
+      // with the same derived ID).
+      const bindings = profiles.recordCollectionBindings(ctx.paths.vault, { session }, profile, runA.missingCollections);
+      // The first binding of a vault creates `me`'s `system` key: it is a new collection key too.
+      if (bindings.createdSystemKey) collectionsCreated++;
+      if (ctx.hooks.failAfterCollectionBinding) {
+        throw hookError('after the collection binding', secretTexts(ctx.request.secrets));
+      }
       for (const slice of nameSlices(runA.missingCollections)) {
-        collectionsCreated += ensureCollectionKeys(ctx.paths.keyring, id, { session }, PROFILE, slice).created;
+        collectionsCreated += ensureCollectionKeys(ctx.paths.keyring, id, { session }, profile, slice).created;
       }
       if (ctx.hooks.failBetweenRunsUpdate) throw hookError('index update between runs', secretTexts(ctx.request.secrets));
       updateIndex(options);
@@ -604,7 +696,16 @@ async function importCommand(ctx: Context): Promise<void> {
       await checkArchiveUnchanged(path, stamps); // before Run B opens or stores anything
       ctx.importStage = 'runB';
       if (ctx.hooks.failRunB) throw hookError('run B', secretTexts(ctx.request.secrets));
-      runB = await importRun(ctx, session, id, options, parts);
+      runB = await importRun(
+        ctx,
+        session,
+        id,
+        options,
+        parts,
+        profile,
+        explicitCollection,
+        profileState.sensitivityRules,
+      );
       if (runB.missingCollections.length > 0) {
         throw new CliError('INTERNAL', 'internal error: the second import run still found collections without a key');
       }
@@ -629,6 +730,214 @@ async function importCommand(ctx: Context): Promise<void> {
   });
 }
 
+async function profileAddCommand(ctx: Context): Promise<void> {
+  const profiles = await import('foundry-profiles');
+  const profile = profiles.assertProfileId(ctx.request.targetProfile);
+  const displayName =
+    ctx.request.displayName === undefined
+      ? undefined
+      : profiles.assertDisplayName(ctx.request.displayName);
+
+  await keyed(ctx, async (session, id) => {
+    await recoverVaultWriter(ctx, session, id);
+    stall(ctx.hooks);
+    const result = profiles.addProfile(ctx.paths.vault, { session }, { profile, displayName });
+    // B7: a mutation command never prints decrypted user text (and takes no --reveal).
+    if (ctx.request.json) {
+      ctx.out({
+        ok: true,
+        profile: result.profile,
+        displayNameSet: result.displayName !== undefined,
+        ts: result.ts,
+        eventSeq: result.eventSeq,
+      });
+    } else {
+      ctx.out(`Profile "${result.profile}" saved (event ${result.eventSeq}).\n`);
+    }
+  });
+}
+
+/** The matcher fields of a sensitivity rule; their values are user-written text. */
+const RULE_MATCHER_FIELDS = ['sourcePrefix', 'pathContains', 'tag', 'keyword'] as const;
+
+/**
+ * C1: a sensitivity rule without its user-written text: its position (`rule 1`, `rule 2`, in replay order), `tier`,
+ * scope (`profile`, when set) and the names of the matcher fields that are set. Round 2 (G2): the rule `id` is free
+ * text too, so it is printed only with --reveal.
+ */
+function redactRule(rule: UserSensitivityRule, index: number): {
+  rule: string;
+  tier: UserSensitivityRule['tier'];
+  profile?: ProfileId;
+  matchers: string[];
+} {
+  return {
+    rule: `rule ${index + 1}`,
+    tier: rule.tier,
+    ...(rule.profile !== undefined ? { profile: rule.profile } : {}),
+    matchers: RULE_MATCHER_FIELDS.filter(field => rule[field] !== undefined),
+  };
+}
+
+async function profileListCommand(ctx: Context): Promise<void> {
+  const profiles = await import('foundry-profiles');
+  await keyed(ctx, async (session, id) => {
+    await recoverVaultWriter(ctx, session, id);
+    stall(ctx.hooks);
+    const { profiles: items, destroyedProfileCount } = profiles.listProfiles(ctx.paths.vault, { session });
+    // B7: the display name is decrypted user text; it is printed only with --reveal.
+    // C1: so is the matcher text of a sensitivity rule (keyword, pathContains, tag, sourcePrefix); round 2 (G2): and
+    // its `id`.
+    const reveal = ctx.request.reveal === true;
+    if (ctx.request.json) {
+      const shown = items.map(({ displayName, sensitivityRules, ...rest }) => ({
+        ...rest,
+        displayNameSet: displayName !== undefined,
+        ...(reveal && displayName !== undefined ? { displayName } : {}),
+        sensitivityRules: reveal ? sensitivityRules : sensitivityRules.map(redactRule),
+      }));
+      ctx.out({ profiles: shown, erasedProfileKeys: destroyedProfileCount });
+      return;
+    }
+    if (items.length === 0) {
+      ctx.out('No profiles recorded.\n');
+      return;
+    }
+    const lines = items.map(p => {
+      const label = p.displayName === undefined ? '' : reveal ? ` (${p.displayName})` : ' (name set)';
+      const consent =
+        p.profile === 'me'
+          ? 'owner'
+          : p.consentRecorded
+            ? `consent:${p.consentBasis ?? 'recorded'}`
+            : 'consent:missing';
+      return `${p.profile}${label}  [${consent}]\n`;
+    });
+    ctx.out(lines.join(''));
+  });
+}
+
+async function consentRecordCommand(ctx: Context): Promise<void> {
+  const profiles = await import('foundry-profiles');
+  const profile = profiles.assertConsentSubjectProfile(ctx.request.targetProfile);
+  const basis = profiles.assertConsentBasis(ctx.request.basis);
+  // Item 13: basis `other` needs a nonempty --note (checked before any key derivation).
+  const note = profiles.assertConsentNoteForBasis(basis, ctx.request.note);
+
+  await keyed(ctx, async (session, id) => {
+    await recoverVaultWriter(ctx, session, id);
+    stall(ctx.hooks);
+    const result = profiles.recordConsent(ctx.paths.vault, { session }, { profile, basis, note });
+    // B7: a mutation command never prints the note.
+    if (ctx.request.json) {
+      ctx.out({
+        ok: true,
+        profile: result.profile,
+        basis: result.basis,
+        noteSet: result.note !== undefined,
+        ts: result.ts,
+        eventSeq: result.eventSeq,
+      });
+    } else {
+      ctx.out(`Recorded consent for profile "${result.profile}" (${result.basis}, event ${result.eventSeq}).\n`);
+    }
+  });
+}
+
+async function consentListCommand(ctx: Context): Promise<void> {
+  const profiles = await import('foundry-profiles');
+  await keyed(ctx, async (session, id) => {
+    await recoverVaultWriter(ctx, session, id);
+    stall(ctx.hooks);
+    const result = profiles.listConsents(ctx.paths.vault, { session });
+    // B7: the note is decrypted user text; it is printed only with --reveal.
+    const reveal = ctx.request.reveal === true;
+    const shown = (records: readonly ConsentRecord[]) =>
+      records.map(({ note, ...rest }) => ({
+        ...rest,
+        noteSet: note !== undefined,
+        ...(reveal && note !== undefined ? { note } : {}),
+      }));
+    if (ctx.request.json) {
+      ctx.out({ consents: shown(result.consents), history: shown(result.history) });
+      return;
+    }
+    if (result.consents.length === 0) {
+      ctx.out('No consent records.\n');
+      return;
+    }
+    const noteText = (note: string | undefined) => (note === undefined ? '' : reveal ? `  ${note}` : '  (note set)');
+    const lines = result.consents.map(c =>
+      `${c.ts}  ${c.profile}  ${c.basis}${noteText(c.note)}  (event ${c.eventSeq})\n`,
+    );
+    ctx.out(lines.join(''));
+  });
+}
+
+async function collectionPromptPolicyCommand(ctx: Context): Promise<void> {
+  const profiles = await import('foundry-profiles');
+  // B1: only a name with a valid profile prefix; that prefix is the policy's owner profile.
+  const { collection } = profiles.assertProfileCollectionName(ctx.request.targetCollection);
+  const allowChildModelPrompts = Boolean(ctx.request.childPrompts);
+
+  await keyed(ctx, async (session, id) => {
+    await recoverVaultWriter(ctx, session, id);
+    stall(ctx.hooks);
+    const result = profiles.setCollectionPromptPolicy(ctx.paths.vault, { session }, {
+      collection,
+      allowChildModelPrompts,
+    });
+    // Fix round 3 (blocker 6): a custom collection name is user text; the output never echoes it. A default name
+    // (`<profile>/<shipped source>/<year|undated>`) is generic and is echoed.
+    const isDefault = profiles.isDefaultCollectionName(result.collection);
+    const onOff = result.allowChildModelPrompts ? 'on' : 'off';
+    if (ctx.request.json) {
+      ctx.out({
+        ok: true,
+        ...(isDefault ? { collection: result.collection } : { customCollection: true }),
+        allowChildModelPrompts: result.allowChildModelPrompts,
+        kind: result.kind,
+        ts: result.ts,
+        eventSeq: result.eventSeq,
+      });
+    } else if (isDefault) {
+      ctx.out(`Collection "${result.collection}" child model prompts: ${onOff} (event ${result.eventSeq}).\n`);
+    } else {
+      ctx.out(`Collection (custom) child model prompts: ${onOff} (event ${result.eventSeq}).\n`);
+    }
+  });
+}
+
+async function collectionListCommand(ctx: Context): Promise<void> {
+  const profiles = await import('foundry-profiles');
+  await keyed(ctx, async (session, id) => {
+    await recoverVaultWriter(ctx, session, id);
+    stall(ctx.hooks);
+    const { collections } = profiles.listCollections(ctx.paths.vault, { session });
+    // Fix round 3 (blocker 6, rule R14): a custom collection name is user text, printed only with --reveal.
+    // Without it, a custom name is `custom collection N` (N = its 1-based position in the listed order); a
+    // default name (`<profile>/<shipped source>/<year|undated>`) is generic and prints as before.
+    const reveal = ctx.request.reveal === true;
+    const hidden = (name: string) => !reveal && !profiles.isDefaultCollectionName(name);
+    if (ctx.request.json) {
+      ctx.out({
+        collections: collections.map(({ collection, ...rest }, index) =>
+          hidden(collection) ? { customCollection: index + 1, ...rest } : { collection, ...rest },
+        ),
+      });
+      return;
+    }
+    if (collections.length === 0) {
+      ctx.out('No collections.\n');
+      return;
+    }
+    const lines = collections.map((c, index) =>
+      `${hidden(c.collection) ? `custom collection ${index + 1}` : c.collection}  profile=${c.profile ?? 'unknown'}  items=${c.itemCount}  child-prompts=${c.allowChildModelPrompts ? 'on' : 'off'}\n`,
+    );
+    ctx.out(lines.join(''));
+  });
+}
+
 const BODIES: Readonly<Record<CommandName, (ctx: Context) => Promise<void>>> = {
   'init': init,
   'import': importCommand,
@@ -636,6 +945,12 @@ const BODIES: Readonly<Record<CommandName, (ctx: Context) => Promise<void>>> = {
   'vault verify': verify,
   'index rebuild': rebuild,
   'vault reset-passphrase': resetPassphraseCommand,
+  'profile add': profileAddCommand,
+  'profile list': profileListCommand,
+  'consent record': consentRecordCommand,
+  'consent list': consentListCommand,
+  'collection prompt-policy': collectionPromptPolicyCommand,
+  'collection list': collectionListCommand,
 };
 
 function secretTexts(secrets: CommandSecrets): string[] {

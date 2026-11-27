@@ -18,6 +18,8 @@ import type {
   ImportResult,
   ItemErrorInfo,
   ItemKeyLookup,
+  ResolveCollectionInput,
+  ResolveSensitivityItem,
   SensitivityTier,
   SourceImportCounts,
   UnlockedKeyringLike,
@@ -40,7 +42,18 @@ import { MAIL_SOURCE_ID } from './importers/mail.js';
 const DEFAULT_BATCH_MAX_ITEMS = 16;
 const DEFAULT_BATCH_MAX_BYTES = 4 * 1024 * 1024;
 
-export type ImportErrorCode = 'BUSY';
+/**
+ * `RESOLVER_MODIFIED_ITEM` (P-1 fix round 2, H1): the `resolveSensitivity` hook changed `item.plaintext`.
+ * The pipeline detects this (it recomputes the blob ID after the hook) and writes nothing for that item or
+ * any later item.
+ */
+export type ImportErrorCode = 'BUSY' | 'INVALID_PROFILE' | 'RESOLVER_MODIFIED_ITEM';
+
+/**
+ * The generic profile identifiers (Architecture 5.3, P-1 fix round 1 B4). A local copy: `importers`
+ * must not depend on `foundry-profiles` (Architecture section 2).
+ */
+const GENERIC_PROFILES: ReadonlySet<string> = new Set(['me', 'partner', 'child', 'other']);
 
 export class ImportError extends Error {
   readonly code: ImportErrorCode;
@@ -79,10 +92,25 @@ export interface ImportArchiveOptions {
    * into an in-memory set: for tests and small vaults only, because it grows with the vault.
    */
   itemKeys?: ItemKeyLookup;
-  /** Profile name stamped on imported events (defaults to `me`, per A-36). */
+  /**
+   * Profile name stamped on imported events (defaults to `me`, per A-36). Must be one of `me`, `partner`,
+   * `child`, `other` (else `ImportError('INVALID_PROFILE')` before anything is read or written). The
+   * caller must check consent for a non-`me` profile first (A-43 caller duty).
+   */
   profile?: string;
-  /** Override sensitivity resolution per source/item (defaults to A-36 fixed table). */
-  resolveSensitivity?: (source: string, path: string) => SensitivityTier;
+  /** Override logical collection assignment per item (defaults to A-36 `<source>/<year>` or `<source>/undated`). */
+  resolveCollection?: (info: ResolveCollectionInput) => string;
+  /**
+   * Override sensitivity resolution per source/item (defaults to A-36 fixed table). May return a promise
+   * (P-1: the command line derives the item's text first); a synchronous result is used directly.
+   * Called only for items that will be written: never for an item whose key is already in the vault or
+   * in the pending batch, and never for an item deferred for a missing collection key.
+   */
+  resolveSensitivity?: (
+    source: string,
+    path: string,
+    item?: ResolveSensitivityItem,
+  ) => SensitivityTier | Promise<SensitivityTier>;
   /** Optional clock override for deterministic tests. */
   now?: () => Date;
   /** Maximum plaintext byte size per individual item before skipping. Default: 64 MiB. */
@@ -170,6 +198,11 @@ export async function importArchive(options: ImportArchiveOptions): Promise<Impo
   }
   if (typeof options.readVaultRecord !== 'function') {
     throw new TypeError('importArchive requires readVaultRecord to derive durable item identity state.');
+  }
+  // P-1 fix round 1 (B4): only generic profiles, checked before the archive is read or anything is written.
+  // Consent is NOT checked here; the supported ingest boundary (`foundry import`) checks it first.
+  if (options.profile !== undefined && !GENERIC_PROFILES.has(options.profile)) {
+    throw new ImportError('INVALID_PROFILE', 'Profile must be one of the generic identifiers: me, partner, child, other.');
   }
 
   // Round 2 Finding 8: Reject concurrent imports sharing one VaultWriter instance.
@@ -451,7 +484,14 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
         }
 
         const plaintext = read.buffer;
-        const collection = defaultCollectionName(importer.id, rawItem.sourceTs);
+        const collection = options.resolveCollection
+          ? options.resolveCollection({
+              profile,
+              source: importer.id,
+              sourceTs: rawItem.sourceTs,
+              path: rawItem.path,
+            })
+          : defaultCollectionName(importer.id, rawItem.sourceTs);
         const keyId = options.resolveCollectionKeyId(collection);
         if (keyId === undefined) {
           // A-41: no key for this collection yet. Not stored, not an error; the caller creates the key and imports again.
@@ -460,7 +500,6 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
           missingCollections.add(collection);
           continue;
         }
-        const sensitivity = resolveSensitivity(importer.id, rawItem.path);
         const idKey = getIdKey(keyId);
         const blobId = computeBlobId(idKey, plaintext);
         const itemKey = computeItemKey(profile, collection, importer.id, rawItem.path, blobId);
@@ -471,6 +510,35 @@ async function runImportArchive(options: ImportArchiveOptions): Promise<ImportRe
           counts.itemsSkipped++;
           totalItemsSkipped++;
           continue;
+        }
+
+        // P-1 fix round 1 (B11): classify only items that will be written. The item key does not include the
+        // tier, so the duplicate check above does not need it.
+        let sensitivity: SensitivityTier;
+        try {
+          const resolved = resolveSensitivity(importer.id, rawItem.path, {
+            plaintext,
+            mime: rawItem.mime,
+            tags: rawItem.tags,
+            profile,
+            collection,
+            sourceTs: rawItem.sourceTs,
+          });
+          // A synchronous resolver takes the same path as before; only a promise is awaited.
+          sensitivity =
+            typeof (resolved as Promise<SensitivityTier> | undefined)?.then === 'function'
+              ? await resolved
+              : (resolved as SensitivityTier);
+        } catch (error) {
+          plaintext.fill(0);
+          throw error;
+        }
+        // P-1 fix round 2 (H1): the hook gets the live write buffer (a copy would double item memory). A hook
+        // must not change it: recompute the blob ID over the same buffer and refuse a mismatch, so the writer
+        // never stores other bytes than the blob ID and item key describe.
+        if (computeBlobId(idKey, plaintext) !== blobId) {
+          plaintext.fill(0);
+          throw new ImportError('RESOLVER_MODIFIED_ITEM', 'The sensitivity resolver changed the item bytes.');
         }
 
         pendingKeys.add(itemKey);

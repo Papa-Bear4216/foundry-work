@@ -203,6 +203,34 @@ jobs:
         if: ${{ !cancelled() }}
         run: npm run budgets --workspace importers
 
+  profiles:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          package-manager-cache: false
+      - name: Install workspace
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Build vault codec and profiles
+        shell: pwsh
+        run: |
+          npm --prefix packages/vault/codec run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run build --workspace foundry-profiles
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --input-type=module -e "await import('foundry-profiles')"
+      - name: Profiles test suites (serial)
+        run: npm test --workspace foundry-profiles
+
   cli:
     strategy:
       fail-fast: false

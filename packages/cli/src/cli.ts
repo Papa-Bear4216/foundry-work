@@ -340,8 +340,24 @@ export async function runCli(argv: readonly string[], options: RunOptions = {}):
     pendingRead = undefined;
     pendingPrompt = undefined;
     const request: CommandRequest = {
-      command: run.command, home, debug: run.debug, json: run.json, path: run.path, query: run.query,
-      filters: run.filters, credential: isKeyed(run.command) ? credential : undefined, secrets,
+      command: run.command,
+      home,
+      debug: run.debug,
+      json: run.json,
+      path: run.path,
+      query: run.query,
+      targetProfile: run.targetProfile,
+      targetCollection: run.targetCollection,
+      importProfile: run.importProfile,
+      importCollection: run.importCollection,
+      displayName: run.displayName,
+      basis: run.basis,
+      note: run.note,
+      childPrompts: run.childPrompts,
+      reveal: run.reveal,
+      filters: run.filters,
+      credential: isKeyed(run.command) ? credential : undefined,
+      secrets,
     };
     if (finished) return 2;
     return options.inline ? executeCommand(request, io, options.testHooks) : runInWorker(request, options.testHooks ?? {}, io, handle);

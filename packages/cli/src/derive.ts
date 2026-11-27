@@ -25,7 +25,25 @@ export const MAX_TEXT_BYTES = 1024 * 1024;
 const MAX_CHUNKS = 1024;
 const CHUNK_CHARS = 800;
 
-type Parsers = Pick<typeof import('importers'), 'parseEmailMessage' | 'parseVcard' | 'formatContactText' | 'parseIcalendar'>;
+export type Parsers = Pick<typeof import('importers'), 'parseEmailMessage' | 'parseVcard' | 'formatContactText' | 'parseIcalendar'>;
+
+/** The importers' synchronous parsers, as the projection and the write-time classifier use them. */
+export async function loadParsers(): Promise<Parsers> {
+  const { parseEmailMessage, parseVcard, formatContactText, parseIcalendar } = await import('importers');
+  return { parseEmailMessage, parseVcard, formatContactText, parseIcalendar };
+}
+
+/**
+ * The search text of one item from its whole plaintext, with the projection's limits: the first
+ * `MAX_DERIVE_BYTES` are parsed (`truncated` when the item has more), and the text is at most
+ * `MAX_TEXT_BYTES`. The input is read through a view, never copied or changed. The write-time classifier
+ * (`classify.ts`) uses this, so it sees the same text the index stores.
+ */
+export function itemTextOfPlaintext(parsers: Parsers, mime: string | null, plaintext: Uint8Array): string | undefined {
+  const take = Math.min(plaintext.byteLength, MAX_DERIVE_BYTES);
+  const view = Buffer.from(plaintext.buffer as ArrayBuffer, plaintext.byteOffset, take);
+  return itemText(parsers, mime, view, plaintext.byteLength > MAX_DERIVE_BYTES);
+}
 
 /** Split text into chunks of at most 800 characters (cut at whitespace when possible), at most 1,024 chunks. */
 export function chunkPlainText(text: string): string[] {
@@ -101,6 +119,8 @@ class TextBudget {
   }
 
   text(): string {
+    // One piece is returned as it is (no copy); the output is the same as the join.
+    if (this.#pieces.length === 1) return this.#pieces[0]!;
     return this.#pieces.join('');
   }
 }
@@ -159,11 +179,6 @@ export function itemText(parsers: Parsers, mime: string | null, bytes: Buffer, t
 function renderItem(parsers: Parsers, mime: string | null, bytes: Buffer, truncated: boolean, budget: TextBudget): boolean {
   const type = (mime ?? '').split(';', 1)[0]!.trim().toLowerCase();
   if (!['message/rfc822', 'text/vcard', 'text/calendar', 'text/plain'].includes(type)) return false;
-  const lines = (values: readonly string[]) => {
-    values.forEach((line, i) => {
-      if (!budget.full) budget.add((i > 0 ? '\n' : '') + line);
-    });
-  };
   try {
     if (type === 'message/rfc822') {
       const mail = parsers.parseEmailMessage(bytes);
@@ -175,7 +190,9 @@ function renderItem(parsers: Parsers, mime: string | null, bytes: Buffer, trunca
       if (mail.labels.length > 0) head.push(`Labels: ${mail.labels.join(', ')}`);
       if (mail.attachments.length > 0) head.push(`Attachments: ${mail.attachments.map(a => a.filename).join(', ')}`);
       if (mail.bodyText) head.push('', mail.bodyText);
-      lines(head);
+      // ONE piece: the same text (and the same cut at the cap) as adding each line, without building a new
+      // concatenated string per line (that cost the 1 GiB import its memory headroom).
+      budget.add(head.join('\n'));
     } else if (type === 'text/vcard') {
       const contact = parsers.parseVcard(bytes.toString('utf8'));
       if (contact) budget.add(parsers.formatContactText(contact));
@@ -216,8 +233,7 @@ export function capChunks(chunks: readonly string[]): string[] {
 
 /** Build the projection options every index call of the command line uses. */
 export async function loadProjection(): Promise<ProjectionOptions> {
-  const { parseEmailMessage, parseVcard, formatContactText, parseIcalendar } = await import('importers');
-  const parsers: Parsers = { parseEmailMessage, parseVcard, formatContactText, parseIcalendar };
+  const parsers = await loadParsers();
   return {
     version: DERIVER_VERSION,
     derive(item: DeriveItem, frames: Iterable<Uint8Array>): Iterable<string> {

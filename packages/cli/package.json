@@ -8,15 +8,16 @@
   "bin": { "foundry": "./bin/foundry.mjs" },
   "exports": "./dist/cli.js",
   "scripts": {
-    "build": "npm --prefix ../importers run build && npm --prefix ../index run build && tsc -p tsconfig.json",
-    "typecheck": "npm --prefix ../importers run build && npm --prefix ../index run build && tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test --test-concurrency=1 test/units.test.mjs test/commands.test.mjs test/import.test.mjs test/process.test.mjs test/secrets.test.mjs",
+    "build": "npm --prefix ../importers run build && npm --prefix ../index run build && npm --prefix ../profiles run build && tsc -p tsconfig.json",
+    "typecheck": "npm --prefix ../importers run build && npm --prefix ../index run build && npm --prefix ../profiles run build && tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test --test-concurrency=1 test/units.test.mjs test/commands.test.mjs test/import.test.mjs test/profiles-cli.test.mjs test/p1-fix-b-cli.test.mjs test/process.test.mjs test/secrets.test.mjs",
     "gate:offline": "node test/gates/offline-gate.mjs",
     "gate:memory": "node test/gates/memory-gate.mjs",
     "gate:e2e": "node test/gates/e2e-1gib-gate.mjs"
   },
   "dependencies": {
     "foundry-index": "0.0.0",
+    "foundry-profiles": "0.0.0",
     "importers": "0.0.0",
     "vault": "0.0.0"
   }

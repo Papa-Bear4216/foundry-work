@@ -1,0 +1,144 @@
+export const PROFILE_IDS = ['me', 'partner', 'child', 'other'] as const;
+export type ProfileId = (typeof PROFILE_IDS)[number];
+
+export const CONSENT_SUBJECT_PROFILES = ['partner', 'child', 'other'] as const;
+export type ConsentSubjectProfileId = (typeof CONSENT_SUBJECT_PROFILES)[number];
+
+export const SENSITIVITY_TIERS = [
+  'public',
+  'personal',
+  'private',
+  'secret',
+  'clinical',
+  'child',
+] as const;
+export type SensitivityTier = (typeof SENSITIVITY_TIERS)[number];
+
+export const CONSENT_BASES = [
+  'exported-by-them',
+  'parent-or-guardian',
+  'shared-conversation',
+  'other',
+] as const;
+export type ConsentBasis = (typeof CONSENT_BASES)[number];
+
+/**
+ * User-configured generic sensitivity rule stored inside vault events.
+ * At least one matcher (`sourcePrefix`, `pathContains`, `tag`, `keyword`) must be defined.
+ */
+export interface UserSensitivityRule {
+  readonly id: string;
+  readonly tier: SensitivityTier;
+  readonly profile?: ProfileId;
+  readonly sourcePrefix?: string;
+  readonly pathContains?: string;
+  readonly tag?: string;
+  readonly keyword?: string;
+}
+
+export interface ClassificationInput {
+  readonly source: string;
+  readonly profile?: string;
+  readonly collection?: string;
+  readonly title?: string;
+  readonly path?: string;
+  readonly text?: string;
+  readonly plaintext?: Uint8Array;
+  /**
+   * Text derived from the item by its source's deriver (for example a decoded base64 or
+   * quoted-printable mail body). Scanned in addition to `plaintext`, through the same windows.
+   */
+  readonly derivedTexts?: readonly string[];
+  readonly mime?: string;
+  /** Trusted tags (set by the caller). `sensitivity:<tier>` here may also choose `public`. */
+  readonly tags?: readonly string[];
+  /**
+   * Tags that come from the archive (for example Gmail labels): untrusted input (P-1 fix round 2, C3).
+   * They match user-rule `tag` matchers like `tags`, but a `sensitivity:<tier>` archive tag only RAISES
+   * the tier: it applies only when it is higher than what the rules give (and than the source default),
+   * and `sensitivity:public` from the archive is ignored.
+   */
+  readonly archiveTags?: readonly string[];
+  readonly explicitTier?: SensitivityTier;
+  readonly userRules?: readonly UserSensitivityRule[];
+}
+
+export interface ClassificationResult {
+  readonly sensitivity: SensitivityTier;
+  readonly rule: string;
+}
+
+export interface ProfileRecord {
+  readonly profile: ProfileId;
+  readonly displayName?: string;
+  readonly hasKeyringEntry: boolean;
+  readonly consentRequired: boolean;
+  readonly consentRecorded: boolean;
+  readonly consentBasis?: ConsentBasis;
+  readonly createdAt?: string;
+  readonly updatedAt?: string;
+  readonly eventSeq?: number;
+  readonly sensitivityRules: readonly UserSensitivityRule[];
+}
+
+export interface ConsentRecord {
+  readonly profile: ConsentSubjectProfileId;
+  readonly basis: ConsentBasis;
+  readonly note?: string;
+  readonly ts: string;
+  readonly eventSeq: number;
+  readonly active: boolean;
+}
+
+export interface CollectionState {
+  readonly collection: string;
+  readonly profile?: ProfileId;
+  readonly itemCount: number;
+  readonly allowChildModelPrompts: boolean;
+  readonly policyEventSeq?: number;
+  readonly policyUpdatedAt?: string;
+}
+
+export interface VaultProfileState {
+  /**
+   * The vault ID from `VAULT.json` (informational, for callers that label prompt candidates). The prompt
+   * gate never reads this field: it uses the private copy taken at replay time (P-1 fix round 2, G1).
+   */
+  readonly vaultId: string;
+  readonly profiles: ReadonlyMap<ProfileId, ProfileRecord>;
+  readonly consents: ReadonlyMap<ConsentSubjectProfileId, ConsentRecord>;
+  readonly consentHistory: readonly ConsentRecord[];
+  readonly collections: ReadonlyMap<string, CollectionState>;
+  /**
+   * Global rules (no `profile`) plus every profile's scoped rules, each with its true scope
+   * (P-1 fix round 1, item 8).
+   */
+  readonly sensitivityRules: readonly UserSensitivityRule[];
+  readonly destroyedProfileCount: number;
+  readonly skippedEvents: number;
+  readonly lastEventSeq: number;
+  /**
+   * Readable `item.imported` events whose collection does not start with `<their profile>/` (written by
+   * builds before P-1, or with a missing or unknown profile). Nonzero: `foundry import` refuses the vault
+   * (`PRE_PROFILE_VAULT`).
+   */
+  readonly preProfileItemEvents: number;
+}
+
+export interface PromptCandidateItem {
+  /** The vault the item was read from (its `VAULT.json` `vault_id`). Required (P-1 fix round 2, G1). */
+  readonly vaultId: string;
+  readonly profile: string;
+  readonly collection: string;
+  readonly sensitivity: SensitivityTier;
+}
+
+export type PromptExclusionReason =
+  | 'VAULT_MISMATCH'
+  | 'SECRET_TIER_EXCLUDED'
+  | 'COLLECTION_PROFILE_MISMATCH'
+  | 'CHILD_TIER_EXCLUDED';
+
+export type PromptEligibility =
+  | { readonly eligible: true }
+  | { readonly eligible: false; readonly reason: PromptExclusionReason };

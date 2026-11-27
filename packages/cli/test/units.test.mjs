@@ -32,15 +32,54 @@ test('location rule: --vault, then FOUNDRY_HOME, then <home>/Foundry', () => {
 
 test('commands, default timeouts, --timeout bounds and filters', () => {
   assert.deepEqual(DEFAULT_TIMEOUTS, {
-    'init': 120, 'vault reset-passphrase': 120, 'search': 120, 'vault verify': 3600, 'import': 21600, 'index rebuild': 21600,
+    'init': 120,
+    'vault reset-passphrase': 120,
+    'search': 120,
+    'profile add': 120,
+    'profile list': 120,
+    'consent record': 120,
+    'consent list': 120,
+    'collection prompt-policy': 120,
+    'collection list': 120,
+    'vault verify': 3600,
+    'import': 21600,
+    'index rebuild': 21600,
   });
-  for (const [argv, command] of [[['init'], 'init'], [['import', 'a.zip'], 'import'], [['search', 'q'], 'search'],
-    [['vault', 'verify'], 'vault verify'], [['index', 'rebuild'], 'index rebuild'],
-    [['vault', 'reset-passphrase'], 'vault reset-passphrase']]) {
+  for (const [argv, command] of [
+    [['init'], 'init'],
+    [['import', 'a.zip'], 'import'],
+    [['search', 'q'], 'search'],
+    [['vault', 'verify'], 'vault verify'],
+    [['index', 'rebuild'], 'index rebuild'],
+    [['vault', 'reset-passphrase'], 'vault reset-passphrase'],
+    [['profile', 'add', 'me'], 'profile add'],
+    [['profile', 'list'], 'profile list'],
+    [['consent', 'record', 'partner', '--basis', 'exported-by-them'], 'consent record'],
+    [['consent', 'list'], 'consent list'],
+    [['collection', 'prompt-policy', 'child/google-takeout/mail/2024', '--child-prompts', 'on'], 'collection prompt-policy'],
+    [['collection', 'list'], 'collection list'],
+  ]) {
     const parsed = parse(argv);
     assert.equal(parsed.command, command);
     assert.equal(parsed.timeoutSeconds, DEFAULT_TIMEOUTS[command]);
   }
+  const pAdd = parse(['profile', 'add', 'partner', '--display-name', 'Partner Label', '--json']);
+  assert.equal(pAdd.targetProfile, 'partner');
+  assert.equal(pAdd.displayName, 'Partner Label');
+  assert.equal(pAdd.json, true);
+
+  const cRec = parse(['consent', 'record', 'child', '--basis', 'parent-or-guardian', '--note', 'Guardian export']);
+  assert.equal(cRec.targetProfile, 'child');
+  assert.equal(cRec.basis, 'parent-or-guardian');
+  assert.equal(cRec.note, 'Guardian export');
+
+  const pol = parse(['collection', 'prompt-policy', 'child/google-takeout/mail/2024', '--child-prompts', 'off']);
+  assert.equal(pol.targetCollection, 'child/google-takeout/mail/2024');
+  assert.equal(pol.childPrompts, false);
+
+  const imp = parse(['import', 'archive.zip', '--profile', 'partner', '--collection', 'partner/custom/2024']);
+  assert.equal(imp.importProfile, 'partner');
+  assert.equal(imp.importCollection, 'partner/custom/2024');
   assert.equal(parse(['vault', 'verify', '--timeout', '1']).timeoutSeconds, 1);
   assert.equal(parse(['vault', 'verify', '--timeout', '604800']).timeoutSeconds, 604800);
   for (const bad of ['0', '604801', '1.5', '-3', 'abc']) {
@@ -64,6 +103,9 @@ test('usage errors exit 1 and never quote argv text', () => {
     [], ['frobnicate'], ['search'], ['import'], ['vault', 'verify', '--json', `--x${marker}`],
     ['search', 'q', '--limit', '0'], ['search', 'q', '--limit', '1001'], ['search', 'q', '--from', marker],
     ['import', 'a', '--passphrase-stdin', '--recovery-key-stdin'], ['init', '--json'], ['vault', 'verify', '--timeout'],
+    ['profile'], ['profile', 'add'], ['consent', 'record'], ['consent', 'record', 'partner'],
+    ['collection', 'prompt-policy'], ['collection', 'prompt-policy', 'child/a/2024'],
+    ['collection', 'prompt-policy', 'child/a/2024', '--child-prompts', marker],
   ];
   for (const argv of cases) {
     assert.throws(() => parse(argv), error => {
@@ -77,7 +119,12 @@ test('usage errors exit 1 and never quote argv text', () => {
 
 test('the secret guard runs first: secret options, extra positionals and secret environment names are refused', () => {
   for (const argv of [['init', '--passphrase', 'x'], ['search', 'q', '--recovery-key=x'], ['import', '--password', 'x', 'a'],
-    ['vault', 'verify', 'surplus'], ['search', 'q', 'extra'], ['init', '--secret']]) {
+    ['vault', 'verify', 'surplus'], ['search', 'q', 'extra'], ['init', '--secret'],
+    ['profile', 'add', 'me', 'surplus-secret'], ['profile', 'list', 'surplus-secret'],
+    ['consent', 'record', 'partner', 'surplus-secret', '--basis', 'other'],
+    ['consent', 'list', 'surplus-secret'],
+    ['collection', 'prompt-policy', 'child/a/2024', 'surplus-secret', '--child-prompts', 'on'],
+    ['collection', 'list', 'surplus-secret']]) {
     assert.throws(() => parse(argv), error => !(error instanceof CliError) && /secrets/iu.test(error.message));
   }
   for (const name of ['FOUNDRY_PASSPHRASE', 'FOUNDRY_RECOVERY_KEY', 'VAULT_TOKEN']) {
@@ -133,7 +180,12 @@ test('error mapping: typed codes give one fixed line; messages of library errors
   const cases = [
     [typed('VaultFormatError', 'AUTH'), 'AUTH'], [typed('VaultFormatError', 'INVENTORY'), 'INVENTORY'],
     [typed('IndexError', 'PROJECTION'), 'PROJECTION'], [typed('ArchiveError', 'CRC_MISMATCH'), 'CRC_MISMATCH'],
-    [typed('ImportError', 'BUSY'), 'BUSY'], [Object.assign(new Error(marker), { code: 'ENOSPC' }), 'IO'],
+    [typed('ImportError', 'BUSY'), 'BUSY'],
+    [typed('ProfileError', 'INVALID_PROFILE'), 'INVALID_PROFILE'],
+    [typed('ProfileError', 'CONSENT_REQUIRED'), 'CONSENT_REQUIRED'],
+    [typed('ProfileError', 'CONSENT_NOT_APPLICABLE'), 'CONSENT_NOT_APPLICABLE'],
+    [typed('ProfileError', 'INVALID_COLLECTION'), 'INVALID_COLLECTION'],
+    [Object.assign(new Error(marker), { code: 'ENOSPC' }), 'IO'],
     [new Error('Invalid recovery key format.'), 'RECOVERY_KEY_FORMAT'], [new TypeError(marker), 'INTERNAL'],
     [new CliError('TIMEOUT', 'passed its limit'), 'TIMEOUT'],
   ];
@@ -267,6 +319,64 @@ test('search text budget: for every MIME type (mail, vCard, plain text, calendar
     assert.ok(total > MAX_TEXT_BYTES - 8192, `${mime}: only ${total} bytes of search text`);
     assert.ok(chunks.every(chunk => !/[\uD800-\uDBFF]$|^[\uDC00-\uDFFF]/u.test(chunk)), `${mime}: no split surrogate pair`);
   }
+});
+
+test('M1: mail search text is byte-identical to the old line-by-line rendering (normal, cut at a multi-byte character, no body)', async () => {
+  const parsers = await import('importers');
+  const person = a => (a.name ? `${a.name} <${a.address}>` : a.address);
+  // The old algorithm (before fix round 2), rebuilt here: one budget piece per head line, '\n' before every line
+  // after the first, each piece cut at the remaining bytes and moved back to a character start.
+  const oldMailText = bytes => {
+    const mail = parsers.parseEmailMessage(bytes);
+    const head = [`Subject: ${mail.subject}`];
+    if (mail.from.length > 0) head.push(`From: ${mail.from.map(person).join(', ')}`);
+    if (mail.to.length > 0) head.push(`To: ${mail.to.map(person).join(', ')}`);
+    if (mail.cc.length > 0) head.push(`Cc: ${mail.cc.map(person).join(', ')}`);
+    if (mail.date) head.push(`Date: ${mail.date}`);
+    if (mail.labels.length > 0) head.push(`Labels: ${mail.labels.join(', ')}`);
+    if (mail.attachments.length > 0) head.push(`Attachments: ${mail.attachments.map(a => a.filename).join(', ')}`);
+    if (mail.bodyText) head.push('', mail.bodyText);
+    const pieces = [];
+    let left = MAX_TEXT_BYTES;
+    head.forEach((line, i) => {
+      if (left <= 0) return;
+      const piece = (i > 0 ? '\n' : '') + line;
+      const size = Buffer.byteLength(piece);
+      if (size <= left) { pieces.push(piece); left -= size; return; }
+      const cutHead = Buffer.from(piece.slice(0, left), 'utf8');
+      let cut = Math.min(left, cutHead.length);
+      while (cut > 0 && cut < cutHead.length && (cutHead[cut] & 0xc0) === 0x80) cut--;
+      pieces.push(cutHead.subarray(0, cut).toString('utf8'));
+      left = 0;
+    });
+    return pieces.join('');
+  };
+  const headLines = `From: TEST ONLY <${parsers.syntheticEmail('m1-sender')}>\r\nTo: <${parsers.syntheticEmail('m1-to')}>\r\n`
+    + 'Cc: TEST ONLY Copy <' + parsers.syntheticEmail('m1-cc') + '>\r\nDate: Thu, 01 Jan 2026 00:00:00 +0000\r\n'
+    + 'Subject: TEST ONLY M1 éè mail\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n';
+  // (a) a normal mail.
+  const normal = Buffer.from(`${headLines}\r\nTEST ONLY body line one\r\nline two \u{1F600}\r\n`);
+  const a = itemText(parsers, 'message/rfc822', normal);
+  assert.equal(a, oldMailText(normal));
+  assert.match(a, /^Subject: TEST ONLY M1[\s\S]*From: [\s\S]*\n\nTEST ONLY body line one/u);
+  // (b) head plus body crosses MAX_TEXT_BYTES; the 4-byte characters make the cap fall inside one character for at
+  // least one of the four paddings.
+  let cutInside = 0;
+  for (let pad = 0; pad < 4; pad++) {
+    const big = Buffer.from(`${headLines}\r\n${'a'.repeat(pad)}${'\u{1F600}'.repeat(300_000)}\r\n`);
+    const expected = oldMailText(big);
+    const got = itemText(parsers, 'message/rfc822', big);
+    assert.equal(Buffer.from(got).equals(Buffer.from(expected)), true, `pad ${pad}: byte-identical`);
+    assert.ok(Buffer.byteLength(got) <= MAX_TEXT_BYTES && Buffer.byteLength(got) > MAX_TEXT_BYTES - 4);
+    assert.ok(!/[\uD800-\uDBFF]$/u.test(got), `pad ${pad}: no split surrogate pair`);
+    if (Buffer.byteLength(got) < MAX_TEXT_BYTES) cutInside++;
+  }
+  assert.ok(cutInside >= 1, 'at least one case cuts inside a multi-byte character');
+  // (c) a mail with no body.
+  const empty = Buffer.from(`${headLines}\r\n`);
+  const c = itemText(parsers, 'message/rfc822', empty);
+  assert.equal(c, oldMailText(empty));
+  assert.ok(!c.endsWith('\n'), 'no body: no blank separator line');
 });
 
 test('calendar search text: the 8 MiB input cut keeps the completed fields of a truncated first event', async () => {
