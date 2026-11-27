@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  decodeKeyring, exportVaultIso, initSecondCopy, openSecondCopySession, VaultWriter, verifyVault,
+  decodeKeyring, exportVaultIso, initSecondCopy, openSecondCopySession, unlockVault, VaultWriter, verifyVault,
 } from '../dist/index.js';
+import { getKdfCallCountForTest, resetKdfCallCountForTest } from '../dist/keyring.js';
 
 const command = process.argv[2];
 const root = process.cwd();
@@ -27,16 +28,21 @@ if (command === 'prepare') {
   }
   initSecondCopy(vault, drive, { probe: ntfs });
 } else if (command === 'seal') {
-  // Keyed: close the open segment, copy it, re-hash it, copy the keyring.
+  // Keyed, as oundry vault seal runs it: one passphrase unlock (production scrypt settings, one KDF run), then
+  // close the open segment, copy it, re-hash it and copy the keyring.
+  resetKdfCallCountForTest();
+  const unlockSession = unlockVault(join(vault, 'keyring', 'keyring.json'), cases.metadata.vault_id, { passphrase: cases.passphrase });
   const session = openSecondCopySession(vault, drive, { probe: ntfs });
   let result;
   try {
-    result = session.seal(unlock());
+    result = session.seal(decodeKeyring(readFileSync(join(vault, 'keyring', 'keyring.json')), { session: unlockSession }, cases.metadata.vault_id));
   } finally {
     session.release();
+    unlockSession.dispose();
   }
+  assert.equal(getKdfCallCountForTest(), 1);
   assert.ok(result.bytesCopied > 256 * MiB);
-  console.log(JSON.stringify({ bytes: result.bytesCopied, peakRssKiB: process.resourceUsage().maxRSS }));
+  console.log(JSON.stringify({ bytes: result.bytesCopied, kdf: 1, peakRssKiB: process.resourceUsage().maxRSS }));
 } else if (command === 'session-check') {
   // Keyless steps 1 to 3 on a drive that already holds the 256 MiB segment.
   const session = openSecondCopySession(vault, drive, { probe: ntfs, recorded: null });

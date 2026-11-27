@@ -20,7 +20,7 @@
  *  8. and 9. are done by the caller with the returned result: record the new head on the working device, append
  *     `copy.sealed`, and print the anchor.
  *
- * The chain is tamper-evident, not tamper-proof (Architecture 8.2): an exact copy of a drive cannot be told from the
+ * The chain is only tamper-evident (Architecture 8.2): it shows a change, it cannot stop one; an exact copy of a drive cannot be told from the
  * original, and an out-of-date recorded head cannot reveal the loss of segments written after it.
  */
 import { Buffer } from 'node:buffer';

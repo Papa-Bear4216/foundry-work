@@ -2,7 +2,7 @@
  * The printable chain-head anchor (Architecture 4.5, 8.1 step 9, 8.2): vault ID, epoch, segment number, manifest
  * hash and the SHA-256 fingerprint of the signing public key. It is shown as text and as a QR code. Comparing a
  * drive against an independent anchor is what makes rollback and whole-drive replacement detectable; the chain
- * alone is tamper-evident, not tamper-proof.
+ * alone is only tamper-evident: it shows a change, it cannot stop one.
  */
 import { Buffer } from 'node:buffer';
 import { check, hex, integer, sha256 } from './bytes.ts';

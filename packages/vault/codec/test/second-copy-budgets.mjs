@@ -2,11 +2,12 @@
 // checked keylessly and the sealed vault is exported as an ISO image (keyless: 128 MiB ceiling). Each step is
 // measured in its own process, by the process itself and by the operating system.
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempDisposableSync } from 'node:fs';
+import { mkdirSync, mkdtempDisposableSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { fixture, writable } from './vault-fixture.mjs';
+import { encodeKeyring } from '../dist/index.js';
+import { cases, fixture, identity, keyringPath, writable } from './vault-fixture.mjs';
 import { measurePeakRss } from './peak-rss.mjs';
 
 assert.equal(process.versions.node, '24.22.3');
@@ -17,7 +18,14 @@ const temp = mkdtempDisposableSync(join(tmpdir(), 'foundry-copy-budget-'));
 try {
   const vault = join(temp.path, 'vault');
   mkdirSync(vault);
-  fixture(vault);
+  const vector = fixture(vault);
+  // Production scrypt settings (as session-budgets.mjs), so the keyed seal measures a real passphrase unlock.
+  const entries = vector.keyring.keys.map(entry => entry.state === 'destroyed' ? entry : {
+    ...entry, key: vector.keys.get(entry.key_id), label: vector.labels.get(entry.key_id),
+  });
+  writeFileSync(keyringPath(vault), encodeKeyring(
+    { vaultId: identity.vaultId, version: 1, masterKey: vector.masterKey, entries }, cases.passphrase, Buffer.from(cases.recovery_key, 'hex'),
+  ));
   const prepared = measurePeakRss(probe, 'prepare', temp.path);
   assert.equal(prepared.status, 0, prepared.stderr);
   for (const [command, ceiling] of Object.entries(CEILINGS)) {

@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import { verifyVault } from 'vault';
 import { parseCommandLine } from '../dist/args.js';
 import { REGISTER_NAME } from '../dist/commands.js';
-import { cleanEnv, initVault, PASSPHRASE, runInline, scratch } from './helpers.mjs';
+import { cleanEnv, initVault, PASSPHRASE, runInline, scratch, takeoutFolder } from './helpers.mjs';
 
 const ntfs = () => ({ type: 'ntfs', method: 'injected' });
 const fat = () => ({ type: 'vfat', method: 'injected' });
@@ -158,7 +158,9 @@ test('export-iso writes a keyless image by default and warns before an irreversi
   const { home } = await initVault(dir);
   const drive = join(dir, 'drive');
   await runInline(dir, ['vault', 'copy', 'init', drive, '--vault', home], { hooks: { secondCopyProbe: ntfs } });
-  await seal(dir, home, drive);
+  await addEvent(dir, home);
+  const sealed = await seal(dir, home, drive);
+  assert.equal(sealed.code, 0, sealed.stderr);
   const iso = join(dir, 'vault.iso');
   const plain = await runInline(dir, ['vault', 'export-iso', iso, '--vault', home]);
   assert.equal(plain.code, 0, plain.stderr);
@@ -243,4 +245,33 @@ test('the reminder is keyless, records the check and shows the overdue banner', 
   assert.match(reminder.stdout, /No second copy is set up/u);
   assert.match(reminder.stdout, /Keyless vault check: ok\./u);
   assert.equal(JSON.parse(readFileSync(join(home, REGISTER_NAME), 'utf8')).last_check.verify, 'ok');
+});
+
+test('a seal before any profile or import: the next profile, import, search and seal still work', async t => {
+  // A user who sets up the backup first: the seal creates `me`'s `system` key and `copy.sealed` is the first event.
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const drive = join(dir, 'drive');
+  assert.equal((await runInline(dir, ['vault', 'copy', 'init', drive, '--vault', home], { hooks: { secondCopyProbe: ntfs } })).code, 0);
+  const first = await seal(dir, home, drive);
+  assert.equal(first.code, 0, first.stderr);
+  assert.match(first.stdout, /sealed: segment 0 -> 0, 0 segment\(s\)/u);
+  const { folder } = await takeoutFolder(dir);
+  const imported = await runInline(dir, ['import', folder, '--vault', home, '--passphrase-stdin', '--json'], { stdin: `${PASSPHRASE}\n` });
+  assert.equal(imported.code, 0, imported.stderr);
+  assert.ok(JSON.parse(imported.stdout).itemsAdded > 0);
+  await addEvent(dir, home);
+  const profiles = await runInline(dir, ['profile', 'list', '--vault', home, '--passphrase-stdin', '--json'], { stdin: `${PASSPHRASE}\n` });
+  assert.equal(profiles.code, 0, profiles.stderr);
+  assert.deepEqual(JSON.parse(profiles.stdout).profiles.map(p => p.profile), ['me']);
+  const found = await runInline(dir, ['search', 'Subject', '--vault', home, '--passphrase-stdin', '--json'], { stdin: `${PASSPHRASE}\n` });
+  assert.equal(found.code, 0, found.stderr);
+  assert.ok(JSON.parse(found.stdout).results.length > 0);
+  const second = await seal(dir, home, drive, ['--json']);
+  assert.equal(second.code, 0, second.stderr);
+  const summary = JSON.parse(second.stdout);
+  assert.ok(summary.segment >= 1);
+  assert.equal(verifyVault(drive).position.segment, summary.segment);
+  const rebuild = await runInline(dir, ['index', 'rebuild', '--vault', home, '--passphrase-stdin'], { stdin: `${PASSPHRASE}\n` });
+  assert.equal(rebuild.code, 0, rebuild.stderr);
 });
