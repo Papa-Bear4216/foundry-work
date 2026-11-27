@@ -23,3 +23,17 @@ export type { ReplayLocation, ReplayOptions, VaultReplayItem } from './vault-rep
 export { retireIndexKey, stageIndexKey } from './index-keys.ts';
 export { collectionKeyId, ensureCollectionKeys } from './collection-keys.ts';
 export type { EnsureCollectionKeysResult } from './collection-keys.ts';
+// P-3: Mode B second copy, printable anchor, write-once export and scheduler reminders.
+export {
+  addCopyRecord, assertCadence, assertCopyLabel, CADENCE_DAYS, CADENCES, checkFileSystem, copyRegisterStatus,
+  defaultRunner, diskRelation, emptyRegister, FAT_FILE_SYSTEMS, initSecondCopy, openSecondCopySession, OVERDUE_DAYS,
+  probeFileSystem, readCopyRegister, recordSeal, SecondCopyError, selectCopy, writeCopyRegister,
+} from './second-copy.ts';
+export type {
+  Cadence, CommandResult, CommandRunner, CopyCheckpoint, CopyHead, CopyInitResult, CopyRecord, CopyRegister,
+  CopyStatus, DiskRelation, FileSystemProbe, FileSystemReport, RegisterStatus, SealResult, SecondCopyErrorCode,
+  SessionOptions, SessionReport, TargetOptions,
+} from './second-copy.ts';
+export { anchorPayload, anchorQr, anchorQrSvg, anchorQrText, anchorText, chainAnchor, parseAnchor } from './anchor.ts';
+export { encodeQr, renderQrSvg, renderQrText } from './qr.ts';
+export type { QrCode, QrErrorCorrection, QrOptions } from './qr.ts';

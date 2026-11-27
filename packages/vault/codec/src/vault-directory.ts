@@ -193,6 +193,8 @@ export function scanSealed(
   directory: string, vault: VaultMetadata, scanner: StreamScanner, unlocked?: UnlockedKeyring, anchor?: VaultAnchor,
   inspect?: (segment: number, ...args: Parameters<InspectRecord>) => void,
   verified?: (segment: number, files: ManifestFile[]) => void,
+  /** P-3 second-copy session only: leave out this segment folder (an unfinished copy, checked by the caller). */
+  exclude?: number,
 ) {
   const root = join(directory, 'segments');
   check(statIfPresent(root)?.isDirectory(), 'INVENTORY');
@@ -201,7 +203,7 @@ export function scanSealed(
     check(entry.isDirectory() && Number.isSafeInteger(number) && number > 0 && entry.name === segmentName(number),
       'INVENTORY');
     return number;
-  }).sort((a, b) => a - b);
+  }).filter(number => number !== exclude).sort((a, b) => a - b);
   const publicKey = Buffer.from(vault.signing_public_key, 'base64');
   if (anchor) {
     check(anchor.epoch === 1 && anchor.vaultId === vault.vault_id && anchor.signingKeyFingerprint === sha256(publicKey)

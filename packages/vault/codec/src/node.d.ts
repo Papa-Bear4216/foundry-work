@@ -93,6 +93,15 @@ declare module 'node:fs' {
   export function closeSync(fd: number): void;
   export function renameSync(source: string, target: string): void;
   export function unlinkSync(path: string): void;
+  // P-3 second copy, ISO export and scheduler.
+  export function rmdirSync(path: string): void;
+  export function readFileSync(path: string, encoding: 'utf8'): string;
+  export function writeFileSync(path: string, data: Uint8Array | string): void;
+  export function statSync(path: string): Stats;
+  export function statSync(path: string, options: { bigint: true }): { dev: bigint };
+  export function statfsSync(path: string): { type: number };
+  export const realpathSync: { (path: string): string; native(path: string): string };
+  export function openSync(path: string, flags: 'w' | 'wx' | 'r', mode?: number): number;
 }
 
 declare module 'node:path' {
@@ -100,6 +109,33 @@ declare module 'node:path' {
   export function dirname(path: string): string;
   export function join(...paths: string[]): string;
   export function resolve(...paths: string[]): string;
+  export function relative(from: string, to: string): string;
+  export function isAbsolute(path: string): boolean;
+  export function parse(path: string): { root: string; dir: string; base: string; name: string; ext: string };
+  export const sep: string;
+  export const win32: { parse(path: string): { root: string } };
+}
+
+declare module 'node:os' {
+  export function homedir(): string;
+}
+
+declare module 'node:child_process' {
+  export interface SpawnSyncResult {
+    status: number | null;
+    signal: string | null;
+    stdout: string;
+    stderr: string;
+    error?: Error;
+  }
+  export function spawnSync(command: string, args: readonly string[], options: {
+    shell: false;
+    encoding: 'utf8';
+    windowsHide?: boolean;
+    timeout?: number;
+    input?: string;
+    env?: Record<string, string | undefined>;
+  }): SpawnSyncResult;
 }
 
 declare module 'node:sqlite' {
