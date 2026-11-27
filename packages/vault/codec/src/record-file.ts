@@ -61,7 +61,18 @@ export function setFrameKeyObserverForTest(
 
 export class StreamScanner {
   readonly #header = Buffer.alloc(HEADER_BYTES);
-  readonly #frame = Buffer.allocUnsafe(FRAME_BYTES + FRAME_OVERHEAD);
+  readonly #frame: Buffer;
+
+  /**
+   * `frameCapacity` sizes the frame read buffer. The default fits the largest FVR1 frame. A caller that reads one
+   * known record may pass its body length (at least `FRAME_OVERHEAD`, the size of an empty frame), since no frame
+   * of that record can be larger.
+   */
+  constructor(frameCapacity = FRAME_BYTES + FRAME_OVERHEAD) {
+    check(Number.isSafeInteger(frameCapacity) && frameCapacity >= FRAME_OVERHEAD
+      && frameCapacity <= FRAME_BYTES + FRAME_OVERHEAD, 'LENGTH');
+    this.#frame = Buffer.allocUnsafe(frameCapacity);
+  }
 
   frames(
     fd: number, record: DiskRecord, hash?: ReturnType<typeof createHash>,
@@ -96,6 +107,7 @@ export class StreamScanner {
         const size = this.#frame.readUInt32BE(0);
         checkFrameSize(size, remaining, record.type, index === 0);
         const frameLength = size + FRAME_OVERHEAD;
+        check(frameLength <= this.#frame.length, 'LENGTH');
         offset += frameLength;
         if (hash || key) readExactly(fd, this.#frame.subarray(4, frameLength), offset - frameLength + 4);
         hash?.update(this.#frame.subarray(0, frameLength));

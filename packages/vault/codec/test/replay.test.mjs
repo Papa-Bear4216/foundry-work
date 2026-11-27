@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { encodeRecord, FRAME_BYTES, openVaultReplay, VaultFormatError, VaultWriter, verifyVaultDeep } from '../src/index.ts';
-import { setFrameKeyObserverForTest } from '../src/record-file.ts';
+import { setFrameKeyObserverForTest, StreamScanner } from '../src/record-file.ts';
 import { activeReplayIteratorCountForTest } from '../src/vault-replay.ts';
 import { blob, cases, event, fixture, identity, keyId, keyringPath, writable } from './vault-fixture.mjs';
 
@@ -457,4 +457,30 @@ test('close, return, next fails KEY on a never-started iterator; the other close
       assert.equal(activeReplayIteratorCountForTest(source), 0, `${kind} ${order.name}`);
     }
   }
+});
+
+test('P-3 (V-3b item 1): streamBlob refuses a sealed pack whose size changed after capture', t => {
+  const vault = setup(t);
+  vault.write(writer => {
+    writer.appendBatch([event('TEST ONLY size'), blob('TEST ONLY sealed size blob')]);
+    writer.closeSegment();
+  });
+  const source = vault.capture();
+  const item = consume(source.replay()).items.find(entry => entry.type === 'blob');
+  assert.equal(Buffer.concat([...source.streamBlob(item.location)]).toString(), 'TEST ONLY sealed size blob');
+  writable(vault.directory);
+  appendFileSync(join(vault.directory, 'segments', '000001', item.location.stream), Buffer.from('TEST ONLY tail'));
+  assert.throws(() => source.streamBlob(item.location).next(), { code: 'FILE_SIZE' });
+});
+
+test('P-3 (V-3b item 3): a stream scanner sized to one record reads small and empty blobs', t => {
+  assert.throws(() => new StreamScanner(19), { code: 'LENGTH' });
+  assert.throws(() => new StreamScanner(FRAME_BYTES + 21), { code: 'LENGTH' });
+  const vault = setup(t);
+  vault.write(writer => {
+    writer.appendBatch([blob(''), blob('TEST ONLY small'), blob('x'.repeat(FRAME_BYTES + 5))]);
+  });
+  const source = vault.capture();
+  const blobs = consume(source.replay()).items.filter(entry => entry.type === 'blob');
+  assert.deepEqual(blobs.map(entry => Buffer.concat([...source.streamBlob(entry.location)]).length), [0, 15, FRAME_BYTES + 5]);
 });

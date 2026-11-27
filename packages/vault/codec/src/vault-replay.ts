@@ -2,14 +2,14 @@ import { Buffer } from 'node:buffer';
 import { createHash, createHmac } from 'node:crypto';
 import { closeSync, fstatSync, openSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { check, integer, sha256 } from './bytes.ts';
+import { check, clearPlaintext, integer, sha256 } from './bytes.ts';
 import { collectionIdKey, decodeKeyring } from './keyring.ts';
 import type { Unlock } from './keyring.ts';
 import { streamOrdinal } from './manifest.ts';
 import type { ManifestFile } from './manifest.ts';
 import { diskRecord, StreamScanner } from './record-file.ts';
 import type { UnlockedKeyring } from './record-file.ts';
-import { FRAME_OVERHEAD, HEADER_BYTES } from './record.ts';
+import { FRAME_BYTES, FRAME_OVERHEAD, HEADER_BYTES } from './record.ts';
 import {
   checkRootInventory, checkVerifiedHead, metadata, OPEN_ARTIFACTS, readHead, scanOpen, scanSealed, segmentName,
   statIfPresent, streamNames, streamType,
@@ -246,7 +246,8 @@ export function openVaultReplay(directory: string, credential: Unlock, { anchor 
                 try {
                   event = JSON.parse(bytes.toString()) as Record<string, unknown>;
                 } finally {
-                  bytes.fill(0);
+                  // V-3b review item 2: wipe, and release a dedicated allocation of 64 KiB or more at once.
+                  clearPlaintext(bytes);
                 }
                 if (!withdrawalsOnly || withdrawalKinds.has(event.kind)) {
                   yield { type: 'event', seq: Number(record.context), event, keyId, location };
@@ -293,6 +294,10 @@ export function openVaultReplay(directory: string, credential: Unlock, { anchor 
       check(encodedLength <= stream.bytes - offset, 'LENGTH');
       const fd = openCapturedStream(directory, stream, openSegment);
       try {
+        // V-3b review item 1: the same size rule as replay(). A sealed stream has exactly its captured length; the
+        // open segment's stream may only have grown since the capture.
+        const size = fstatSync(fd).size;
+        check(stream.segment === openSegment ? size >= stream.bytes : size === stream.bytes, 'FILE_SIZE');
         const record = diskRecord(fd, offset, offset + encodedLength, Buffer.alloc(HEADER_BYTES));
         check(record && record.end === offset + encodedLength, 'LENGTH');
         check(record.type === 2);
@@ -300,7 +305,9 @@ export function openVaultReplay(directory: string, credential: Unlock, { anchor 
         check(!closed, 'KEY');
         const key = unlocked.collectionEncryptionKey(record.keyId);
         try {
-          const frames = new StreamScanner().frameChunks(fd, record, undefined, { vaultId: vault.vault_id, key });
+          // V-3b review item 3: no frame of this record is larger than its body, so a small blob gets a small buffer.
+          const capacity = Math.min(FRAME_BYTES + FRAME_OVERHEAD, record.end - record.offset - HEADER_BYTES);
+          const frames = new StreamScanner(capacity).frameChunks(fd, record, undefined, { vaultId: vault.vault_id, key });
           for (const chunk of frames) {
             check(!closed, 'KEY');
             yield chunk;
