@@ -299,5 +299,5 @@ jobs:
           sudo umount "$work/joliet"
           # Without Joliet the kernel reads the Level 2 primary tree (upper-case names, mapped to lower case).
           sudo mount -o loop,ro,nojoliet,norock -t iso9660 "$work/export.iso" "$work/primary"
-          test -f "$work/primary/segments/000002/pack_0001.fvr"
+          node packages/vault/codec/test/iso-mount-check.mjs primary "$work/primary" "$work"
           sudo umount "$work/primary"

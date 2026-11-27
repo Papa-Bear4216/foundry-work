@@ -31,6 +31,8 @@ import { verifyVault } from './vault-reader.ts';
 export const SECTOR_BYTES = 2048;
 /** The largest extent: the 32-bit length field, rounded down to whole sectors. */
 export const MAX_EXTENT_BYTES = 0xfffff800;
+/** The most sections (extents) one file may have: the Linux isofs reader's limit (`fs/isofs/inode.c`). */
+export const MAX_FILE_SECTIONS = 100;
 const STREAM_BUFFER_BYTES = 1024 * 1024;
 
 type Source = { path: string; sha256: string } | { bytes: Buffer };
@@ -352,6 +354,8 @@ export function writeIsoImage(output: string, entries: readonly IsoEntryInput[],
   // File extents first need their count only (records' sizes do not depend on locations).
   for (const file of files) {
     const count = Math.max(1, Math.ceil(file.size / maxExtent));
+    // Linux isofs reads at most 100 sections of one multi-extent file (fs/isofs/inode.c); refuse more.
+    if (count > MAX_FILE_SECTIONS) throw new SecondCopyError('ISO_TOO_MANY_EXTENTS');
     file.extents = Array.from({ length: count }, (_, i) => ({ sector: 0, length: Math.min(maxExtent, file.size - i * maxExtent) }));
   }
   const tables = {

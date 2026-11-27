@@ -2,7 +2,8 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
-  chmodSync, cpSync, lstatSync, mkdirSync, mkdtempDisposableSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync,
+  chmodSync, cpSync, lstatSync, mkdirSync, mkdtempDisposableSync, readdirSync, readFileSync, statSync, symlinkSync, unlinkSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, parse } from 'node:path';
@@ -10,7 +11,7 @@ import { test } from 'node:test';
 import { verifyVault, VaultWriter } from '../src/index.ts';
 import {
   addCopyRecord, copyRegisterStatus, diskRelation, emptyRegister, fsutilType, initSecondCopy, mountInfoType,
-  openSecondCopySession, probeFileSystem, readCopyRegister, recordSeal, selectCopy, writeCopyRegister,
+  openSecondCopySession, pathInside, probeFileSystem, readCopyRegister, recordSeal, selectCopy, writeCopyRegister,
 } from '../src/second-copy.ts';
 import { blob, event, fixture, identity, keyringPath } from './vault-fixture.mjs';
 
@@ -262,13 +263,23 @@ test('a drive from another vault or with changed metadata is refused', t => {
   assert.throws(() => vault.session(), { code: 'NOT_A_COPY' });
 });
 
-test('a write-protected drive is reported before any check', { skip: process.platform === 'win32' || process.getuid?.() === 0 }, t => {
+test('a write-protected drive is reported and left unchanged', { skip: process.platform === 'win32' || process.getuid?.() === 0 }, t => {
   const vault = setup(t);
+  vault.append([event('TEST ONLY protected')], true);
   initSecondCopy(vault.working, vault.drive, { probe: ntfs });
-  chmodSync(join(vault.drive, 'keyring'), 0o500);
+  t.after(() => makeWritable(vault.drive));
+  // The drive root is read-only (no keyring folder yet).
   chmodSync(vault.drive, 0o500);
-  t.after(() => { chmodSync(vault.drive, 0o700); chmodSync(join(vault.drive, 'keyring'), 0o700); });
+  let before = tree(vault.drive);
   assert.throws(() => vault.session(), { code: 'WRITE_PROTECTED' });
+  assert.deepEqual(tree(vault.drive), before);
+  // The keyring folder exists and is read-only too.
+  chmodSync(vault.drive, 0o700);
+  mkdirSync(join(vault.drive, 'keyring'), { mode: 0o500 });
+  chmodSync(vault.drive, 0o500);
+  before = tree(vault.drive);
+  assert.throws(() => vault.session(), { code: 'WRITE_PROTECTED' });
+  assert.deepEqual(tree(vault.drive), before);
 });
 
 test('an interrupted session at any step is finished or rolled back by the next one', t => {
@@ -344,6 +355,27 @@ test('the copy must be its own folder: not a volume root, not around or inside t
   assert.throws(() => vault.session({}, foreign), { code: 'NOT_A_COPY' });
   assert.throws(() => vault.session({}, join(vault.root, 'missing')), { code: 'NOT_A_COPY' });
   assert.equal(diskRelation(vault.working, vault.root), 'same-volume');
+});
+
+test('placement is checked on canonical paths: a link to the vault and a child named ..x are both inside it', t => {
+  const vault = setup(t);
+  // A directory junction on Windows, a symbolic link elsewhere: the same bug class as a Windows short (8.3) name.
+  const link = join(vault.root, 'link-to-working');
+  symlinkSync(vault.working, link, process.platform === 'win32' ? 'junction' : 'dir');
+  for (const target of [join(link, 'new-copy'), join(link, 'segments', 'deep', 'copy'), join(vault.working, '..copy'),
+    join(vault.working, '..', 'working', 'x')]) {
+    assert.throws(() => initSecondCopy(vault.working, target, { probe: ntfs }), { code: 'TARGET_UNSUITABLE', reason: 'overlaps-vault' }, target);
+    assert.throws(() => openSecondCopySession(vault.working, target, { probe: ntfs }), { code: 'TARGET_UNSUITABLE' }, target);
+  }
+  // The vault reached through the link is the same vault: a folder around it is refused too.
+  assert.throws(() => initSecondCopy(link, vault.root, { probe: ntfs }), { code: 'TARGET_UNSUITABLE' });
+  // A sibling whose name only starts with the vault's name is outside it.
+  assert.equal(initSecondCopy(vault.working, join(vault.root, 'working-copy'), { probe: ntfs }).created, true);
+  assert.equal(pathInside(vault.working, join(link, 'x')), true);
+  assert.equal(pathInside(vault.working, join(vault.root, 'working-copy')), false);
+  assert.equal(pathInside('C:\\vault', 'c:\\VAULT\\..x', 'win32'), true);
+  assert.equal(pathInside('C:\\vault', 'D:\\vault', 'win32'), false);
+  assert.equal(pathInside('/srv/vault', '/srv/vault2', 'linux'), false);
 });
 
 test('the working-device register: strict format, labels, selection, seal record and the 14-day banner', t => {

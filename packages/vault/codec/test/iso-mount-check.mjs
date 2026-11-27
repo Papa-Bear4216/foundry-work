@@ -1,11 +1,19 @@
 // TEST ONLY: `make <dir>` builds a synthetic vault with two sealed segments and a multi-extent file, exports it to
 // `<dir>/export.iso` and prints the sealed head hash. `verify <folder> <hash>` runs the keyless vault check on a
-// mounted (or extracted) image and compares the head. CI mounts the image with the Linux kernel's ISO 9660 driver.
+// mounted (or extracted) Joliet image and compares the head. `primary <folder> <dir>` checks every file of the
+// Level 2 primary tree (mounted with `nojoliet,norock`) byte for byte against the source vault in `<dir>/vault`.
+// CI mounts the image with the Linux kernel's ISO 9660 driver.
 import assert from 'node:assert/strict';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { exportVaultIso, VaultWriter, verifyVault } from '../dist/index.js';
 import { blob, event, fixture } from './vault-fixture.mjs';
+
+/**
+ * Extents of 64 KiB: the large pack needs more than one (the 4 GiB multi-extent rule, scaled down) and fewer than
+ * the 100 sections the Linux isofs reader accepts for one file.
+ */
+const EXTENT = 64 * 1024;
 
 const [command, folder, expected] = process.argv.slice(2);
 if (command === 'make') {
@@ -20,14 +28,36 @@ if (command === 'make') {
   } finally {
     writer.release();
   }
-  // Small extents so the kernel reader also sees multi-extent files (the 4 GiB rule, scaled down).
-  const result = exportVaultIso(vault, join(folder, 'export.iso'), { maxExtentBytes: 4096 });
+  const sizes = readdirSync(join(vault, 'segments', '000001')).map(name => statSync(join(vault, 'segments', '000001', name)).size);
+  const sections = Math.ceil(Math.max(...sizes) / EXTENT);
+  assert.ok(sections >= 2 && sections <= 100, `the largest file needs ${sections} sections`);
+  const result = exportVaultIso(vault, join(folder, 'export.iso'), { maxExtentBytes: EXTENT });
   process.stdout.write(`${result.head.hash}\n`);
 } else if (command === 'verify') {
   const verified = verifyVault(folder);
   assert.equal(verified.position.segment, 2);
   assert.equal(verified.position.hash, expected);
   process.stdout.write(`verified segment ${verified.position.segment} ${verified.position.hash}\n`);
+} else if (command === 'primary') {
+  // The kernel shows primary names in lower case without the `;1` version; `-` was mapped to `_` by the writer.
+  const vault = join(expected, 'vault');
+  let checked = 0;
+  const walk = relative => {
+    for (const entry of readdirSync(join(vault, ...relative), { withFileTypes: true })) {
+      if (relative.length === 0 && !['VAULT.json', 'segments'].includes(entry.name)) continue;
+      const parts = [...relative, entry.name];
+      if (entry.isDirectory()) {
+        walk(parts);
+        continue;
+      }
+      const mapped = join(folder, ...parts.map(part => part.toLowerCase().replace(/-/gu, '_')));
+      assert.deepEqual(readFileSync(mapped), readFileSync(join(vault, ...parts)), parts.join('/'));
+      checked++;
+    }
+  };
+  walk([]);
+  assert.ok(checked >= 9, `checked ${checked} primary-tree files`);
+  process.stdout.write(`primary tree: ${checked} file(s) match the source\n`);
 } else {
-  throw new Error('TEST ONLY: usage: iso-mount-check.mjs make <dir> | verify <folder> <hash>');
+  throw new Error('TEST ONLY: usage: iso-mount-check.mjs make <dir> | verify <folder> <hash> | primary <folder> <dir>');
 }

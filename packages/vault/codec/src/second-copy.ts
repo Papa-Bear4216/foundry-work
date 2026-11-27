@@ -30,7 +30,8 @@ import {
   chmodSync, closeSync, fstatSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, readSync,
   realpathSync, rmdirSync, statfsSync, statSync, unlinkSync, writeSync,
 } from 'node:fs';
-import { dirname, isAbsolute, join, relative, resolve, win32 } from 'node:path';
+import { dirname, join, posix, resolve, win32 } from 'node:path';
+import type { PlatformPath } from 'node:path';
 import { platform as hostPlatform } from 'node:process';
 import { canonical, check, hex, integer, object, parseCanonical, sha256, timestamp, VaultFormatError } from './bytes.ts';
 import type { Json } from './bytes.ts';
@@ -52,7 +53,7 @@ export type SecondCopyErrorCode =
   | 'FILESYSTEM_UNSUPPORTED' | 'WRITE_PROTECTED' | 'ROLLBACK_DETECTED' | 'TAMPER_DETECTED' | 'VAULT_MISMATCH'
   | 'NOT_A_COPY' | 'TARGET_NOT_EMPTY' | 'TARGET_UNSUITABLE' | 'COPY_BUSY' | 'COPY_VERIFY_FAILED'
   | 'WORKING_VAULT_DAMAGED' | 'OUTPUT_EXISTS' | 'REGISTER' | 'COPY_UNKNOWN' | 'COPY_AMBIGUOUS' | 'INVALID_LABEL' | 'INVALID_CADENCE'
-  | 'SCHEDULER_UNSUPPORTED' | 'SCHEDULER_FAILED';
+  | 'SCHEDULER_UNSUPPORTED' | 'SCHEDULER_FAILED' | 'ISO_TOO_MANY_EXTENTS';
 
 /** A typed second-copy failure. `reason` is a fixed token (never a path or user text). */
 export class SecondCopyError extends Error {
@@ -153,7 +154,8 @@ export function fsutilType(output: string): string | undefined {
 /** Detect the file system that holds `path` (an existing path). Never throws for an undetectable type. */
 export function probeFileSystem(path: string, { platform = hostPlatform, run = defaultRunner }: { platform?: string; run?: CommandRunner } = {}): FileSystemReport {
   if (platform === 'win32') {
-    const root = win32.parse(resolve(path)).root;
+    // Windows path rules even on another host (an injected platform in tests): `E:\x` is absolute here.
+    const root = win32.parse(win32.resolve(path)).root;
     if (!/^[A-Za-z]:\\$/u.test(root)) return { type: undefined, method: 'none' };
     const result = run('fsutil', ['fsinfo', 'volumeinfo', root.slice(0, 2)]);
     const type = result.status === 0 ? fsutilType(result.stdout) : undefined;
@@ -436,31 +438,63 @@ export interface TargetOptions {
   probe?: FileSystemProbe;
 }
 
+/** Path rules of the platform being checked (an injected `win32` on a Linux host still uses Windows rules). */
+function pathApi(platform: string): PlatformPath {
+  return platform === 'win32' ? win32 : posix;
+}
+
 function folded(path: string, platform: string): string {
   return platform === 'win32' ? path.toLowerCase() : path;
 }
 
-function within(parent: string, child: string, platform: string): boolean {
-  const rel = relative(folded(parent, platform), folded(child, platform));
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+/**
+ * The canonical form of `path`: the real path of its nearest existing ancestor (links, junctions and Windows short
+ * names resolved), followed by the components that do not exist yet. Both sides of a containment check go through
+ * this, so an existing path and a new one are compared in the same form.
+ */
+export function canonicalPath(path: string, platform: string = hostPlatform): string {
+  const api = pathApi(platform);
+  const absolute = api.resolve(path);
+  const missing: string[] = [];
+  let current = absolute;
+  for (;;) {
+    try {
+      const real = realpathSync.native(current);
+      return missing.length === 0 ? real : api.join(real, ...missing.reverse());
+    } catch (error) {
+      if (!['ENOENT', 'ENOTDIR'].includes(errorCode(error) ?? '') && platform === hostPlatform) throw error;
+    }
+    const parent = api.dirname(current);
+    if (parent === current) return absolute;
+    missing.push(api.basename(current));
+    current = parent;
+  }
 }
 
-function realOrResolved(path: string): string {
-  try {
-    return realpathSync.native(path);
-  } catch {
-    return resolve(path);
-  }
+/** True when `child` is `parent` or below it, compared by whole path components (a name such as `..x` is a child). */
+function within(parent: string, child: string, platform: string): boolean {
+  const api = pathApi(platform);
+  const rel = api.relative(folded(parent, platform), folded(child, platform));
+  if (rel === '') return true;
+  if (api.isAbsolute(rel)) return false;
+  return rel.split(api.sep)[0] !== '..';
+}
+
+/** True when `path` is `folder` or below it, after both are canonicalised (links resolved). */
+export function pathInside(folder: string, path: string, platform: string = hostPlatform): boolean {
+  return within(canonicalPath(folder, platform), canonicalPath(path, platform), platform);
 }
 
 /** The copy must be its own folder: not a volume root, not inside the working home's vault and not around it. */
 function checkPlacement(workingVault: string, target: string, platform: string): void {
-  const root = platform === 'win32' ? win32.parse(target).root : '/';
-  if (folded(target, platform) === folded(root, platform) || target === dirname(target)) {
-    throw new SecondCopyError('TARGET_UNSUITABLE', 'volume-root');
+  const api = pathApi(platform);
+  const working = canonicalPath(workingVault, platform);
+  const real = canonicalPath(target, platform);
+  for (const path of [target, real]) {
+    if (folded(path, platform) === folded(api.parse(path).root, platform) || path === api.dirname(path)) {
+      throw new SecondCopyError('TARGET_UNSUITABLE', 'volume-root');
+    }
   }
-  const working = realOrResolved(workingVault);
-  const real = realOrResolved(target);
   if (within(working, real, platform) || within(real, working, platform)) throw new SecondCopyError('TARGET_UNSUITABLE', 'overlaps-vault');
 }
 

@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { verifyVault, VaultWriter } from '../src/index.ts';
-import { exportVaultIso, primaryIdentifier, SECTOR_BYTES, writeIsoImage } from '../src/iso9660.ts';
+import { exportVaultIso, MAX_FILE_SECTIONS, primaryIdentifier, SECTOR_BYTES, writeIsoImage } from '../src/iso9660.ts';
 import { blob, event, fixture, keyringPath, writable } from './vault-fixture.mjs';
 
 function setup(t) {
@@ -195,6 +195,112 @@ test('files larger than one extent become consecutive multi-extent records and r
   extract(joliet, extracted);
   assert.equal(verifyVault(extracted).position.segment, 1);
   assert.throws(() => writeIsoImage(join(s.root, 'bad.iso'), [], { maxExtentBytes: 1000 }), { code: 'LENGTH' });
+});
+
+/**
+ * A second, independent reader: it walks one directory tree (primary or Joliet) from its volume descriptor and returns
+ * every directory record of every file, without joining extents, so each recorded size and extent can be checked.
+ */
+function fileRecords(image, joliet) {
+  const descriptorSector = n => image.subarray(n * SECTOR_BYTES, (n + 1) * SECTOR_BYTES);
+  let descriptor;
+  for (let n = 16; image[n * SECTOR_BYTES] !== 255; n++) {
+    if (image[n * SECTOR_BYTES] === (joliet ? 2 : 1)) descriptor = descriptorSector(n);
+  }
+  assert.ok(descriptor, joliet ? 'Joliet descriptor' : 'primary descriptor');
+  const name = id => {
+    if (!joliet) return id.toString('latin1');
+    let text = '';
+    for (let i = 0; i < id.length; i += 2) text += String.fromCharCode((id[i] << 8) | id[i + 1]);
+    return text;
+  };
+  const records = new Map();
+  const directories = [];
+  const visit = (extent, size, prefix) => {
+    directories.push(prefix);
+    let index = 0;
+    for (let sector = extent; sector < extent + size / SECTOR_BYTES; sector++) {
+      for (let offset = sector * SECTOR_BYTES; offset < (sector + 1) * SECTOR_BYTES;) {
+        const length = image[offset];
+        if (length === 0) break;
+        const location = image.readUInt32LE(offset + 2);
+        const bytes = image.readUInt32LE(offset + 10);
+        assert.equal(image.readUInt32BE(offset + 6), location);
+        assert.equal(image.readUInt32BE(offset + 14), bytes);
+        const flags = image[offset + 25];
+        const id = image.subarray(offset + 33, offset + 33 + image[offset + 32]);
+        offset += length;
+        if (index++ < 2) continue;
+        if (flags & 0x02) {
+          visit(location, bytes, `${prefix}${name(id)}/`);
+        } else {
+          const key = prefix + name(id).replace(/;1$/u, '');
+          records.set(key, [...(records.get(key) ?? []), { location, bytes, flags }]);
+        }
+      }
+    }
+  };
+  const root = descriptor.subarray(156, 190);
+  visit(root.readUInt32LE(2), root.readUInt32LE(10), '');
+  return { records, directories };
+}
+
+test('primary and Joliet records each give every file its exact size and extents (independent reader)', t => {
+  const s = setup(t);
+  const extent = 8192;
+  s.append([event('TEST ONLY tree one'), { ...blob(''), plaintext: Buffer.alloc(5 * extent + 123, 0x21) }], true);
+  s.append([event('TEST ONLY tree two'), { ...blob(''), plaintext: Buffer.alloc(2 * extent, 0x42) }], true);
+  const output = join(s.root, 'trees.iso');
+  exportVaultIso(s.vault, output, { maxExtentBytes: extent });
+  const image = readFileSync(output);
+  const primary = fileRecords(image, false);
+  const joliet = fileRecords(image, true);
+  const primaryName = path => path.split('/').map((part, i, all) => i === all.length - 1 ? primaryIdentifier(part, false).replace(/;1$/u, '') : primaryIdentifier(part, true)).join('/');
+  let multi = 0;
+  const sources = [['VAULT.json']];
+  for (const segment of ['000001', '000002']) {
+    for (const file of readdirSync(join(s.vault, 'segments', segment))) sources.push(['segments', segment, file]);
+  }
+  for (const parts of sources) {
+    const source = readFileSync(join(s.vault, ...parts));
+    const expectedSections = Math.max(1, Math.ceil(source.length / extent));
+    const views = [['joliet', joliet.records.get(parts.join('/'))], ['primary', primary.records.get(primaryName(parts.join('/')))]];
+    for (const [tree, records] of views) {
+      const label = `${tree} ${parts.join('/')}`;
+      assert.ok(records, label);
+      assert.equal(records.length, expectedSections, label);
+      records.forEach((record, i) => {
+        const last = i === records.length - 1;
+        assert.equal(record.flags, last ? 0 : 0x80, `${label} flags ${i}`);
+        if (!last) assert.equal(record.bytes, extent, `${label} section ${i} is a whole extent`);
+        if (i > 0) assert.equal(record.location, records[i - 1].location + records[i - 1].bytes / SECTOR_BYTES, `${label} contiguous`);
+      });
+      assert.equal(records.reduce((sum, record) => sum + record.bytes, 0), source.length, `${label} size`);
+      const data = Buffer.concat(records.map(r => image.subarray(r.location * SECTOR_BYTES, r.location * SECTOR_BYTES + r.bytes)));
+      assert.deepEqual(data, source, `${label} bytes`);
+    }
+    assert.deepEqual(views[0][1], views[1][1], `both trees point at the same extents: ${parts.join('/')}`);
+    if (expectedSections > 1) multi++;
+  }
+  assert.ok(multi >= 2, 'at least two multi-extent files');
+});
+
+test('a file that would need more than 100 sections is refused; 100 sections are written', t => {
+  const s = setup(t);
+  const source = join(s.root, 'sections.bin');
+  const bytes = Buffer.alloc(100 * SECTOR_BYTES, 7);
+  writeFileSync(source, bytes);
+  const hash = createHash('sha256').update(bytes).digest('hex');
+  assert.equal(MAX_FILE_SECTIONS, 100);
+  writeIsoImage(join(s.root, 'hundred.iso'), [{ path: ['a.bin'], size: bytes.length, source: { path: source, sha256: hash } }],
+    { maxExtentBytes: SECTOR_BYTES });
+  assert.equal(fileRecords(readFileSync(join(s.root, 'hundred.iso')), true).records.get('a.bin').length, 100);
+  const more = Buffer.alloc(100 * SECTOR_BYTES + 1, 7);
+  writeFileSync(source, more);
+  assert.throws(() => writeIsoImage(join(s.root, 'too-many.iso'),
+    [{ path: ['a.bin'], size: more.length, source: { path: source, sha256: createHash('sha256').update(more).digest('hex') } }],
+    { maxExtentBytes: SECTOR_BYTES }), { name: 'SecondCopyError', code: 'ISO_TOO_MANY_EXTENTS' });
+  assert.ok(!readdirSync(s.root).includes('too-many.iso'));
 });
 
 test('an empty vault exports VAULT.json and the genesis head', t => {

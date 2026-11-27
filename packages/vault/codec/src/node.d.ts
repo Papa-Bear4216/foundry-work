@@ -113,7 +113,19 @@ declare module 'node:path' {
   export function isAbsolute(path: string): boolean;
   export function parse(path: string): { root: string; dir: string; base: string; name: string; ext: string };
   export const sep: string;
-  export const win32: { parse(path: string): { root: string } };
+  /** One platform's path rules (P-3: `win32` and `posix` are chosen by the injected platform, not the host). */
+  export interface PlatformPath {
+    basename(path: string): string;
+    dirname(path: string): string;
+    join(...paths: string[]): string;
+    resolve(...paths: string[]): string;
+    relative(from: string, to: string): string;
+    isAbsolute(path: string): boolean;
+    parse(path: string): { root: string };
+    readonly sep: string;
+  }
+  export const win32: PlatformPath;
+  export const posix: PlatformPath;
 }
 
 declare module 'node:os' {
