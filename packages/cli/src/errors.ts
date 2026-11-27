@@ -102,6 +102,8 @@ const SECOND_COPY_MESSAGES: Readonly<Record<string, string>> = {
   INVALID_CADENCE: 'the cadence must be daily, weekly, monthly or manual',
   SCHEDULER_UNSUPPORTED: 'reminders can be scheduled on Windows and Linux only',
   SCHEDULER_FAILED: 'the scheduler did not accept the reminder',
+  COPY_MISMATCH: 'the folder holds a different second copy than the one selected (its copy id differs); give --copy <label>, '
+    + 'or take it over with `foundry vault copy init <folder> --adopt`',
   ISO_TOO_MANY_EXTENTS: 'a vault file is too large for the disc image (more than 100 sections of 4 GiB)',
 };
 

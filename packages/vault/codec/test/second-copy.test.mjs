@@ -2,28 +2,34 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
-  chmodSync, cpSync, lstatSync, mkdirSync, mkdtempDisposableSync, readdirSync, readFileSync, statSync, symlinkSync, unlinkSync,
-  writeFileSync,
+  chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempDisposableSync, readdirSync, readFileSync, renameSync, rmdirSync,
+  rmSync, statSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, parse } from 'node:path';
 import { test } from 'node:test';
 import { verifyVault, VaultWriter } from '../src/index.ts';
 import {
-  addCopyRecord, copyRegisterStatus, diskRelation, emptyRegister, fsutilType, initSecondCopy, mountInfoType,
-  openSecondCopySession, pathInside, probeFileSystem, readCopyRegister, recordSeal, selectCopy, writeCopyRegister,
+  addCopyRecord, COPY_REGISTERED, COPY_SEALED, copyRegisteredBody, copyRegisterStatus, copySealedBody, diskRelation,
+  emptyRegister, fsutilType, initSecondCopy, inspectCopyTarget, loadCopyRegister, MAX_REGISTER_BYTES, mountInfoType,
+  openSecondCopySession, pathInside, probeFileSystem, readCopyIdentity, readCopyRegister, recordSeal, registerFromEvents,
+  replayCopyRegister, selectCopy, writeCopyRegister,
 } from '../src/second-copy.ts';
-import { blob, event, fixture, identity, keyringPath } from './vault-fixture.mjs';
+import { blob, cases, event, fixture, identity, keyId, keyringPath } from './vault-fixture.mjs';
 
 const ntfs = () => ({ type: 'ntfs', method: 'injected' });
+const ID = 'a1'.repeat(16);
+const OTHER = 'b2'.repeat(16);
+const asCopy = { secondCopy: true };
 
 function makeWritable(path) {
+  if (!existsSync(path)) return;
+  chmodSync(path, 0o700);
   for (const entry of readdirSync(path, { withFileTypes: true })) {
     const full = join(path, entry.name);
     if (entry.isDirectory()) {
-      chmodSync(full, 0o700);
       makeWritable(full);
-    } else {
+    } else if (entry.isFile()) {
       chmodSync(full, 0o600);
     }
   }
@@ -48,8 +54,11 @@ function setup(t) {
         writer.release();
       }
     },
+    init(target = drive, options = {}) {
+      return initSecondCopy(working, target, { probe: ntfs, copyId: ID, ...options });
+    },
     session(options = {}, target = drive) {
-      const session = openSecondCopySession(working, target, { probe: ntfs, ...options });
+      const session = openSecondCopySession(working, target, { probe: ntfs, copyId: ID, ...options });
       try {
         return { report: session.report, result: session.seal(unlocked) };
       } finally {
@@ -59,18 +68,19 @@ function setup(t) {
   };
 }
 
-/** Every file below `root` with its bytes' hash, leaving out the SQLite lock files (taking a lock may touch them). */
+/** Every entry below `root` with its type and, for files, the hash of its bytes (lock files included). */
 function tree(root) {
   const out = [];
   const walk = relative => {
     for (const entry of readdirSync(join(root, relative), { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : 1))) {
       const path = join(relative, entry.name);
-      if (entry.name.includes('.lock.sqlite')) continue;
       if (entry.isDirectory()) {
         out.push(`${path}/`);
         walk(path);
-      } else {
+      } else if (entry.isFile()) {
         out.push(`${path} ${createHash('sha256').update(readFileSync(join(root, path))).digest('hex')}`);
+      } else {
+        out.push(`${path} (link)`);
       }
     }
   };
@@ -79,23 +89,29 @@ function tree(root) {
 }
 
 const segmentDir = (root, n) => join(root, 'segments', String(n).padStart(6, '0'));
+const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+const linkKind = process.platform === 'win32' ? 'junction' : 'dir';
 
 test('init and one session copy every closed segment, close the open one, and leave a verifiable sealed copy', t => {
   const vault = setup(t);
   vault.append([event('TEST ONLY one'), blob('TEST ONLY blob one')], true);
   vault.append([event('TEST ONLY two'), blob('TEST ONLY blob two'.repeat(4000))]);
-  const init = initSecondCopy(vault.working, vault.drive, { probe: ntfs });
-  assert.equal(init.created, true);
+  const init = vault.init();
+  assert.deepEqual([init.created, init.resumed, init.adoptedFrom], [true, false, undefined]);
   assert.equal(init.disk, 'same-volume');
-  assert.deepEqual(verifyVault(vault.drive).position.segment, 0);
+  assert.equal(readCopyIdentity(vault.drive, identity.vaultId), ID);
+  assert.equal(verifyVault(vault.drive, asCopy).position.segment, 0);
+  // A working vault never accepts a copy identity file: the opt-in is for second copies only.
+  assert.throws(() => verifyVault(vault.drive), { code: 'INVENTORY' });
   const { report, result } = vault.session();
   assert.deepEqual(report.driveHead.segment, 0);
   assert.equal(result.previous.segment, 0);
   assert.equal(result.head.segment, 2);
   assert.equal(result.segmentsCopied, 2);
   assert.equal(result.filesCopied, 8);
+  assert.equal(result.keyringWritten, true);
   assert.ok(result.bytesCopied > 18 * 4000);
-  const verified = verifyVault(vault.drive);
+  const verified = verifyVault(vault.drive, asCopy);
   assert.equal(verified.position.segment, 2);
   assert.equal(verified.position.hash, result.head.hash);
   assert.deepEqual(verifyVault(vault.working).position, verified.position);
@@ -110,29 +126,85 @@ test('init and one session copy every closed segment, close the open one, and le
   assert.equal(result.anchor.segment, 2);
   assert.equal(result.anchor.manifestHash, result.head.hash);
   assert.equal(result.anchor.signingKeyFingerprint, createHash('sha256').update(identity.signingPublicKey).digest('hex'));
-  assert.doesNotThrow(() => verifyVault(vault.drive, { anchor: result.anchor }));
-  // A second session with nothing new copies nothing and keeps the head.
+  assert.doesNotThrow(() => verifyVault(vault.drive, { anchor: result.anchor, secondCopy: true }));
+  // A second session with nothing new copies nothing, keeps the head and does not rewrite the keyring.
   const again = vault.session({ recorded: result.head });
-  assert.equal(again.result.segmentsCopied, 0);
+  assert.deepEqual([again.result.segmentsCopied, again.result.keyringWritten], [0, false]);
   assert.deepEqual(again.result.head, result.head);
   // New records are closed into segment 3 and copied.
   vault.append([event('TEST ONLY three')]);
   const third = vault.session({ recorded: result.head });
   assert.deepEqual([third.result.previous.segment, third.result.head.segment, third.result.segmentsCopied], [2, 3, 1]);
-  // Adopting an existing copy of the same vault registers it without changing it.
+  // Init again with the same record: nothing changes.
   const before = tree(vault.drive);
-  assert.equal(initSecondCopy(vault.working, vault.drive, { probe: ntfs }).created, false);
+  assert.deepEqual([vault.init().created, vault.init().resumed], [false, true]);
   assert.deepEqual(tree(vault.drive), before);
+});
+
+test('a copy has an identity: another record needs --adopt, and a session refuses a mismatched or missing id', t => {
+  const vault = setup(t);
+  vault.append([event('TEST ONLY id')], true);
+  vault.init();
+  const first = vault.session().result;
+  const before = tree(vault.drive);
+  assert.equal(inspectCopyTarget(vault.working, vault.drive, { probe: ntfs }).copyId, ID);
+  assert.throws(() => vault.init(vault.drive, { copyId: OTHER }), { code: 'COPY_MISMATCH', reason: 'adopt-required' });
+  assert.throws(() => vault.session({ copyId: OTHER, recorded: first.head }), { code: 'COPY_MISMATCH', reason: 'different' });
+  assert.deepEqual(tree(vault.drive), before);
+  // A second valid drive of the same vault cannot stand in for the first.
+  const second = join(vault.root, 'second');
+  initSecondCopy(vault.working, second, { probe: ntfs, copyId: OTHER });
+  assert.throws(() => vault.session({ recorded: null }, second), { code: 'COPY_MISMATCH', reason: 'different' });
+  // Adoption is explicit: the folder gets the new id and names the old one.
+  const adopted = vault.init(vault.drive, { copyId: OTHER, adopt: true });
+  assert.equal(adopted.adoptedFrom, ID);
+  assert.equal(readCopyIdentity(vault.drive, identity.vaultId), OTHER);
+  assert.throws(() => vault.session({ recorded: first.head }), { code: 'COPY_MISMATCH' });
+  assert.equal(vault.session({ copyId: OTHER, recorded: first.head }).result.head.segment, 1);
+  // A copy without COPY.json is refused by a session and can only be adopted.
+  makeWritable(vault.drive);
+  unlinkSync(join(vault.drive, 'COPY.json'));
+  assert.throws(() => vault.session({ copyId: OTHER, recorded: first.head }), { code: 'COPY_MISMATCH', reason: 'missing' });
+  assert.equal(vault.init(vault.drive, { copyId: ID, adopt: true }).adoptedFrom, null);
+});
+
+test('an interrupted copy init is recognised and completed; a foreign or other-record folder is not', t => {
+  const vault = setup(t);
+  const stop = new Error('TEST ONLY pulled');
+  assert.throws(() => vault.init(vault.drive, { checkpoint: () => { throw stop; } }), error => error === stop);
+  assert.deepEqual(readdirSync(vault.drive), ['COPY.json']);
+  assert.equal(inspectCopyTarget(vault.working, vault.drive, { probe: ntfs }).state, 'interrupted');
+  assert.throws(() => vault.init(vault.drive, { copyId: OTHER }), { code: 'COPY_MISMATCH', reason: 'interrupted-init' });
+  const resumed = vault.init();
+  assert.deepEqual([resumed.created, resumed.resumed], [false, true]);
+  assert.equal(verifyVault(vault.drive, asCopy).position.segment, 0);
+  // The layout half-written by initializeVault (no VAULT.json yet) is completed too.
+  const half = join(vault.root, 'half');
+  mkdirSync(join(half, 'segments'), { recursive: true });
+  writeFileSync(join(half, 'COPY.json'), readFileSync(join(vault.drive, 'COPY.json')));
+  writeFileSync(join(half, 'HEAD.json.pending'), '{');
+  assert.equal(vault.init(half).resumed, true);
+  assert.equal(verifyVault(half, asCopy).position.segment, 0);
+  // Only a pending identity file: the folder counts as empty.
+  const pending = join(vault.root, 'pending');
+  mkdirSync(pending);
+  writeFileSync(join(pending, 'COPY.json.pending'), '{');
+  assert.equal(vault.init(pending).created, true);
+  // A head without COPY.json is not Foundry's own unfinished init.
+  const foreign = join(vault.root, 'foreign-head');
+  mkdirSync(foreign);
+  writeFileSync(join(foreign, 'HEAD.json'), '{}');
+  assert.throws(() => vault.init(foreign), { code: 'TARGET_NOT_EMPTY' });
 });
 
 test('FAT file systems are refused at init and at session start, before anything is written', t => {
   const vault = setup(t);
   for (const type of ['vfat', 'msdos', 'fat32', 'fat']) {
-    assert.throws(() => initSecondCopy(vault.working, vault.drive, { probe: () => ({ type, method: 'injected' }) }),
+    assert.throws(() => vault.init(vault.drive, { probe: () => ({ type, method: 'injected' }) }),
       { name: 'SecondCopyError', code: 'FILESYSTEM_UNSUPPORTED' });
   }
   assert.throws(() => lstatSync(vault.drive), { code: 'ENOENT' });
-  initSecondCopy(vault.working, vault.drive, { probe: ntfs });
+  vault.init();
   const before = tree(vault.drive);
   assert.throws(() => vault.session({ probe: () => ({ type: 'vfat', method: 'injected' }) }), { code: 'FILESYSTEM_UNSUPPORTED' });
   assert.deepEqual(tree(vault.drive), before);
@@ -178,32 +250,49 @@ test('Windows probe asks fsutil for the drive letter with explicit arguments, an
     { type: undefined, method: 'none' });
 });
 
-test('step 3 stops on a rolled-back drive before anything on either side changes', t => {
+test('step 3 stops on a rolled-back drive before anything on either side changes (no lock, no keyring folder)', t => {
   const vault = setup(t);
   vault.append([event('TEST ONLY a')], true);
-  initSecondCopy(vault.working, vault.drive, { probe: ntfs });
+  vault.init();
   const first = vault.session().result;
   const saved = join(vault.root, 'saved');
   cpSync(vault.drive, saved, { recursive: true });
   vault.append([event('TEST ONLY b')]);
   const second = vault.session({ recorded: first.head }).result;
   assert.equal(second.head.segment, 2);
-  // Swap the drive for its older state.
-  makeWritable(vault.drive);
+  // Swap the drive for its older state, without its lock file and keyring folder.
   const restored = join(vault.root, 'restored');
   cpSync(saved, restored, { recursive: true });
+  makeWritable(restored);
+  rmSync(join(restored, 'keyring'), { recursive: true });
+  for (const name of readdirSync(restored)) if (name.startsWith('.writer.lock')) unlinkSync(join(restored, name));
   vault.append([event('TEST ONLY open record')]);
   const drive = tree(restored);
   const working = tree(vault.working);
   assert.throws(() => vault.session({ recorded: second.head }, restored), { code: 'ROLLBACK_DETECTED', reason: 'drive-older-than-recorded' });
-  assert.deepEqual(tree(restored), drive);
+  assert.deepEqual(tree(restored), drive, 'no lock file, no keyring folder, no probe');
   assert.deepEqual(tree(vault.working), working);
+});
+
+test('a lost newest segment with a surviving HEAD.json is a rollback, not head damage', t => {
+  const vault = setup(t);
+  vault.append([event('TEST ONLY one')], true);
+  vault.append([event('TEST ONLY two')], true);
+  vault.init();
+  const { result } = vault.session();
+  makeWritable(vault.drive);
+  rmSync(segmentDir(vault.drive, 2), { recursive: true });
+  const drive = tree(vault.drive);
+  assert.throws(() => vault.session({ recorded: result.head }), { code: 'ROLLBACK_DETECTED', reason: 'drive-older-than-recorded' });
+  assert.deepEqual(tree(vault.drive), drive);
+  // Without a recorded head the same drive is head damage.
+  assert.throws(() => vault.session({ recorded: null }), { code: 'COPY_VERIFY_FAILED', reason: 'HEAD' });
 });
 
 test('step 3 stops on a forked chain and on a recorded hash that differs at the same segment number', t => {
   const vault = setup(t);
   vault.append([event('TEST ONLY shared')], true);
-  initSecondCopy(vault.working, vault.drive, { probe: ntfs });
+  vault.init();
   const shared = vault.session().result;
   // A real fork: a clone of the working vault seals different events into segment 2 and is copied to the drive.
   const clone = join(vault.root, 'clone');
@@ -215,7 +304,7 @@ test('step 3 stops on a forked chain and on a recorded hash that differs at the 
   } finally {
     writer.release();
   }
-  const forkSession = openSecondCopySession(clone, vault.drive, { probe: ntfs, recorded: shared.head });
+  const forkSession = openSecondCopySession(clone, vault.drive, { probe: ntfs, copyId: ID, recorded: shared.head });
   try {
     forkSession.seal(vault.unlocked);
   } finally {
@@ -231,15 +320,15 @@ test('step 3 stops on a forked chain and on a recorded hash that differs at the 
   assert.deepEqual(tree(vault.working), working);
   // A drive that is ahead of the working vault (here: a fresh working vault with the same identity) is refused too.
   const other = setup(t);
-  assert.throws(() => openSecondCopySession(other.working, vault.drive, { probe: ntfs }),
+  assert.throws(() => openSecondCopySession(other.working, vault.drive, { probe: ntfs, copyId: ID }),
     { code: 'ROLLBACK_DETECTED', reason: 'working-older-than-drive' });
   assert.deepEqual(tree(vault.drive), drive);
 });
 
-test('a drive with a manifest hand-edited fails the keyless check (step 2) and nothing changes', t => {
+test('a drive with a stream hand-edited fails the keyless check (step 2) and nothing changes', t => {
   const vault = setup(t);
   vault.append([event('TEST ONLY x'), blob('TEST ONLY y')], true);
-  initSecondCopy(vault.working, vault.drive, { probe: ntfs });
+  vault.init();
   const { result } = vault.session();
   makeWritable(vault.drive);
   const pack = readdirSync(segmentDir(vault.drive, 1)).find(name => name.startsWith('pack-'));
@@ -254,7 +343,7 @@ test('a drive with a manifest hand-edited fails the keyless check (step 2) and n
 
 test('a drive from another vault or with changed metadata is refused', t => {
   const vault = setup(t);
-  initSecondCopy(vault.working, vault.drive, { probe: ntfs });
+  vault.init();
   const metadataPath = join(vault.drive, 'VAULT.json');
   const original = readFileSync(metadataPath, 'utf8');
   writeFileSync(metadataPath, original.replace(/"created_at":"[^"]+"/u, '"created_at":"2001-01-01T00:00:00Z"'));
@@ -266,7 +355,7 @@ test('a drive from another vault or with changed metadata is refused', t => {
 test('a write-protected drive is reported and left unchanged', { skip: process.platform === 'win32' || process.getuid?.() === 0 }, t => {
   const vault = setup(t);
   vault.append([event('TEST ONLY protected')], true);
-  initSecondCopy(vault.working, vault.drive, { probe: ntfs });
+  vault.init();
   t.after(() => makeWritable(vault.drive));
   // The drive root is read-only (no keyring folder yet).
   chmodSync(vault.drive, 0o500);
@@ -280,15 +369,20 @@ test('a write-protected drive is reported and left unchanged', { skip: process.p
   before = tree(vault.drive);
   assert.throws(() => vault.session(), { code: 'WRITE_PROTECTED' });
   assert.deepEqual(tree(vault.drive), before);
+  // Only the keyring folder is read-only.
+  chmodSync(vault.drive, 0o700);
+  before = tree(vault.drive);
+  assert.throws(() => vault.session(), { code: 'WRITE_PROTECTED' });
+  assert.deepEqual(tree(vault.drive), before);
 });
 
 test('an interrupted session at any step is finished or rolled back by the next one', t => {
-  const points = ['after-stream-files', 'after-signature', 'after-manifest-pending', 'after-head-pending',
-    'after-manifest-rename', 'after-head-update', 'after-read-only', 'after-keyring'];
+  const points = ['after-stream-files', 'after-signature', 'after-manifest-pending', 'after-manifest-rename',
+    'after-read-back', 'after-read-only', 'after-keyring', 'after-head-update'];
   for (const point of points) {
     const vault = setup(t);
     vault.append([event('TEST ONLY first'), blob('TEST ONLY first blob')], true);
-    initSecondCopy(vault.working, vault.drive, { probe: ntfs });
+    vault.init();
     const first = vault.session().result;
     vault.append([event('TEST ONLY second'), blob('TEST ONLY second blob')]);
     const stop = new Error('TEST ONLY drive pulled');
@@ -297,22 +391,112 @@ test('an interrupted session at any step is finished or rolled back by the next 
       checkpoint: (name, segment) => { if (name === point && segment >= 2) throw stop; },
     }), error => error === stop, point);
     // Segment 1 on the drive is untouched by the interrupted session.
-    assert.equal(createHash('sha256').update(readFileSync(join(segmentDir(vault.drive, 1), 'MANIFEST.json'))).digest('hex'), first.head.hash);
+    assert.equal(sha(readFileSync(join(segmentDir(vault.drive, 1), 'MANIFEST.json'))), first.head.hash);
     const next = vault.session({ recorded: first.head });
-    const early = points.indexOf(point) <= points.indexOf('after-head-pending');
-    assert.equal(next.report.removedPartialSegment, early ? 2 : undefined, point);
-    assert.equal(next.report.completedHead, point === 'after-manifest-rename', point);
+    const index = points.indexOf(point);
+    assert.equal(next.report.removedPartialSegment, index <= points.indexOf('after-manifest-pending') ? 2 : undefined, point);
+    assert.equal(next.report.completedHead, index >= points.indexOf('after-manifest-rename') && point !== 'after-head-update', point);
+    assert.equal(next.report.protectedSegments, ['after-manifest-rename', 'after-read-back'].includes(point) ? 1 : 0, point);
     assert.equal(next.result.head.segment, 2, point);
-    assert.equal(verifyVault(vault.drive, { anchor: next.result.anchor }).position.segment, 2, point);
+    assert.equal(verifyVault(vault.drive, { anchor: next.result.anchor, secondCopy: true }).position.segment, 2, point);
     assert.deepEqual(readFileSync(keyringPath(vault.drive)), readFileSync(keyringPath(vault.working)), point);
+    for (const name of readdirSync(segmentDir(vault.drive, 2))) {
+      assert.equal(statSync(join(segmentDir(vault.drive, 2), name)).mode & 0o222, 0, `${point}: ${name} read-only`);
+    }
   }
+});
+
+test('a short or stale pending head is discarded and HEAD.json is rebuilt from the verified chain', t => {
+  const vault = setup(t);
+  vault.append([event('TEST ONLY one')], true);
+  vault.init();
+  const first = vault.session().result;
+  // A durable pending head that names a segment whose folder entry was lost.
+  writeFileSync(join(vault.drive, 'HEAD.json.pending'), JSON.stringify({ manifest_sha256: 'c'.repeat(64), segment: 2 }));
+  assert.equal(vault.session({ recorded: first.head }).result.head.segment, 1);
+  assert.equal(existsSync(join(vault.drive, 'HEAD.json.pending')), false);
+  // A crash after the manifest rename, then a short pending head.
+  vault.append([event('TEST ONLY two')]);
+  const stop = new Error('TEST ONLY pulled');
+  assert.throws(() => vault.session({ recorded: first.head, checkpoint: name => { if (name === 'after-manifest-rename') throw stop; } }),
+    error => error === stop);
+  writeFileSync(join(vault.drive, 'HEAD.json.pending'), '{');
+  const next = vault.session({ recorded: first.head });
+  assert.deepEqual([next.report.completedHead, next.result.head.segment], [true, 2]);
+  assert.deepEqual(JSON.parse(readFileSync(join(vault.drive, 'HEAD.json'))).segment, 2);
+  // A HEAD.json older than the recorded head is damage, not an interrupted session.
+  makeWritable(vault.drive);
+  writeFileSync(join(vault.drive, 'HEAD.json'), JSON.stringify({ manifest_sha256: first.head.hash, segment: 1 }));
+  assert.throws(() => vault.session({ recorded: next.result.head }), { code: 'COPY_VERIFY_FAILED', reason: 'HEAD' });
+});
+
+test('read-back checks exact file names and publishes HEAD.json only after it', t => {
+  const vault = setup(t);
+  vault.append([event('TEST ONLY one'), blob('TEST ONLY blob')], true);
+  vault.init();
+  const first = vault.session().result;
+  vault.append([event('TEST ONLY two'), blob('TEST ONLY second blob')]);
+  const head = readFileSync(join(vault.drive, 'HEAD.json'));
+  assert.throws(() => vault.session({
+    recorded: first.head,
+    checkpoint: (name, segment) => {
+      if (name !== 'after-manifest-rename') return;
+      // An extra, validly framed stream in the copied folder (same file count after the pack is renamed).
+      const folder = segmentDir(vault.drive, segment);
+      renameSync(join(folder, 'pack-0001.fvr'), join(folder, 'pack-0002.fvr'));
+    },
+  }), { code: 'COPY_VERIFY_FAILED', reason: 'INVENTORY' });
+  assert.deepEqual(readFileSync(join(vault.drive, 'HEAD.json')), head, 'HEAD.json is not published before read-back');
+});
+
+test('drive entries are type-checked before use: a linked keyring folder or keyring file is refused', t => {
+  const vault = setup(t);
+  vault.append([event('TEST ONLY link')], true);
+  vault.init();
+  const first = vault.session().result;
+  const outside = join(vault.root, 'outside');
+  mkdirSync(outside);
+  writeFileSync(join(outside, 'keep.txt'), 'TEST ONLY');
+  const keyring = join(vault.drive, 'keyring');
+  renameSync(keyring, join(vault.root, 'old-keyring'));
+  symlinkSync(outside, keyring, linkKind);
+  const before = tree(outside);
+  assert.throws(() => vault.session({ recorded: first.head }), { code: 'COPY_VERIFY_FAILED', reason: 'INVENTORY' });
+  assert.deepEqual(tree(outside), before, 'nothing written through the link');
+  // Remove only the link itself (a junction is removed like an empty folder; never a recursive delete).
+  if (process.platform === 'win32') rmdirSync(keyring); else unlinkSync(keyring);
+  renameSync(join(vault.root, 'old-keyring'), keyring);
+  // A folder planted at the keyring file's name, and an unknown entry, are refused too.
+  unlinkSync(join(keyring, 'keyring.json'));
+  mkdirSync(join(keyring, 'keyring.json'));
+  assert.throws(() => vault.session({ recorded: first.head }), { code: 'COPY_VERIFY_FAILED', reason: 'INVENTORY' });
+  rmSync(join(keyring, 'keyring.json'), { recursive: true });
+  writeFileSync(join(keyring, 'notes.txt'), 'TEST ONLY');
+  assert.throws(() => vault.session({ recorded: first.head }), { code: 'COPY_VERIFY_FAILED', reason: 'INVENTORY' });
+  unlinkSync(join(keyring, 'notes.txt'));
+  assert.equal(vault.session({ recorded: first.head }).result.keyringWritten, true);
+});
+
+test('a large planted keyring file on the drive is replaced without being read whole', t => {
+  const vault = setup(t);
+  vault.init();
+  vault.session();
+  const planted = keyringPath(vault.drive);
+  writeFileSync(planted, Buffer.alloc(4 * 1024 * 1024, 0x20));
+  assert.equal(vault.session().result.keyringWritten, true);
+  assert.deepEqual(readFileSync(planted), readFileSync(keyringPath(vault.working)));
+  // Same size, different bytes: compared and replaced.
+  const working = readFileSync(keyringPath(vault.working));
+  writeFileSync(planted, Buffer.alloc(working.length, 0x20));
+  assert.equal(vault.session().result.keyringWritten, true);
+  assert.deepEqual(readFileSync(planted), working);
 });
 
 test('an unfinished folder at a recorded segment number is never removed (rollback STOP instead)', t => {
   const vault = setup(t);
   vault.append([event('TEST ONLY one')], true);
   vault.append([event('TEST ONLY two')], true);
-  initSecondCopy(vault.working, vault.drive, { probe: ntfs });
+  vault.init();
   const { result } = vault.session();
   makeWritable(vault.drive);
   unlinkSync(join(segmentDir(vault.drive, 2), 'MANIFEST.json'));
@@ -324,7 +508,7 @@ test('an unfinished folder at a recorded segment number is never removed (rollba
 test('damage in the working vault stops the copy and leaves the earlier drive segments untouched', t => {
   const vault = setup(t);
   vault.append([event('TEST ONLY good')], true);
-  initSecondCopy(vault.working, vault.drive, { probe: ntfs });
+  vault.init();
   const { result } = vault.session();
   vault.append([event('TEST ONLY will be damaged'), blob('TEST ONLY damaged blob')], true);
   makeWritable(vault.working);
@@ -336,22 +520,18 @@ test('damage in the working vault stops the copy and leaves the earlier drive se
   const segmentOne = tree(segmentDir(vault.drive, 1));
   assert.throws(() => vault.session({ recorded: result.head }), { code: 'WORKING_VAULT_DAMAGED', reason: 'FILE_HASH' });
   assert.deepEqual(tree(segmentDir(vault.drive, 1)), segmentOne);
-  assert.equal(readCopyHead(vault.drive), result.head.hash);
+  assert.equal(JSON.parse(readFileSync(join(vault.drive, 'HEAD.json'))).manifest_sha256, result.head.hash);
 });
-
-function readCopyHead(drive) {
-  return JSON.parse(readFileSync(join(drive, 'HEAD.json'))).manifest_sha256;
-}
 
 test('the copy must be its own folder: not a volume root, not around or inside the vault, not a foreign folder', t => {
   const vault = setup(t);
-  assert.throws(() => initSecondCopy(vault.working, parse(vault.root).root, { probe: ntfs }), { code: 'TARGET_UNSUITABLE', reason: 'volume-root' });
-  assert.throws(() => initSecondCopy(vault.working, join(vault.working, 'segments', 'copy'), { probe: ntfs }), { code: 'TARGET_UNSUITABLE' });
-  assert.throws(() => initSecondCopy(vault.working, vault.root, { probe: ntfs }), { code: 'TARGET_UNSUITABLE' });
+  assert.throws(() => vault.init(parse(vault.root).root), { code: 'TARGET_UNSUITABLE', reason: 'volume-root' });
+  assert.throws(() => vault.init(join(vault.working, 'segments', 'copy')), { code: 'TARGET_UNSUITABLE' });
+  assert.throws(() => vault.init(vault.root), { code: 'TARGET_UNSUITABLE' });
   const foreign = join(vault.root, 'foreign');
   mkdirSync(foreign);
   writeFileSync(join(foreign, 'notes.txt'), 'TEST ONLY');
-  assert.throws(() => initSecondCopy(vault.working, foreign, { probe: ntfs }), { code: 'TARGET_NOT_EMPTY' });
+  assert.throws(() => vault.init(foreign), { code: 'TARGET_NOT_EMPTY' });
   assert.throws(() => vault.session({}, foreign), { code: 'NOT_A_COPY' });
   assert.throws(() => vault.session({}, join(vault.root, 'missing')), { code: 'NOT_A_COPY' });
   assert.equal(diskRelation(vault.working, vault.root), 'same-volume');
@@ -361,16 +541,16 @@ test('placement is checked on canonical paths: a link to the vault and a child n
   const vault = setup(t);
   // A directory junction on Windows, a symbolic link elsewhere: the same bug class as a Windows short (8.3) name.
   const link = join(vault.root, 'link-to-working');
-  symlinkSync(vault.working, link, process.platform === 'win32' ? 'junction' : 'dir');
+  symlinkSync(vault.working, link, linkKind);
   for (const target of [join(link, 'new-copy'), join(link, 'segments', 'deep', 'copy'), join(vault.working, '..copy'),
     join(vault.working, '..', 'working', 'x')]) {
-    assert.throws(() => initSecondCopy(vault.working, target, { probe: ntfs }), { code: 'TARGET_UNSUITABLE', reason: 'overlaps-vault' }, target);
+    assert.throws(() => vault.init(target), { code: 'TARGET_UNSUITABLE', reason: 'overlaps-vault' }, target);
     assert.throws(() => openSecondCopySession(vault.working, target, { probe: ntfs }), { code: 'TARGET_UNSUITABLE' }, target);
   }
   // The vault reached through the link is the same vault: a folder around it is refused too.
-  assert.throws(() => initSecondCopy(link, vault.root, { probe: ntfs }), { code: 'TARGET_UNSUITABLE' });
+  assert.throws(() => initSecondCopy(link, vault.root, { probe: ntfs, copyId: ID }), { code: 'TARGET_UNSUITABLE' });
   // A sibling whose name only starts with the vault's name is outside it.
-  assert.equal(initSecondCopy(vault.working, join(vault.root, 'working-copy'), { probe: ntfs }).created, true);
+  assert.equal(vault.init(join(vault.root, 'working-copy')).created, true);
   assert.equal(pathInside(vault.working, join(link, 'x')), true);
   assert.equal(pathInside(vault.working, join(vault.root, 'working-copy')), false);
   assert.equal(pathInside('C:\\vault', 'c:\\VAULT\\..x', 'win32'), true);
@@ -378,13 +558,16 @@ test('placement is checked on canonical paths: a link to the vault and a child n
   assert.equal(pathInside('/srv/vault', '/srv/vault2', 'linux'), false);
 });
 
-test('the working-device register: strict format, labels, selection, seal record and the 14-day banner', t => {
+test('the working-device register: strict format, labels, selection, seal record, size limit and the 14-day banner', t => {
   const vault = setup(t);
   const path = join(vault.root, 'second-copies.json');
   const id = identity.vaultId;
-  const empty = readCopyRegister(path, id);
-  assert.deepEqual(empty, emptyRegister(id));
-  assert.equal(copyRegisterStatus(empty, new Date()).banner.includes('No second copy'), true);
+  const missing = readCopyRegister(path, id);
+  assert.deepEqual(missing, emptyRegister(id, true), 'a missing register is flagged for a keyed rebuild');
+  assert.match(copyRegisterStatus(missing, new Date()).banner, /No second copy is recorded on this device/u);
+  assert.deepEqual(loadCopyRegister(path, id), { register: emptyRegister(id, true), readable: false, rebuild: true });
+  const empty = emptyRegister(id);
+  assert.match(copyRegisterStatus(empty, new Date()).banner, /No second copy is set up/u);
   assert.throws(() => selectCopy(empty), { code: 'COPY_UNKNOWN' });
   const created = new Date('2026-01-01T00:00:00Z');
   let { register, copy } = addCopyRecord(empty, undefined, created);
@@ -393,6 +576,7 @@ test('the working-device register: strict format, labels, selection, seal record
   for (const bad of ['', 'has space', '../x', 'x'.repeat(33), 'é']) assert.throws(() => addCopyRecord(register, bad, created), { code: 'INVALID_LABEL' });
   writeCopyRegister(path, register);
   assert.deepEqual(readCopyRegister(path, id), register);
+  assert.deepEqual(loadCopyRegister(path, id), { register, readable: true, rebuild: false });
   assert.throws(() => readCopyRegister(path, 'f'.repeat(32)), { code: 'REGISTER' });
   assert.equal(selectCopy(register).copy_id, copy.copy_id);
   const second = addCopyRecord(register, 'offsite', created).register;
@@ -414,8 +598,59 @@ test('the working-device register: strict format, labels, selection, seal record
   const manual = { ...sealed, cadence: 'manual' };
   assert.equal(copyRegisterStatus(manual, new Date('2026-01-12T00:00:00Z')).due, false);
   assert.equal(copyRegisterStatus(manual, new Date('2026-01-17T00:00:00Z')).overdue, true);
+  // The writer refuses a register larger than the reader's limit, and the last readable one stays.
+  const before = readFileSync(path);
+  const bulk = Array.from({ length: 9000 }, (_, n) => ({
+    copy_id: n.toString(16).padStart(32, '0'), label: `bulk-${n}`, created_at: '2026-01-01T00:00:00Z', head: null, keyring: null,
+  }));
+  const big = { ...sealed, copies: [...sealed.copies, ...bulk] };
+  assert.ok(Buffer.byteLength(JSON.stringify(big)) > MAX_REGISTER_BYTES);
+  assert.throws(() => writeCopyRegister(path, big), { code: 'REGISTER', reason: 'too-large' });
+  assert.deepEqual(readFileSync(path), before);
+  assert.deepEqual(readdirSync(vault.root).filter(name => name.startsWith('second-copies')), ['second-copies.json']);
   writeFileSync(path, readFileSync(path, 'utf8').replace('"weekly"', '"hourly"'));
   assert.throws(() => readCopyRegister(path, id), { code: 'REGISTER' });
+  assert.deepEqual(loadCopyRegister(path, id).rebuild, true, 'a damaged register is rebuilt by a keyed command');
   writeFileSync(path, ' {}');
   assert.throws(() => readCopyRegister(path, id), { code: 'REGISTER' });
+});
+
+test('the register is rebuilt from copy.registered and copy.sealed events, idempotently', t => {
+  const vault = setup(t);
+  const id = identity.vaultId;
+  const copy = { copy_id: ID, label: 'offsite', created_at: '2026-01-01T00:00:00Z', head: null, keyring: null };
+  const seal = {
+    previous: { segment: 0, hash: '0'.repeat(64) }, head: { segment: 3, hash: 'd'.repeat(64) }, sealedAt: '2026-01-02T00:00:00Z',
+    segmentsCopied: 3, filesCopied: 9, bytesCopied: 900, keyringVersion: 2,
+  };
+  const events = [
+    { kind: COPY_REGISTERED, ts: '2026-01-01T00:00:00Z', body: copyRegisteredBody(copy, 'monthly', undefined) },
+    { kind: COPY_SEALED, ts: '2026-01-02T00:00:00Z', body: copySealedBody(copy, 'monthly', seal) },
+    { kind: COPY_SEALED, ts: '2026-01-02T00:00:00Z', body: copySealedBody(copy, 'monthly', seal) },
+    { kind: COPY_REGISTERED, ts: 'not a time', body: {} },
+    { kind: 'vault.created', ts: '2026-01-03T00:00:00Z', body: { marker: 'TEST ONLY' } },
+  ];
+  const rebuilt = registerFromEvents(id, events);
+  assert.equal(rebuilt.cadence, 'monthly');
+  assert.equal(rebuilt.needs_replay, false);
+  assert.deepEqual(rebuilt.copies, [{
+    ...copy, head: { segment: 3, manifest_sha256: 'd'.repeat(64), sealed_at: '2026-01-02T00:00:00Z' },
+    keyring: { version: 2, written_at: '2026-01-02T00:00:00Z' },
+  }]);
+  assert.deepEqual(registerFromEvents(id, [...events, ...events]), rebuilt, 'the same events twice give the same register');
+  // A readable register keeps its cadence and last check (they are set by keyless commands).
+  const base = { ...emptyRegister(id, true), cadence: 'daily', last_check: { checked_at: '2026-01-04T00:00:00Z', verify: 'ok' } };
+  assert.deepEqual([registerFromEvents(id, events, base).cadence, registerFromEvents(id, events, base).last_check], ['daily', base.last_check]);
+  // Adoption: a new record whose event names the old id.
+  assert.deepEqual(copyRegisteredBody({ ...copy, copy_id: OTHER }, 'weekly', ID),
+    { copy_id: OTHER, label: 'offsite', cadence: 'weekly', adopted: true, previous_copy_id: ID });
+  // The real thing: events in the working vault, replayed with a credential (read-only).
+  vault.append(events.slice(0, 2).map(item => ({
+    type: 'event', keyId, event: { ts: item.ts, kind: item.kind, profile: 'me', collection: 'system', sensitivity: 'personal', body: item.body },
+  })), true);
+  vault.append([{ type: 'event', keyId, event: { kind: COPY_SEALED, profile: 'partner', collection: 'system', ts: '2026-01-05T00:00:00Z', body: copySealedBody({ ...copy, copy_id: OTHER, label: 'other' }, 'daily', seal) } }]);
+  const before = tree(vault.working);
+  const replayed = replayCopyRegister(vault.working, { recoveryKey: Buffer.from(cases.recovery_key, 'hex') });
+  assert.deepEqual(replayed, rebuilt, 'only me/system copy events count');
+  assert.deepEqual(tree(vault.working), before, 'the replay writes nothing');
 });

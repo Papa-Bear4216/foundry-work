@@ -45,7 +45,8 @@ test('commands, default timeouts, --timeout bounds and filters', () => {
     'import': 21600,
     'index rebuild': 21600,
     // P-3 second-copy commands.
-    'vault copy init': 120,
+    // Keyed since fix round 1: it may replay the vault to rebuild a missing register.
+    'vault copy init': 600,
     'vault status': 120,
     'vault schedule set': 120,
     'vault schedule status': 120,

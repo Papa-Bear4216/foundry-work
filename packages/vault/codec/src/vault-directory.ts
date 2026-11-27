@@ -34,6 +34,8 @@ export interface VaultAnchor {
 
 export interface VerifyOptions {
   anchor?: VaultAnchor;
+  /** P-3: the folder is a Mode B second copy, so its root may hold `COPY.json` (A-44). */
+  secondCopy?: boolean;
 }
 
 export function statIfPresent(path: string): ReturnType<typeof lstatSync> | undefined {
@@ -78,9 +80,18 @@ export function removePending(path: string): boolean {
   return true;
 }
 
-export function checkRootInventory(directory: string): void {
+/** P-3 (A-44): the copy identity file in the root of a Mode B second copy, and its pending name. */
+export const COPY_IDENTITY = 'COPY.json';
+export const COPY_IDENTITY_PENDING = COPY_IDENTITY + '.pending';
+
+/**
+ * The root may hold only these entries (links are refused: a Dirent of a link is neither a file nor a folder).
+ * `secondCopy` (P-3 second copies only) also allows the copy identity file; a working vault never holds one.
+ */
+export function checkRootInventory(directory: string, secondCopy = false): void {
   const directories = ['keyring', 'segments', 'open'];
-  const files = [VAULT_METADATA, HEAD, HEAD_PENDING, LOCK, LOCK + '-journal', LOCK + '-wal', LOCK + '-shm'];
+  const files = [VAULT_METADATA, HEAD, HEAD_PENDING, LOCK, LOCK + '-journal', LOCK + '-wal', LOCK + '-shm',
+    ...(secondCopy ? [COPY_IDENTITY, COPY_IDENTITY_PENDING] : [])];
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     check((entry.isDirectory() && directories.includes(entry.name)) || (entry.isFile() && files.includes(entry.name)),
       'INVENTORY');

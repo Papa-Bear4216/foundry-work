@@ -58,6 +58,8 @@ export interface CommandRequest {
   includeKeyring?: boolean;
   cadence?: string;
   verifyChain?: boolean;
+  /** `vault copy init --adopt`: take over a copy of this vault that holds another copy id (R18-3). */
+  adopt?: boolean;
   /** Keyed commands: which secret unlocks the vault. */
   credential?: 'passphrase' | 'recovery';
   secrets: CommandSecrets;
@@ -1005,51 +1007,161 @@ function diskWarning(ctx: Context, relation: string): void {
   }
 }
 
+type VaultModule = typeof import('vault');
+type CopyRegisterValue = ReturnType<VaultModule['readCopyRegister']>;
+
+/**
+ * Keyed commands: the register, rebuilt from a read-only replay of the `copy.*` events when it is missing, damaged
+ * or flagged (R18-2). Nothing is written here; the caller writes the register after its event.
+ */
+async function keyedRegister(ctx: Context, session: UnlockSession, id: string): Promise<CopyRegisterValue> {
+  const vault = await import('vault');
+  const state = vault.loadCopyRegister(registerPath(ctx), id);
+  if (!state.rebuild) return state.register;
+  try {
+    return vault.replayCopyRegister(ctx.paths.vault, { session }, state.readable ? state.register : undefined);
+  } catch (error) {
+    if (error instanceof Error && error.name === 'VaultFormatError') {
+      throw new CliError('REGISTER', 'the second-copy register must be rebuilt from the vault, and the vault could not be '
+        + 'read (an unfinished write is finished by `foundry profile list`); then repeat this command');
+    }
+    throw error;
+  }
+}
+
+/** Append one `copy.*` event under `me`'s `system` key (counts, ids and hashes only). */
+async function appendCopyEvent(
+  ctx: Context, session: UnlockSession, id: string, keyId: string, kind: string, ts: string, body: Record<string, unknown>,
+): Promise<void> {
+  const vault = await import('vault');
+  const unlocked = vault.decodeKeyring(readKeyring(ctx), { session }, id);
+  try {
+    const writer = vault.VaultWriter.open(ctx.paths.vault, unlocked);
+    try {
+      writer.appendBatch([{ type: 'event', keyId, event: { ts, kind, profile: PROFILE, collection: 'system', sensitivity: 'personal', body } }]);
+    } finally {
+      writer.release();
+    }
+  } finally {
+    unlocked.masterKey.fill(0);
+    for (const key of unlocked.keys.values()) key.fill(0);
+  }
+}
+
+/** `me`'s `system` collection key (created on first use), for the `copy.*` events. */
+async function systemKeyId(ctx: Context, session: UnlockSession, id: string): Promise<string> {
+  const vault = await import('vault');
+  const keyId = vault.ensureCollectionKeys(ctx.paths.keyring, id, { session }, PROFILE, ['system']).keyIds.get('system');
+  if (keyId === undefined) throw new CliError('INTERNAL', 'internal error: the system collection key is missing');
+  return keyId;
+}
+
 async function copyInitCommand(ctx: Context): Promise<void> {
   const vault = await import('vault');
-  const id = await vaultId(ctx);
-  // Read (and so validate) the register and the label before the drive is touched.
-  const register = vault.readCopyRegister(registerPath(ctx), id);
-  const added = vault.addCopyRecord(register, ctx.request.label, nowOf(ctx));
-  stall(ctx.hooks);
-  const result = vault.initSecondCopy(ctx.paths.vault, ctx.request.target!, targetOptions(ctx));
-  vault.writeCopyRegister(registerPath(ctx), added.register);
-  fileSystemNotice(ctx, result.fileSystem);
-  diskWarning(ctx, result.disk);
-  const summary = {
-    ok: true, label: added.copy.label, copyId: added.copy.copy_id, created: result.created,
-    fileSystem: result.fileSystem.type ?? null, disk: result.disk,
-  };
-  if (ctx.request.json) ctx.out(summary);
-  else {
-    ctx.out(`Second copy "${summary.label}" is ${summary.created ? 'ready' : 'registered (the folder already held a copy of this vault)'}.\n`
+  const target = ctx.request.target!;
+  const label = ctx.request.label;
+  await keyed(ctx, async (session, id) => {
+    // `copy init` compares no chain head, so the working vault may finish an earlier interrupted write first.
+    await recoverVaultWriter(ctx, session, id);
+    const path = registerPath(ctx);
+    let register = await keyedRegister(ctx, session, id);
+    // Keyless and read-only: placement, file system, and what the folder holds.
+    const inspected = vault.inspectCopyTarget(ctx.paths.vault, target, targetOptions(ctx));
+    let copy: CopyRegisterValue['copies'][number];
+    let adoptedFrom: string | null | undefined;
+    let registered = false;
+    const known = inspected.copyId === undefined ? undefined : register.copies.find(entry => entry.copy_id === inspected.copyId);
+    if (known) {
+      // This record's own folder (complete, or an interrupted init): finish it, no new record.
+      if (label !== undefined && vault.assertCopyLabel(label) !== known.label) throw new vault.SecondCopyError('COPY_MISMATCH', 'label');
+      copy = known;
+    } else if (inspected.state === 'copy') {
+      if (!ctx.request.adopt) throw new vault.SecondCopyError('COPY_MISMATCH', 'adopt-required');
+      adoptedFrom = inspected.copyId ?? null;
+      ({ register, copy } = vault.addCopyRecord(register, label, nowOf(ctx)));
+      registered = true;
+    } else if (inspected.state === 'interrupted') {
+      // Another record's (or device's) unfinished init: not this device's to finish.
+      throw new vault.SecondCopyError('COPY_MISMATCH', 'interrupted-init');
+    } else {
+      const unsealed = label === undefined ? undefined : register.copies.find(entry => entry.label === label && entry.head === null);
+      if (unsealed) {
+        // The record exists (its event and register write happened) but its folder was never finished.
+        copy = unsealed;
+      } else {
+        ({ register, copy } = vault.addCopyRecord(register, label, nowOf(ctx)));
+        registered = true;
+      }
+    }
+    stall(ctx.hooks);
+    if (registered) {
+      // Events first, register second (R18-2): flag the register, append `copy.registered`, then write it.
+      const keyId = await systemKeyId(ctx, session, id);
+      const previous = { ...register, copies: register.copies.filter(entry => entry.copy_id !== copy.copy_id) };
+      vault.writeCopyRegister(path, { ...previous, needs_replay: true });
+      await appendCopyEvent(ctx, session, id, keyId, vault.COPY_REGISTERED, copy.created_at,
+        vault.copyRegisteredBody(copy, register.cadence, adoptedFrom));
+    }
+    vault.writeCopyRegister(path, { ...register, needs_replay: false });
+    const result = vault.initSecondCopy(ctx.paths.vault, target, {
+      ...targetOptions(ctx), copyId: copy.copy_id, adopt: adoptedFrom !== undefined,
+    });
+    fileSystemNotice(ctx, result.fileSystem);
+    diskWarning(ctx, result.disk);
+    const summary = {
+      ok: true, label: copy.label, copyId: copy.copy_id, created: result.created, resumed: result.resumed,
+      adoptedFrom: adoptedFrom ?? null, adopted: adoptedFrom !== undefined,
+      fileSystem: result.fileSystem.type ?? null, disk: result.disk,
+    };
+    if (ctx.request.json) {
+      ctx.out(summary);
+      return;
+    }
+    const state = adoptedFrom !== undefined
+      ? `adopted: the folder's copy id ${adoptedFrom ?? '(none)'} is replaced by ${copy.copy_id}`
+      : result.created ? 'ready' : 'ready (an earlier copy init of this record was finished)';
+    ctx.out(`Second copy "${summary.label}" is ${state}.\n`
       + `Next: run \`foundry vault seal <folder>\` to copy the vault to it.\n`);
+  });
+}
+
+/** The record a session acts on: `--copy`, else the one whose id the drive's `COPY.json` names, else the only one. */
+function selectSessionCopy(vault: VaultModule, register: CopyRegisterValue, ctx: Context, id: string) {
+  if (ctx.request.copyLabel !== undefined) return vault.selectCopy(register, ctx.request.copyLabel);
+  let driveId: string | undefined;
+  try {
+    driveId = vault.readCopyIdentity(ctx.request.target!, id);
+  } catch {
+    driveId = undefined; // The session's own phase 1 reports what is wrong with the drive.
   }
+  return register.copies.find(entry => entry.copy_id === driveId) ?? vault.selectCopy(register);
 }
 
 async function sealCommand(ctx: Context): Promise<void> {
   const vault = await import('vault');
   const target = ctx.request.target!;
   await keyed(ctx, async (session, id) => {
-    // An earlier command may have stopped inside a segment seal: the writer completes or rolls it back first.
-    await recoverVaultWriter(ctx, session, id);
     const path = registerPath(ctx);
-    let register = vault.readCopyRegister(path, id);
-    const copy = vault.selectCopy(register, ctx.request.copyLabel);
+    // Read-only so far: the register (or its replay) and the selected record.
+    let register = await keyedRegister(ctx, session, id);
+    const copy = selectSessionCopy(vault, register, ctx, id);
     const recorded = copy.head === null ? null : { segment: copy.head.segment, hash: copy.head.manifest_sha256 };
-    // Steps 1 to 3 (keyless): file system, write-protect, keyless check of the drive, rollback and tamper STOP.
+    // Steps 1 to 3 (keyless, read-only), then the drive's lock and its recovery (R18-2).
     const copySession = vault.openSecondCopySession(ctx.paths.vault, target, {
-      recorded, ...targetOptions(ctx), ...(ctx.hooks.copyCheckpoint ? { checkpoint: ctx.hooks.copyCheckpoint } : {}),
+      recorded, copyId: copy.copy_id, ...targetOptions(ctx),
+      ...(ctx.hooks.copyCheckpoint ? { checkpoint: ctx.hooks.copyCheckpoint } : {}),
     });
     let result: ReturnType<typeof copySession.seal>;
-    let keyId: string | undefined;
+    let keyId: string;
     try {
       fileSystemNotice(ctx, copySession.report.fileSystem);
       diskWarning(ctx, copySession.report.disk);
-      // After step 3 and before the keyring copy (step 7): `me`'s `system` key for the `copy.sealed` event exists,
-      // so the keyring on the drive already holds it.
-      keyId = vault.ensureCollectionKeys(ctx.paths.keyring, id, { session }, PROFILE, ['system']).keyIds.get('system');
-      if (keyId === undefined) throw new CliError('INTERNAL', 'internal error: the system collection key is missing');
+      // Working-device writes start only now, after the drive passed steps 1 to 3: an earlier command may have
+      // stopped inside a segment seal, and the writer completes or rolls it back.
+      await recoverVaultWriter(ctx, session, id);
+      // Before the keyring copy (step 7): `me`'s `system` key for the `copy.sealed` event exists, so the keyring on
+      // the drive already holds it.
+      keyId = await systemKeyId(ctx, session, id);
       const unlocked = vault.decodeKeyring(readKeyring(ctx), { session }, id);
       try {
         stall(ctx.hooks);
@@ -1061,30 +1173,12 @@ async function sealCommand(ctx: Context): Promise<void> {
     } finally {
       copySession.release();
     }
+    // Step 8, events first and register second (R18-2): a crash between them leaves the register flagged, and the
+    // next keyed second-copy command rebuilds it from the events.
+    vault.writeCopyRegister(path, { ...register, needs_replay: true });
+    await appendCopyEvent(ctx, session, id, keyId, vault.COPY_SEALED, result.sealedAt, vault.copySealedBody(copy, register.cadence, result));
     register = vault.recordSeal(register, copy.copy_id, result);
-    vault.writeCopyRegister(path, register);
-    // The working vault records the seal: counts and hashes only, under `me`'s `system` key.
-    const unlocked = vault.decodeKeyring(readKeyring(ctx), { session }, id);
-    try {
-      const writer = vault.VaultWriter.open(ctx.paths.vault, unlocked);
-      try {
-        writer.appendBatch([{
-          type: 'event', keyId, event: {
-            ts: result.sealedAt, kind: 'copy.sealed', profile: PROFILE, collection: 'system', sensitivity: 'personal',
-            body: {
-              copy_id: copy.copy_id, previous_segment: result.previous.segment, segment: result.head.segment,
-              manifest_sha256: result.head.hash, segments_copied: result.segmentsCopied, files_copied: result.filesCopied,
-              bytes_copied: result.bytesCopied, keyring_version: result.keyringVersion,
-            },
-          },
-        }]);
-      } finally {
-        writer.release();
-      }
-    } finally {
-      unlocked.masterKey.fill(0);
-      for (const key of unlocked.keys.values()) key.fill(0);
-    }
+    vault.writeCopyRegister(path, { ...register, needs_replay: false });
     if (ctx.request.anchorSvg !== undefined) {
       const svg = ctx.request.anchorSvg;
       const fs = await import('node:fs');
@@ -1129,7 +1223,8 @@ async function statusCommand(ctx: Context): Promise<void> {
   const vault = await import('vault');
   const id = await vaultId(ctx);
   stall(ctx.hooks);
-  const register = vault.readCopyRegister(registerPath(ctx), id);
+  // Keyless: a missing or damaged register cannot be replayed here, so it is reported as "rebuild needed" (R18-2).
+  const { register } = vault.loadCopyRegister(registerPath(ctx), id);
   const status = vault.copyRegisterStatus(register, nowOf(ctx), keyringVersionOf(ctx));
   if (ctx.request.json) {
     ctx.out({ ...status, lastCheck: register.last_check });

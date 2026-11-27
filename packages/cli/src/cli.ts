@@ -119,8 +119,7 @@ async function readSecrets(run: Run, fd: number, terminal: PromptIo, secrets: Co
   track: (read: StdinRead) => void, trackPrompt: (pending: Cancellable) => void): Promise<CommandRequest['credential']> {
   switch (run.command) {
     case 'vault verify':
-    // P-3: keyless second-copy commands (only `vault seal` and `vault session` read a key).
-    case 'vault copy init':
+    // P-3: keyless second-copy commands (only `vault copy init`, `vault seal` and `vault session` read a key).
     case 'vault status':
     case 'vault reminder':
     case 'vault export-iso':
@@ -374,6 +373,7 @@ export async function runCli(argv: readonly string[], options: RunOptions = {}):
       includeKeyring: run.includeKeyring,
       cadence: run.cadence,
       verifyChain: run.verifyChain,
+      adopt: run.adopt,
       credential: isKeyed(run.command) ? credential : undefined,
       secrets,
     };

@@ -102,6 +102,8 @@ declare module 'node:fs' {
   export function statfsSync(path: string): { type: number };
   export const realpathSync: { (path: string): string; native(path: string): string };
   export function openSync(path: string, flags: 'w' | 'wx' | 'wx+' | 'r', mode?: number): number;
+  export function accessSync(path: string, mode: number): void;
+  export const constants: { readonly W_OK: number };
 }
 
 declare module 'node:path' {

@@ -15,6 +15,7 @@ const credential = { recoveryKey: Buffer.from(cases.recovery_key, 'hex') };
 const vault = join(root, 'vault');
 const drive = join(root, 'drive');
 const ntfs = () => ({ type: 'ntfs', method: 'injected' });
+const copyId = 'a1'.repeat(16);
 const unlock = () => decodeKeyring(readFileSync(join(vault, 'keyring', 'keyring.json')), credential, cases.metadata.vault_id);
 
 if (command === 'prepare') {
@@ -26,13 +27,13 @@ if (command === 'prepare') {
   } finally {
     writer.release();
   }
-  initSecondCopy(vault, drive, { probe: ntfs });
+  initSecondCopy(vault, drive, { probe: ntfs, copyId });
 } else if (command === 'seal') {
-  // Keyed, as oundry vault seal runs it: one passphrase unlock (production scrypt settings, one KDF run), then
+  // Keyed, as `foundry vault seal` runs it: one passphrase unlock (production scrypt settings, one KDF run), then
   // close the open segment, copy it, re-hash it and copy the keyring.
   resetKdfCallCountForTest();
   const unlockSession = unlockVault(join(vault, 'keyring', 'keyring.json'), cases.metadata.vault_id, { passphrase: cases.passphrase });
-  const session = openSecondCopySession(vault, drive, { probe: ntfs });
+  const session = openSecondCopySession(vault, drive, { probe: ntfs, copyId });
   let result;
   try {
     result = session.seal(decodeKeyring(readFileSync(join(vault, 'keyring', 'keyring.json')), { session: unlockSession }, cases.metadata.vault_id));
@@ -45,9 +46,9 @@ if (command === 'prepare') {
   console.log(JSON.stringify({ bytes: result.bytesCopied, kdf: 1, peakRssKiB: process.resourceUsage().maxRSS }));
 } else if (command === 'session-check') {
   // Keyless steps 1 to 3 on a drive that already holds the 256 MiB segment.
-  const session = openSecondCopySession(vault, drive, { probe: ntfs, recorded: null });
+  const session = openSecondCopySession(vault, drive, { probe: ntfs, copyId, recorded: null });
   session.release();
-  assert.equal(verifyVault(drive).position.segment, session.report.driveHead.segment);
+  assert.equal(verifyVault(drive, { secondCopy: true }).position.segment, session.report.driveHead.segment);
   console.log(JSON.stringify({ bytes: 0, peakRssKiB: process.resourceUsage().maxRSS }));
 } else if (command === 'export-iso') {
   const result = exportVaultIso(vault, join(root, 'vault.iso'));

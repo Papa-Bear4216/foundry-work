@@ -1,6 +1,6 @@
 // TEST ONLY: `foundry vault` second-copy, export and reminder commands (P-3). Every vault, secret and path is synthetic.
 import assert from 'node:assert/strict';
-import { cpSync, existsSync, readFileSync, statSync } from 'node:fs';
+import { cpSync, existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { verifyVault } from 'vault';
@@ -22,7 +22,13 @@ async function seal(dir, home, drive, extra = [], hooks = { secondCopyProbe: ntf
   return runInline(dir, ['vault', 'seal', drive, '--vault', home, '--passphrase-stdin', ...extra], { stdin: `${PASSPHRASE}\n`, hooks });
 }
 
-test('P-3 commands parse with explicit words, keyed only for seal and session, and refuse extra arguments', () => {
+/** `vault copy init` is keyed since fix round 1: it appends `copy.registered` before it writes the register. */
+async function copyInit(dir, home, drive, extra = [], hooks = { secondCopyProbe: ntfs }) {
+  return runInline(dir, ['vault', 'copy', 'init', drive, '--vault', home, '--passphrase-stdin', ...extra], { stdin: `${PASSPHRASE}\n`, hooks });
+}
+
+test('P-3 commands parse with explicit words, keyed only for copy init, seal and session, and refuse extra arguments', () => {
+  assert.equal(parse(['vault', 'copy', 'init', 'D:/copy', '--adopt']).adopt, true);
   assert.equal(parse(['vault', 'copy', 'init', 'D:/copy']).command, 'vault copy init');
   assert.equal(parse(['vault', 'copy', 'init', 'D:/copy']).target, 'D:/copy');
   assert.equal(parse(['vault', 'copy', 'init', 'D:/copy', '--label', 'offsite']).label, 'offsite');
@@ -46,13 +52,13 @@ test('P-3 commands parse with explicit words, keyed only for seal and session, a
   assert.equal(parse(['vault', 'reset-passphrase']).command, 'vault reset-passphrase');
 });
 
-test('copy init, seal, status: one KDF run, a verifiable copy, the anchor, the copy.sealed event and no echoed path', async t => {
+test('copy init, seal, status: one KDF run each, a verifiable copy, the anchor, the copy.sealed event and no echoed path', async t => {
   const dir = scratch(t);
   const { home } = await initVault(dir);
   const drive = join(dir, 'drive-TEST-ONLY-marker');
-  const init = await runInline(dir, ['vault', 'copy', 'init', drive, '--vault', home, '--label', 'offsite'], { hooks: { secondCopyProbe: ntfs } });
+  const init = await copyInit(dir, home, drive, ['--label', 'offsite']);
   assert.equal(init.code, 0, init.stderr);
-  assert.equal(init.kdf, 0);
+  assert.equal(init.kdf, 1);
   assert.match(init.stdout, /Second copy "offsite" is ready/u);
   assert.match(init.stderr, /same disk as this vault/u, 'the same-disk warning');
   await addEvent(dir, home);
@@ -67,7 +73,7 @@ test('copy init, seal, status: one KDF run, a verifiable copy, the anchor, the c
   for (const output of [init.stdout, init.stderr, first.stdout, first.stderr]) {
     assert.ok(!output.includes('drive-TEST-ONLY-marker'), 'the drive path is never echoed');
   }
-  const verified = verifyVault(drive);
+  const verified = verifyVault(drive, { secondCopy: true });
   assert.equal(verified.position.segment, 1);
   const register = JSON.parse(readFileSync(join(home, REGISTER_NAME), 'utf8'));
   assert.equal(register.copies[0].label, 'offsite');
@@ -101,7 +107,7 @@ test('a FAT drive and an unregistered folder are refused with fixed text; nothin
   const dir = scratch(t);
   const { home } = await initVault(dir);
   const drive = join(dir, 'fat-drive');
-  const refused = await runInline(dir, ['vault', 'copy', 'init', drive, '--vault', home], { hooks: { secondCopyProbe: fat } });
+  const refused = await copyInit(dir, home, drive, [], { secondCopyProbe: fat });
   assert.equal(refused.code, 2);
   assert.match(refused.stderr, /FAT32.*\[FILESYSTEM_UNSUPPORTED\]\n$/u);
   assert.equal(existsSync(drive), false);
@@ -109,20 +115,94 @@ test('a FAT drive and an unregistered folder are refused with fixed text; nothin
   const none = await seal(dir, home, drive);
   assert.equal(none.code, 2);
   assert.match(none.stderr, /\[COPY_UNKNOWN\]\n$/u);
-  const ok = await runInline(dir, ['vault', 'copy', 'init', drive, '--vault', home], { hooks: { secondCopyProbe: ntfs } });
+  const ok = await copyInit(dir, home, drive);
   assert.equal(ok.code, 0, ok.stderr);
   const fatSeal = await seal(dir, home, drive, [], { secondCopyProbe: fat });
   assert.equal(fatSeal.code, 2);
   assert.match(fatSeal.stderr, /\[FILESYSTEM_UNSUPPORTED\]\n$/u);
-  const again = await runInline(dir, ['vault', 'copy', 'init', drive, '--vault', home, '--label', 'copy-1'], { hooks: { secondCopyProbe: ntfs } });
-  assert.match(again.stderr, /\[INVALID_LABEL\]\n$/u);
+  // Repeating init on the same folder finishes nothing new and adds no record.
+  const again = await copyInit(dir, home, drive, ['--label', 'copy-1', '--json']);
+  assert.equal(again.code, 0, again.stderr);
+  assert.deepEqual([JSON.parse(again.stdout).created, JSON.parse(again.stdout).resumed], [false, true]);
+  assert.equal(JSON.parse(readFileSync(join(home, REGISTER_NAME), 'utf8')).copies.length, 1);
+  // Once sealed, a record's label is taken.
+  assert.equal((await seal(dir, home, drive)).code, 0);
+  const taken = await copyInit(dir, home, join(dir, 'other-drive'), ['--label', 'copy-1']);
+  assert.match(taken.stderr, /\[INVALID_LABEL\]\n$/u);
+});
+
+test('the register is a projection of the events: a lost or flagged register is rebuilt and still catches a rollback', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const drive = join(dir, 'drive');
+  assert.equal((await copyInit(dir, home, drive, ['--label', 'offsite'])).code, 0);
+  await addEvent(dir, home);
+  assert.equal((await seal(dir, home, drive)).code, 0);
+  const old = join(dir, 'old-drive');
+  cpSync(drive, old, { recursive: true });
+  await addEvent(dir, home);
+  assert.equal((await seal(dir, home, drive)).code, 0);
+  const sealedRegister = JSON.parse(readFileSync(join(home, REGISTER_NAME), 'utf8'));
+  // The register file is lost. Keyless status cannot replay, so it says so instead of claiming no copy exists.
+  unlinkSync(join(home, REGISTER_NAME));
+  const status = await runInline(dir, ['vault', 'status', '--vault', home, '--json']);
+  assert.equal(status.code, 0, status.stderr);
+  assert.equal(JSON.parse(status.stdout).needsReplay, true);
+  assert.match(JSON.parse(status.stdout).banner, /No second copy is recorded on this device.*rebuilds the record/u);
+  assert.equal(existsSync(join(home, REGISTER_NAME)), false, 'status writes nothing');
+  // The next keyed command rebuilds it from copy.registered and copy.sealed: the old drive is still a rollback.
+  const stopped = await seal(dir, home, old);
+  assert.match(stopped.stderr, /\[ROLLBACK_DETECTED\]\n$/u);
+  const resealed = await seal(dir, home, drive, ['--json']);
+  assert.equal(resealed.code, 0, resealed.stderr);
+  const rebuilt = JSON.parse(readFileSync(join(home, REGISTER_NAME), 'utf8'));
+  assert.equal(rebuilt.needs_replay, false);
+  assert.deepEqual(rebuilt.copies.map(c => [c.copy_id, c.label]), sealedRegister.copies.map(c => [c.copy_id, c.label]));
+  assert.equal(rebuilt.copies[0].head.segment, JSON.parse(resealed.stdout).segment);
+  // A register flagged between an event and its write (a crash there), with a stale head, is rebuilt too.
+  const flaggedBytes = readFileSync(join(home, REGISTER_NAME), 'utf8')
+    .replace('"needs_replay":false', '"needs_replay":true');
+  writeFileSync(join(home, REGISTER_NAME), flaggedBytes);
+  const flagged = await seal(dir, home, old);
+  assert.match(flagged.stderr, /\[ROLLBACK_DETECTED\]\n$/u);
+});
+
+test('a copy has an identity: --copy must match the drive, a foreign copy needs --adopt, and the ids are printed', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const one = join(dir, 'one');
+  const two = join(dir, 'two');
+  assert.equal((await copyInit(dir, home, one, ['--label', 'first'])).code, 0);
+  assert.equal((await copyInit(dir, home, two, ['--label', 'second'])).code, 0);
+  await addEvent(dir, home);
+  // Without --copy the drive's COPY.json picks the record; with a wrong --copy the session stops before any write.
+  assert.equal((await seal(dir, home, two, ['--json'])).code, 0);
+  const before = readFileSync(join(home, REGISTER_NAME));
+  const wrong = await seal(dir, home, one, ['--copy', 'second']);
+  assert.match(wrong.stderr, /copy id differs.*\[COPY_MISMATCH\]\n$/u);
+  assert.deepEqual(readFileSync(join(home, REGISTER_NAME)), before);
+  // A copy of this vault that names an id this device does not know.
+  const foreign = join(dir, 'foreign');
+  cpSync(one, foreign, { recursive: true });
+  const metadata = JSON.parse(readFileSync(join(foreign, 'VAULT.json'), 'utf8'));
+  const oldId = 'c3'.repeat(16);
+  writeFileSync(join(foreign, 'COPY.json'), `{"copy_id":"${oldId}","format":"foundry-copy/1","vault_id":"${metadata.vault_id}"}`);
+  const refused = await copyInit(dir, home, foreign, ['--label', 'third']);
+  assert.match(refused.stderr, /\[COPY_MISMATCH\]\n$/u);
+  const adopted = await copyInit(dir, home, foreign, ['--label', 'third', '--adopt']);
+  assert.equal(adopted.code, 0, adopted.stderr);
+  const register = JSON.parse(readFileSync(join(home, REGISTER_NAME), 'utf8'));
+  const third = register.copies.find(c => c.label === 'third');
+  assert.match(adopted.stdout, new RegExp(`copy id ${oldId} is replaced by ${third.copy_id}`, 'u'));
+  assert.equal(JSON.parse(readFileSync(join(foreign, 'COPY.json'), 'utf8')).copy_id, third.copy_id);
+  assert.equal((await seal(dir, home, foreign)).code, 0);
 });
 
 test('a rolled-back drive stops the session with ROLLBACK_DETECTED and changes nothing', async t => {
   const dir = scratch(t);
   const { home } = await initVault(dir);
   const drive = join(dir, 'drive');
-  await runInline(dir, ['vault', 'copy', 'init', drive, '--vault', home], { hooks: { secondCopyProbe: ntfs } });
+  await copyInit(dir, home, drive);
   await addEvent(dir, home);
   assert.equal((await seal(dir, home, drive)).code, 0);
   const old = join(dir, 'old-drive');
@@ -133,31 +213,31 @@ test('a rolled-back drive stops the session with ROLLBACK_DETECTED and changes n
   assert.equal(stopped.code, 2);
   assert.match(stopped.stderr, /^foundry: STOP: the second copy is older .*\[ROLLBACK_DETECTED\]\n$/u);
   assert.deepEqual(readFileSync(join(home, 'vault', 'HEAD.json')), head, 'the working head is unchanged');
-  assert.equal(verifyVault(old).position.segment, 1);
+  assert.equal(verifyVault(old, { secondCopy: true }).position.segment, 1);
 });
 
 test('an interrupted seal is finished by the next one', async t => {
   const dir = scratch(t);
   const { home } = await initVault(dir);
   const drive = join(dir, 'drive');
-  await runInline(dir, ['vault', 'copy', 'init', drive, '--vault', home], { hooks: { secondCopyProbe: ntfs } });
+  await copyInit(dir, home, drive);
   await addEvent(dir, home);
   const pulled = await seal(dir, home, drive, [], {
-    secondCopyProbe: ntfs, copyCheckpoint: point => { if (point === 'after-head-pending') throw Object.assign(new Error('TEST ONLY pulled'), { code: 'EIO' }); },
+    secondCopyProbe: ntfs, copyCheckpoint: point => { if (point === 'after-manifest-pending') throw Object.assign(new Error('TEST ONLY pulled'), { code: 'EIO' }); },
   });
   assert.equal(pulled.code, 2);
   assert.match(pulled.stderr, /\[IO\]\n$/u);
   const next = await seal(dir, home, drive);
   assert.equal(next.code, 0, next.stderr);
   assert.match(next.stdout, /unfinished segment 1 from an interrupted session was removed/u);
-  assert.equal(verifyVault(drive).position.segment, 1);
+  assert.equal(verifyVault(drive, { secondCopy: true }).position.segment, 1);
 });
 
 test('export-iso writes a keyless image by default and warns before an irreversible keyring export', async t => {
   const dir = scratch(t);
   const { home } = await initVault(dir);
   const drive = join(dir, 'drive');
-  await runInline(dir, ['vault', 'copy', 'init', drive, '--vault', home], { hooks: { secondCopyProbe: ntfs } });
+  await copyInit(dir, home, drive);
   await addEvent(dir, home);
   const sealed = await seal(dir, home, drive);
   assert.equal(sealed.code, 0, sealed.stderr);
@@ -242,20 +322,21 @@ test('the reminder is keyless, records the check and shows the overdue banner', 
   const reminder = await runInline(dir, ['vault', 'reminder', '--verify', '--vault', home]);
   assert.equal(reminder.code, 0, reminder.stderr);
   assert.equal(reminder.kdf, 0);
-  assert.match(reminder.stdout, /No second copy is set up/u);
+  assert.match(reminder.stdout, /No second copy is recorded on this device/u);
   assert.match(reminder.stdout, /Keyless vault check: ok\./u);
   assert.equal(JSON.parse(readFileSync(join(home, REGISTER_NAME), 'utf8')).last_check.verify, 'ok');
 });
 
 test('a seal before any profile or import: the next profile, import, search and seal still work', async t => {
-  // A user who sets up the backup first: the seal creates `me`'s `system` key and `copy.sealed` is the first event.
+  // A user who sets up the backup first: copy init creates `me`'s `system` key and `copy.registered` is the first
+  // event, so the first seal closes and copies that one segment.
   const dir = scratch(t);
   const { home } = await initVault(dir);
   const drive = join(dir, 'drive');
-  assert.equal((await runInline(dir, ['vault', 'copy', 'init', drive, '--vault', home], { hooks: { secondCopyProbe: ntfs } })).code, 0);
+  assert.equal((await copyInit(dir, home, drive)).code, 0);
   const first = await seal(dir, home, drive);
   assert.equal(first.code, 0, first.stderr);
-  assert.match(first.stdout, /sealed: segment 0 -> 0, 0 segment\(s\)/u);
+  assert.match(first.stdout, /sealed: segment 0 -> 1, 1 segment\(s\)/u);
   const { folder } = await takeoutFolder(dir);
   const imported = await runInline(dir, ['import', folder, '--vault', home, '--passphrase-stdin', '--json'], { stdin: `${PASSPHRASE}\n` });
   assert.equal(imported.code, 0, imported.stderr);
@@ -270,8 +351,8 @@ test('a seal before any profile or import: the next profile, import, search and 
   const second = await seal(dir, home, drive, ['--json']);
   assert.equal(second.code, 0, second.stderr);
   const summary = JSON.parse(second.stdout);
-  assert.ok(summary.segment >= 1);
-  assert.equal(verifyVault(drive).position.segment, summary.segment);
+  assert.ok(summary.segment >= 2);
+  assert.equal(verifyVault(drive, { secondCopy: true }).position.segment, summary.segment);
   const rebuild = await runInline(dir, ['index', 'rebuild', '--vault', home, '--passphrase-stdin'], { stdin: `${PASSPHRASE}\n` });
   assert.equal(rebuild.code, 0, rebuild.stderr);
 });

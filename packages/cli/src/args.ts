@@ -33,7 +33,7 @@ export type CommandName =
   | 'vault schedule status'
   | 'vault schedule remove';
 
-/** P-3 commands: `vault seal` and `vault session` are keyed; the others never read a key. */
+/** P-3 commands: `vault copy init`, `vault seal` and `vault session` are keyed; the others never read a key. */
 export const SECOND_COPY_COMMANDS: readonly CommandName[] = [
   'vault copy init', 'vault seal', 'vault session', 'vault status', 'vault reminder', 'vault export-iso',
   'vault schedule set', 'vault schedule status', 'vault schedule remove',
@@ -53,7 +53,7 @@ export const DEFAULT_TIMEOUTS: Readonly<Record<CommandName, number>> = {
   'vault verify': 3600,
   'import': 21600,
   'index rebuild': 21600,
-  'vault copy init': 120,
+  'vault copy init': 600,
   'vault status': 120,
   'vault schedule set': 120,
   'vault schedule status': 120,
@@ -78,7 +78,7 @@ const CREDENTIAL = ['passphrase-stdin', 'recovery-key-stdin'] as const;
 const FILTERS = ['from', 'until', 'source', 'profile', 'collection', 'tier', 'limit'] as const;
 const P1_STRING_OPTIONS = ['display-name', 'basis', 'note', 'child-prompts'] as const;
 const P3_STRING_OPTIONS = ['label', 'copy', 'anchor-svg', 'cadence'] as const;
-const P3_BOOLEAN_OPTIONS = ['qr-invert', 'include-keyring-irreversible', 'verify'] as const;
+const P3_BOOLEAN_OPTIONS = ['qr-invert', 'include-keyring-irreversible', 'verify', 'adopt'] as const;
 
 const COMMANDS: Readonly<Record<CommandName, CommandSpec>> = {
   'init': { words: 1, options: [...COMMON, 'passphrase-stdin'], keyed: false },
@@ -93,7 +93,8 @@ const COMMANDS: Readonly<Record<CommandName, CommandSpec>> = {
   'consent list': { words: 2, options: [...COMMON, ...CREDENTIAL, 'json', 'reveal'], keyed: true },
   'collection prompt-policy': { words: 2, positional: 'collection', options: [...COMMON, ...CREDENTIAL, 'json', 'child-prompts'], keyed: true },
   'collection list': { words: 2, options: [...COMMON, ...CREDENTIAL, 'json', 'reveal'], keyed: true },
-  'vault copy init': { words: 3, positional: 'target', options: [...COMMON, 'json', 'label'], keyed: false },
+  // Keyed since fix round 1 (R18-2): it appends a `copy.registered` event before it writes the register.
+  'vault copy init': { words: 3, positional: 'target', options: [...COMMON, ...CREDENTIAL, 'json', 'label', 'adopt'], keyed: true },
   'vault seal': { words: 2, positional: 'target', options: [...COMMON, ...CREDENTIAL, 'json', 'copy', 'anchor-svg', 'qr-invert'], keyed: true },
   'vault session': { words: 2, positional: 'target', options: [...COMMON, ...CREDENTIAL, 'json', 'copy', 'anchor-svg', 'qr-invert'], keyed: true },
   'vault status': { words: 2, options: [...COMMON, 'json'], keyed: false },
@@ -159,6 +160,7 @@ export type ParsedCommand =
     includeKeyring?: boolean;
     cadence?: string;
     verifyChain?: boolean;
+    adopt?: boolean;
   };
 
 function commandOf(positionals: readonly string[]): CommandName | undefined {
@@ -325,6 +327,7 @@ export function parseCommandLine(argv: readonly string[], env: Readonly<Record<s
       includeKeyring: values['include-keyring-irreversible'] === true,
       cadence,
       verifyChain: values.verify === true,
+      adopt: values.adopt === true,
     } : {}),
   };
 }
@@ -395,9 +398,13 @@ terminal prompt, or from stdin with --passphrase-stdin / --recovery-key-stdin.
     + '  The output names a default collection (<profile>/<source>/<year>); a custom name is shown as "(custom)".\n',
   'collection list': 'Usage: foundry collection list [--reveal] [--json] [--passphrase-stdin | --recovery-key-stdin]\n'
     + '  Custom collection names are shown as "custom collection N" unless you give --reveal.\n',
-  'vault copy init': 'Usage: foundry vault copy init <folder> [--label <name>] [--json]\n'
+  'vault copy init': 'Usage: foundry vault copy init <folder> [--label <name>] [--adopt] [--json]\n'
+    + '       [--passphrase-stdin | --recovery-key-stdin]\n'
     + '  The folder must be on an external drive formatted exFAT, NTFS, ext4, APFS or similar (FAT32 is refused).\n'
-    + '  It must be empty or a second copy of this vault. --label: letters, digits, dot, dash, underscore (1-32).\n',
+    + '  It must be empty, an unfinished copy init of this device, or a second copy of this vault.\n'
+    + '  --label: letters, digits, dot, dash, underscore (1-32). Repeat with the same --label to finish an\n'
+    + '  interrupted init. --adopt: take over a copy of this vault that another record or device set up (its copy id\n'
+    + '  is replaced; the old and new ids are printed).\n',
   'vault seal': 'Usage: foundry vault seal <folder> [--copy <label>] [--anchor-svg <file.svg>] [--qr-invert] [--json]\n'
     + '       [--passphrase-stdin | --recovery-key-stdin]\n'
     + '  Checks the drive without a key, stops on a rolled-back or different chain, then closes the open segment,\n'

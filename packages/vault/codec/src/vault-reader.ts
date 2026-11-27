@@ -17,9 +17,9 @@ export interface VaultRecordLocation {
   offset: number;
 }
 
-function verify(directory: string, { anchor }: VerifyOptions, unlocked?: UnlockedKeyring) {
+function verify(directory: string, { anchor, secondCopy }: VerifyOptions, unlocked?: UnlockedKeyring) {
   const vault = metadata(directory);
-  checkRootInventory(directory);
+  checkRootInventory(directory, secondCopy === true);
   if (unlocked) check(unlocked.keyring.vault_id === vault.vault_id, 'KEY');
   const scanner = new StreamScanner();
   const { position, previous, erased } = scanSealed(directory, vault, scanner, unlocked, anchor);

@@ -1,34 +1,46 @@
 /**
  * Mode B second copy: an offline drive that is writable only during a vault session (Architecture 8.1, 8.2; Product 8).
  *
- * Session steps (Architecture 8.1):
+ * Session steps (Architecture 8.1), in two phases (P-3 fix round 1, ruling R18-2):
+ *
+ * Phase 1, keyless and read-only (nothing on the drive or the working device is written, no lock is taken):
  *  1. Detect the target folder, refuse a file system with a 4 GiB file limit (FAT), read VAULT.json and refuse a
- *     different vault.
- *  2. Check that the drive is writable (a hardware write-protect switch still on is reported as `WRITE_PROTECTED`)
- *     and verify every manifest, signature, file hash and the whole chain without any secret. A trailing segment
- *     folder without a manifest (an interrupted earlier session) is left out of this check.
+ *     different vault, and read `COPY.json`: its `copy_id` must be the selected record's (`COPY_MISMATCH`, R18-3).
+ *  2. Check the type of every root and keyring entry (a link is refused), bound every read of a drive file, and
+ *     verify every manifest, signature, file hash and the whole chain without any secret. A trailing segment folder
+ *     without a manifest (an interrupted earlier session) is left out of this check.
  *  3. Compare the drive's verified chain with the head recorded on the working device for this copy, and with the
  *     working vault's own chain. Older than recorded: `ROLLBACK_DETECTED`. A different manifest hash at the same
- *     segment number: `TAMPER_DETECTED`. Nothing on the drive or the working device is changed before this passes.
- *     Only then is the unfinished segment folder of step 2 removed.
- *  4. Close the open segment on the working device.
- *  5. Copy each missing segment in order: stream files first, then `MANIFEST.sig`, then `MANIFEST.json` through a
- *     pending name and a rename, with fsync of every file and (on POSIX) of the folders. A crash leaves earlier
- *     segments untouched.
- *  6. Re-read and re-hash every copied file and manifest on the drive.
- *  7. Mark the copied segments read-only, write `keyring/keyring.json` (temp file, fsync, rename) and `HEAD.json`.
- *  8. and 9. are done by the caller with the returned result: record the new head on the working device, append
- *     `copy.sealed`, and print the anchor.
+ *     segment number: `TAMPER_DETECTED`. Only after this comparison is `HEAD.json` (a convenience copy that is never
+ *     trusted) classified: it must name a verified chain position at or after the recorded head.
  *
- * The chain is only tamper-evident (Architecture 8.2): it shows a change, it cannot stop one; an exact copy of a drive cannot be told from the
- * original, and an out-of-date recorded head cannot reveal the loss of segments written after it.
+ * Phase 2, after phase 1 passed: a writability probe (a hardware write-protect switch still on is reported as
+ * `WRITE_PROTECTED`), the drive's writer lock, a re-check that the drive did not change, then recovery of an
+ * interrupted session: an unfinished segment folder is removed, a pending head is discarded, segments past the
+ * recorded head are made read-only again, and `HEAD.json` is rewritten from the verified chain when it is behind.
+ *  4. Close the open segment on the working device (`seal`).
+ *  5. Copy each missing segment in order: stream files first, then `MANIFEST.sig`, then `MANIFEST.json` through a
+ *     pending name and a rename, with fsync of every file and (on POSIX) of the segment folder and `segments/`.
+ *  6. Re-read every copied segment from the drive: exact file names, the manifest hash, every stream hash; the chain
+ *     head is derived from those bytes.
+ *  7. Mark the copied segments read-only, write `keyring/keyring.json` (temp file, fsync, rename), and only then
+ *     write `HEAD.json`.
+ *  8. and 9. are done by the caller with the returned result: append `copy.sealed`, record the new head on the
+ *     working device, and print the anchor.
+ *
+ * The working-device register is a projection of the `copy.registered` and `copy.sealed` events (R18-2): a missing,
+ * unreadable or flagged register is rebuilt from a keyed replay, never silently treated as empty.
+ *
+ * The chain is only tamper-evident (Architecture 8.2): it shows a change, it cannot stop one; an exact copy of a
+ * drive cannot be told from the original, and an out-of-date recorded head cannot reveal the loss of segments
+ * written after it.
  */
 import { Buffer } from 'node:buffer';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import {
-  chmodSync, closeSync, fstatSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, readSync,
-  realpathSync, rmdirSync, statfsSync, statSync, unlinkSync, writeSync,
+  accessSync, chmodSync, closeSync, constants, fstatSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync,
+  readSync, realpathSync, rmdirSync, statfsSync, statSync, unlinkSync, writeSync,
 } from 'node:fs';
 import { dirname, join, posix, resolve, win32 } from 'node:path';
 import type { PlatformPath } from 'node:path';
@@ -36,24 +48,26 @@ import { platform as hostPlatform } from 'node:process';
 import { canonical, check, hex, integer, object, parseCanonical, sha256, timestamp, VaultFormatError } from './bytes.ts';
 import type { Json } from './bytes.ts';
 import { chainAnchor } from './anchor.ts';
-import { acquireWriterLock, publishKeyring, renameWithRetry, syncDirectory } from './keyring-file.ts';
+import type { Unlock } from './keyring.ts';
+import { acquireWriterLock, renameWithRetry, syncDirectory } from './keyring-file.ts';
 import { checkManifestLink, checkManifestRecords, decodeManifest, GENESIS_HASH } from './manifest.ts';
 import type { ChainPosition, ManifestFile } from './manifest.ts';
 import { StreamScanner } from './record-file.ts';
 import type { UnlockedKeyring } from './record-file.ts';
 import {
-  checkRootInventory, checkVerifiedHead, HEAD_PENDING, headBytes, headMatches, LOCK, makeReadOnly,
-  MANIFEST, MANIFEST_PENDING, metadata, readHead, replaceHead, scanSealed, scanStreams, segmentName, SIGNATURE,
+  checkRootInventory, COPY_IDENTITY, COPY_IDENTITY_PENDING, HEAD, HEAD_PENDING, headMatches, LOCK, makeReadOnly,
+  MANIFEST, MANIFEST_PENDING, metadata, publishHead, readHead, scanSealed, scanStreams, segmentName, SIGNATURE,
   statIfPresent, streamNames, VAULT_METADATA, writePending,
 } from './vault-directory.ts';
 import type { VaultAnchor, VaultMetadata } from './vault-directory.ts';
+import { openVaultReplay } from './vault-replay.ts';
 import { initializeVault, VaultWriter } from './vault-writer.ts';
 
 export type SecondCopyErrorCode =
   | 'FILESYSTEM_UNSUPPORTED' | 'WRITE_PROTECTED' | 'ROLLBACK_DETECTED' | 'TAMPER_DETECTED' | 'VAULT_MISMATCH'
   | 'NOT_A_COPY' | 'TARGET_NOT_EMPTY' | 'TARGET_UNSUITABLE' | 'COPY_BUSY' | 'COPY_VERIFY_FAILED'
   | 'WORKING_VAULT_DAMAGED' | 'OUTPUT_EXISTS' | 'REGISTER' | 'COPY_UNKNOWN' | 'COPY_AMBIGUOUS' | 'INVALID_LABEL' | 'INVALID_CADENCE'
-  | 'SCHEDULER_UNSUPPORTED' | 'SCHEDULER_FAILED' | 'ISO_TOO_MANY_EXTENTS';
+  | 'SCHEDULER_UNSUPPORTED' | 'SCHEDULER_FAILED' | 'ISO_TOO_MANY_EXTENTS' | 'COPY_MISMATCH';
 
 /** A typed second-copy failure. `reason` is a fixed token (never a path or user text). */
 export class SecondCopyError extends Error {
@@ -78,8 +92,20 @@ function nowStamp(now: Date): string {
   return text;
 }
 
+const READ_ONLY_CODES = ['EROFS', 'EACCES', 'EPERM'];
+
+/** Run `work`; a write refused by the medium or its permissions becomes `WRITE_PROTECTED`. */
+function writeProtected<T>(work: () => T): T {
+  try {
+    return work();
+  } catch (error) {
+    if (READ_ONLY_CODES.includes(errorCode(error) ?? '')) throw new SecondCopyError('WRITE_PROTECTED');
+    throw error;
+  }
+}
+
 // ---------------------------------------------------------------------------------------------------------------
-// External commands (fsutil, schtasks, systemctl, crontab): always explicit arguments, never a shell.
+// External commands (fsutil, schtasks, systemctl, crontab, notify-send): always explicit arguments, never a shell.
 
 export interface CommandResult {
   status: number | null;
@@ -224,6 +250,52 @@ export function diskRelation(a: string, b: string, platform = hostPlatform): Dis
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// Bounded reads of files that may come from an untrusted drive.
+
+/** The largest `MANIFEST.json` a second copy may hold (a manifest lists a few files; this is generous). */
+export const MAX_MANIFEST_BYTES = 1024 * 1024;
+const MAX_COPY_IDENTITY_BYTES = 256;
+
+/**
+ * The bytes of a regular file of at most `limit` bytes, or undefined when nothing is there. A link, folder or other
+ * entry, or a larger file, fails `INVENTORY` before it is opened; the size is checked again on the open descriptor.
+ */
+function readRegularFile(path: string, limit: number): Buffer | undefined {
+  const stat = statIfPresent(path);
+  if (!stat) return undefined;
+  check(stat.isFile() && stat.size <= limit, 'INVENTORY');
+  const fd = openSync(path, 'r');
+  try {
+    const opened = fstatSync(fd);
+    check(opened.isFile() && opened.size <= limit, 'INVENTORY');
+    const bytes = Buffer.allocUnsafe(opened.size);
+    for (let offset = 0; offset < bytes.length;) {
+      const count = readSync(fd, bytes, offset, bytes.length - offset, offset);
+      check(count > 0, 'LENGTH');
+      offset += count;
+    }
+    return bytes;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function manifestHash(directory: string, segment: number): string | undefined {
+  if (segment === 0) return GENESIS_HASH;
+  const bytes = readRegularFile(join(directory, 'segments', segmentName(segment), MANIFEST), MAX_MANIFEST_BYTES);
+  return bytes === undefined ? undefined : sha256(bytes);
+}
+
+/** Remove `path` when it is a regular file; anything else there fails `INVENTORY`. */
+function removeRegularFile(path: string): boolean {
+  const stat = statIfPresent(path);
+  if (!stat) return false;
+  check(stat.isFile(), 'INVENTORY');
+  unlinkSync(path);
+  return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // The working device's register of second copies (Architecture 5.4 keyring-copy register and 8.1 step 8).
 
 export const REGISTER_FORMAT = 'foundry-second-copies/1';
@@ -233,7 +305,7 @@ export type Cadence = (typeof CADENCES)[number];
 export const CADENCE_DAYS: Readonly<Record<Cadence, number | null>> = { daily: 1, weekly: 7, monthly: 30, manual: null };
 /** Product 8 and D-8: a persistent banner after 14 days without a seal. */
 export const OVERDUE_DAYS = 14;
-const MAX_REGISTER_BYTES = 1024 * 1024;
+export const MAX_REGISTER_BYTES = 1024 * 1024;
 const LABEL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/u;
 
 export interface CopyHead {
@@ -256,6 +328,12 @@ export interface CopyRegister {
   cadence: Cadence;
   copies: CopyRecord[];
   last_check: { checked_at: string; verify: 'ok' | 'failed' | 'skipped' } | null;
+  /**
+   * True when this file may be behind the vault's `copy.*` events: it was created by a keyless command while no
+   * register existed, or a keyed command is between appending an event and writing the register. The next keyed
+   * second-copy command rebuilds the copies from a replay of the events (R18-2).
+   */
+  needs_replay: boolean;
 }
 
 export function assertCadence(value: unknown): Cadence {
@@ -271,8 +349,8 @@ export function assertCopyLabel(value: unknown): string {
 
 function validateRegister(value: unknown, vaultId: string): CopyRegister {
   try {
-    object(value, 'format vault_id cadence copies last_check');
-    check(value.format === REGISTER_FORMAT && value.vault_id === vaultId);
+    object(value, 'format vault_id cadence copies last_check needs_replay');
+    check(value.format === REGISTER_FORMAT && value.vault_id === vaultId && typeof value.needs_replay === 'boolean');
     assertCadence(value.cadence);
     check(Array.isArray(value.copies));
     const ids = new Set<string>();
@@ -310,19 +388,18 @@ function validateRegister(value: unknown, vaultId: string): CopyRegister {
   }
 }
 
-export function emptyRegister(vaultId: string): CopyRegister {
+export function emptyRegister(vaultId: string, needsReplay = false): CopyRegister {
   hex(vaultId, 16);
-  return { format: REGISTER_FORMAT, vault_id: vaultId, cadence: 'weekly', copies: [], last_check: null };
+  return { format: REGISTER_FORMAT, vault_id: vaultId, cadence: 'weekly', copies: [], last_check: null, needs_replay: needsReplay };
 }
 
-/** Read the register (a missing file is an empty register with the weekly default cadence). */
-export function readCopyRegister(path: string, vaultId: string): CopyRegister {
-  const stat = statIfPresent(path);
-  if (!stat) return emptyRegister(vaultId);
-  if (!stat.isFile() || stat.size > MAX_REGISTER_BYTES) throw new SecondCopyError('REGISTER');
+function parseRegister(path: string, vaultId: string): CopyRegister | undefined {
+  let bytes: Buffer | undefined;
   let value: Json;
   try {
-    value = parseCanonical(readFileSync(path));
+    bytes = readRegularFile(path, MAX_REGISTER_BYTES);
+    if (bytes === undefined) return undefined;
+    value = parseCanonical(bytes);
   } catch (error) {
     if (error instanceof VaultFormatError) throw new SecondCopyError('REGISTER');
     throw error;
@@ -330,10 +407,43 @@ export function readCopyRegister(path: string, vaultId: string): CopyRegister {
   return validateRegister(value, vaultId);
 }
 
-/** Replace the register atomically: unique temp file, fsync, rename, folder sync. */
+/**
+ * Read the register (keyless). A missing file is an empty register flagged `needs_replay`: this device cannot tell
+ * without a key whether the vault's events name a copy. A damaged file fails `REGISTER`.
+ */
+export function readCopyRegister(path: string, vaultId: string): CopyRegister {
+  return parseRegister(path, vaultId) ?? emptyRegister(vaultId, true);
+}
+
+export interface RegisterState {
+  /** The register as read; for a missing or damaged file, an empty one flagged `needs_replay`. */
+  register: CopyRegister;
+  /** The file was readable (its cadence and last check are kept by a rebuild). */
+  readable: boolean;
+  /** A keyed command must rebuild the copies from the events before it uses them. */
+  rebuild: boolean;
+}
+
+/** For keyed commands: the register and whether it must be rebuilt from the events (missing, damaged or flagged). */
+export function loadCopyRegister(path: string, vaultId: string): RegisterState {
+  try {
+    const register = parseRegister(path, vaultId);
+    if (register === undefined) return { register: emptyRegister(vaultId, true), readable: false, rebuild: true };
+    return { register, readable: true, rebuild: register.needs_replay };
+  } catch (error) {
+    if (error instanceof SecondCopyError && error.code === 'REGISTER') {
+      return { register: emptyRegister(vaultId, true), readable: false, rebuild: true };
+    }
+    throw error;
+  }
+}
+
+/** Replace the register atomically: unique temp file, fsync, rename, folder sync. Larger than the read limit: `REGISTER`. */
 export function writeCopyRegister(path: string, register: CopyRegister): void {
   validateRegister(JSON.parse(JSON.stringify(register)), register.vault_id);
   const bytes = Buffer.from(canonical(register as unknown as Json));
+  // The reader refuses a file above this size, so a larger one is never written (the last readable one stays).
+  if (bytes.length > MAX_REGISTER_BYTES) throw new SecondCopyError('REGISTER', 'too-large');
   const pending = `${path}.pending-${randomBytes(16).toString('hex')}`;
   writePending(pending, bytes);
   try {
@@ -345,13 +455,21 @@ export function writeCopyRegister(path: string, register: CopyRegister): void {
   syncDirectory(dirname(path));
 }
 
-export function addCopyRecord(register: CopyRegister, label: string | undefined, now: Date): { register: CopyRegister; copy: CopyRecord } {
+/** A new random copy identity (16 bytes, hex). */
+export function newCopyId(): string {
+  return randomBytes(16).toString('hex');
+}
+
+export function addCopyRecord(
+  register: CopyRegister, label: string | undefined, now: Date, copyId: string = newCopyId(),
+): { register: CopyRegister; copy: CopyRecord } {
   let name = label === undefined ? undefined : assertCopyLabel(label);
   if (name === undefined) {
     for (let n = 1; name === undefined; n++) if (!register.copies.some(copy => copy.label === `copy-${n}`)) name = `copy-${n}`;
   }
   if (register.copies.some(copy => copy.label === name)) throw new SecondCopyError('INVALID_LABEL', 'taken');
-  const copy: CopyRecord = { copy_id: randomBytes(16).toString('hex'), label: name, created_at: nowStamp(now), head: null, keyring: null };
+  hex(copyId, 16);
+  const copy: CopyRecord = { copy_id: copyId, label: name, created_at: nowStamp(now), head: null, keyring: null };
   return { register: { ...register, copies: [...register.copies, copy] }, copy };
 }
 
@@ -367,7 +485,7 @@ export function selectCopy(register: CopyRegister, label?: string): CopyRecord {
   return register.copies[0]!;
 }
 
-export function recordSeal(register: CopyRegister, copyId: string, result: SealResult): CopyRegister {
+export function recordSeal(register: CopyRegister, copyId: string, result: Pick<SealResult, 'head' | 'sealedAt' | 'keyringVersion'>): CopyRegister {
   return {
     ...register,
     copies: register.copies.map(copy => copy.copy_id !== copyId ? copy : {
@@ -376,6 +494,112 @@ export function recordSeal(register: CopyRegister, copyId: string, result: SealR
       keyring: { version: result.keyringVersion, written_at: result.sealedAt },
     }),
   };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Events: the register is a projection of `copy.registered` and `copy.sealed` (R18-2).
+
+export const COPY_REGISTERED = 'copy.registered';
+export const COPY_SEALED = 'copy.sealed';
+
+export interface CopyEvent {
+  kind: unknown;
+  ts: unknown;
+  body: unknown;
+}
+
+/** The body of `copy.registered` (counts, ids and the label only). */
+export function copyRegisteredBody(
+  copy: CopyRecord, cadence: Cadence, adoptedFrom: string | null | undefined,
+): Record<string, Json> {
+  return {
+    copy_id: copy.copy_id, label: copy.label, cadence, adopted: adoptedFrom !== undefined,
+    previous_copy_id: adoptedFrom ?? null,
+  };
+}
+
+/** The body of `copy.sealed`: everything the register needs, plus counts and hashes (Architecture 4.3). */
+export function copySealedBody(copy: CopyRecord, cadence: Cadence, result: SealResult): Record<string, Json> {
+  return {
+    copy_id: copy.copy_id, label: copy.label, cadence, previous_segment: result.previous.segment,
+    segment: result.head.segment, manifest_sha256: result.head.hash, sealed_at: result.sealedAt,
+    keyring_version: result.keyringVersion, segments_copied: result.segmentsCopied, files_copied: result.filesCopied,
+    bytes_copied: result.bytesCopied,
+  };
+}
+
+/**
+ * Build the copies from `copy.*` events in vault order. Idempotent: an event seen twice changes nothing. The cadence
+ * and last check come from `base` (a readable register) when given, else the cadence of the last event. A malformed
+ * event is skipped.
+ */
+export function registerFromEvents(vaultId: string, events: Iterable<CopyEvent>, base?: CopyRegister): CopyRegister {
+  const copies = new Map<string, CopyRecord>();
+  let cadence: Cadence | undefined;
+  const claim = (id: string, label: string) => {
+    for (const [other, record] of copies) if (other !== id && record.label === label) copies.delete(other);
+  };
+  for (const event of events) {
+    try {
+      const body = event.body as Record<string, Json>;
+      check(body !== null && typeof body === 'object' && !Array.isArray(body));
+      hex(body.copy_id, 16);
+      timestamp(event.ts);
+      const label = assertCopyLabel(body.label);
+      const id = body.copy_id;
+      if (event.kind === COPY_REGISTERED) {
+        if (!copies.has(id)) {
+          claim(id, label);
+          copies.set(id, { copy_id: id, label, created_at: event.ts, head: null, keyring: null });
+        }
+      } else if (event.kind === COPY_SEALED) {
+        integer(body.segment);
+        hex(body.manifest_sha256, 32);
+        timestamp(body.sealed_at);
+        integer(body.keyring_version, 1);
+        if (body.segment === 0) check(body.manifest_sha256 === GENESIS_HASH);
+        let record = copies.get(id);
+        if (!record) {
+          claim(id, label);
+          record = { copy_id: id, label, created_at: event.ts, head: null, keyring: null };
+          copies.set(id, record);
+        }
+        record.head = { segment: body.segment, manifest_sha256: body.manifest_sha256, sealed_at: body.sealed_at };
+        record.keyring = { version: body.keyring_version, written_at: body.sealed_at };
+      } else {
+        continue;
+      }
+      if (typeof body.cadence === 'string' && (CADENCES as readonly string[]).includes(body.cadence)) cadence = body.cadence as Cadence;
+    } catch (error) {
+      if (error instanceof VaultFormatError || error instanceof SecondCopyError) continue;
+      throw error;
+    }
+  }
+  const register: CopyRegister = {
+    format: REGISTER_FORMAT, vault_id: vaultId, cadence: base?.cadence ?? cadence ?? 'weekly',
+    copies: [...copies.values()], last_check: base?.last_check ?? null, needs_replay: false,
+  };
+  return validateRegister(JSON.parse(JSON.stringify(register)), vaultId);
+}
+
+/**
+ * Rebuild the register from a keyed, read-only replay of the working vault (`me`'s `system` events). The replay
+ * refuses a vault with an unfinished write; the caller reports that (it may not recover the vault first, R18-2).
+ */
+export function replayCopyRegister(vaultDirectory: string, credential: Unlock, base?: CopyRegister): CopyRegister {
+  const vaultId = metadata(vaultDirectory).vault_id;
+  const source = openVaultReplay(vaultDirectory, credential);
+  const events: CopyEvent[] = [];
+  try {
+    for (const item of source.replay()) {
+      if (item.type !== 'event') continue;
+      const { kind, profile, collection, ts, body } = item.event;
+      if ((kind === COPY_REGISTERED || kind === COPY_SEALED) && profile === 'me' && collection === 'system') events.push({ kind, ts, body });
+    }
+  } finally {
+    source.close();
+  }
+  return registerFromEvents(vaultId, events, base);
 }
 
 export interface CopyStatus {
@@ -397,6 +621,8 @@ export interface RegisterStatus {
   due: boolean;
   overdue: boolean;
   banner: string | undefined;
+  /** The register may be behind the vault's events (rebuilt by the next keyed second-copy command). */
+  needsReplay: boolean;
 }
 
 const DAY_MS = 86_400_000;
@@ -419,17 +645,23 @@ export function copyRegisterStatus(register: CopyRegister, now: Date, currentKey
   const overdue = copies.filter(copy => copy.overdue);
   let banner: string | undefined;
   if (copies.length === 0) {
-    banner = 'No second copy is set up. Run `foundry vault copy init <folder>` on an offline drive.';
+    banner = register.needs_replay
+      ? 'No second copy is recorded on this device. If one was set up, `foundry vault seal <folder>` rebuilds the record '
+        + 'from the vault; otherwise run `foundry vault copy init <folder>` on an offline drive.'
+      : 'No second copy is set up. Run `foundry vault copy init <folder>` on an offline drive.';
   } else if (overdue.length > 0) {
     const days = Math.max(...overdue.map(copy => copy.daysUnsealed));
     banner = `SECOND COPY OVERDUE: ${overdue.length === 1 ? `copy "${overdue[0]!.label}" was` : `${overdue.length} copies were`} `
       + `last sealed ${days} day(s) ago (limit ${OVERDUE_DAYS}). Connect the drive and run \`foundry vault seal <folder>\`.`;
   }
-  return { cadence: register.cadence, copies, due: copies.length === 0 || copies.some(copy => copy.due), overdue: overdue.length > 0, banner };
+  return {
+    cadence: register.cadence, copies, due: copies.length === 0 || copies.some(copy => copy.due), overdue: overdue.length > 0,
+    banner, needsReplay: register.needs_replay,
+  };
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Target placement and `vault copy init`.
+// Target placement.
 
 export interface TargetOptions {
   platform?: string;
@@ -526,57 +758,167 @@ function targetMetadata(target: string, working: VaultMetadata): VaultMetadata {
   return meta;
 }
 
-export interface CopyInitResult {
-  /** False when the folder already held a copy of this vault (it is registered again, unchanged). */
-  created: boolean;
-  fileSystem: FileSystemReport;
-  disk: DiskRelation;
+// ---------------------------------------------------------------------------------------------------------------
+// The copy identity on the drive (R18-3).
+
+const COPY_FORMAT = 'foundry-copy/1';
+
+/** The `copy_id` in the drive's `COPY.json`, or undefined when there is none. Bounded, keyless. */
+export function readCopyIdentity(target: string, vaultId: string): string | undefined {
+  let value: Json;
+  try {
+    const bytes = readRegularFile(join(target, COPY_IDENTITY), MAX_COPY_IDENTITY_BYTES);
+    if (bytes === undefined) return undefined;
+    value = parseCanonical(bytes);
+    object(value, 'format vault_id copy_id');
+    check(value.format === COPY_FORMAT);
+    hex(value.copy_id, 16);
+    hex(value.vault_id, 16);
+  } catch (error) {
+    if (error instanceof VaultFormatError) throw new SecondCopyError('COPY_VERIFY_FAILED', 'INVENTORY');
+    throw error;
+  }
+  if (value.vault_id !== vaultId) throw new SecondCopyError('VAULT_MISMATCH');
+  return value.copy_id;
 }
 
-/** Prepare an empty folder (or adopt an existing copy of the same vault) as a Mode B second copy. Keyless. */
-export function initSecondCopy(workingVault: string, target: string, options: TargetOptions = {}): CopyInitResult {
+/** Write `COPY.json` atomically: pending name, fsync, rename, folder sync. */
+function writeCopyIdentity(target: string, vaultId: string, copyId: string): void {
+  hex(copyId, 16);
+  const bytes = Buffer.from(canonical({ format: COPY_FORMAT, vault_id: vaultId, copy_id: copyId }));
+  const pending = join(target, COPY_IDENTITY_PENDING);
+  removeRegularFile(pending);
+  writePending(pending, bytes);
+  renameWithRetry(pending, join(target, COPY_IDENTITY));
+  syncDirectory(target);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// `vault copy init`.
+
+/** What an interrupted `copy init` may leave in the folder before `VAULT.json` exists. */
+const INIT_FILES = [COPY_IDENTITY, COPY_IDENTITY_PENDING, HEAD, HEAD_PENDING, VAULT_METADATA + '.pending', LOCK,
+  LOCK + '-journal', LOCK + '-wal', LOCK + '-shm'];
+
+export interface CopyTargetState {
+  /** `empty`: no folder, or an empty one. `interrupted`: Foundry's own unfinished `copy init`. `copy`: a copy of this vault. */
+  state: 'empty' | 'interrupted' | 'copy';
+  /** The `copy_id` in the folder's `COPY.json` (undefined when it has none). */
+  copyId: string | undefined;
+  fileSystem: FileSystemReport;
+}
+
+/** Keyless and read-only: what the folder holds, after the placement and file-system checks. */
+export function inspectCopyTarget(workingVault: string, target: string, options: TargetOptions = {}): CopyTargetState {
   const platform = options.platform ?? hostPlatform;
   workingVault = resolve(workingVault);
   target = resolve(target);
   const working = metadata(workingVault);
   checkPlacement(workingVault, target, platform);
-  const existing = nearestExisting(target);
-  const fileSystem = checkFileSystem((options.probe ?? (path => probeFileSystem(path, options)))(existing));
+  const fileSystem = checkFileSystem((options.probe ?? (path => probeFileSystem(path, options)))(nearestExisting(target)));
   const stat = statIfPresent(target);
-  if (stat && !stat.isDirectory()) throw new SecondCopyError('TARGET_UNSUITABLE', 'not-a-folder');
-  const entries = stat ? readdirSync(target, { withFileTypes: true }) : [];
-  let created = false;
-  if (entries.length > 0) {
-    if (!entries.some(entry => entry.name === VAULT_METADATA)) throw new SecondCopyError('TARGET_NOT_EMPTY');
+  if (!stat) return { state: 'empty', copyId: undefined, fileSystem };
+  if (!stat.isDirectory()) throw new SecondCopyError('TARGET_UNSUITABLE', 'not-a-folder');
+  const entries = readdirSync(target, { withFileTypes: true });
+  if (entries.length === 0) return { state: 'empty', copyId: undefined, fileSystem };
+  if (entries.some(entry => entry.name === VAULT_METADATA)) {
     targetMetadata(target, working);
-  } else {
     try {
-      mkdirSync(target, { recursive: true, mode: 0o700 });
-      initializeVault(target, {
-        vaultId: working.vault_id, createdAt: working.created_at,
-        signingPublicKey: Buffer.from(working.signing_public_key, 'base64'),
-      });
+      checkRootInventory(target, true);
     } catch (error) {
-      if (['EROFS', 'EACCES', 'EPERM'].includes(errorCode(error) ?? '')) throw new SecondCopyError('WRITE_PROTECTED');
+      if (error instanceof VaultFormatError) throw new SecondCopyError('COPY_VERIFY_FAILED', error.code);
       throw error;
     }
-    created = true;
+    return { state: 'copy', copyId: readCopyIdentity(target, working.vault_id), fileSystem };
   }
-  return { created, fileSystem, disk: diskRelation(workingVault, target, platform) };
+  const own = entries.every(entry => (entry.isFile() && INIT_FILES.includes(entry.name))
+    || (entry.isDirectory() && entry.name === 'segments' && readdirSync(join(target, 'segments'), { withFileTypes: true }).length === 0));
+  if (!own) throw new SecondCopyError('TARGET_NOT_EMPTY');
+  const copyId = readCopyIdentity(target, working.vault_id);
+  if (copyId !== undefined) return { state: 'interrupted', copyId, fileSystem };
+  // `COPY.json` is written first, so without it only its own pending file can be Foundry's.
+  if (entries.every(entry => entry.name === COPY_IDENTITY_PENDING)) return { state: 'empty', copyId: undefined, fileSystem };
+  throw new SecondCopyError('TARGET_NOT_EMPTY');
+}
+
+export interface InitOptions extends TargetOptions {
+  /** The id of the register record for this copy; written to `COPY.json`. */
+  copyId: string;
+  /** Take over a copy of this vault whose `COPY.json` names another (or no) id: it gets `copyId` (R18-3). */
+  adopt?: boolean;
+  /** TEST ONLY crash point after `COPY.json` is written, before the vault layout. */
+  checkpoint?: (point: 'init-after-identity') => void;
+}
+
+export interface CopyInitResult {
+  /** A new copy was written in an empty folder. */
+  created: boolean;
+  /** An interrupted `copy init` of this record was completed, or the folder already was this record's copy. */
+  resumed: boolean;
+  /** `--adopt` only: the id the folder held before (null when it had no `COPY.json`). */
+  adoptedFrom: string | null | undefined;
+  fileSystem: FileSystemReport;
+  disk: DiskRelation;
+}
+
+/**
+ * Prepare a folder as the Mode B second copy of record `copyId`. Keyless. `COPY.json` is written first, then the
+ * vault layout (`initializeVault`, which completes its own interrupted run), so a retry recognises Foundry's own
+ * unfinished folder. A copy of this vault with another id is refused (`COPY_MISMATCH`) unless `adopt` is set.
+ */
+export function initSecondCopy(workingVault: string, target: string, options: InitOptions): CopyInitResult {
+  const platform = options.platform ?? hostPlatform;
+  workingVault = resolve(workingVault);
+  target = resolve(target);
+  const working = metadata(workingVault);
+  const inspected = inspectCopyTarget(workingVault, target, options);
+  let created = false;
+  let resumed = false;
+  let adoptedFrom: string | null | undefined;
+  writeProtected(() => {
+    if (inspected.state === 'empty') {
+      mkdirSync(target, { recursive: true, mode: 0o700 });
+      writeCopyIdentity(target, working.vault_id, options.copyId);
+      options.checkpoint?.('init-after-identity');
+      initializeVault(target, {
+        vaultId: working.vault_id, createdAt: working.created_at, signingPublicKey: Buffer.from(working.signing_public_key, 'base64'),
+      });
+      created = true;
+    } else if (inspected.state === 'interrupted') {
+      if (inspected.copyId !== options.copyId) throw new SecondCopyError('COPY_MISMATCH', 'interrupted-init');
+      removeRegularFile(join(target, COPY_IDENTITY_PENDING));
+      initializeVault(target, {
+        vaultId: working.vault_id, createdAt: working.created_at, signingPublicKey: Buffer.from(working.signing_public_key, 'base64'),
+      });
+      resumed = true;
+    } else if (inspected.copyId === options.copyId) {
+      resumed = true;
+    } else if (options.adopt) {
+      adoptedFrom = inspected.copyId ?? null;
+      writeCopyIdentity(target, working.vault_id, options.copyId);
+    } else {
+      throw new SecondCopyError('COPY_MISMATCH', 'adopt-required');
+    }
+  });
+  return { created, resumed, adoptedFrom, fileSystem: inspected.fileSystem, disk: diskRelation(workingVault, target, platform) };
 }
 
 // ---------------------------------------------------------------------------------------------------------------
 // The vault session.
 
 export type CopyCheckpoint =
-  | 'after-stream-files' | 'after-signature' | 'after-manifest-pending' | 'after-head-pending'
-  | 'after-manifest-rename' | 'after-head-update' | 'after-read-only' | 'after-keyring';
+  | 'after-stream-files' | 'after-signature' | 'after-manifest-pending' | 'after-manifest-rename'
+  | 'after-read-back' | 'after-read-only' | 'after-keyring' | 'after-head-update';
 
 export interface SessionOptions extends TargetOptions {
   /** The head recorded on this working device for this copy (null or absent: never sealed). */
   recorded?: { segment: number; hash: string } | null;
+  /** The selected record's id: the drive's `COPY.json` must hold it (`COPY_MISMATCH`). Absent: not checked. */
+  copyId?: string;
   /** TEST ONLY crash points. A throw here stops the session at that point, like a pulled drive. */
   checkpoint?: (point: CopyCheckpoint, segment: number) => void;
+  /** TEST ONLY: runs after phase 1 (read-only) and before phase 2 (lock, recovery). */
+  afterInspection?: () => void;
 }
 
 export interface SealResult {
@@ -587,6 +929,8 @@ export interface SealResult {
   filesCopied: number;
   bytesCopied: number;
   keyringVersion: number;
+  /** False when the drive already held exactly this keyring. */
+  keyringWritten: boolean;
   anchor: VaultAnchor;
 }
 
@@ -597,62 +941,65 @@ export interface SessionReport {
   driveHead: { segment: number; hash: string };
   /** An unfinished segment folder left by an interrupted session, removed after the step-3 check. */
   removedPartialSegment: number | undefined;
-  /** A drive head left pending by an interrupted session and completed after the step-3 check. */
+  /** `HEAD.json` was behind the verified chain (an interrupted session) and was rewritten. */
   completedHead: boolean;
+  /** Segments past the recorded head that an interrupted session left writable and that were made read-only. */
+  protectedSegments: number;
 }
 
-function writableProbe(target: string): void {
-  const keyring = join(target, 'keyring');
-  // The probe uses the abandoned-temp-file name that keyring writers remove, so a crash here leaves nothing lasting.
-  const probe = join(keyring, `keyring.json.pending-${randomBytes(16).toString('hex')}`);
-  try {
-    mkdirSync(keyring, { recursive: true, mode: 0o700 });
-    const fd = openSync(probe, 'wx', 0o600);
-    try {
-      writeSync(fd, Buffer.from('probe'), 0, 5, 0);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-    unlinkSync(probe);
-  } catch (error) {
-    if (['EROFS', 'EACCES', 'EPERM'].includes(errorCode(error) ?? '')) throw new SecondCopyError('WRITE_PROTECTED');
-    throw error;
-  }
+const KEYRING_ENTRY = /^keyring\.json(?:\.lock\.sqlite(?:-journal|-wal|-shm)?|\.pending-[0-9a-f]{32})?$/u;
+
+/** Every entry of the drive's `keyring/` folder must be a regular file with a name a keyring writer uses. */
+function checkDriveKeyring(target: string): void {
+  const folder = join(target, 'keyring');
+  const stat = statIfPresent(folder);
+  if (!stat) return;
+  check(stat.isDirectory(), 'INVENTORY');
+  for (const entry of readdirSync(folder, { withFileTypes: true })) check(entry.isFile() && KEYRING_ENTRY.test(entry.name), 'INVENTORY');
 }
 
-function takeTargetLock(target: string) {
-  try {
-    return acquireWriterLock(join(target, LOCK));
-  } catch (error) {
-    if (['EROFS', 'EACCES', 'EPERM'].includes(errorCode(error) ?? '')) throw new SecondCopyError('WRITE_PROTECTED');
-    if (error instanceof Error && /locked|busy/iu.test(error.message)) throw new SecondCopyError('COPY_BUSY');
-    throw error;
-  }
+/** Segment folder numbers on the drive (every entry must be a real folder with a segment name). */
+function segmentFolders(target: string): number[] {
+  const root = join(target, 'segments');
+  check(statIfPresent(root)?.isDirectory(), 'INVENTORY');
+  return readdirSync(root, { withFileTypes: true }).map(entry => {
+    const number = Number(entry.name);
+    check(entry.isDirectory() && Number.isSafeInteger(number) && number > 0 && entry.name === segmentName(number), 'INVENTORY');
+    return number;
+  }).sort((a, b) => a - b);
 }
 
 /** The highest segment folder when it has no manifest. Its contents must be what an interrupted copy leaves. */
-function findPartialSegment(target: string): number | undefined {
-  const root = join(target, 'segments');
-  if (!statIfPresent(root)?.isDirectory()) return undefined;
-  const numbers = readdirSync(root, { withFileTypes: true })
-    .map(entry => Number(entry.name))
-    .filter(number => Number.isSafeInteger(number) && number > 0);
-  if (numbers.length === 0) return undefined;
-  const last = Math.max(...numbers);
-  const folder = join(root, segmentName(last));
-  if (!statIfPresent(folder)?.isDirectory() || statIfPresent(join(folder, MANIFEST))) return undefined;
+function findPartialSegment(target: string, folders: readonly number[]): number | undefined {
+  const last = folders.at(-1);
+  if (last === undefined) return undefined;
+  const folder = join(target, 'segments', segmentName(last));
+  if (statIfPresent(join(folder, MANIFEST))) return undefined;
   for (const entry of readdirSync(folder, { withFileTypes: true })) {
     const allowed = entry.isFile() && (entry.name === SIGNATURE || entry.name === MANIFEST_PENDING
       || /^(?:events|pack)-[0-9]{4,16}\.fvr$/u.test(entry.name));
-    if (!allowed) throw new SecondCopyError('COPY_VERIFY_FAILED', 'INVENTORY');
+    check(allowed, 'INVENTORY');
   }
   return last;
 }
 
+/** Every manifest and signature on the drive is a regular file within its size limit, before any is read. */
+function checkManifestSizes(target: string, folders: readonly number[]): void {
+  for (const number of folders) {
+    const folder = join(target, 'segments', segmentName(number));
+    for (const [name, limit] of [[MANIFEST, MAX_MANIFEST_BYTES], [SIGNATURE, 64], [MANIFEST_PENDING, MAX_MANIFEST_BYTES]] as const) {
+      const stat = statIfPresent(join(folder, name));
+      if (stat) check(stat.isFile() && stat.size <= limit, 'INVENTORY');
+    }
+  }
+}
+
 function removeFolder(folder: string): void {
+  check(statIfPresent(folder)?.isDirectory(), 'INVENTORY');
   chmodSync(folder, 0o700);
   for (const entry of readdirSync(folder, { withFileTypes: true })) {
+    // Only regular files are ever made writable and removed; a link is never followed by chmod.
+    check(entry.isFile(), 'INVENTORY');
     const path = join(folder, entry.name);
     chmodSync(path, 0o600);
     unlinkSync(path);
@@ -661,45 +1008,16 @@ function removeFolder(folder: string): void {
   rmdirSync(folder);
 }
 
-function manifestHash(directory: string, segment: number): string | undefined {
-  const path = join(directory, 'segments', segmentName(segment), MANIFEST);
-  return statIfPresent(path)?.isFile() ? sha256(readFileSync(path)) : undefined;
-}
-
-/** Step 2: keyless verification of the drive, leaving out an unfinished trailing segment folder. */
-function verifyDrive(target: string, working: VaultMetadata, partial: number | undefined) {
-  const meta = targetMetadata(target, working);
-  try {
-    checkRootInventory(target);
-    check(!statIfPresent(join(target, 'open')), 'INVENTORY');
-    const { position, previous } = scanSealed(target, meta, new StreamScanner(), undefined, undefined, undefined, undefined, partial);
-    // HEAD.json is a convenience copy that is never trusted on its own (Architecture 4.1). With an unfinished
-    // trailing folder, its check waits until step 3 has compared the verified chain; it only decides whether that
-    // folder is what an interrupted session leaves (HEAD names the last verified segment, a pending head names
-    // the unfinished one).
-    let partialConsistent = true;
-    if (partial === undefined) {
-      checkVerifiedHead(target, position, previous);
-    } else {
-      check(partial === position.segment + 1, 'INVENTORY');
-      partialConsistent = headMatches(readHead(target), position) && (!statIfPresent(join(target, HEAD_PENDING))
-        || readHead(target, HEAD_PENDING, 'INVENTORY').segment === partial);
-    }
-    return { meta, position, previous, partialConsistent };
-  } catch (error) {
-    if (error instanceof VaultFormatError) throw new SecondCopyError('COPY_VERIFY_FAILED', error.code);
-    throw error;
-  }
+function writable(folder: string): boolean {
+  if (hostPlatform !== 'win32' && statSync(folder).mode & 0o222) return true;
+  return readdirSync(folder, { withFileTypes: true }).some(entry => statIfPresent(join(folder, entry.name))!.mode & 0o222);
 }
 
 /** Step 3: the drive against the recorded head and against the working chain. Throws before any change. */
 function compareHeads(
-  workingVault: string, target: string, drive: ChainPosition, recorded: { segment: number; hash: string } | null | undefined,
+  workingVault: string, target: string, drive: ChainPosition, expected: { segment: number; hash: string },
   partial: number | undefined,
 ): void {
-  const expected = recorded ?? { segment: 0, hash: GENESIS_HASH };
-  integer(expected.segment);
-  hex(expected.hash, 32);
   if (drive.segment < expected.segment) throw new SecondCopyError('ROLLBACK_DETECTED', 'drive-older-than-recorded');
   if (expected.segment > 0 && manifestHash(target, expected.segment) !== expected.hash) {
     throw new SecondCopyError('TAMPER_DETECTED', 'recorded-segment-differs');
@@ -710,6 +1028,116 @@ function compareHeads(
     if (workingHash !== manifestHash(target, segment)) throw new SecondCopyError('TAMPER_DETECTED', 'chains-differ');
   }
   if (partial !== undefined && partial <= expected.segment) throw new SecondCopyError('TAMPER_DETECTED', 'recorded-segment-incomplete');
+}
+
+interface Inspection {
+  meta: VaultMetadata;
+  copyId: string | undefined;
+  folders: number[];
+  partial: number | undefined;
+  position: ChainPosition;
+  previous: ChainPosition;
+  expected: { segment: number; hash: string };
+  /** `HEAD.json` names the verified head (`current`) or an earlier chain position at or after the recorded head. */
+  head: 'current' | 'behind';
+}
+
+/** Phase 1 (steps 1 to 3 and the head classification): keyless and read-only. */
+function inspectDrive(workingVault: string, target: string, working: VaultMetadata, options: SessionOptions): Inspection {
+  const meta = targetMetadata(target, working);
+  const expected = options.recorded ?? { segment: 0, hash: GENESIS_HASH };
+  integer(expected.segment);
+  hex(expected.hash, 32);
+  let copyId: string | undefined;
+  let folders: number[];
+  let partial: number | undefined;
+  let position: ChainPosition;
+  let previous: ChainPosition;
+  try {
+    checkRootInventory(target, true);
+    copyId = readCopyIdentity(target, working.vault_id);
+    if (options.copyId !== undefined && copyId !== options.copyId) {
+      throw new SecondCopyError('COPY_MISMATCH', copyId === undefined ? 'missing' : 'different');
+    }
+    check(!statIfPresent(join(target, 'open')), 'INVENTORY');
+    checkDriveKeyring(target);
+    for (const name of [HEAD_PENDING, COPY_IDENTITY_PENDING]) {
+      const stat = statIfPresent(join(target, name));
+      if (stat) check(stat.isFile(), 'INVENTORY');
+    }
+    folders = segmentFolders(target);
+    partial = findPartialSegment(target, folders);
+    checkManifestSizes(target, folders);
+    ({ position, previous } = scanSealed(target, meta, new StreamScanner(), undefined, undefined, undefined, undefined, partial));
+    if (partial !== undefined) check(partial === position.segment + 1, 'INVENTORY');
+  } catch (error) {
+    if (error instanceof VaultFormatError) throw new SecondCopyError('COPY_VERIFY_FAILED', error.code);
+    throw error;
+  }
+  // Step 3 comes before any judgement of HEAD.json: a lost newest segment with a surviving HEAD is a rollback.
+  compareHeads(workingVault, target, position, expected, partial);
+  let head: Inspection['head'];
+  try {
+    const recordedHead = readHead(target);
+    if (headMatches(recordedHead, position)) {
+      head = 'current';
+    } else {
+      check(recordedHead.segment >= expected.segment && recordedHead.segment < position.segment
+        && manifestHash(target, recordedHead.segment) === recordedHead.hash, 'HEAD');
+      head = 'behind';
+    }
+  } catch (error) {
+    if (error instanceof VaultFormatError) throw new SecondCopyError('COPY_VERIFY_FAILED', error.code === 'INVENTORY' ? 'INVENTORY' : 'HEAD');
+    throw error;
+  }
+  return { meta, copyId, folders, partial, position, previous, expected, head };
+}
+
+/** Phase 2 starts here: the medium accepts writes (root and keyring folder), without leaving anything lasting. */
+function writableProbe(target: string): void {
+  writeProtected(() => {
+    accessSync(target, constants.W_OK);
+    const keyring = join(target, 'keyring');
+    if (!statIfPresent(keyring)) mkdirSync(keyring, { mode: 0o700 });
+    check(statIfPresent(keyring)?.isDirectory(), 'INVENTORY');
+    accessSync(keyring, constants.W_OK);
+    // The probe uses the abandoned-temp-file name the session removes, so a crash here leaves nothing lasting.
+    const probe = join(keyring, `keyring.json.pending-${randomBytes(16).toString('hex')}`);
+    const fd = openSync(probe, 'wx', 0o600);
+    try {
+      writeSync(fd, Buffer.from('probe'), 0, 5, 0);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    unlinkSync(probe);
+  });
+}
+
+function takeTargetLock(target: string) {
+  try {
+    return acquireWriterLock(join(target, LOCK));
+  } catch (error) {
+    if (READ_ONLY_CODES.includes(errorCode(error) ?? '')) throw new SecondCopyError('WRITE_PROTECTED');
+    const message = error instanceof Error ? error.message : '';
+    // node:sqlite reports a read-only medium as ERR_SQLITE_ERROR, not as an errno code.
+    if (/readonly|read-only|unable to open/iu.test(message)) throw new SecondCopyError('WRITE_PROTECTED');
+    if (/locked|busy/iu.test(message)) throw new SecondCopyError('COPY_BUSY');
+    throw error;
+  }
+}
+
+/** After the lock: the drive is still what phase 1 verified. */
+function recheck(target: string, inspection: Inspection, vaultId: string): void {
+  try {
+    const folders = segmentFolders(target);
+    check(folders.length === inspection.folders.length && folders.every((n, i) => n === inspection.folders[i]), 'INVENTORY');
+    check(manifestHash(target, inspection.position.segment) === inspection.position.hash, 'CHAIN');
+    check(readCopyIdentity(target, vaultId) === inspection.copyId, 'INVENTORY');
+  } catch (error) {
+    if (error instanceof VaultFormatError) throw new SecondCopyError('COPY_VERIFY_FAILED', 'CHANGED');
+    throw error;
+  }
 }
 
 function copyStream(source: string, destination: string, file: ManifestFile, buffer: Buffer): void {
@@ -750,11 +1178,36 @@ function keyringVersionOf(bytes: Buffer, vaultId: string): number {
   return value.version;
 }
 
+/**
+ * Write the working keyring to the drive unless the drive holds exactly these bytes. The drive file is read only
+ * when its size equals the working keyring's, and then only that many bytes, so a huge planted file costs nothing.
+ */
+function publishDriveKeyring(target: string, bytes: Buffer): boolean {
+  const folder = join(target, 'keyring');
+  const destination = join(folder, 'keyring.json');
+  const stat = statIfPresent(destination);
+  if (stat) {
+    check(stat.isFile(), 'INVENTORY');
+    if (stat.size === bytes.length && readRegularFile(destination, bytes.length)?.equals(bytes)) return false;
+  }
+  const pending = join(folder, `keyring.json.pending-${randomBytes(16).toString('hex')}`);
+  try {
+    writePending(pending, bytes);
+    renameWithRetry(pending, destination);
+  } catch (error) {
+    try { unlinkSync(pending); } catch { /* keep the first failure */ }
+    throw error;
+  }
+  syncDirectory(folder);
+  return true;
+}
+
 export const COPY_BUFFER_BYTES = 1024 * 1024;
 
 /**
- * Steps 1 to 3 of a vault session on `target`, keyless. On success the drive is verified, consistent with the
- * recorded head and with the working chain, and locked for this session; `seal` then runs steps 4 to 7.
+ * Steps 1 to 3 (phase 1, keyless and read-only), then phase 2: the writability probe, the lock, a re-check and the
+ * recovery of an interrupted session. On success the drive is verified, consistent with the recorded head and the
+ * working chain, and locked for this session; `seal` then runs steps 4 to 7.
  */
 export function openSecondCopySession(workingVault: string, target: string, options: SessionOptions = {}) {
   const platform = options.platform ?? hostPlatform;
@@ -763,32 +1216,46 @@ export function openSecondCopySession(workingVault: string, target: string, opti
   const working = metadata(workingVault);
   checkPlacement(workingVault, target, platform);
   if (!statIfPresent(target)?.isDirectory()) throw new SecondCopyError('NOT_A_COPY');
-  // Step 1.
+  // Phase 1: steps 1 to 3, nothing written on either side.
   const fileSystem = checkFileSystem((options.probe ?? (path => probeFileSystem(path, options)))(target));
-  targetMetadata(target, working);
-  // Step 2: writability first, so a switch left on is reported plainly, then the lock and the keyless check.
+  const inspection = inspectDrive(workingVault, target, working, options);
+  options.afterInspection?.();
+  // Phase 2.
   writableProbe(target);
   const lock = takeTargetLock(target);
   try {
-    const partial = findPartialSegment(target);
-    const { meta, position: drive, previous: drivePrevious, partialConsistent } = verifyDrive(target, working, partial);
-    // Step 3.
-    compareHeads(workingVault, target, drive, options.recorded, partial);
-    if (!partialConsistent) throw new SecondCopyError('COPY_VERIFY_FAILED', 'HEAD');
-    // Only now may the drive change: finish or roll back what an interrupted session left.
+    recheck(target, inspection, working.vault_id);
+    const { meta, partial, expected } = inspection;
+    const drive = inspection.position;
+    let protectedSegments = 0;
     let completedHead = false;
-    if (partial !== undefined) {
-      if (statIfPresent(join(target, HEAD_PENDING))) unlinkSync(join(target, HEAD_PENDING));
-      removeFolder(join(target, 'segments', segmentName(partial)));
-      syncDirectory(join(target, 'segments'));
+    writeProtected(() => {
+      if (partial !== undefined) {
+        removeFolder(join(target, 'segments', segmentName(partial)));
+        syncDirectory(join(target, 'segments'));
+      }
+      // A pending head is never trusted or read: the verified chain decides what HEAD.json must say.
+      removeRegularFile(join(target, HEAD_PENDING));
+      removeRegularFile(join(target, COPY_IDENTITY_PENDING));
+      for (const entry of readdirSync(join(target, 'keyring'), { withFileTypes: true })) {
+        if (/^keyring\.json\.pending-[0-9a-f]{32}$/u.test(entry.name)) removeRegularFile(join(target, 'keyring', entry.name));
+      }
+      for (let segment = expected.segment + 1; segment <= drive.segment; segment++) {
+        const folder = join(target, 'segments', segmentName(segment));
+        if (writable(folder)) {
+          makeReadOnly(folder);
+          protectedSegments++;
+        }
+      }
+      if (inspection.head === 'behind') {
+        publishHead(target, drive);
+        completedHead = true;
+      }
       syncDirectory(target);
-    } else if (statIfPresent(join(target, HEAD_PENDING))) {
-      replaceHead(target);
-      completedHead = true;
-    }
+    });
     const report: SessionReport = {
       fileSystem, disk: diskRelation(workingVault, target, platform),
-      driveHead: { segment: drive.segment, hash: drive.hash }, removedPartialSegment: partial, completedHead,
+      driveHead: { segment: drive.segment, hash: drive.hash }, removedPartialSegment: partial, completedHead, protectedSegments,
     };
     let released = false;
     const release = () => {
@@ -801,8 +1268,7 @@ export function openSecondCopySession(workingVault: string, target: string, opti
     const seal = (unlocked: UnlockedKeyring, { now = () => new Date(), writer }: { now?: () => Date; writer?: string } = {}): SealResult => {
       check(!released, 'KEY');
       const point = (name: CopyCheckpoint, segment: number) => options.checkpoint?.(name, segment);
-      // Step 4.
-      // Opening the writer verifies the working chain's structure and hashes; damage there stops the session.
+      // Step 4. Opening the writer verifies the working chain's structure and hashes; damage there stops the session.
       let closed: ChainPosition;
       try {
         const vaultWriter = VaultWriter.open(workingVault, unlocked, writer === undefined ? {} : { writer });
@@ -819,8 +1285,7 @@ export function openSecondCopySession(workingVault: string, target: string, opti
       const publicKey = Buffer.from(meta.signing_public_key, 'base64');
       const buffer = Buffer.allocUnsafe(COPY_BUFFER_BYTES);
       let position: ChainPosition = drive;
-      let previous: ChainPosition = drivePrevious;
-      const copied: { segment: number; files: ManifestFile[]; start: ChainPosition }[] = [];
+      const copied: { segment: number; files: ManifestFile[]; start: ChainPosition; hash: string }[] = [];
       let filesCopied = 0;
       let bytesCopied = 0;
       // Step 5.
@@ -846,7 +1311,11 @@ export function openSecondCopySession(workingVault: string, target: string, opti
           if (error instanceof VaultFormatError) throw new SecondCopyError('WORKING_VAULT_DAMAGED', error.code);
           throw error;
         }
-        mkdirSync(destination, { mode: 0o700 });
+        writeProtected(() => {
+          mkdirSync(destination, { mode: 0o700 });
+          // The new folder's entry is durable before anything that depends on it is written.
+          syncDirectory(join(target, 'segments'));
+        });
         for (const file of files) {
           try {
             copyStream(join(source, file.name), join(destination, file.name), file, buffer);
@@ -863,50 +1332,56 @@ export function openSecondCopySession(workingVault: string, target: string, opti
         writePending(join(destination, MANIFEST_PENDING), bytes);
         syncDirectory(destination);
         point('after-manifest-pending', segment);
-        writePending(join(target, HEAD_PENDING), headBytes(next));
-        syncDirectory(target);
-        point('after-head-pending', segment);
         renameWithRetry(join(destination, MANIFEST_PENDING), join(destination, MANIFEST));
         syncDirectory(destination);
         syncDirectory(join(target, 'segments'));
         point('after-manifest-rename', segment);
-        replaceHead(target);
-        point('after-head-update', segment);
         filesCopied += 2;
         bytesCopied += bytes.length + signature.length;
-        copied.push({ segment, files, start: position });
-        previous = position;
+        copied.push({ segment, files, start: position, hash: next.hash });
         position = next;
       }
-      // Step 6: re-read and re-hash what landed on the drive.
+      // Step 6: re-read everything that landed on the drive; the head is derived from those bytes.
+      let derived: ChainPosition = drive;
       try {
         const scanner = new StreamScanner();
-        for (const { segment, start } of copied) {
+        for (const { segment, start, hash } of copied) {
           const folder = join(target, 'segments', segmentName(segment));
-          const bytes = readFileSync(join(folder, MANIFEST));
-          const manifest = decodeManifest(bytes, readFileSync(join(folder, SIGNATURE)), publicKey);
-          checkManifestLink(manifest, meta.vault_id, start);
+          const bytes = readRegularFile(join(folder, MANIFEST), MAX_MANIFEST_BYTES);
+          check(bytes !== undefined, 'INVENTORY');
+          check(sha256(bytes) === hash, 'FILE_HASH');
+          const signature = readRegularFile(join(folder, SIGNATURE), 64);
+          check(signature !== undefined, 'INVENTORY');
+          const manifest = decodeManifest(bytes, signature, publicKey);
+          checkManifestLink(manifest, meta.vault_id, derived);
           const names = streamNames(folder, [MANIFEST, SIGNATURE]);
-          check(names.length === manifest.files.length, 'INVENTORY');
-          const scanned = scanStreams(folder, names, start.lastEventSequence, scanner, undefined, manifest.files);
+          check(names.length === manifest.files.length
+            && [...names].sort().every((entry, index) => entry === manifest.files[index]!.name), 'INVENTORY');
+          const scanned = scanStreams(folder, names, derived.lastEventSequence, scanner, undefined, manifest.files);
           checkManifestRecords(manifest, scanned.keyIds, scanned.first, scanned.last);
+          derived = { segment, hash: sha256(bytes), lastEventSequence: scanned.last };
         }
-        checkVerifiedHead(target, position, previous);
+        check(derived.segment === position.segment && derived.hash === position.hash, 'CHAIN');
       } catch (error) {
         if (error instanceof VaultFormatError) throw new SecondCopyError('COPY_VERIFY_FAILED', error.code);
         throw error;
       }
-      // Step 7.
+      point('after-read-back', position.segment);
+      // Step 7: read-only, keyring, and HEAD.json last.
       for (const { segment } of copied) makeReadOnly(join(target, 'segments', segmentName(segment)));
       point('after-read-only', position.segment);
       const keyringBytes = readFileSync(join(workingVault, 'keyring', 'keyring.json'));
       const keyringVersion = keyringVersionOf(keyringBytes, meta.vault_id);
-      const destination = join(target, 'keyring', 'keyring.json');
-      mkdirSync(join(target, 'keyring'), { recursive: true, mode: 0o700 });
-      const existing = statIfPresent(destination)?.isFile() ? readFileSync(destination) : undefined;
-      if (!existing?.equals(keyringBytes)) publishKeyring(destination, keyringBytes, existing);
+      let keyringWritten: boolean;
+      try {
+        keyringWritten = writeProtected(() => publishDriveKeyring(target, keyringBytes));
+      } catch (error) {
+        if (error instanceof VaultFormatError) throw new SecondCopyError('COPY_VERIFY_FAILED', error.code);
+        throw error;
+      }
       point('after-keyring', position.segment);
-      check(headMatches(readHead(target), position), 'HEAD');
+      if (copied.length > 0) publishHead(target, position);
+      point('after-head-update', position.segment);
       return {
         previous: { segment: drive.segment, hash: drive.hash },
         head: { segment: position.segment, hash: position.hash },
@@ -915,6 +1390,7 @@ export function openSecondCopySession(workingVault: string, target: string, opti
         filesCopied,
         bytesCopied,
         keyringVersion,
+        keyringWritten,
         anchor: chainAnchor(meta.vault_id, meta.signing_public_key, position),
       };
     };
@@ -924,4 +1400,3 @@ export function openSecondCopySession(workingVault: string, target: string, opti
     throw error;
   }
 }
-
