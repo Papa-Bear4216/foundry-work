@@ -13,7 +13,8 @@ import {
   addCopyRecord, COPY_REGISTERED, COPY_SEALED, copyRegisteredBody, copyRegisterStatus, copySealedBody, diskRelation,
   emptyRegister, fsutilType, initSecondCopy, inspectCopyTarget, loadCopyRegister, MAX_REGISTER_BYTES, mountInfoType,
   openSecondCopySession, pathInside, probeFileSystem, readCopyIdentity, readCopyRegister, recordSeal, registerFromEvents,
-  replayCopyRegister, selectCopy, verifySecondCopy, writeCopyRegister,
+  MAX_ROOT_ENTRIES, MAX_SEGMENT_ENTRIES, replayCopyRegister, selectCopy, setSegmentEntryCapForTest, verifySecondCopy,
+  writeCopyRegister,
 } from '../src/second-copy.ts';
 import { blob, cases, event, fixture, identity, keyId, keyringPath } from './vault-fixture.mjs';
 
@@ -471,6 +472,50 @@ test('the session state outlives the head: every sync, then HEAD.json, then SESS
   writeFileSync(join(vault.drive, 'SESSION.json'), `{"format":"foundry-copy-session/1","manifest_sha256":"${first.head.hash}","segment":1}`);
   writeFileSync(join(vault.drive, 'HEAD.json'), `{"manifest_sha256":"${'c'.repeat(64)}","segment":2}`);
   assert.throws(() => vault.session({ recorded: first.head }), { code: 'COPY_VERIFY_FAILED', reason: 'HEAD' });
+});
+
+test('a drive folder with more entries than a valid one can hold stops with a fixed error before it is listed whole (R20-4, 39)', t => {
+  assert.equal(MAX_SEGMENT_ENTRIES, 9365);
+  assert.equal(MAX_ROOT_ENTRIES, 14);
+  const tooMany = { code: 'COPY_VERIFY_FAILED', reason: 'TOO_MANY_ENTRIES' };
+  const fill = (folder, count, name) => {
+    for (let n = readdirSync(folder).length; n < count; n++) writeFileSync(join(folder, name(n)), 'TEST ONLY');
+  };
+  // An uncommitted segment folder of an interrupted session, one entry over the (lowered) cap.
+  const vault = setup(t);
+  vault.append([event('TEST ONLY one'), blob('TEST ONLY blob')], true);
+  vault.init();
+  const first = vault.session().result;
+  const cap = readdirSync(segmentDir(vault.drive, 1)).length + 2;
+  setSegmentEntryCapForTest(cap);
+  t.after(() => setSegmentEntryCapForTest(undefined));
+  vault.append([event('TEST ONLY two'), blob('TEST ONLY blob two')]);
+  const stop = new Error('TEST ONLY pulled');
+  assert.throws(() => vault.session({ recorded: first.head, checkpoint: name => { if (name === 'after-stream-files') throw stop; } }),
+    error => error === stop);
+  fill(segmentDir(vault.drive, 2), cap + 1, n => `events-${String(9000 + n)}.fvr`);
+  let before = tree(vault.drive);
+  assert.throws(() => vault.session({ recorded: first.head }), tooMany);
+  assert.throws(() => verifySecondCopy(vault.drive, { anchor: first.anchor }), tooMany);
+  assert.deepEqual(tree(vault.drive), before, 'nothing changed');
+  // Exactly at the cap the folder is accepted (and removed and copied again).
+  setSegmentEntryCapForTest(cap + 1);
+  assert.equal(vault.session({ recorded: first.head }).result.head.segment, 2);
+  setSegmentEntryCapForTest(cap);
+  // A committed segment folder: its count is checked before the chain scan lists it (not INVENTORY from the scan).
+  const committed = setup(t);
+  committed.append([event('TEST ONLY three'), blob('TEST ONLY blob three')], true);
+  committed.init();
+  const sealed = committed.session().result;
+  makeWritable(committed.drive);
+  fill(segmentDir(committed.drive, 1), cap + 1, n => `TEST-ONLY-${n}`);
+  assert.throws(() => verifySecondCopy(committed.drive, { anchor: sealed.anchor }), tooMany);
+  // A copy root with more entries than its inventory allows.
+  rmSync(segmentDir(committed.drive, 1), { recursive: true });
+  fill(committed.drive, MAX_ROOT_ENTRIES + 1, n => `TEST-ONLY-${n}`);
+  before = tree(committed.drive);
+  assert.throws(() => committed.session(), tooMany);
+  assert.deepEqual(tree(committed.drive), before);
 });
 
 test('a short or stale pending head is discarded and HEAD.json is rebuilt from the verified chain', t => {

@@ -104,6 +104,12 @@ declare module 'node:fs' {
   export function openSync(path: string, flags: 'w' | 'wx' | 'wx+' | 'r', mode?: number): number;
   export function accessSync(path: string, mode: number): void;
   export const constants: { readonly W_OK: number };
+  // P-3 fix round 3 (R20-4): drive folders are listed one entry at a time.
+  interface Dir {
+    readSync(): Dirent | null;
+    closeSync(): void;
+  }
+  export function opendirSync(path: string, options?: { bufferSize?: number }): Dir;
 }
 
 declare module 'node:path' {

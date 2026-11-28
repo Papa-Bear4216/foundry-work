@@ -48,8 +48,8 @@ import { Buffer } from 'node:buffer';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import {
-  accessSync, chmodSync, closeSync, constants, fstatSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync,
-  readSync, realpathSync, rmdirSync, statfsSync, statSync, unlinkSync, writeSync,
+  accessSync, chmodSync, closeSync, constants, fstatSync, fsyncSync, mkdirSync, openSync, readFileSync,
+  opendirSync, readSync, realpathSync, rmdirSync, statfsSync, statSync, unlinkSync, writeSync,
 } from 'node:fs';
 import { dirname, join, posix, resolve, win32 } from 'node:path';
 import type { PlatformPath } from 'node:path';
@@ -298,6 +298,64 @@ function readRegularFile(path: string, limit: number): Buffer | undefined {
     return bytes;
   } finally {
     closeSync(fd);
+  }
+}
+
+// R20-4 (39): drive folders are listed one entry at a time (`opendirSync`), never as one array, and a folder with
+// more entries than a valid one can hold stops the command with a fixed error before the next entry is read.
+
+/** A copy root holds at most its inventory: `keyring/`, `segments/`, `open/` and 11 named files (A-44). */
+export const MAX_ROOT_ENTRIES = 14;
+/**
+ * The smallest canonical `files` entry of a manifest: `{"bytes":89,"name":"pack-0001.fvr","sha256":"<64 hex>"}` is
+ * 111 bytes, plus the comma before the next entry (`bytes` is at least 89, a name at least 13 characters).
+ */
+const MIN_MANIFEST_ENTRY_BYTES = 112;
+/**
+ * A segment folder holds `MANIFEST.json`, `MANIFEST.json.pending`, `MANIFEST.sig` and one stream file per manifest
+ * entry; a manifest within `MAX_MANIFEST_BYTES` lists at most `MAX_MANIFEST_BYTES / 112` entries (9,365 in all).
+ * The drive's `keyring/` folder uses the same cap (it holds `keyring.json`, its lock files and temp files).
+ */
+export const MAX_SEGMENT_ENTRIES = Math.floor(MAX_MANIFEST_BYTES / MIN_MANIFEST_ENTRY_BYTES) + 3;
+
+let segmentEntryCapForTest: number | undefined;
+/** TEST ONLY: lower the segment and keyring folder cap (undefined restores `MAX_SEGMENT_ENTRIES`). */
+export function setSegmentEntryCapForTest(cap: number | undefined): void {
+  segmentEntryCapForTest = cap;
+}
+
+type FolderEntry = { name: string; isFile(): boolean; isDirectory(): boolean };
+
+/** Visit each entry of `folder`, at most `cap` of them; one more fails (`tooMany`, else `COPY_VERIFY_FAILED`). */
+function eachEntry(folder: string, cap: number, visit: (entry: FolderEntry) => void, tooMany?: () => never): number {
+  const dir = opendirSync(folder, { bufferSize: 32 });
+  let count = 0;
+  try {
+    for (let entry = dir.readSync(); entry !== null; entry = dir.readSync()) {
+      if (++count > cap) {
+        tooMany?.();
+        throw new SecondCopyError('COPY_VERIFY_FAILED', 'TOO_MANY_ENTRIES');
+      }
+      visit(entry);
+    }
+  } finally {
+    dir.closeSync();
+  }
+  return count;
+}
+
+/** The entries of a segment folder or of the drive's keyring folder, bounded (R20-4). */
+function eachSegmentEntry(folder: string, visit: (entry: FolderEntry) => void): number {
+  return eachEntry(folder, segmentEntryCapForTest ?? MAX_SEGMENT_ENTRIES, visit);
+}
+
+/** True when `folder` holds no entry (only the first entry is read). */
+function emptyFolder(folder: string): boolean {
+  const dir = opendirSync(folder, { bufferSize: 32 });
+  try {
+    return dir.readSync() === null;
+  } finally {
+    dir.closeSync();
   }
 }
 
@@ -908,7 +966,9 @@ export function inspectCopyTarget(workingVault: string, target: string, options:
   const stat = statIfPresent(target);
   if (!stat) return { state: 'empty', copyId: undefined, fileSystem };
   if (!stat.isDirectory()) throw new SecondCopyError('TARGET_UNSUITABLE', 'not-a-folder');
-  const entries = readdirSync(target, { withFileTypes: true });
+  // R20-4: no copy root and no init folder holds more than its inventory, so a fuller folder is not empty.
+  const entries: FolderEntry[] = [];
+  eachEntry(target, MAX_ROOT_ENTRIES, entry => { entries.push(entry); }, () => { throw new SecondCopyError('TARGET_NOT_EMPTY'); });
   if (entries.length === 0) return { state: 'empty', copyId: undefined, fileSystem };
   if (entries.some(entry => entry.name === VAULT_METADATA)) {
     targetMetadata(target, working);
@@ -921,7 +981,7 @@ export function inspectCopyTarget(workingVault: string, target: string, options:
     return { state: 'copy', copyId: readCopyIdentity(target, working.vault_id), fileSystem };
   }
   const own = entries.every(entry => (entry.isFile() && INIT_FILES.includes(entry.name))
-    || (entry.isDirectory() && entry.name === 'segments' && readdirSync(join(target, 'segments'), { withFileTypes: true }).length === 0));
+    || (entry.isDirectory() && entry.name === 'segments' && emptyFolder(join(target, 'segments'))));
   if (!own) throw new SecondCopyError('TARGET_NOT_EMPTY');
   const copyId = readCopyIdentity(target, working.vault_id);
   if (copyId !== undefined) return { state: 'interrupted', copyId, fileSystem };
@@ -1056,18 +1116,23 @@ function checkDriveKeyring(target: string): void {
   const stat = statIfPresent(folder);
   if (!stat) return;
   check(stat.isDirectory(), 'INVENTORY');
-  for (const entry of readdirSync(folder, { withFileTypes: true })) check(entry.isFile() && KEYRING_ENTRY.test(entry.name), 'INVENTORY');
+  eachSegmentEntry(folder, entry => check(entry.isFile() && KEYRING_ENTRY.test(entry.name), 'INVENTORY'));
 }
 
-/** Segment folder numbers on the drive (every entry must be a real folder with a segment name). */
+/**
+ * Segment folder numbers on the drive (every entry must be a real folder with a segment name). Listed one entry at
+ * a time and kept as numbers only; `segments/` has no format cap (a long history is valid).
+ */
 function segmentFolders(target: string): number[] {
   const root = join(target, 'segments');
   check(statIfPresent(root)?.isDirectory(), 'INVENTORY');
-  return readdirSync(root, { withFileTypes: true }).map(entry => {
+  const numbers: number[] = [];
+  eachEntry(root, Number.MAX_SAFE_INTEGER, entry => {
     const number = Number(entry.name);
     check(entry.isDirectory() && Number.isSafeInteger(number) && number > 0 && entry.name === segmentName(number), 'INVENTORY');
-    return number;
-  }).sort((a, b) => a - b);
+    numbers.push(number);
+  });
+  return numbers.sort((a, b) => a - b);
 }
 
 /** The highest segment folder when it has no manifest. Its contents must be what an interrupted copy leaves. */
@@ -1076,11 +1141,11 @@ function findPartialSegment(target: string, folders: readonly number[]): number 
   if (last === undefined) return undefined;
   const folder = join(target, 'segments', segmentName(last));
   if (statIfPresent(join(folder, MANIFEST))) return undefined;
-  for (const entry of readdirSync(folder, { withFileTypes: true })) {
+  eachSegmentEntry(folder, entry => {
     const allowed = entry.isFile() && (entry.name === SIGNATURE || entry.name === MANIFEST_PENDING
       || /^(?:events|pack)-[0-9]{4,16}\.fvr$/u.test(entry.name));
     check(allowed, 'INVENTORY');
-  }
+  });
   return last;
 }
 
@@ -1088,7 +1153,7 @@ const SEGMENT_ENTRY = /^(?:MANIFEST\.json(?:\.pending)?|MANIFEST\.sig|(?:events|
 
 /** An uncommitted segment folder may hold only regular files with the names a copy writes (it is never read). */
 function checkUncommitted(folder: string): void {
-  for (const entry of readdirSync(folder, { withFileTypes: true })) check(entry.isFile() && SEGMENT_ENTRY.test(entry.name), 'INVENTORY');
+  eachSegmentEntry(folder, entry => check(entry.isFile() && SEGMENT_ENTRY.test(entry.name), 'INVENTORY'));
 }
 
 const SESSION_FORMAT = 'foundry-copy-session/1';
@@ -1150,21 +1215,25 @@ function protectSegment(folder: string, segment: number, hooks: SessionHooks): b
   const changed = writable(folder);
   if (changed) makeReadOnly(folder);
   hooks.point('after-chmod', segment);
-  for (const entry of readdirSync(folder, { withFileTypes: true })) {
+  eachSegmentEntry(folder, entry => {
     check(entry.isFile(), 'INVENTORY');
     hooks.sync('segment-file', segment);
     syncFile(join(folder, entry.name));
-  }
+  });
   hooks.sync('segment-dir', segment);
   syncDirectory(folder);
   check(!writable(folder), 'INVENTORY');
   return changed;
 }
 
-/** Every manifest and signature on the drive is a regular file within its size limit, before any is read. */
+/**
+ * Every manifest and signature on the drive is a regular file within its size limit, before any is read. R20-4:
+ * each folder's entry count is checked first, so the whole-folder listing of the chain scan stays bounded.
+ */
 function checkManifestSizes(target: string, folders: readonly number[]): void {
   for (const number of folders) {
     const folder = join(target, 'segments', segmentName(number));
+    eachSegmentEntry(folder, () => {});
     for (const [name, limit] of [[MANIFEST, MAX_MANIFEST_BYTES], [SIGNATURE, 64], [MANIFEST_PENDING, MAX_MANIFEST_BYTES]] as const) {
       const stat = statIfPresent(join(folder, name));
       if (stat) check(stat.isFile() && stat.size <= limit, 'INVENTORY');
@@ -1175,10 +1244,15 @@ function checkManifestSizes(target: string, folders: readonly number[]): void {
 function removeFolder(folder: string): void {
   check(statIfPresent(folder)?.isDirectory(), 'INVENTORY');
   chmodSync(folder, 0o700);
-  for (const entry of readdirSync(folder, { withFileTypes: true })) {
+  // The names are collected first (bounded), so no entry is removed while the folder is being listed.
+  const names: string[] = [];
+  eachSegmentEntry(folder, entry => {
     // Only regular files are ever made writable and removed; a link is never followed by chmod.
     check(entry.isFile(), 'INVENTORY');
-    const path = join(folder, entry.name);
+    names.push(entry.name);
+  });
+  for (const name of names) {
+    const path = join(folder, name);
     chmodSync(path, 0o600);
     unlinkSync(path);
   }
@@ -1188,7 +1262,11 @@ function removeFolder(folder: string): void {
 
 function writable(folder: string): boolean {
   if (hostPlatform !== 'win32' && statSync(folder).mode & 0o222) return true;
-  return readdirSync(folder, { withFileTypes: true }).some(entry => statIfPresent(join(folder, entry.name))!.mode & 0o222);
+  let found = false;
+  eachSegmentEntry(folder, entry => {
+    if (!found && statIfPresent(join(folder, entry.name))!.mode & 0o222) found = true;
+  });
+  return found;
 }
 
 /** Step 3: the drive against the recorded head and against the working chain. Throws before any change. */
@@ -1263,6 +1341,7 @@ function inspectDrive(target: string, trust: DriveTrust): Inspection {
   let position: ChainPosition;
   let previous: ChainPosition;
   try {
+    eachEntry(target, MAX_ROOT_ENTRIES, () => {});
     checkRootInventory(target, true);
     copyId = readCopyIdentity(target, meta.vault_id);
     if (!('anchor' in trust) && trust.copyId !== undefined && copyId !== trust.copyId) {
@@ -1561,9 +1640,11 @@ export function openSecondCopySession(workingVault: string, target: string, opti
         removeRegularFile(join(target, HEAD_PENDING));
         removeRegularFile(join(target, COPY_IDENTITY_PENDING));
         removeRegularFile(join(target, COPY_SESSION_PENDING));
-        for (const entry of readdirSync(join(target, 'keyring'), { withFileTypes: true })) {
-          if (/^keyring\.json\.pending-[0-9a-f]{32}$/u.test(entry.name)) removeRegularFile(join(target, 'keyring', entry.name));
-        }
+        const pendingKeyrings: string[] = [];
+        eachSegmentEntry(join(target, 'keyring'), entry => {
+          if (/^keyring\.json\.pending-[0-9a-f]{32}$/u.test(entry.name)) pendingKeyrings.push(entry.name);
+        });
+        for (const name of pendingKeyrings) removeRegularFile(join(target, 'keyring', name));
         // R19-2, R20-1 (46): every committed segment, recorded ones included, is read-only again, synced, and checked.
         for (let segment = 1; segment <= drive.segment; segment++) {
           if (protectSegment(join(target, 'segments', segmentName(segment)), segment, hooks)) protectedSegments++;
