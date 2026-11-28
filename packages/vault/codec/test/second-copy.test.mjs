@@ -13,7 +13,7 @@ import {
   addCopyRecord, COPY_REGISTERED, COPY_SEALED, copyRegisteredBody, copyRegisterStatus, copySealedBody, diskRelation,
   emptyRegister, fsutilType, initSecondCopy, inspectCopyTarget, loadCopyRegister, MAX_REGISTER_BYTES, mountInfoType,
   openSecondCopySession, pathInside, probeFileSystem, readCopyIdentity, readCopyRegister, recordSeal, registerFromEvents,
-  replayCopyRegister, selectCopy, writeCopyRegister,
+  replayCopyRegister, selectCopy, verifySecondCopy, writeCopyRegister,
 } from '../src/second-copy.ts';
 import { blob, cases, event, fixture, identity, keyId, keyringPath } from './vault-fixture.mjs';
 
@@ -421,13 +421,14 @@ test('an interrupted session at any step is finished or rolled back by the next 
     }), error => error === stop, point);
     // Segment 1 on the drive is untouched by the interrupted session.
     assert.equal(sha(readFileSync(join(segmentDir(vault.drive, 1), 'MANIFEST.json'))), first.head.hash);
-    // R19-2: until SESSION.json is removed, segment 2 is uncommitted: HEAD.json still names segment 1.
-    const committed = ['after-session-end', 'after-head-update'].includes(point);
-    assert.equal(existsSync(join(vault.drive, 'SESSION.json')), !committed, point);
-    if (point !== 'after-head-update') assert.equal(JSON.parse(readFileSync(join(vault.drive, 'HEAD.json'))).segment, 1, point);
+    // R19-2, R20-1 (54): until HEAD.json names segment 2, segment 2 is uncommitted; SESSION.json is removed only
+    // after that, so a stop between the two leaves both and the verified published head decides.
+    const committed = ['after-head-update', 'after-session-end'].includes(point);
+    assert.equal(existsSync(join(vault.drive, 'SESSION.json')), point !== 'after-session-end', point);
+    assert.equal(JSON.parse(readFileSync(join(vault.drive, 'HEAD.json'))).segment, committed ? 2 : 1, point);
     const next = vault.session({ recorded: first.head });
     assert.equal(next.report.removedPartialSegment, committed ? undefined : 2, point);
-    assert.equal(next.report.completedHead, point === 'after-session-end', point);
+    assert.equal(next.report.completedHead, false, point);
     assert.equal(next.report.protectedSegments, 0, point);
     assert.equal(next.result.segmentsCopied, committed ? 0 : 1, point);
     assert.equal(existsSync(join(vault.drive, 'SESSION.json')), false, point);
@@ -438,6 +439,38 @@ test('an interrupted session at any step is finished or rolled back by the next 
       assert.equal(statSync(join(segmentDir(vault.drive, 2), name)).mode & 0o222, 0, `${point}: ${name} read-only`);
     }
   }
+});
+
+test('the session state outlives the head: every sync, then HEAD.json, then SESSION.json is removed (R20-1, 54)', t => {
+  const vault = setup(t);
+  vault.append([event('TEST ONLY one'), blob('TEST ONLY blob one')], true);
+  vault.init();
+  const first = vault.session().result;
+  vault.append([event('TEST ONLY two'), blob('TEST ONLY blob two')]);
+  const events = [];
+  const stop = new Error('TEST ONLY pulled after the head');
+  assert.throws(() => vault.session({
+    recorded: first.head, onSync: name => events.push(name),
+    checkpoint: name => { if (name === 'after-head-update') throw stop; },
+  }), error => error === stop);
+  const head = events.indexOf('head-published');
+  assert.ok(head > 0 && !events.includes('session-removed'), events.join(' '));
+  assert.ok(events.slice(0, head).includes('keyring-dir') && events.slice(0, head).includes('segment-dir'));
+  // The published head is verified and ends the committed chain: the retry recopies nothing and keeps the seal.
+  const segmentTwo = tree(segmentDir(vault.drive, 2));
+  assert.equal(existsSync(join(vault.drive, 'SESSION.json')), true);
+  assert.deepEqual(verifySecondCopy(vault.drive, { workingVault: vault.working, recorded: first.head, copyId: ID }).segment, 2);
+  const retryEvents = [];
+  const retry = vault.session({ recorded: first.head, onSync: name => retryEvents.push(name) });
+  assert.deepEqual([retry.report.removedPartialSegment, retry.result.segmentsCopied, retry.result.head.segment], [undefined, 0, 2]);
+  assert.deepEqual(tree(segmentDir(vault.drive, 2)), segmentTwo);
+  assert.equal(existsSync(join(vault.drive, 'SESSION.json')), false);
+  assert.deepEqual(retryEvents.slice(-1), ['session-removed']);
+  // A published head after the session's base that the chain does not end at is refused.
+  makeWritable(vault.drive);
+  writeFileSync(join(vault.drive, 'SESSION.json'), `{"format":"foundry-copy-session/1","manifest_sha256":"${first.head.hash}","segment":1}`);
+  writeFileSync(join(vault.drive, 'HEAD.json'), `{"manifest_sha256":"${'c'.repeat(64)}","segment":2}`);
+  assert.throws(() => vault.session({ recorded: first.head }), { code: 'COPY_VERIFY_FAILED', reason: 'HEAD' });
 });
 
 test('a short or stale pending head is discarded and HEAD.json is rebuilt from the verified chain', t => {

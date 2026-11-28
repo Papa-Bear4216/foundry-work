@@ -9,7 +9,9 @@
  *  2. Check the type of every root and keyring entry (a link is refused), bound every read of a drive file, and
  *     verify every manifest, signature, file hash and the whole chain without any secret. When `SESSION.json` (an
  *     interrupted session, R19-2) exists, every segment folder after the head it names is uncommitted: those folders
- *     are only type-checked, never read, and the committed chain must end at that head. Without it, a trailing
+ *     are only type-checked, never read, and the committed chain must end at that head. R20-1: when `HEAD.json`
+ *     names a later segment (a stop after the head was published), that head ends the committed chain instead and
+ *     must verify as its exact end; only the folders after it are uncommitted. Without `SESSION.json`, a trailing
  *     segment folder without a manifest (an interrupted session of an earlier version) is left out of this check.
  *  3. Compare the drive's verified chain with the head recorded on the working device for this copy, and with the
  *     working vault's own chain. Older than recorded: `ROLLBACK_DETECTED`. A different manifest hash at the same
@@ -27,10 +29,11 @@
  *     pending name and a rename, with fsync of every file and (on POSIX) of the segment folder and `segments/`.
  *  6. Re-read every copied segment from the drive: exact file names, the manifest hash, every stream hash; the chain
  *     head is derived from those bytes.
- *  7. Mark the copied segments read-only (on POSIX the mode changes are synced) and check them, write
- *     `keyring/keyring.json` (temp file, fsync, rename) and read it back, remove `SESSION.json` (the new segments
- *     are committed from here on), and only then write `HEAD.json` (also when no segment was copied and it was
- *     behind).
+ *  7. Mark the copied segments read-only and check them, write `keyring/keyring.json` (temp file, fsync, rename)
+ *     and read it back, write `HEAD.json` (also when no segment was copied and it was behind), and only then remove
+ *     `SESSION.json`. R20-1: on POSIX every segment whose modes were set or checked in this session (phase 2
+ *     included) and the keyring file and folder are synced before the head, whether or not this session changed
+ *     them.
  *  8. and 9. are done by the caller with the returned result: append `copy.sealed`, record the new head on the
  *     working device, and print the anchor.
  *
@@ -998,7 +1001,7 @@ export type CopyCheckpoint =
   | 'after-session-end' | 'after-head-update';
 
 /** What a session makes durable on the drive (R20-1), as reported to the TEST ONLY `onSync` observer. */
-export type CopySync = 'segment-file' | 'segment-dir' | 'keyring-file' | 'keyring-dir';
+export type CopySync = 'segment-file' | 'segment-dir' | 'keyring-file' | 'keyring-dir' | 'head-published' | 'session-removed';
 
 export interface SessionOptions extends TargetOptions {
   /** The head recorded on this working device for this copy (null or absent: never sealed). */
@@ -1106,6 +1109,21 @@ function readSessionState(target: string): { segment: number; hash: string } | u
   hex(value.manifest_sha256, 32);
   if (value.segment === 0) check(value.manifest_sha256 === GENESIS_HASH, 'INVENTORY');
   return { segment: value.segment, hash: value.manifest_sha256 };
+}
+
+/**
+ * R20-1 (54): the head `HEAD.json` names when it is after `base` (the segment of `SESSION.json`), else undefined. A
+ * missing or unreadable `HEAD.json` gives undefined here; the head classification after step 3 reports it.
+ */
+function publishedBeyond(target: string, base: number): { segment: number; hash: string } | undefined {
+  let head: { segment: number; hash: string };
+  try {
+    head = readHead(target);
+  } catch (error) {
+    if (error instanceof VaultFormatError) return undefined;
+    throw error;
+  }
+  return head.segment > base ? head : undefined;
 }
 
 /** Write `SESSION.json` atomically (pending name, fsync, rename, folder sync) before the first change of a session. */
@@ -1240,6 +1258,7 @@ function inspectDrive(target: string, trust: DriveTrust): Inspection {
   let folders: number[];
   let partial: number | undefined;
   let session: Inspection['session'];
+  let published: { segment: number; hash: string } | undefined;
   let uncommitted: number[] = [];
   let position: ChainPosition;
   let previous: ChainPosition;
@@ -1259,7 +1278,11 @@ function inspectDrive(target: string, trust: DriveTrust): Inspection {
     folders = segmentFolders(target);
     if (session !== undefined) {
       // R19-2: an interrupted session's segments are uncommitted: never read, only type-checked, then removed.
-      const base = session.segment;
+      // R20-1 (54): `SESSION.json` is removed only after `HEAD.json` is durably published, so a head after the
+      // session's base means the stop came between the two. The published head then decides: the segments up to it
+      // are committed (and must verify, ending exactly at that head), the ones after it are uncommitted.
+      published = publishedBeyond(target, session.segment);
+      const base = published?.segment ?? session.segment;
       uncommitted = folders.filter(number => number > base);
       for (const number of uncommitted) checkUncommitted(join(target, 'segments', segmentName(number)));
     } else {
@@ -1269,6 +1292,7 @@ function inspectDrive(target: string, trust: DriveTrust): Inspection {
     ({ position, previous } = scanSealed(target, meta, new StreamScanner(), undefined, anchor, undefined, undefined,
       uncommitted[0] ?? partial));
     if (partial !== undefined) check(partial === position.segment + 1, 'INVENTORY');
+    if (published !== undefined) check(published.segment === position.segment && published.hash === position.hash, 'HEAD');
   } catch (error) {
     if (error instanceof VaultFormatError) {
       if (error.code === 'ANCHOR') throw error;
@@ -1278,8 +1302,11 @@ function inspectDrive(target: string, trust: DriveTrust): Inspection {
   }
   // Step 3 comes before any judgement of HEAD.json: a lost newest segment with a surviving HEAD is a rollback.
   if (!('anchor' in trust)) compareHeads(trust.workingVault, target, position, expected, partial);
-  // The committed chain ends exactly where the interrupted session started.
-  if (session !== undefined && (session.segment !== position.segment || session.hash !== position.hash)) {
+  // The committed chain ends exactly where the interrupted session started, or (R20-1) at its verified published
+  // head, which then lies after the session's base on the same chain.
+  if (session !== undefined && (published === undefined
+    ? session.segment !== position.segment || session.hash !== position.hash
+    : manifestHash(target, session.segment) !== session.hash)) {
     throw new SecondCopyError('COPY_VERIFY_FAILED', 'INVENTORY');
   }
   let head: Inspection['head'];
@@ -1579,8 +1606,12 @@ export function openSecondCopySession(workingVault: string, target: string, opti
       }
       check(closed.segment >= drive.segment, 'CHAIN');
       // R19-2: one durable "in progress" state before the first change of this session (kept when an interrupted
-      // session left it: its base is the verified head, checked in phase 1).
-      if (inspection.session === undefined) writeProtected(() => writeSessionState(target, drive));
+      // session left it with the verified head as its base, checked in phase 1; R20-1: rewritten with that head when
+      // its base is older because the interrupted session stopped after publishing its head).
+      const marker = inspection.session;
+      if (marker === undefined || marker.segment !== drive.segment || marker.hash !== drive.hash) {
+        writeProtected(() => writeSessionState(target, drive));
+      }
       const publicKey = Buffer.from(meta.signing_public_key, 'base64');
       const buffer = Buffer.allocUnsafe(COPY_BUFFER_BYTES);
       let position: ChainPosition = drive;
@@ -1666,7 +1697,7 @@ export function openSecondCopySession(workingVault: string, target: string, opti
         throw error;
       }
       point('after-read-back', position.segment);
-      // Step 7: read-only (durable and checked), keyring (re-read), the end of the session state, and HEAD.json last.
+      // Step 7: read-only (durable and checked), keyring (synced and re-read), HEAD.json, then the end of the session.
       const keyringBytes = readFileSync(join(workingVault, 'keyring', 'keyring.json'));
       const keyringVersion = keyringVersionOf(keyringBytes, meta.vault_id);
       let keyringWritten: boolean;
@@ -1680,14 +1711,20 @@ export function openSecondCopySession(workingVault: string, target: string, opti
         throw error;
       }
       point('after-keyring', position.segment);
-      // Only now are the new segments committed; a stop before this line leaves them for the next session to remove.
+      // R20-1 (54): HEAD.json is published durably first; only then is the session state removed. A stop before the
+      // head lands leaves the new segments for the next session to remove; a stop after it leaves a published head
+      // after the session's base, and the next session takes that verified head as the end of the committed chain.
+      if (copied.length > 0 || inspection.head === 'behind') {
+        hooks.sync('head-published', position.segment);
+        publishHead(target, position);
+      }
+      point('after-head-update', position.segment);
       writeProtected(() => {
+        hooks.sync('session-removed', position.segment);
         removeRegularFile(join(target, COPY_SESSION));
         syncDirectory(target);
       });
       point('after-session-end', position.segment);
-      if (copied.length > 0 || inspection.head === 'behind') publishHead(target, position);
-      point('after-head-update', position.segment);
       return {
         previous: { segment: drive.segment, hash: drive.hash },
         head: { segment: position.segment, hash: position.hash },
