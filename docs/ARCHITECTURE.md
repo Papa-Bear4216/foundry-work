@@ -737,6 +737,12 @@ interface Deriver {
   is writable and says which state it expected.
 - Any failure leaves the drive's previous segments untouched, reports loudly, and the
   session can be re-run. A partly copied segment has no manifest and is removed at the next session.
+- Step 3 comes before any judgement of `HEAD.json`: a drive that lost a recorded segment shows the rollback
+  warning even when its `HEAD.json` still names that segment. A `HEAD.json` that does not end the verified chain is
+  then reported as head damage.
+- The drive is inspected before its lock is taken. Under the lock the session checks again that nothing changed,
+  `HEAD.json` included (the exact bytes read at inspection). If another session changed the drive in that gap, the
+  session stops (`CHANGED`) before it writes or removes anything.
 - Cadence (**Decided**): weekly default; daily, monthly, manual. Banner after 14 days.
 - Optical export: `foundry vault export-iso` writes closed segments and manifests (no
   keyring by default) to an image for BD-R or M-DISC. The disc must be written as a
