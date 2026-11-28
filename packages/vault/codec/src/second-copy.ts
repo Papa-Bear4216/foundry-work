@@ -66,7 +66,7 @@ import type { UnlockedKeyring } from './record-file.ts';
 import {
   checkRootInventory, COPY_IDENTITY, COPY_IDENTITY_PENDING, COPY_SESSION, COPY_SESSION_PENDING, HEAD, HEAD_PENDING,
   headMatches, LOCK, makeReadOnly,
-  MANIFEST, MANIFEST_PENDING, metadata, publishHead, readHead, scanSealed, scanStreams, segmentName, SIGNATURE,
+  MANIFEST, MANIFEST_PENDING, metadata, parseHead, publishHead, scanSealed, scanStreams, segmentName, SIGNATURE,
   statIfPresent, streamNames, VAULT_METADATA, writePending,
 } from './vault-directory.ts';
 import type { VaultAnchor, VaultMetadata } from './vault-directory.ts';
@@ -1176,14 +1176,45 @@ function readSessionState(target: string): { segment: number; hash: string } | u
   return { segment: value.segment, hash: value.manifest_sha256 };
 }
 
+/** The largest `HEAD.json` (as `readHead` bounds it). */
+const MAX_HEAD_BYTES = 128;
+
+/**
+ * R21-1 (55): `HEAD.json` as phase 1 read it, once: whether a file was there, and the bytes read (undefined when it
+ * was missing, or was not a regular file of at most `MAX_HEAD_BYTES`). This read never throws a format error; the
+ * head judgement after step 3 reports a bad head, and the re-check under the drive lock compares these exact bytes.
+ */
+interface HeadRead {
+  present: boolean;
+  bytes: Buffer | undefined;
+  sha256: string | undefined;
+}
+
+function readHeadOnce(target: string): HeadRead {
+  const path = join(target, HEAD);
+  try {
+    const bytes = readRegularFile(path, MAX_HEAD_BYTES);
+    return { present: bytes !== undefined, bytes, sha256: bytes === undefined ? undefined : sha256(bytes) };
+  } catch (error) {
+    if (error instanceof VaultFormatError) return { present: true, bytes: undefined, sha256: undefined };
+    throw error;
+  }
+}
+
+/** The head in the bytes phase 1 read; any fault there is `HEAD` (as `readHead` reports it). */
+function parseHeadRead(read: HeadRead): { segment: number; hash: string } {
+  if (read.bytes === undefined) throw new VaultFormatError('HEAD');
+  return parseHead(read.bytes);
+}
+
 /**
  * R20-1 (54): the head `HEAD.json` names when it is after `base` (the segment of `SESSION.json`), else undefined. A
  * missing or unreadable `HEAD.json` gives undefined here; the head classification after step 3 reports it.
  */
-function publishedBeyond(target: string, base: number): { segment: number; hash: string } | undefined {
+function publishedBeyond(read: HeadRead, base: number): { segment: number; hash: string } | undefined {
   let head: { segment: number; hash: string };
   try {
-    head = readHead(target);
+    head = parseHeadRead(read);
   } catch (error) {
     if (error instanceof VaultFormatError) return undefined;
     throw error;
@@ -1326,6 +1357,8 @@ interface Inspection {
   expected: { segment: number; hash: string };
   /** `HEAD.json` names the verified head (`current`) or an earlier chain position at or after the recorded head. */
   head: 'current' | 'behind';
+  /** R21-1a (55): whether phase 1 found `HEAD.json`, and the SHA-256 of exactly the bytes it judged. */
+  headFile: { present: boolean; sha256: string | undefined };
 }
 
 /**
@@ -1367,6 +1400,7 @@ function inspectDrive(target: string, trust: DriveTrust): Inspection {
   let uncommitted: number[] = [];
   let position: ChainPosition;
   let previous: ChainPosition;
+  let headRead: HeadRead;
   try {
     eachEntry(target, MAX_ROOT_ENTRIES, () => {});
     checkRootInventory(target, true);
@@ -1380,6 +1414,9 @@ function inspectDrive(target: string, trust: DriveTrust): Inspection {
       const stat = statIfPresent(join(target, name));
       if (stat) check(stat.isFile(), 'INVENTORY');
     }
+    // R21-1a (55): HEAD.json is read once, with or without SESSION.json; every head decision below uses these bytes,
+    // and the re-check under the drive lock compares them.
+    headRead = readHeadOnce(target);
     session = readSessionState(target);
     folders = segmentFolders(target);
     if (session !== undefined) {
@@ -1387,7 +1424,7 @@ function inspectDrive(target: string, trust: DriveTrust): Inspection {
       // R20-1 (54): `SESSION.json` is removed only after `HEAD.json` is durably published, so a head after the
       // session's base means the stop came between the two. The published head then decides: the segments up to it
       // are committed (and must verify, ending exactly at that head), the ones after it are uncommitted.
-      published = publishedBeyond(target, session.segment);
+      published = publishedBeyond(headRead, session.segment);
       const base = published?.segment ?? session.segment;
       uncommitted = folders.filter(number => number > base);
       for (const number of uncommitted) checkUncommitted(join(target, 'segments', segmentName(number)));
@@ -1421,7 +1458,7 @@ function inspectDrive(target: string, trust: DriveTrust): Inspection {
   }
   let head: Inspection['head'];
   try {
-    const recordedHead = readHead(target);
+    const recordedHead = parseHeadRead(headRead);
     if (headMatches(recordedHead, position)) {
       head = 'current';
     } else {
@@ -1433,7 +1470,10 @@ function inspectDrive(target: string, trust: DriveTrust): Inspection {
     if (error instanceof VaultFormatError) throw new SecondCopyError('COPY_VERIFY_FAILED', error.code === 'INVENTORY' ? 'INVENTORY' : 'HEAD');
     throw error;
   }
-  return { meta, copyId, folders, partial, session, uncommitted, position, previous, expected, head };
+  return {
+    meta, copyId, folders, partial, session, uncommitted, position, previous, expected, head,
+    headFile: { present: headRead.present, sha256: headRead.sha256 },
+  };
 }
 
 /** Before the drive lock, without writing anything: the root and the keyring folder accept writes. */
@@ -1487,6 +1527,24 @@ function recheck(target: string, inspection: Inspection, vaultId: string): void 
     check(readCopyIdentity(target, vaultId) === inspection.copyId, 'INVENTORY');
     const session = readSessionState(target);
     check(session?.segment === inspection.session?.segment && session?.hash === inspection.session?.hash, 'INVENTORY');
+    // R21-1a (55): HEAD.json is still the file phase 1 judged (same bounded reader; a read fault here is a change).
+    const head = readRegularFile(join(target, HEAD), MAX_HEAD_BYTES);
+    check((head !== undefined) === inspection.headFile.present, 'INVENTORY');
+    check(head === undefined || sha256(head) === inspection.headFile.sha256, 'INVENTORY');
+  } catch (error) {
+    if (error instanceof VaultFormatError) throw new SecondCopyError('COPY_VERIFY_FAILED', 'CHANGED');
+    throw error;
+  }
+}
+
+/**
+ * R21-1b (55): under the drive lock, immediately before a folder is removed, it is checked again as phase 1 checked
+ * it (an uncommitted folder holds only names a copy writes; a legacy partial folder also still has no manifest).
+ */
+function stillUncommitted(folder: string, partial: boolean): void {
+  try {
+    checkUncommitted(folder);
+    if (partial) check(!statIfPresent(join(folder, MANIFEST)), 'INVENTORY');
   } catch (error) {
     if (error instanceof VaultFormatError) throw new SecondCopyError('COPY_VERIFY_FAILED', 'CHANGED');
     throw error;
@@ -1666,8 +1724,16 @@ export function openSecondCopySession(workingVault: string, target: string, opti
       try {
         // R19-2: an interrupted session's uncommitted segments (and an older unfinished folder) are removed and are
         // copied again below; the committed segments and their seals are untouched.
-        for (const segment of [...uncommitted].reverse()) removeFolder(join(target, 'segments', segmentName(segment)));
-        if (partial !== undefined) removeFolder(join(target, 'segments', segmentName(partial)));
+        for (const segment of [...uncommitted].reverse()) {
+          const folder = join(target, 'segments', segmentName(segment));
+          stillUncommitted(folder, false);
+          removeFolder(folder);
+        }
+        if (partial !== undefined) {
+          const folder = join(target, 'segments', segmentName(partial));
+          stillUncommitted(folder, true);
+          removeFolder(folder);
+        }
         if (uncommitted.length > 0 || partial !== undefined) syncDirectory(join(target, 'segments'));
         // A pending head is never trusted or read: the verified chain decides what HEAD.json must say.
         removeRegularFile(join(target, HEAD_PENDING));

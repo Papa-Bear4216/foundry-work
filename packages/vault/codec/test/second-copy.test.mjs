@@ -496,6 +496,61 @@ test('the session state outlives the head: every sync, then HEAD.json, then SESS
   assert.throws(() => vault.session({ recorded: first.head }), { code: 'COPY_VERIFY_FAILED', reason: 'HEAD' });
 });
 
+test('a head published by another session between inspection and the drive lock stops the session with CHANGED (R21-1, 55)', t => {
+  /** Session B runs on the same drive inside A's gap; A then continues to the lock and its re-check. */
+  const race = (vault, first, bSession) => {
+    let segmentTwo;
+    let head;
+    assert.throws(() => vault.session({
+      recorded: first.head,
+      afterInspection: () => {
+        bSession();
+        segmentTwo = tree(segmentDir(vault.drive, 2));
+        head = readFileSync(join(vault.drive, 'HEAD.json'));
+      },
+    }), { code: 'COPY_VERIFY_FAILED', reason: 'CHANGED' });
+    assert.equal(JSON.parse(head).segment, 2);
+    assert.deepEqual(tree(segmentDir(vault.drive, 2)), segmentTwo, "B's segment is untouched");
+    assert.deepEqual(readFileSync(join(vault.drive, 'HEAD.json')), head, "B's head is untouched");
+  };
+  const interrupted = () => {
+    const vault = setup(t);
+    vault.append([event('TEST ONLY one'), blob('TEST ONLY blob one')], true);
+    vault.init();
+    const first = vault.session().result;
+    vault.append([event('TEST ONLY two'), blob('TEST ONLY blob two')]);
+    const stop = new Error('TEST ONLY pulled');
+    assert.throws(() => vault.session({ recorded: first.head, checkpoint: name => { if (name === 'after-stream-files') throw stop; } }),
+      error => error === stop);
+    return { vault, first };
+  };
+  // (i) SESSION=1, HEAD=1, uncommitted segment 2: B recopies it, publishes HEAD=2 and stops before SESSION.json goes.
+  {
+    const { vault, first } = interrupted();
+    const stop = new Error('TEST ONLY B pulled after the head');
+    race(vault, first, () => {
+      assert.throws(() => vault.session({ recorded: first.head, checkpoint: name => { if (name === 'after-head-update') throw stop; } }),
+        error => error === stop);
+      assert.equal(existsSync(join(vault.drive, 'SESSION.json')), true);
+    });
+    // The drive is consistent: the next session keeps B's committed segment 2.
+    const next = vault.session({ recorded: first.head });
+    assert.deepEqual([next.report.removedPartialSegment, next.result.segmentsCopied, next.result.head.segment], [undefined, 0, 2]);
+  }
+  // (ii) No SESSION.json: a legacy partial folder 2 and HEAD=1; B runs to completion in A's gap.
+  {
+    const { vault, first } = interrupted();
+    makeWritable(vault.drive);
+    unlinkSync(join(vault.drive, 'SESSION.json'));
+    race(vault, first, () => {
+      const b = vault.session({ recorded: first.head });
+      assert.deepEqual([b.report.removedPartialSegment, b.result.head.segment], [2, 2]);
+      assert.equal(existsSync(join(vault.drive, 'SESSION.json')), false);
+    });
+    assert.equal(verifySecondCopy(vault.drive, { workingVault: vault.working, recorded: first.head, copyId: ID }).segment, 2);
+  }
+});
+
 test('a drive folder with more entries than a valid one can hold stops with a fixed error before it is listed whole (R20-4, 39)', t => {
   assert.equal(MAX_SEGMENT_ENTRIES, 9365);
   assert.equal(MAX_ROOT_ENTRIES, 14);

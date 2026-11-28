@@ -119,7 +119,18 @@ export function headBytes(position: ChainPosition): Buffer {
 
 export function readHead(directory: string, name = HEAD, errorCode: 'HEAD' | 'INVENTORY' = 'HEAD') {
   try {
-    const value = parseCanonical(readDocument(join(directory, name), 'HEAD', 128));
+    return parseHead(readDocument(join(directory, name), 'HEAD', 128), errorCode);
+  } catch (error) {
+    if (!(error instanceof VaultFormatError)) throw error;
+    throw new VaultFormatError(errorCode);
+  }
+}
+
+/** R21-1a: the head in bytes already read (at most 128 of them); any fault is `errorCode`. */
+export function parseHead(raw: Buffer, errorCode: 'HEAD' | 'INVENTORY' = 'HEAD') {
+  try {
+    check(raw.length <= 128, 'HEAD');
+    const value = parseCanonical(raw);
     object(value, 'segment manifest_sha256');
     integer(value.segment);
     hex(value.manifest_sha256, 32);
