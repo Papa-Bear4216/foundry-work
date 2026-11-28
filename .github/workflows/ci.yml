@@ -301,3 +301,27 @@ jobs:
           sudo mount -o loop,ro,nojoliet,norock -t iso9660 "$work/export.iso" "$work/primary"
           node packages/vault/codec/test/iso-mount-check.mjs primary "$work/primary" "$work"
           sudo umount "$work/primary"
+      # R20-5 (A-44, finding 53): copy init and two seals onto a real Linux exFAT mount (its folders keep their write
+      # bits), then a keyless check against the printed anchor after a read-only remount.
+      - name: Seal onto a Linux exFAT mount and verify it keylessly
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v mkfs.exfat || (sudo apt-get update && sudo apt-get install -y exfatprogs)
+          work="$RUNNER_TEMP/exfat-check"
+          mkdir -p "$work/mnt"
+          truncate -s 64M "$work/exfat.img"
+          mkfs.exfat "$work/exfat.img"
+          sudo mount -o "loop,uid=$(id -u),gid=$(id -g)" -t exfat "$work/exfat.img" "$work/mnt"
+          # The copy is a subfolder: a volume root is refused (TARGET_UNSUITABLE).
+          anchor=$(node packages/vault/codec/test/exfat-mount-check.mjs seal "$work/mnt/foundry-copy" "$work")
+          sudo umount "$work/mnt"
+          sudo mount -o "loop,ro,uid=$(id -u),gid=$(id -g)" -t exfat "$work/exfat.img" "$work/mnt"
+          node packages/vault/codec/test/exfat-mount-check.mjs verify "$work/mnt/foundry-copy" "$anchor"
+          sudo umount "$work/mnt"
+      - name: Unmount the exFAT image
+        if: always() && runner.os == 'Linux'
+        shell: bash
+        run: |
+          if mountpoint -q "$RUNNER_TEMP/exfat-check/mnt"; then sudo umount "$RUNNER_TEMP/exfat-check/mnt"; fi

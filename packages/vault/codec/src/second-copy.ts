@@ -1207,13 +1207,39 @@ interface SessionHooks {
 }
 
 /**
+ * R20-5 (53): file systems whose folders keep their write bits whatever `chmod` asks (Linux exFAT keeps directory
+ * write bits and ignores the change). There only the segment FILES carry the read-only state (exFAT's read-only
+ * attribute); every other file system also has its segment folders checked. FAT variants never reach this code:
+ * they are refused in step 1.
+ */
+const FILE_MODES_ONLY: ReadonlySet<string> = new Set(['exfat']);
+
+/** True when the probed file system keeps folder write bits, so only file modes are set and checked (R20-5). */
+function fileModesOnly(fileSystem: FileSystemReport): boolean {
+  return fileSystem.type !== undefined && FILE_MODES_ONLY.has(fileSystem.type);
+}
+
+/** Remove the write bits of every file of a segment folder (the folder's own mode is left alone, R20-5). */
+function makeFilesReadOnly(folder: string): void {
+  eachSegmentEntry(folder, entry => {
+    const path = join(folder, entry.name);
+    const mode = statIfPresent(path)!.mode & 0o777;
+    if (mode & 0o222) chmodSync(path, mode & ~0o222);
+  });
+}
+
+/**
  * Make a segment folder read-only again when any entry is writable, then make its mode bits durable on POSIX (fsync
  * of every file and of the folder) and check them. R20-1 (46): the sync runs whether or not this call changed a
- * mode, because a mode change of an interrupted session can look right and still be lost by a power cut.
+ * mode, because a mode change of an interrupted session can look right and still be lost by a power cut. With
+ * `filesOnly` (R20-5, exFAT) only the files are made read-only and checked; they and the folder are still synced.
  */
-function protectSegment(folder: string, segment: number, hooks: SessionHooks): boolean {
-  const changed = writable(folder);
-  if (changed) makeReadOnly(folder);
+function protectSegment(folder: string, segment: number, hooks: SessionHooks, filesOnly: boolean): boolean {
+  const changed = writable(folder, filesOnly);
+  if (changed) {
+    if (filesOnly) makeFilesReadOnly(folder);
+    else makeReadOnly(folder);
+  }
   hooks.point('after-chmod', segment);
   eachSegmentEntry(folder, entry => {
     check(entry.isFile(), 'INVENTORY');
@@ -1222,7 +1248,7 @@ function protectSegment(folder: string, segment: number, hooks: SessionHooks): b
   });
   hooks.sync('segment-dir', segment);
   syncDirectory(folder);
-  check(!writable(folder), 'INVENTORY');
+  check(!writable(folder, filesOnly), 'INVENTORY');
   return changed;
 }
 
@@ -1260,8 +1286,9 @@ function removeFolder(folder: string): void {
   rmdirSync(folder);
 }
 
-function writable(folder: string): boolean {
-  if (hostPlatform !== 'win32' && statSync(folder).mode & 0o222) return true;
+/** Any write bit on the segment's files, or (POSIX, unless `filesOnly`) on the folder itself. */
+function writable(folder: string, filesOnly: boolean): boolean {
+  if (hostPlatform !== 'win32' && !filesOnly && statSync(folder).mode & 0o222) return true;
   let found = false;
   eachSegmentEntry(folder, entry => {
     if (!found && statIfPresent(join(folder, entry.name))!.mode & 0o222) found = true;
@@ -1620,6 +1647,8 @@ export function openSecondCopySession(workingVault: string, target: string, opti
     point: (name, segment) => options.checkpoint?.(name, segment),
     sync: (event, segment) => options.onSync?.(event, segment),
   };
+  // R20-5 (53): on exFAT only the segment files carry the read-only state.
+  const filesOnly = fileModesOnly(fileSystem);
   // Phase 2: no write before the lock; the probe file only after the re-check.
   writableCheck(target);
   const lock = takeTargetLock(target);
@@ -1647,7 +1676,7 @@ export function openSecondCopySession(workingVault: string, target: string, opti
         for (const name of pendingKeyrings) removeRegularFile(join(target, 'keyring', name));
         // R19-2, R20-1 (46): every committed segment, recorded ones included, is read-only again, synced, and checked.
         for (let segment = 1; segment <= drive.segment; segment++) {
-          if (protectSegment(join(target, 'segments', segmentName(segment)), segment, hooks)) protectedSegments++;
+          if (protectSegment(join(target, 'segments', segmentName(segment)), segment, hooks, filesOnly)) protectedSegments++;
         }
         syncDirectory(target);
       } catch (error) {
@@ -1783,7 +1812,7 @@ export function openSecondCopySession(workingVault: string, target: string, opti
       const keyringVersion = keyringVersionOf(keyringBytes, meta.vault_id);
       let keyringWritten: boolean;
       try {
-        for (const { segment } of copied) protectSegment(join(target, 'segments', segmentName(segment)), segment, hooks);
+        for (const { segment } of copied) protectSegment(join(target, 'segments', segmentName(segment)), segment, hooks, filesOnly);
         point('after-read-only', position.segment);
         keyringWritten = writeProtected(() => publishDriveKeyring(target, keyringBytes,
           event => hooks.sync(event, position.segment), () => point('after-keyring-rename', position.segment)));

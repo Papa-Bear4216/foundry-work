@@ -618,6 +618,31 @@ test('interrupted between the manifest and the keyring: no head names the new se
   assert.equal(existsSync(join(vault.drive, 'SESSION.json')), false);
 });
 
+test('exFAT: only segment files carry the read-only state; folder write bits are left alone and not checked (R20-5, 53)', t => {
+  const exfat = () => ({ type: 'exfat', method: 'injected' });
+  const vault = setup(t);
+  vault.append([event('TEST ONLY one'), blob('TEST ONLY blob')], true);
+  vault.init(vault.drive, { probe: exfat });
+  const first = vault.session({ probe: exfat }).result;
+  const folder = segmentDir(vault.drive, 1);
+  for (const name of readdirSync(folder)) assert.equal(statSync(join(folder, name)).mode & 0o222, 0, `${name} read-only`);
+  // Like Linux exFAT, the folder keeps its write bits: no chmod of the folder, and no failed check.
+  if (process.platform !== 'win32') assert.notEqual(statSync(folder).mode & 0o222, 0, 'the folder mode is not changed');
+  const events = [];
+  const again = vault.session({ probe: exfat, recorded: first.head, onSync: name => events.push(name) });
+  assert.equal(again.report.protectedSegments, 0);
+  assert.ok(events.includes('segment-file') && events.includes('segment-dir'), 'files and folder are still synced');
+  // A writable file is still repaired and checked.
+  chmodSync(join(folder, 'pack-0001.fvr'), 0o644);
+  assert.equal(vault.session({ probe: exfat, recorded: first.head }).report.protectedSegments, 1);
+  assert.equal(statSync(join(folder, 'pack-0001.fvr')).mode & 0o222, 0);
+  // On every other file system a writable folder is a repair too (the folder check is kept).
+  if (process.platform !== 'win32') {
+    assert.equal(vault.session({ recorded: first.head }).report.protectedSegments, 1);
+    assert.equal(statSync(folder).mode & 0o222, 0);
+  }
+});
+
 test('a keyring rename that was never synced is synced by the retry although the bytes match (R20-1, 35)', t => {
   const vault = setup(t);
   vault.append([event('TEST ONLY one')], true);
