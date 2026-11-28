@@ -408,7 +408,7 @@ test('a write-protected drive is reported and left unchanged', { skip: process.p
 
 test('an interrupted session at any step is finished or rolled back by the next one', t => {
   const points = ['after-stream-files', 'after-signature', 'after-manifest-pending', 'after-manifest-rename',
-    'after-read-back', 'after-read-only', 'after-keyring', 'after-session-end', 'after-head-update'];
+    'after-read-back', 'after-chmod', 'after-read-only', 'after-keyring', 'after-session-end', 'after-head-update'];
   for (const point of points) {
     const vault = setup(t);
     vault.append([event('TEST ONLY first'), blob('TEST ONLY first blob')], true);

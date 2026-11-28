@@ -309,6 +309,7 @@ jobs:
         run: |
           set -euo pipefail
           command -v mkfs.exfat || (sudo apt-get update && sudo apt-get install -y exfatprogs)
+          sudo modprobe exfat || (sudo apt-get update && sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe exfat)
           work="$RUNNER_TEMP/exfat-check"
           mkdir -p "$work/mnt"
           truncate -s 64M "$work/exfat.img"

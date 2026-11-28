@@ -1,5 +1,5 @@
 import { Buffer } from 'node:buffer';
-import { chmodSync, closeSync, fsyncSync, lstatSync, openSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, fsyncSync, lstatSync, opendirSync, openSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { platform } from 'node:process';
 import { canonical, check, hex, integer, object, parseCanonical, sha256, VaultFormatError } from './bytes.ts';
@@ -36,6 +36,18 @@ export interface VerifyOptions {
   anchor?: VaultAnchor;
   /** P-3: the folder is a Mode B second copy, so its root may hold `COPY.json` (A-44). */
   secondCopy?: boolean;
+}
+
+type FolderEntry = { name: string; isFile(): boolean; isDirectory(): boolean };
+
+/** P-3 (R20-4): visit a folder's entries one at a time (`opendirSync`), never as one array. */
+export function forEachEntry(directory: string, visit: (entry: FolderEntry) => void): void {
+  const dir = opendirSync(directory, { bufferSize: 32 });
+  try {
+    for (let entry = dir.readSync(); entry !== null; entry = dir.readSync()) visit(entry);
+  } finally {
+    dir.closeSync();
+  }
 }
 
 export function statIfPresent(path: string): ReturnType<typeof lstatSync> | undefined {
@@ -95,10 +107,10 @@ export function checkRootInventory(directory: string, secondCopy = false): void 
   const directories = ['keyring', 'segments', 'open'];
   const files = [VAULT_METADATA, HEAD, HEAD_PENDING, LOCK, LOCK + '-journal', LOCK + '-wal', LOCK + '-shm',
     ...(secondCopy ? [COPY_IDENTITY, COPY_IDENTITY_PENDING, COPY_SESSION, COPY_SESSION_PENDING] : [])];
-  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+  forEachEntry(directory, entry => {
     check((entry.isDirectory() && directories.includes(entry.name)) || (entry.isFile() && files.includes(entry.name)),
       'INVENTORY');
-  }
+  });
 }
 
 export function headBytes(position: ChainPosition): Buffer {
@@ -148,13 +160,13 @@ export function streamType(name: string): 1 | 2 {
 export function streamNames(directory: string, artifacts: readonly string[]): string[] {
   check(lstatSync(directory).isDirectory(), 'INVENTORY');
   const names: string[] = [];
-  for (const file of readdirSync(directory, { withFileTypes: true })) {
+  forEachEntry(directory, file => {
     check(file.isFile(), 'INVENTORY');
     if (!artifacts.includes(file.name)) {
       streamType(file.name);
       names.push(file.name);
     }
-  }
+  });
   return names.sort((a, b) => streamType(a) - streamType(b) || streamOrdinal(a) - streamOrdinal(b));
 }
 
@@ -215,12 +227,14 @@ export function scanSealed(
 ) {
   const root = join(directory, 'segments');
   check(statIfPresent(root)?.isDirectory(), 'INVENTORY');
-  const segments = readdirSync(root, { withFileTypes: true }).map(entry => {
+  const segments: number[] = [];
+  forEachEntry(root, entry => {
     const number = Number(entry.name);
     check(entry.isDirectory() && Number.isSafeInteger(number) && number > 0 && entry.name === segmentName(number),
       'INVENTORY');
-    return number;
-  }).filter(number => exclude === undefined || number < exclude).sort((a, b) => a - b);
+    if (exclude === undefined || number < exclude) segments.push(number);
+  });
+  segments.sort((a, b) => a - b);
   const publicKey = Buffer.from(vault.signing_public_key, 'base64');
   if (anchor) {
     check(anchor.epoch === 1 && anchor.vaultId === vault.vault_id && anchor.signingKeyFingerprint === sha256(publicKey)
@@ -281,11 +295,11 @@ export function checkVerifiedHead(directory: string, position: ChainPosition, pr
 }
 
 export function makeReadOnly(directory: string): void {
-  for (const name of readdirSync(directory, { withFileTypes: true })) {
+  forEachEntry(directory, name => {
     const path = join(directory, name.name);
     const mode = lstatSync(path).mode & 0o777;
     if (mode & 0o222) chmodSync(path, mode & ~0o222);
-  }
+  });
   if (platform !== 'win32') {
     const mode = lstatSync(directory).mode & 0o777;
     if (mode & 0o222) chmodSync(directory, mode & ~0o222);
