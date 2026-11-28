@@ -75,7 +75,7 @@ export type SecondCopyErrorCode =
   | 'NOT_A_COPY' | 'TARGET_NOT_EMPTY' | 'TARGET_UNSUITABLE' | 'COPY_BUSY' | 'COPY_VERIFY_FAILED'
   | 'WORKING_VAULT_DAMAGED' | 'OUTPUT_EXISTS' | 'REGISTER' | 'COPY_UNKNOWN' | 'COPY_AMBIGUOUS' | 'INVALID_LABEL' | 'INVALID_CADENCE'
   | 'SCHEDULER_UNSUPPORTED' | 'SCHEDULER_FAILED' | 'ISO_TOO_MANY_EXTENTS' | 'COPY_MISMATCH' | 'OUTPUT_UNSUITABLE'
-  | 'KEYRING_INVALID';
+  | 'KEYRING_INVALID' | 'COPY_UNVERIFIABLE';
 
 /** A typed second-copy failure. `reason` is a fixed token (never a path or user text). */
 export class SecondCopyError extends Error {

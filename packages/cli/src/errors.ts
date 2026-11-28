@@ -107,6 +107,8 @@ const SECOND_COPY_MESSAGES: Readonly<Record<string, string>> = {
   ISO_TOO_MANY_EXTENTS: 'a vault file is too large for the disc image (more than 100 sections of 4 GiB)',
   OUTPUT_UNSUITABLE: 'the output file cannot go inside the vault or the second copy; choose a folder outside both',
   KEYRING_INVALID: 'the keyring is damaged or belongs to another vault, so it was not put on the image; nothing was written',
+  COPY_UNVERIFIABLE: 'the second copy cannot be compared with a seal recorded on this device (no readable register, no '
+    + 'matching record, or never sealed); check it with --anchor <compact anchor>',
 };
 
 const RECOVERY_FORMAT = new Set([

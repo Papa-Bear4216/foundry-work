@@ -370,7 +370,9 @@ export async function runCli(argv: readonly string[], options: RunOptions = {}):
       credential: undefined,
       secrets,
     };
-    const anchorOnly = false;
+    // R19-4: `vault verify-copy --anchor` trusts only the printed anchor, so it needs no Foundry home (no home
+    // preflight, no lock): a person with only the drive and the anchor can run it.
+    const anchorOnly = run.command === 'vault verify-copy' && run.anchor !== undefined;
     // Fixed text for file-system errors here: the path may hold a secret pasted into --vault or FOUNDRY_HOME.
     if (!anchorOnly) withFixedFileErrors(() => checkHome(run, home));
     if (run.command === 'vault seal' || run.command === 'vault session') {

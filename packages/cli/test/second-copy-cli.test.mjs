@@ -1,6 +1,7 @@
 // TEST ONLY: `foundry vault` second-copy, export and reminder commands (P-3). Every vault, secret and path is synthetic.
 import assert from 'node:assert/strict';
-import { cpSync, existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { Buffer } from 'node:buffer';
+import { chmodSync, cpSync, existsSync, readdirSync, readFileSync, statSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { verifyVault } from 'vault';
@@ -445,8 +446,62 @@ test('verify-copy checks a copy against the printed anchor and the recorded seal
   assert.match(current.stdout, /^Second copy OK: segment \d+; its head is the seal recorded on this device\.\n$/u);
   const bad = await runInline(dir, ['vault', 'verify-copy', drive, '--vault', home, '--anchor', 'TEST ONLY not an anchor']);
   assert.match(bad.stderr, /\[ANCHOR\]\n$/u);
+  // R19-4 (44): with --anchor, no Foundry home is needed (no home preflight, no lock).
+  const nowhere = join(dir, 'no-foundry-home');
+  const clean = await runInline(dir, ['vault', 'verify-copy', drive, '--vault', nowhere, '--anchor', second.anchor, '--json']);
+  assert.equal(clean.code, 0, clean.stderr);
+  assert.equal(JSON.parse(clean.stdout).segment, second.segment);
+  assert.equal(existsSync(nowhere), false, 'nothing created for the missing home');
+  // R19-4 (38): every comparison is required. A drive with another signing key in VAULT.json is refused.
+  const resigned = join(dir, 'resigned');
+  cpSync(drive, resigned, { recursive: true });
+  const meta = JSON.parse(readFileSync(join(resigned, 'VAULT.json'), 'utf8'));
+  const otherKey = Buffer.from(meta.signing_public_key, 'base64');
+  otherKey[0] ^= 1;
+  chmodSync(join(resigned, 'VAULT.json'), 0o644);
+  writeFileSync(join(resigned, 'VAULT.json'), JSON.stringify({ ...meta, signing_public_key: otherKey.toString('base64') }));
+  assert.match((await runInline(dir, ['vault', 'verify-copy', resigned, '--vault', home])).stderr, /\[VAULT_MISMATCH\]\n$/u);
+  // No COPY.json: the selected copy's identity is required.
+  const anonymous = join(dir, 'anonymous');
+  cpSync(drive, anonymous, { recursive: true });
+  chmodSync(join(anonymous, 'COPY.json'), 0o644);
+  unlinkSync(join(anonymous, 'COPY.json'));
+  assert.match((await runInline(dir, ['vault', 'verify-copy', anonymous, '--vault', home])).stderr, /\[COPY_UNVERIFIABLE\]\n$/u);
+  assert.match((await runInline(dir, ['vault', 'verify-copy', anonymous, '--vault', home, '--copy', 'copy-1'])).stderr,
+    /\[COPY_MISMATCH\]\n$/u);
+  // A copy never sealed, and a lost register: the comparison cannot be done, so the command fails.
+  const fresh = join(dir, 'fresh');
+  assert.equal((await copyInit(dir, home, fresh, ['--label', 'fresh'])).code, 0);
+  assert.match((await runInline(dir, ['vault', 'verify-copy', fresh, '--vault', home])).stderr, /\[COPY_UNVERIFIABLE\]\n$/u);
+  unlinkSync(join(home, REGISTER_NAME));
+  const lost = await runInline(dir, ['vault', 'verify-copy', drive, '--vault', home, '--json']);
+  assert.equal(lost.code, 2);
+  assert.equal(lost.stdout, '');
+  assert.match(lost.stderr, /\[COPY_UNVERIFIABLE\]\n$/u);
   // The seal output points at the new command.
   assert.match((await seal(dir, home, drive)).stdout, /foundry vault verify-copy <folder> --anchor/u);
+});
+
+test('verify-copy reads a planted 256 MiB manifest by no more than its size check (keyless ceiling, R19-4, 39)', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const drive = join(dir, 'drive');
+  assert.equal((await copyInit(dir, home, drive)).code, 0);
+  await addEvent(dir, home);
+  const sealed = JSON.parse((await seal(dir, home, drive, ['--json'])).stdout);
+  const folder = join(drive, 'segments', '000001');
+  chmodSync(folder, 0o755);
+  const manifest = join(folder, 'MANIFEST.json');
+  chmodSync(manifest, 0o644);
+  truncateSync(manifest, 256 * 1024 * 1024);
+  const before = process.resourceUsage().maxRSS;
+  for (const extra of [['--anchor', sealed.anchor], []]) {
+    const result = await runInline(dir, ['vault', 'verify-copy', drive, '--vault', home, ...extra]);
+    assert.equal(result.code, 2);
+    assert.match(result.stderr, /\(INVENTORY\) \[COPY_VERIFY_FAILED\]\n$/u, result.stderr);
+  }
+  const grownKiB = process.resourceUsage().maxRSS - before;
+  assert.ok(grownKiB < 128 * 1024, `peak memory grew by ${grownKiB} KiB`);
 });
 
 test('anchor SVG: checked before the seal; a failed write after the seal still prints the anchor and step 9 (findings 17, 18)', async t => {

@@ -431,8 +431,8 @@ terminal prompt, or from stdin with --passphrase-stdin / --recovery-key-stdin.
     + '  a key burned to a disc can never be erased. --include-keyring-irreversible adds it anyway.\n',
   'vault verify-copy': 'Usage: foundry vault verify-copy <folder> [--anchor <compact anchor>] [--copy <label>] [--json]\n'
     + '  Checks a second copy without a key. With --anchor (the "compact" line of a printed anchor), the copy must hold\n'
-    + '  that segment with that hash, so an older copy fails. Without it, the copy is compared with the last seal\n'
-    + '  recorded on this device.\n',
+    + '  that segment with that hash, so an older copy fails; no Foundry folder is needed. Without it, the copy must hold\n'
+    + '  the last seal recorded on this device for it (a copy never sealed here cannot be checked this way).\n',
   'vault schedule set': 'Usage: foundry vault schedule set --cadence <daily|weekly|monthly|manual> [--verify] [--json]\n'
     + '  Windows: a per-user Task Scheduler task. Linux: a systemd --user timer, else a crontab line.\n'
     + '  manual: no reminder job; the overdue banner still shows after 14 days.\n',

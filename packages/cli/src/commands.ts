@@ -1320,50 +1320,53 @@ const AFTER_SEAL = 'Now switch on the drive\'s write-protect (if it has one) and
 const FINALISE_DISC = 'Burn it as a single, finalised (closed) session, so nothing can be appended to the disc later.';
 
 /**
- * `foundry vault verify-copy <folder> [--anchor <text>] [--copy <label>]` (finding 32). Keyless. The folder must pass
- * the full keyless check as a second copy of this vault. With `--anchor`, its chain must hold the anchored segment
- * with the anchored hash (an older copy fails). Without it, the chain head is compared with the seal recorded on
- * this device: older is a rollback STOP, the same segment with another hash is a tamper STOP.
+ * `foundry vault verify-copy <folder> [--anchor <text>] [--copy <label>]` (findings 32, 38, 39, 44; ruling R19-4).
+ * Keyless, and the same bounded, read-only inspection as a session's phase 1 (no generic full read of a manifest).
+ * With `--anchor`, the anchor is the only trust input and no Foundry home is used (the main thread skips the home
+ * preflight and the lock): the chain must hold the anchored segment with the anchored hash under the anchored
+ * signing key. Without it, the selected copy (by `--copy`, else by the drive's `COPY.json`) must have a recorded seal:
+ * the drive's identity, the working vault's identity and signing key, the recorded manifest hash as an ancestor of
+ * the drive's chain, and the working chain are all checked. A comparison that cannot be done fails
+ * (`COPY_UNVERIFIABLE`), never `ok: true`.
  */
 async function verifyCopyCommand(ctx: Context): Promise<void> {
   const vault = await import('vault/second-copy');
-  const id = await vaultId(ctx);
   const target = ctx.request.target!;
   const anchor = ctx.request.anchor === undefined ? undefined : vault.parseAnchor(ctx.request.anchor);
   stall(ctx.hooks);
-  const verified = withHomeSystemErrors(() => vault.verifyVault(target, { secondCopy: true, ...(anchor ? { anchor } : {}) }));
-  if (verified.vault.vault_id !== id) throw new vault.SecondCopyError('VAULT_MISMATCH');
-  const position = verified.position;
+  let checked: ReturnType<typeof vault.verifySecondCopy>;
   let recorded: 'match' | 'newer' | 'none' = 'none';
-  if (anchor === undefined) {
-    const { register } = vault.loadCopyRegister(registerPath(ctx), id);
+  if (anchor !== undefined) {
+    checked = withHomeSystemErrors(() => vault.verifySecondCopy(target, { anchor }));
+  } else {
+    const id = await vaultId(ctx);
+    const state = vault.loadCopyRegister(registerPath(ctx), id);
+    if (!state.readable) throw new vault.SecondCopyError('COPY_UNVERIFIABLE', 'register');
     let driveId: string | undefined;
     try {
       driveId = vault.readCopyIdentity(target, id);
     } catch {
-      driveId = undefined;
+      driveId = undefined; // The inspection below reports what is wrong with the drive's identity.
     }
     const copy = ctx.request.copyLabel !== undefined
-      ? vault.selectCopy(register, ctx.request.copyLabel)
-      : register.copies.find(entry => entry.copy_id === driveId);
-    if (copy !== undefined && driveId !== undefined && copy.copy_id !== driveId) throw new vault.SecondCopyError('COPY_MISMATCH', 'different');
-    if (copy?.head) {
-      if (position.segment < copy.head.segment) throw new vault.SecondCopyError('ROLLBACK_DETECTED', 'drive-older-than-recorded');
-      if (position.segment === copy.head.segment && position.hash !== copy.head.manifest_sha256) {
-        throw new vault.SecondCopyError('TAMPER_DETECTED', 'recorded-segment-differs');
-      }
-      recorded = position.segment === copy.head.segment ? 'match' : 'newer';
-    }
+      ? vault.selectCopy(state.register, ctx.request.copyLabel)
+      : state.register.copies.find(entry => entry.copy_id === driveId);
+    if (copy === undefined) throw new vault.SecondCopyError('COPY_UNVERIFIABLE', 'no-record');
+    if (copy.head === null) throw new vault.SecondCopyError('COPY_UNVERIFIABLE', 'never-sealed');
+    const head = copy.head;
+    checked = withHomeSystemErrors(() => vault.verifySecondCopy(target, {
+      workingVault: ctx.paths.vault, recorded: { segment: head.segment, hash: head.manifest_sha256 }, copyId: copy.copy_id,
+    }));
+    recorded = checked.segment === head.segment ? 'match' : 'newer';
   }
   if (ctx.request.json) {
-    ctx.out({ ok: true, segment: position.segment, manifestSha256: position.hash, anchorChecked: anchor !== undefined, recorded });
+    ctx.out({ ok: true, segment: checked.segment, manifestSha256: checked.hash, anchorChecked: anchor !== undefined, recorded });
     return;
   }
   const against = anchor !== undefined ? 'it holds the anchored segment with the anchored hash'
     : recorded === 'match' ? 'its head is the seal recorded on this device'
-      : recorded === 'newer' ? 'its head is newer than the seal recorded on this device'
-        : 'no seal is recorded for it on this device and no anchor was given, so its age is not checked';
-  ctx.out(`Second copy OK: segment ${position.segment}; ${against}.\n`);
+      : 'its head is newer than the seal recorded on this device, and holds that seal';
+  ctx.out(`Second copy OK: segment ${checked.segment}; ${against}.\n`);
 }
 
 async function statusCommand(ctx: Context): Promise<void> {
