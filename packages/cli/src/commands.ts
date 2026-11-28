@@ -1109,6 +1109,11 @@ async function copyInitCommand(ctx: Context): Promise<void> {
     } else if (live && resumable) {
       // The intent's record (registered, or not yet) for this target: finish it with the same id and label.
       if (label !== undefined && vault.assertCopyLabel(label) !== live.label) throw new vault.SecondCopyError('COPY_MISMATCH', 'label');
+      // R20-2 (37): a pending adoption of a folder without `COPY.json` is bound only to the path, and another
+      // identity-less copy of this vault could be mounted there now, so finishing it needs `--adopt` again.
+      if (live.adopt && live.previous_copy_id === null && !ctx.request.adopt) {
+        throw new vault.SecondCopyError('COPY_MISMATCH', 'adopt-again');
+      }
       if (live.adopt) adoptedFrom = live.previous_copy_id;
       if (boundRecord) {
         copy = boundRecord;

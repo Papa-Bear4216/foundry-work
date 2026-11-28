@@ -2,7 +2,8 @@
 import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
 import {
-  chmodSync, cpSync, existsSync, readdirSync, readFileSync, statSync, symlinkSync, truncateSync, unlinkSync, writeFileSync,
+  chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync,
+  writeFileSync,
 } from 'node:fs';
 import { join, sep } from 'node:path';
 import { test } from 'node:test';
@@ -248,6 +249,50 @@ test('copy init is a transaction bound to its target: a retry finishes it, anoth
   const other = await copyInit(dir, home, five, ['--json']);
   assert.equal(other.code, 0, other.stderr);
   assert.notEqual(JSON.parse(other.stdout).copyId, pending.copy_id);
+});
+
+test('a pending adoption of a folder without COPY.json needs --adopt again; a plain intent needs its own empty target (R20-2, 37)', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const one = join(dir, 'one');
+  assert.equal((await copyInit(dir, home, one, ['--label', 'first'])).code, 0);
+  /** A copy of this vault with no COPY.json (no identity on the drive). */
+  const anonymousCopy = target => {
+    cpSync(one, target, { recursive: true });
+    unlinkSync(join(target, 'COPY.json'));
+  };
+  const anonymous = join(dir, 'anonymous');
+  anonymousCopy(anonymous);
+  const pulled = await copyInit(dir, home, anonymous, ['--label', 'adopted', '--adopt'], { secondCopyProbe: ntfs, failCopyInitAfterRegister: true });
+  assert.match(pulled.stderr, /\[IO\]\n$/u);
+  // The retry without --adopt stops with fixed text and writes nothing to the drive.
+  const refused = await copyInit(dir, home, anonymous);
+  assert.equal(refused.code, 2);
+  assert.match(refused.stderr, /run `foundry vault copy init <folder> --adopt` again \[COPY_MISMATCH\]\n$/u);
+  assert.equal(existsSync(join(anonymous, 'COPY.json')), false);
+  assert.equal(existsSync(join(home, INIT_INTENT_NAME)), true, 'the intent is kept for the consented retry');
+  const adopted = await copyInit(dir, home, anonymous, ['--adopt', '--json']);
+  assert.equal(adopted.code, 0, adopted.stderr);
+  const summary = JSON.parse(adopted.stdout);
+  assert.deepEqual([summary.label, summary.adopted, summary.adoptedFrom], ['adopted', true, null]);
+  assert.equal(JSON.parse(readFileSync(join(anonymous, 'COPY.json'), 'utf8')).copy_id, summary.copyId);
+  assert.equal(existsSync(join(home, INIT_INTENT_NAME)), false);
+  // A plain (non-adopt) intent finishes only on an empty target (or its own partial state): a foreign file or an
+  // identity-less copy put there since is refused.
+  const two = join(dir, 'two');
+  assert.equal((await copyInit(dir, home, two, ['--label', 'second'], { secondCopyProbe: ntfs, failCopyInitAfterRegister: true })).code, 2);
+  assert.equal(existsSync(two), false);
+  mkdirSync(two);
+  writeFileSync(join(two, 'TEST-ONLY-foreign.txt'), 'TEST ONLY');
+  assert.match((await copyInit(dir, home, two)).stderr, /\[TARGET_NOT_EMPTY\]\n$/u);
+  rmSync(two, { recursive: true });
+  anonymousCopy(two);
+  assert.match((await copyInit(dir, home, two)).stderr, /--adopt`\s*\[COPY_MISMATCH\]\n$/u);
+  assert.equal(existsSync(join(two, 'COPY.json')), false);
+  rmSync(two, { recursive: true });
+  const finished = await copyInit(dir, home, two, ['--json']);
+  assert.equal(finished.code, 0, finished.stderr);
+  assert.equal(JSON.parse(finished.stdout).label, 'second');
 });
 
 test('a rolled-back drive stops the session with ROLLBACK_DETECTED and changes nothing', async t => {

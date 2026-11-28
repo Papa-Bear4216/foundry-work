@@ -111,6 +111,12 @@ const SECOND_COPY_MESSAGES: Readonly<Record<string, string>> = {
     + 'matching record, or never sealed); check it with --anchor <compact anchor>',
 };
 
+/** Fixed texts for a second-copy error with one particular fixed reason (`code:reason`), in place of the code's text. */
+const SECOND_COPY_REASON_MESSAGES: Readonly<Record<string, string>> = {
+  'COPY_MISMATCH:adopt-again': 'an unfinished `copy init --adopt` of this folder was found, and the folder has no copy id '
+    + 'that ties it to that run; to finish the takeover, run `foundry vault copy init <folder> --adopt` again',
+};
+
 const RECOVERY_FORMAT = new Set([
   'Invalid recovery key format.', 'Recovery key checksum mismatch.', 'Invalid recovery key padding.',
 ]);
@@ -157,7 +163,9 @@ export function mapError(error: unknown, context: { erasedInImport?: boolean } =
     const detail = error.code === 'COPY_VERIFY_FAILED' || error.code === 'WORKING_VAULT_DAMAGED'
       ? (typeof reason === 'string' && /^[A-Z_]{1,32}$/u.test(reason) ? ` (${reason})` : '')
       : '';
-    return { code: error.code, message: (SECOND_COPY_MESSAGES[error.code] ?? 'the second-copy step failed') + detail, exit: 2 };
+    const text = (typeof reason === 'string' ? SECOND_COPY_REASON_MESSAGES[`${error.code}:${reason}`] : undefined)
+      ?? SECOND_COPY_MESSAGES[error.code] ?? 'the second-copy step failed';
+    return { code: error.code, message: text + detail, exit: 2 };
   }
   if (isRecoveryFormatError(error)) {
     return { code: 'RECOVERY_KEY_FORMAT', message: 'the recovery key is not in the expected format', exit: 2 };
