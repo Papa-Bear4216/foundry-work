@@ -23,29 +23,5 @@ export type { ReplayLocation, ReplayOptions, VaultReplayItem } from './vault-rep
 export { retireIndexKey, stageIndexKey } from './index-keys.ts';
 export { collectionKeyId, ensureCollectionKeys } from './collection-keys.ts';
 export type { EnsureCollectionKeysResult } from './collection-keys.ts';
-// P-3: Mode B second copy, printable anchor, write-once export and scheduler reminders.
-export {
-  addCopyRecord, assertCadence, assertCopyLabel, CADENCE_DAYS, CADENCES, canonicalPath, checkFileSystem, COPY_REGISTERED,
-  COPY_SEALED, copyRegisteredBody, copyRegisterStatus, copySealedBody, defaultRunner, diskRelation, emptyRegister,
-  FAT_FILE_SYSTEMS, initSecondCopy, inspectCopyTarget, loadCopyRegister, MAX_REGISTER_BYTES, newCopyId,
-  openSecondCopySession, OVERDUE_DAYS, pathInside, probeFileSystem, readCopyIdentity, readCopyRegister, recordSeal,
-  registerFromEvents, replayCopyRegister, SecondCopyError, selectCopy, writeCopyRegister,
-} from './second-copy.ts';
-export type {
-  Cadence, CommandResult, CommandRunner, CopyCheckpoint, CopyEvent, CopyHead, CopyInitResult, CopyRecord, CopyRegister,
-  CopyStatus, CopyTargetState, DiskRelation, FileSystemProbe, FileSystemReport, InitOptions, RegisterState,
-  RegisterStatus, SealResult, SecondCopyErrorCode, SessionOptions, SessionReport, TargetOptions,
-} from './second-copy.ts';
-export { anchorPayload, anchorQr, anchorQrSvg, anchorQrText, anchorText, chainAnchor, parseAnchor } from './anchor.ts';
-export { encodeQr, renderQrSvg, renderQrText } from './qr.ts';
-export { exportVaultIso, MAX_EXTENT_BYTES, writeIsoImage } from './iso9660.ts';
-export type { ExportIsoResult, IsoEntryInput, WriteIsoOptions } from './iso9660.ts';
-export type { QrCode, QrErrorCorrection, QrOptions } from './qr.ts';
-export {
-  cronCommand, cronLine, installReminder, notifyDesktop, reminderArgs, reminderName, reminderStatus, removeReminder,
-  runReminder, systemdUnits, systemdWord, WINDOWS_CONSOLE, WINDOWS_PROMPT, windowsConsoleArguments, windowsTaskXml,
-} from './schedule.ts';
-export type {
-  ReminderDelivery, ReminderInstallResult, ReminderJob, ReminderJobStatus, ReminderRemoveResult, ReminderResult,
-  ScheduledCadence, SchedulerEnvironment, SchedulerMethod,
-} from './schedule.ts';
+// P-3 (second copy, anchor, ISO export, reminders) is the separate entry `vault/second-copy` (second-copy-index.ts),
+// so commands without a second copy load none of it (R18-8 D2).

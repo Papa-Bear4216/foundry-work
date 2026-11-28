@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict';
 import { mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { exportVaultIso, VaultWriter, verifyVault } from '../dist/index.js';
+import { exportVaultIso, VaultWriter, verifyVault } from '../dist/second-copy-index.js';
 import { blob, event, fixture } from './vault-fixture.mjs';
 
 /**

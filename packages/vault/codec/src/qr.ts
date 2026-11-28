@@ -32,19 +32,25 @@ const LEVELS: readonly QrErrorCorrection[] = ['L', 'M', 'Q', 'H'];
 /** The two format bits of each level (the standard's order is M, L, H, Q = 00, 01, 10, 11). */
 const FORMAT_BITS: Readonly<Record<QrErrorCorrection, number>> = { L: 1, M: 0, Q: 3, H: 2 };
 
-// Index [level][version]; index 0 is unused.
-const ECC_CODEWORDS_PER_BLOCK: readonly (readonly number[])[] = [
+// Index [level][version]; index 0 is unused. Built on first use: no module-level allocation (R18-8 D2).
+let eccCache: readonly (readonly number[])[] | undefined;
+let blockCache: readonly (readonly number[])[] | undefined;
+function eccTable(): readonly (readonly number[])[] {
+  return eccCache ??= [
   [-1, 7, 10, 15, 20, 26, 18, 20, 24, 30, 18, 20, 24, 26, 30, 22, 24, 28, 30, 28, 28, 28, 28, 30, 30, 26, 28, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30],
   [-1, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26, 30, 22, 22, 24, 24, 28, 28, 26, 26, 26, 26, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28],
   [-1, 13, 22, 18, 26, 18, 24, 18, 22, 20, 24, 28, 26, 24, 20, 30, 24, 28, 28, 26, 30, 28, 30, 30, 30, 30, 28, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30],
   [-1, 17, 28, 22, 16, 22, 28, 26, 26, 24, 28, 24, 28, 22, 24, 24, 30, 28, 28, 26, 28, 30, 24, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30],
 ];
-const ERROR_CORRECTION_BLOCKS: readonly (readonly number[])[] = [
+}
+function blockTable(): readonly (readonly number[])[] {
+  return blockCache ??= [
   [-1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 4, 6, 6, 6, 6, 7, 8, 8, 9, 9, 10, 12, 12, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20, 21, 22, 24, 25],
   [-1, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5, 5, 8, 9, 9, 10, 10, 11, 13, 14, 16, 17, 17, 18, 20, 21, 23, 25, 26, 28, 29, 31, 33, 35, 37, 38, 40, 43, 45, 47, 49],
   [-1, 1, 1, 2, 2, 4, 4, 6, 6, 8, 8, 8, 10, 12, 16, 12, 17, 16, 18, 21, 20, 23, 23, 25, 27, 29, 34, 34, 35, 38, 40, 43, 45, 48, 51, 53, 56, 59, 62, 65, 68],
   [-1, 1, 1, 2, 4, 4, 4, 5, 6, 8, 8, 11, 11, 16, 16, 18, 16, 19, 21, 25, 25, 25, 34, 30, 32, 35, 37, 40, 42, 45, 48, 51, 54, 57, 60, 63, 66, 70, 74, 77, 81],
 ];
+}
 
 function bit(value: number, index: number): boolean {
   return ((value >>> index) & 1) !== 0;
@@ -64,13 +70,13 @@ export function qrRawDataModules(version: number): number {
 /** Data codewords (8-bit) of one version and level. */
 export function qrDataCodewords(version: number, level: QrErrorCorrection): number {
   const l = LEVELS.indexOf(level);
-  return Math.floor(qrRawDataModules(version) / 8) - ECC_CODEWORDS_PER_BLOCK[l]![version]! * ERROR_CORRECTION_BLOCKS[l]![version]!;
+  return Math.floor(qrRawDataModules(version) / 8) - eccTable()[l]![version]! * blockTable()[l]![version]!;
 }
 
 /** Error-correction block layout of one version and level (from the standard's tables). */
 export function qrBlockLayout(version: number, level: QrErrorCorrection): { blocks: number; eccPerBlock: number } {
   const l = LEVELS.indexOf(level);
-  return { blocks: ERROR_CORRECTION_BLOCKS[l]![version]!, eccPerBlock: ECC_CODEWORDS_PER_BLOCK[l]![version]! };
+  return { blocks: blockTable()[l]![version]!, eccPerBlock: eccTable()[l]![version]! };
 }
 
 /** Bits of the byte-mode character count field. */
@@ -322,8 +328,8 @@ export function encodeQr(data: Uint8Array, options: QrOptions = {}): QrCode {
   for (let i = 0; i < bits.length; i += 8) codewords.push(bits.slice(i, i + 8).reduce((byte, b) => (byte << 1) | b, 0));
 
   const l = LEVELS.indexOf(level);
-  const blockCount = ERROR_CORRECTION_BLOCKS[l]![version]!;
-  const eccLength = ECC_CODEWORDS_PER_BLOCK[l]![version]!;
+  const blockCount = blockTable()[l]![version]!;
+  const eccLength = eccTable()[l]![version]!;
   const raw = Math.floor(qrRawDataModules(version) / 8);
   const shortBlocks = blockCount - (raw % blockCount);
   const shortLength = Math.floor(raw / blockCount);

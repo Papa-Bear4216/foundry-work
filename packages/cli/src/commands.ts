@@ -15,7 +15,9 @@ import { runInNewContext } from 'node:vm';
 import type { IndexStoreOptions } from 'foundry-index';
 import type { ConsentRecord, ProfileId, UserSensitivityRule } from 'foundry-profiles';
 import type { ImportResult } from 'importers';
-import type { CommandRunner, CopyCheckpoint, FileSystemProbe, UnlockSession } from 'vault';
+import type { UnlockSession } from 'vault';
+// Types only (erased): the P-3 modules themselves load through `await import('vault/second-copy')` in their handlers.
+import type { CommandRunner, CopyCheckpoint, FileSystemProbe } from 'vault/second-copy';
 import { SECOND_COPY_COMMANDS } from './args.ts';
 import type { CommandName, SearchFilters } from './args.ts';
 import { CliError, debugText, errorLine, isRecoveryFormatError, mapError } from './errors.ts';
@@ -1015,7 +1017,7 @@ function diskWarning(ctx: Context, relation: string): void {
   }
 }
 
-type VaultModule = typeof import('vault');
+type VaultModule = typeof import('vault/second-copy');
 type CopyRegisterValue = ReturnType<VaultModule['readCopyRegister']>;
 
 /**
@@ -1023,7 +1025,7 @@ type CopyRegisterValue = ReturnType<VaultModule['readCopyRegister']>;
  * or flagged (R18-2). Nothing is written here; the caller writes the register after its event.
  */
 async function keyedRegister(ctx: Context, session: UnlockSession, id: string): Promise<CopyRegisterValue> {
-  const vault = await import('vault');
+  const vault = await import('vault/second-copy');
   const state = vault.loadCopyRegister(registerPath(ctx), id);
   if (!state.rebuild) return state.register;
   try {
@@ -1041,7 +1043,7 @@ async function keyedRegister(ctx: Context, session: UnlockSession, id: string): 
 async function appendCopyEvent(
   ctx: Context, session: UnlockSession, id: string, keyId: string, kind: string, ts: string, body: Record<string, unknown>,
 ): Promise<void> {
-  const vault = await import('vault');
+  const vault = await import('vault/second-copy');
   const unlocked = vault.decodeKeyring(readKeyring(ctx), { session }, id);
   try {
     const writer = vault.VaultWriter.open(ctx.paths.vault, unlocked);
@@ -1058,14 +1060,14 @@ async function appendCopyEvent(
 
 /** `me`'s `system` collection key (created on first use), for the `copy.*` events. */
 async function systemKeyId(ctx: Context, session: UnlockSession, id: string): Promise<string> {
-  const vault = await import('vault');
+  const vault = await import('vault/second-copy');
   const keyId = vault.ensureCollectionKeys(ctx.paths.keyring, id, { session }, PROFILE, ['system']).keyIds.get('system');
   if (keyId === undefined) throw new CliError('INTERNAL', 'internal error: the system collection key is missing');
   return keyId;
 }
 
 async function copyInitCommand(ctx: Context): Promise<void> {
-  const vault = await import('vault');
+  const vault = await import('vault/second-copy');
   const target = ctx.request.target!;
   const label = ctx.request.label;
   await keyed(ctx, async (session, id) => {
@@ -1150,7 +1152,7 @@ function selectSessionCopy(vault: VaultModule, register: CopyRegisterValue, ctx:
  * verification would reject the extra entry), not existing, and its parent an existing folder. Fixed texts only.
  */
 async function checkNewOutput(path: string, inside: readonly string[]): Promise<void> {
-  const vault = await import('vault');
+  const vault = await import('vault/second-copy');
   const { lstatSync } = await import('node:fs');
   const { dirname, resolve } = await import('node:path');
   const absolute = resolve(path);
@@ -1165,7 +1167,7 @@ async function checkNewOutput(path: string, inside: readonly string[]): Promise<
 }
 
 async function sealCommand(ctx: Context): Promise<void> {
-  const vault = await import('vault');
+  const vault = await import('vault/second-copy');
   const target = ctx.request.target!;
   // The SVG destination is checked before the seal: a seal is committed once it is written (finding 18).
   if (ctx.request.anchorSvg !== undefined) await checkNewOutput(ctx.request.anchorSvg, [ctx.paths.vault, target]);
@@ -1267,7 +1269,7 @@ const FINALISE_DISC = 'Burn it as a single, finalised (closed) session, so nothi
  * this device: older is a rollback STOP, the same segment with another hash is a tamper STOP.
  */
 async function verifyCopyCommand(ctx: Context): Promise<void> {
-  const vault = await import('vault');
+  const vault = await import('vault/second-copy');
   const id = await vaultId(ctx);
   const target = ctx.request.target!;
   const anchor = ctx.request.anchor === undefined ? undefined : vault.parseAnchor(ctx.request.anchor);
@@ -1308,7 +1310,7 @@ async function verifyCopyCommand(ctx: Context): Promise<void> {
 }
 
 async function statusCommand(ctx: Context): Promise<void> {
-  const vault = await import('vault');
+  const vault = await import('vault/second-copy');
   const id = await vaultId(ctx);
   stall(ctx.hooks);
   // Keyless: a missing or damaged register cannot be replayed here, so it is reported as "rebuild needed" (R18-2).
@@ -1328,7 +1330,7 @@ async function statusCommand(ctx: Context): Promise<void> {
 }
 
 async function reminderCommand(ctx: Context): Promise<void> {
-  const { notifyDesktop, runReminder } = await import('vault');
+  const { notifyDesktop, runReminder } = await import('vault/second-copy');
   stall(ctx.hooks);
   const result = runReminder(ctx.paths.vault, registerPath(ctx), { verify: ctx.request.verifyChain === true, now: nowOf(ctx) });
   const message = result.status.banner ?? (result.status.due ? 'A second-copy session is due.' : 'The second copy is up to date.');
@@ -1351,7 +1353,7 @@ async function reminderCommand(ctx: Context): Promise<void> {
 }
 
 async function exportIsoCommand(ctx: Context): Promise<void> {
-  const vault = await import('vault');
+  const vault = await import('vault/second-copy');
   const includeKeyring = ctx.request.includeKeyring === true;
   if (includeKeyring) {
     ctx.io.err('foundry: warning: --include-keyring-irreversible puts the keyring on the image. A key on a write-once disc '
@@ -1389,7 +1391,7 @@ function schedulerEnvironment(ctx: Context, env: Readonly<Record<string, string 
 }
 
 async function scheduleCommand(ctx: Context): Promise<void> {
-  const vault = await import('vault');
+  const vault = await import('vault/second-copy');
   const { homedir } = await import('node:os');
   const { fileURLToPath } = await import('node:url');
   const env = schedulerEnvironment(ctx, process.env, homedir);

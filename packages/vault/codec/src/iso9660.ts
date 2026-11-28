@@ -148,7 +148,8 @@ function volumeDate(now: Date): Buffer {
   return Buffer.concat([Buffer.from(text), Buffer.from([0])]);
 }
 
-const UNUSED_DATE = Buffer.concat([Buffer.from('0'.repeat(16)), Buffer.from([0])]);
+/** An unused volume date field (built on use: no module-level allocation, R18-8 D2). */
+const unusedDate = (): Buffer => Buffer.concat([Buffer.from('0'.repeat(16)), Buffer.from([0])]);
 
 function directoryRecord(id: Buffer, sector: number, length: number, flags: number, date: Buffer): Buffer {
   const size = 33 + id.length + (id.length % 2 === 0 ? 1 : 0);
@@ -260,8 +261,8 @@ function volumeDescriptor(
   const date = volumeDate(now);
   sector.set(date, 813);
   sector.set(date, 830);
-  sector.set(UNUSED_DATE, 847);
-  sector.set(UNUSED_DATE, 864);
+  sector.set(unusedDate(), 847);
+  sector.set(unusedDate(), 864);
   sector[881] = 1;
   return sector;
 }

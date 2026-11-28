@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   decodeKeyring, exportVaultIso, initSecondCopy, openSecondCopySession, unlockVault, VaultWriter, verifyVault,
-} from '../dist/index.js';
+} from '../dist/second-copy-index.js';
 import { getKdfCallCountForTest, resetKdfCallCountForTest } from '../dist/keyring.js';
 
 const command = process.argv[2];
