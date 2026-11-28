@@ -215,6 +215,17 @@ function childPromptsOption(raw: string | boolean | undefined): boolean {
   throw usage('--child-prompts needs on or off');
 }
 
+/**
+ * R19-6: a path operand (the second-copy folder, the image file, the SVG file) that holds NUL or another control
+ * character is refused with fixed text, before any file-system call (Node's own error could quote it).
+ */
+export function checkPathOperands(values: readonly (string | undefined)[]): void {
+  // eslint-disable-next-line no-control-regex
+  if (values.some(value => value !== undefined && /[\u0000-\u001f\u007f]/u.test(value))) {
+    throw usage('a folder or file name must not contain control characters');
+  }
+}
+
 function missingPositionalMessage(kind: NonNullable<CommandSpec['positional']>): string {
   switch (kind) {
     case 'path':
@@ -293,6 +304,7 @@ export function parseCommandLine(argv: readonly string[], env: Readonly<Record<s
   for (const name of ['label', 'copy', 'anchor-svg'] as const) {
     if (values[name] !== undefined && !textOption(values[name])) throw usage(`--${name} needs a value`);
   }
+  if (spec.positional === 'target' || spec.positional === 'output') checkPathOperands([operand, textOption(values['anchor-svg'])]);
 
   return {
     kind: 'run',

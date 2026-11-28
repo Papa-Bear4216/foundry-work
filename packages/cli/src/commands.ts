@@ -18,7 +18,7 @@ import type { ImportResult } from 'importers';
 import type { UnlockSession } from 'vault';
 // Types only (erased): the P-3 modules themselves load through `await import('vault/second-copy')` in their handlers.
 import type { CommandRunner, CopyCheckpoint, FileSystemProbe } from 'vault/second-copy';
-import { SECOND_COPY_COMMANDS } from './args.ts';
+import { checkPathOperands, SECOND_COPY_COMMANDS } from './args.ts';
 import type { CommandName, SearchFilters } from './args.ts';
 import { CliError, debugText, errorLine, isRecoveryFormatError, mapError } from './errors.ts';
 import { fixedFileError, homeSystemError, isSystemError, withFixedFileErrors, withHomeSystemErrors } from './files.ts';
@@ -1205,29 +1205,80 @@ async function sealPreflight(ctx: Context): Promise<void> {
 }
 
 /**
- * Check a new output file before any work (findings 17 and 18): not inside the working vault or the copy (strict
+ * Check a new output file before any work (findings 17, 18 and 40): not inside the working vault or the copy (strict
  * verification would reject the extra entry), not existing, and its parent an existing folder. Fixed texts only.
+ * R19-5: returns the checked path, with its folder resolved by the file system as an open would resolve it (a link
+ * followed by `..` included), so the caller writes exactly the path that was checked.
  */
-async function checkNewOutput(path: string, inside: readonly string[]): Promise<void> {
+async function checkNewOutput(path: string, inside: readonly string[]): Promise<string> {
   const vault = await import('vault/second-copy');
-  const { lstatSync } = await import('node:fs');
-  const { dirname, resolve } = await import('node:path');
-  const absolute = resolve(path);
-  if (inside.some(folder => vault.pathInside(folder, absolute))) throw new vault.SecondCopyError('OUTPUT_UNSUITABLE');
-  const [existing, parent] = withFixedFileErrors(() => [
-    lstatSync(absolute, { throwIfNoEntry: false }), lstatSync(dirname(absolute), { throwIfNoEntry: false }),
-  ] as const);
-  if (existing !== undefined) throw new vault.SecondCopyError('OUTPUT_EXISTS');
-  if (parent === undefined || !parent.isDirectory()) {
+  const { lstatSync, realpathSync } = await import('node:fs');
+  const { basename, dirname, join: joinPath } = await import('node:path');
+  const folder = withFixedFileErrors(() => {
+    try {
+      return realpathSync.native(dirname(path));
+    } catch (error) {
+      if (['ENOENT', 'ENOTDIR'].includes((error as { code?: string }).code ?? '')) return undefined;
+      throw error;
+    }
+  });
+  const parent = folder === undefined ? undefined : withFixedFileErrors(() => lstatSync(folder, { throwIfNoEntry: false }));
+  if (folder === undefined || parent === undefined || !parent.isDirectory()) {
     throw new CliError('IO', 'the folder for the output file does not exist or is not a folder');
+  }
+  const absolute = joinPath(folder, basename(path));
+  if (inside.some(other => vault.pathInside(other, absolute))) throw new vault.SecondCopyError('OUTPUT_UNSUITABLE');
+  if (withFixedFileErrors(() => lstatSync(absolute, { throwIfNoEntry: false })) !== undefined) {
+    throw new vault.SecondCopyError('OUTPUT_EXISTS');
+  }
+  return absolute;
+}
+
+/**
+ * R19-5 (52): write the anchor SVG to a temporary file in the same folder, every byte written and checked, fsync,
+ * then rename it to the checked name (never over an existing file); the temporary file is removed on a failure.
+ */
+async function writeAnchorSvg(ctx: Context, path: string, text: string): Promise<void> {
+  const fs = await import('node:fs');
+  const { randomBytes } = await import('node:crypto');
+  const { dirname } = await import('node:path');
+  const bytes = Buffer.from(text, 'utf8');
+  const temp = `${path}.pending-${randomBytes(8).toString('hex')}`;
+  const fd = fs.openSync(temp, 'wx', 0o644);
+  try {
+    try {
+      for (let offset = 0; offset < bytes.length;) {
+        const count = fs.writeSync(fd, bytes, offset, bytes.length - offset);
+        if (count <= 0) throw Object.assign(new Error('short write'), { code: 'EIO', syscall: 'write' });
+        offset += count;
+      }
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    if (ctx.hooks.failAnchorSvgWrite) throw Object.assign(new Error('TEST ONLY write failed'), { code: 'EIO', syscall: 'write' });
+    if (fs.lstatSync(path, { throwIfNoEntry: false }) !== undefined) throw Object.assign(new Error('exists'), { code: 'EEXIST', syscall: 'rename' });
+    fs.renameSync(temp, path);
+  } catch (error) {
+    try { fs.unlinkSync(temp); } catch { /* keep the first failure */ }
+    throw error;
+  }
+  if (process.platform !== 'win32') {
+    const dir = fs.openSync(dirname(path), 'r');
+    try {
+      fs.fsyncSync(dir);
+    } finally {
+      fs.closeSync(dir);
+    }
   }
 }
 
 async function sealCommand(ctx: Context): Promise<void> {
   const vault = await import('vault/second-copy');
   const target = ctx.request.target!;
-  // The SVG destination is checked before the seal: a seal is committed once it is written (finding 18).
-  if (ctx.request.anchorSvg !== undefined) await checkNewOutput(ctx.request.anchorSvg, [ctx.paths.vault, target]);
+  // The SVG destination is checked before the seal: a seal is committed once it is written (finding 18). The checked
+  // path is the one written (R19-5).
+  const svg = ctx.request.anchorSvg === undefined ? undefined : await checkNewOutput(ctx.request.anchorSvg, [ctx.paths.vault, target]);
   await keyed(ctx, async (session, id) => {
     const path = registerPath(ctx);
     // Read-only so far: the register (or its replay) and the selected record.
@@ -1270,18 +1321,9 @@ async function sealCommand(ctx: Context): Promise<void> {
     // The seal is committed. An optional SVG that cannot be written is a warning: the anchor text and step 9 below are
     // still printed (finding 18).
     let anchorSvgWritten = false;
-    if (ctx.request.anchorSvg !== undefined) {
-      const svg = ctx.request.anchorSvg;
-      const fs = await import('node:fs');
+    if (svg !== undefined) {
       try {
-        if (ctx.hooks.failAnchorSvgWrite) throw Object.assign(new Error('TEST ONLY write failed'), { code: 'EIO', syscall: 'open' });
-        const fd = fs.openSync(svg, 'wx', 0o644);
-        try {
-          fs.writeSync(fd, vault.anchorQrSvg(result.anchor));
-          fs.fsyncSync(fd);
-        } finally {
-          fs.closeSync(fd);
-        }
+        await writeAnchorSvg(ctx, svg, vault.anchorQrSvg(result.anchor));
         anchorSvgWritten = true;
       } catch {
         ctx.io.err('foundry: warning: the seal is complete, but the anchor SVG file could not be written; '
@@ -1419,9 +1461,9 @@ async function exportIsoCommand(ctx: Context): Promise<void> {
     ctx.io.err('foundry: warning: --include-keyring-irreversible puts the keyring on the image. A key on a write-once disc '
       + 'can never be destroyed: erasing a person or collection later cannot reach that disc.\n');
   }
-  await checkNewOutput(ctx.request.output!, [ctx.paths.vault]);
+  const output = await checkNewOutput(ctx.request.output!, [ctx.paths.vault]);
   stall(ctx.hooks);
-  const result = vault.exportVaultIso(ctx.paths.vault, ctx.request.output!, { includeKeyring });
+  const result = vault.exportVaultIso(ctx.paths.vault, output, { includeKeyring });
   if (ctx.request.json) {
     ctx.out({
       ok: true, segment: result.head.segment, manifestSha256: result.head.hash, segments: result.segments, files: result.files,
@@ -1579,6 +1621,8 @@ export async function executeCommand(request: CommandRequest, io: CommandIo, hoo
   try {
     if (hooks.leakHandle) setInterval(() => {}, 1000);
     if (hooks.throwWithSecret) throw new Error(`test hook: ${secretTexts(request.secrets).join(' | ')}`);
+    // R19-6: also for a request built without the argument parser (the programmatic API).
+    if (SECOND_COPY_COMMANDS.includes(request.command)) checkPathOperands([request.target, request.output, request.anchorSvg]);
     const body = request.preflight && (request.command === 'vault seal' || request.command === 'vault session')
       ? sealPreflight : BODIES[request.command];
     await body(ctx);

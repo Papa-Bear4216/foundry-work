@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
-  chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempDisposableSync, readdirSync, readFileSync, renameSync, rmdirSync,
+  chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempDisposableSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync,
   rmSync, statSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -253,6 +253,30 @@ test('Windows probe asks fsutil for the drive letter with explicit arguments, an
   assert.deepEqual(probeFileSystem('\\\\server\\share\\x', { platform: 'win32', run }), { type: undefined, method: 'none' });
   assert.deepEqual(probeFileSystem('E:\\x', { platform: 'win32', run: () => ({ status: null, stdout: '', stderr: '' }) }),
     { type: undefined, method: 'none' });
+});
+
+test('the FAT check probes the resolved volume: a junction to a folder on another drive is followed (R19-1)', t => {
+  const vault = setup(t);
+  // `fat-volume` stands for a folder on another drive letter; the link lives on the "NTFS" side.
+  const fatVolume = join(vault.root, 'fat-volume');
+  mkdirSync(fatVolume);
+  const real = realpathSync.native(fatVolume).toLowerCase();
+  const link = join(vault.root, 'ntfs-side-link');
+  symlinkSync(fatVolume, link, linkKind);
+  const seen = [];
+  // Lexical comparison only: the probe answers FAT for a path on the other volume exactly as it is passed.
+  const probe = path => {
+    seen.push(path);
+    return { type: path.toLowerCase().startsWith(real) ? 'fat32' : 'ntfs', method: 'injected' };
+  };
+  assert.throws(() => vault.init(join(link, 'copy'), { probe }), { code: 'FILESYSTEM_UNSUPPORTED' });
+  assert.equal(existsSync(join(fatVolume, 'copy')), false);
+  assert.ok(seen.length > 0 && seen.every(path => path.toLowerCase().startsWith(real)), JSON.stringify(seen));
+  // A session through the link probes the resolved target too (the copy itself was made on the real path).
+  vault.init(join(fatVolume, 'copy'));
+  const before = tree(fatVolume);
+  assert.throws(() => vault.session({ probe }, join(link, 'copy')), { code: 'FILESYSTEM_UNSUPPORTED' });
+  assert.deepEqual(tree(fatVolume), before);
 });
 
 test('step 3 stops on a rolled-back drive before anything on either side changes (no lock, no keyring folder)', t => {

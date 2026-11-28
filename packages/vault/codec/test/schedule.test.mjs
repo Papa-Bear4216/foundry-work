@@ -127,6 +127,18 @@ test('Windows: per-user schtasks, logged-on only, a visible console that waits f
   assert.deepEqual(readdirSync(home), []);
 });
 
+test('Windows: the task name comes from the case-folded home path, so remove finds the task set created (R19-8)', t => {
+  const home = scratch(t);
+  assert.equal(reminderName('C:\\Test-Only\\Foundry', 'win32'), reminderName('c:\\TEST-ONLY\\foundry\\', 'win32'));
+  assert.notEqual(reminderName('/srv/Test-Only', 'linux'), reminderName('/srv/test-only', 'linux'), 'Linux paths keep their case');
+  const system = fakeSystem();
+  const set = installReminder(job(home), { platform: 'win32', run: system.run, scratch: home });
+  const status = reminderStatus(home.toUpperCase(), { platform: 'win32', run: system.run });
+  assert.deepEqual([status.name, status.installed], [set.name, ['schtasks']]);
+  assert.deepEqual(removeReminder(home.toLowerCase(), { platform: 'win32', run: system.run }).removed, ['schtasks']);
+  assert.equal(system.task(), false);
+});
+
 test('Windows XML covers daily and monthly cadences and refuses quotes, percent signs and control characters in paths', () => {
   assert.match(windowsTaskXml(job('/srv/a', { cadence: 'daily' })), /<ScheduleByDay><DaysInterval>1<\/DaysInterval>/u);
   assert.match(windowsTaskXml(job('/srv/a', { cadence: 'monthly' })), /<DaysOfMonth><Day>1<\/Day><\/DaysOfMonth>/u);

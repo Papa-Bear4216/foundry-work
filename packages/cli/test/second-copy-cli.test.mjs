@@ -1,11 +1,14 @@
 // TEST ONLY: `foundry vault` second-copy, export and reminder commands (P-3). Every vault, secret and path is synthetic.
 import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
-import { chmodSync, cpSync, existsSync, readdirSync, readFileSync, statSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import {
+  chmodSync, cpSync, existsSync, readdirSync, readFileSync, statSync, symlinkSync, truncateSync, unlinkSync, writeFileSync,
+} from 'node:fs';
+import { join, sep } from 'node:path';
 import { test } from 'node:test';
 import { verifyVault } from 'vault';
 import { parseCommandLine } from '../dist/args.js';
+import { executeCommand } from '../dist/cli.js';
 import { INIT_INTENT_NAME, REGISTER_NAME } from '../dist/commands.js';
 import { cleanEnv, initVault, PASSPHRASE, runInline, scratch, takeoutFolder } from './helpers.mjs';
 
@@ -528,6 +531,9 @@ test('anchor SVG: checked before the seal; a failed write after the seal still p
   assert.match(failed.stderr, /^foundry: warning: the seal is complete, but the anchor SVG file could not be written/mu);
   assert.match(failed.stdout, /foundry-anchor\/1;/u);
   assert.match(failed.stdout, /switch on the drive's write-protect .* and disconnect the drive\.\n$/u);
+  // R19-5 (52): the SVG is published only complete (temporary file, every byte written, fsync, rename).
+  assert.equal(existsSync(svg), false, 'no partial SVG file');
+  assert.deepEqual(readdirSync(dir).filter(name => name.includes('.pending-')), [], 'the temporary file is removed');
   await addEvent(dir, home);
   const json = await seal(dir, home, drive, ['--anchor-svg', join(dir, 'b.svg'), '--json'], { secondCopyProbe: ntfs, failAnchorSvgWrite: true });
   assert.equal(JSON.parse(json.stdout).anchorSvgWritten, false);
@@ -535,6 +541,52 @@ test('anchor SVG: checked before the seal; a failed write after the seal still p
   const written = await seal(dir, home, drive, ['--anchor-svg', svg, '--json']);
   assert.equal(JSON.parse(written.stdout).anchorSvgWritten, true);
   assert.match(readFileSync(svg, 'utf8'), /^<\?xml [^\n]*\n<svg /u);
+});
+
+test('anchor SVG: the checked path is the written path, also through a link followed by .. (R19-5, 40)', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const drive = join(dir, 'drive');
+  assert.equal((await copyInit(dir, home, drive)).code, 0);
+  await addEvent(dir, home);
+  const link = join(dir, 'segments-link');
+  symlinkSync(join(home, 'vault', 'segments'), link, process.platform === 'win32' ? 'junction' : 'dir');
+  // Not normalised: the file system resolves the link first on POSIX (into the vault), lexically on Windows.
+  const raw = `${link}${sep}..${sep}anchor.svg`;
+  const result = await seal(dir, home, drive, ['--anchor-svg', raw]);
+  if (process.platform === 'win32') {
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(existsSync(join(dir, 'anchor.svg')), true);
+  } else {
+    assert.match(result.stderr, /\[OUTPUT_UNSUITABLE\]\n$/u);
+    assert.equal(existsSync(join(dir, 'anchor.svg')), false);
+  }
+  assert.equal(existsSync(join(home, 'vault', 'anchor.svg')), false, 'nothing is written inside the vault');
+  assert.doesNotThrow(() => verifyVault(join(home, 'vault')));
+});
+
+test('a path operand with NUL or a control character is refused with fixed text, also under --debug (R19-6, 41)', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const marker = 'TEST-ONLY-control-marker';
+  for (const argv of [
+    ['vault', 'verify-copy', `${join(dir, marker)}\u0000x`, '--vault', home, '--debug'],
+    ['vault', 'export-iso', `${join(dir, marker)}\u0001.iso`, '--vault', home, '--debug'],
+    ['vault', 'seal', join(dir, 'drive'), '--anchor-svg', `${join(dir, marker)}\n.svg`, '--vault', home, '--debug', '--passphrase-stdin'],
+  ]) {
+    const result = await runInline(dir, argv, { stdin: `${PASSPHRASE}\n` });
+    assert.equal(result.code, 1, argv[1]);
+    assert.match(result.stderr, /must not contain control characters \[USAGE\]\n$/u);
+    assert.ok(!result.stderr.includes(marker), result.stderr);
+  }
+  // The programmatic API without the parser: the same fixed text before any file call.
+  let stderr = '';
+  const code = await executeCommand({
+    command: 'vault verify-copy', home, debug: true, json: false, filters: {}, secrets: {}, target: `${join(dir, marker)}\u0000x`,
+  }, { out: () => {}, err: text => { stderr += text; } });
+  assert.equal(code, 1);
+  assert.match(stderr, /must not contain control characters \[USAGE\]\n$/u);
+  assert.ok(!stderr.includes(marker), stderr);
 });
 
 test('export-iso: refuses a file inside the vault, a missing folder has fixed text, and JSON names the finalisation step', async t => {

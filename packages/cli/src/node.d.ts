@@ -71,6 +71,7 @@ declare module 'node:fs' {
     readonly O_NOFOLLOW?: number;
   };
   export function writeSync(fd: number, data: string | Uint8Array): number;
+  export function writeSync(fd: number, data: Uint8Array, offset: number, length: number): number;
   export function fsyncSync(fd: number): void;
   export function closeSync(fd: number): void;
   export function unlinkSync(path: string): void;

@@ -24,7 +24,8 @@
 import { Buffer } from 'node:buffer';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join, posix, resolve } from 'node:path';
+import { join, posix, resolve, win32 } from 'node:path';
+import { platform as hostPlatform } from 'node:process';
 import { VaultFormatError } from './bytes.ts';
 import {
   copyRegisterStatus, defaultRunner, readCopyRegister, SecondCopyError, writeCopyRegister,
@@ -59,9 +60,13 @@ export interface SchedulerEnvironment {
   now?: Date;
 }
 
-/** One stable name per Foundry home, so two homes never share or overwrite a job. */
-export function reminderName(home: string): string {
-  return `foundry-vault-reminder-${createHash('sha256').update(Buffer.from(resolve(home))).digest('hex').slice(0, 12)}`;
+/**
+ * One stable name per Foundry home, so two homes never share or overwrite a job. On Windows the name comes from the
+ * case-folded resolved path (R19-8), so `schedule remove` finds the task `schedule set` created whatever the casing.
+ */
+export function reminderName(home: string, platform: string = hostPlatform): string {
+  const identity = platform === 'win32' ? win32.resolve(home).toLowerCase() : resolve(home);
+  return `foundry-vault-reminder-${createHash('sha256').update(Buffer.from(identity)).digest('hex').slice(0, 12)}`;
 }
 
 export function reminderArgs(job: ReminderJob): string[] {
@@ -241,7 +246,7 @@ export function cronCommand(argv: readonly string[]): string {
 
 export function cronLine(job: ReminderJob): string {
   assertCadenceScheduled(job.cadence);
-  return `@${job.cadence} ${cronCommand([job.node, ...reminderArgs(job)])} # ${reminderName(job.home)}`;
+  return `@${job.cadence} ${cronCommand([job.node, ...reminderArgs(job)])} # ${reminderName(job.home, 'linux')}`;
 }
 
 function systemdDirectory(env: SchedulerEnvironment): string {
@@ -307,7 +312,7 @@ export function installReminder(job: ReminderJob, env: SchedulerEnvironment): Re
   const platform = platformOf(env);
   assertCadenceScheduled(job.cadence);
   const run = recording(env.run ?? defaultRunner);
-  const name = reminderName(job.home);
+  const name = reminderName(job.home, platform);
   if (platform === 'win32') {
     const xml = windowsTaskXml(job, env.now);
     const scratch = env.scratch ?? resolve(job.home);
@@ -450,7 +455,7 @@ export interface ReminderRemoveResult {
 export function removeReminder(home: string, env: SchedulerEnvironment): ReminderRemoveResult {
   const platform = platformOf(env);
   const run = recording(env.run ?? defaultRunner);
-  const name = reminderName(home);
+  const name = reminderName(home, platform);
   if (platform === 'win32') {
     if (!windowsTaskPresent(run, name)) return { name, removed: [], commands: run.calls };
     if (!ok(run('schtasks', ['/Delete', '/TN', name, '/F']))) throw new SecondCopyError('SCHEDULER_FAILED', 'schtasks');
@@ -468,7 +473,7 @@ export interface ReminderJobStatus {
 export function reminderStatus(home: string, env: SchedulerEnvironment): ReminderJobStatus {
   const platform = platformOf(env);
   const run = env.run ?? defaultRunner;
-  const name = reminderName(home);
+  const name = reminderName(home, platform);
   if (platform === 'win32') return { name, installed: windowsTaskPresent(run, name) ? ['schtasks'] : [] };
   const installed: SchedulerMethod[] = [];
   if (statIfPresent(join(systemdDirectory(env), `${name}.timer`))) installed.push('systemd');

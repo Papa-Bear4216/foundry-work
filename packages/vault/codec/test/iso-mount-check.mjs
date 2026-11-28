@@ -42,21 +42,35 @@ if (command === 'make') {
   // The kernel shows primary names in lower case without the `;1` version; `-` was mapped to `_` by the writer.
   const vault = join(expected, 'vault');
   let checked = 0;
+  const wanted = [];
   const walk = relative => {
     for (const entry of readdirSync(join(vault, ...relative), { withFileTypes: true })) {
-      if (relative.length === 0 && !['VAULT.json', 'segments'].includes(entry.name)) continue;
+      // R19-9 (51): HEAD.json is compared too, like every other exported file.
+      if (relative.length === 0 && !['VAULT.json', 'HEAD.json', 'segments'].includes(entry.name)) continue;
       const parts = [...relative, entry.name];
       if (entry.isDirectory()) {
         walk(parts);
         continue;
       }
-      const mapped = join(folder, ...parts.map(part => part.toLowerCase().replace(/-/gu, '_')));
-      assert.deepEqual(readFileSync(mapped), readFileSync(join(vault, ...parts)), parts.join('/'));
+      const mappedParts = parts.map(part => part.toLowerCase().replace(/-/gu, '_'));
+      assert.deepEqual(readFileSync(join(folder, ...mappedParts)), readFileSync(join(vault, ...parts)), parts.join('/'));
+      wanted.push(mappedParts.join('/'));
       checked++;
     }
   };
   walk([]);
-  assert.ok(checked >= 9, `checked ${checked} primary-tree files`);
+  assert.ok(wanted.includes('head.json') && wanted.includes('vault.json'), JSON.stringify(wanted));
+  // The primary tree holds exactly these files: nothing more (no keyring), nothing less.
+  const found = [];
+  const list = relative => {
+    for (const entry of readdirSync(join(folder, ...relative), { withFileTypes: true })) {
+      if (entry.isDirectory()) list([...relative, entry.name]);
+      else found.push([...relative, entry.name].join('/'));
+    }
+  };
+  list([]);
+  assert.deepEqual(found.sort(), wanted.sort(), 'the primary-tree inventory');
+  assert.ok(checked >= 10, `checked ${checked} primary-tree files`);
   process.stdout.write(`primary tree: ${checked} file(s) match the source\n`);
 } else {
   throw new Error('TEST ONLY: usage: iso-mount-check.mjs make <dir> | verify <folder> <hash> | primary <folder> <dir>');
