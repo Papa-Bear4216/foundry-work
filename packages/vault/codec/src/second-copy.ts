@@ -1398,7 +1398,6 @@ function inspectDrive(target: string, trust: DriveTrust): Inspection {
     ({ position, previous } = scanSealed(target, meta, new StreamScanner(), undefined, anchor, undefined, undefined,
       uncommitted[0] ?? partial));
     if (partial !== undefined) check(partial === position.segment + 1, 'INVENTORY');
-    if (published !== undefined) check(published.segment === position.segment && published.hash === position.hash, 'HEAD');
   } catch (error) {
     if (error instanceof VaultFormatError) {
       if (error.code === 'ANCHOR') throw error;
@@ -1408,6 +1407,11 @@ function inspectDrive(target: string, trust: DriveTrust): Inspection {
   }
   // Step 3 comes before any judgement of HEAD.json: a lost newest segment with a surviving HEAD is a rollback.
   if (!('anchor' in trust)) compareHeads(trust.workingVault, target, position, expected, partial);
+  // R21-2 (56): the published head must end the verified chain, judged only after the recorded-seal comparison, so a
+  // lost newest segment under a surviving head and an older SESSION.json is still a rollback (before any write).
+  if (published !== undefined && (published.segment !== position.segment || published.hash !== position.hash)) {
+    throw new SecondCopyError('COPY_VERIFY_FAILED', 'HEAD');
+  }
   // The committed chain ends exactly where the interrupted session started, or (R20-1) at its verified published
   // head, which then lies after the session's base on the same chain.
   if (session !== undefined && (published === undefined

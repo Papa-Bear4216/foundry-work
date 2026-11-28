@@ -319,6 +319,28 @@ test('a lost newest segment with a surviving HEAD.json is a rollback, not head d
   assert.throws(() => vault.session({ recorded: null }), { code: 'COPY_VERIFY_FAILED', reason: 'HEAD' });
 });
 
+test('a lost recorded segment under a surviving head and an older SESSION.json is still a rollback (R21-2, 56)', t => {
+  const vault = setup(t);
+  vault.append([event('TEST ONLY one')], true);
+  vault.init();
+  const first = vault.session().result;
+  vault.append([event('TEST ONLY two')], true);
+  const second = vault.session({ recorded: first.head }).result;
+  assert.equal(second.head.segment, 2);
+  // The drive keeps HEAD=2 and an older SESSION=1, and segment 2 is gone.
+  makeWritable(vault.drive);
+  writeFileSync(join(vault.drive, 'SESSION.json'), `{"format":"foundry-copy-session/1","manifest_sha256":"${first.head.hash}","segment":1}`);
+  rmSync(segmentDir(vault.drive, 2), { recursive: true });
+  const drive = tree(vault.drive);
+  assert.throws(() => vault.session({ recorded: second.head }), { code: 'ROLLBACK_DETECTED', reason: 'drive-older-than-recorded' });
+  assert.throws(() => verifySecondCopy(vault.drive, { workingVault: vault.working, recorded: second.head, copyId: ID }),
+    { code: 'ROLLBACK_DETECTED', reason: 'drive-older-than-recorded' });
+  assert.deepEqual(tree(vault.drive), drive, 'nothing changed');
+  // Recorded at segment 1, the same drive is a published head the chain does not end at.
+  assert.throws(() => vault.session({ recorded: first.head }), { code: 'COPY_VERIFY_FAILED', reason: 'HEAD' });
+  assert.deepEqual(tree(vault.drive), drive);
+});
+
 test('step 3 stops on a forked chain and on a recorded hash that differs at the same segment number', t => {
   const vault = setup(t);
   vault.append([event('TEST ONLY shared')], true);
