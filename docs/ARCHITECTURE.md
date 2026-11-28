@@ -742,7 +742,7 @@ interface Deriver {
   then reported as head damage.
 - The drive is inspected before its lock is taken. Under the lock the session checks again that nothing changed,
   `HEAD.json` included (the exact bytes read at inspection). If another session changed the drive in that gap, the
-  session stops (`CHANGED`) before it writes or removes anything.
+  session stops (`CHANGED`) before the write probe or any removal.
 - Cadence (**Decided**): weekly default; daily, monthly, manual. Banner after 14 days.
 - Optical export: `foundry vault export-iso` writes closed segments and manifests (no
   keyring by default) to an image for BD-R or M-DISC. The disc must be written as a

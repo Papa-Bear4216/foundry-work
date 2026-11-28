@@ -844,7 +844,7 @@ const COPY_FORMAT = 'foundry-copy/1';
 
 /**
  * The bytes of the identity file `name` (`COPY.json` or its pending file), or undefined when nothing is there. R21-3a:
- * the entry itself must be a regular file (lstat: a link is never followed, a FIFO never opened) of at most
+ * the entry itself must be a regular file (checked with lstat before the open: a link or FIFO there is refused) of at most
  * `MAX_COPY_IDENTITY_BYTES`; anything else fails `INVENTORY`. The size is checked again on the open descriptor.
  */
 function readIdentityFile(target: string, name: string): Buffer | undefined {
