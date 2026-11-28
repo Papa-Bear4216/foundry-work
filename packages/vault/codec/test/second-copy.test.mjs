@@ -646,6 +646,57 @@ test('a head published by another session between inspection and the drive lock 
   }
 });
 
+test('a removal folder that grows past its entry cap before the drive lock stops with CHANGED, nothing removed (R22-2, 55)', t => {
+  const vault = setup(t);
+  vault.append([event('TEST ONLY one'), blob('TEST ONLY blob one')], true);
+  vault.init();
+  const first = vault.session().result;
+  const cap = readdirSync(segmentDir(vault.drive, 1)).length + 2;
+  setSegmentEntryCapForTest(cap);
+  t.after(() => setSegmentEntryCapForTest(undefined));
+  vault.append([event('TEST ONLY two'), blob('TEST ONLY blob two')]);
+  const stop = new Error('TEST ONLY pulled');
+  assert.throws(() => vault.session({ recorded: first.head, checkpoint: name => { if (name === 'after-stream-files') throw stop; } }),
+    error => error === stop);
+  // Phase 1 accepts the uncommitted folder 2; in the gap before the lock it grows one entry past the cap.
+  const folder = segmentDir(vault.drive, 2);
+  let segmentTwo;
+  let session;
+  let head;
+  assert.throws(() => vault.session({
+    recorded: first.head,
+    afterInspection: () => {
+      for (let n = readdirSync(folder).length; n < cap + 1; n++) writeFileSync(join(folder, `events-${String(9000 + n)}.fvr`), 'TEST ONLY');
+      segmentTwo = tree(folder);
+      session = readFileSync(join(vault.drive, 'SESSION.json'));
+      head = readFileSync(join(vault.drive, 'HEAD.json'));
+    },
+  }), { code: 'COPY_VERIFY_FAILED', reason: 'CHANGED' });
+  assert.deepEqual(tree(folder), segmentTwo, 'nothing removed');
+  assert.deepEqual(readFileSync(join(vault.drive, 'SESSION.json')), session);
+  assert.deepEqual(readFileSync(join(vault.drive, 'HEAD.json')), head);
+});
+
+test('an OS read error in the re-check under the drive lock is CHANGED, nothing written (R22-2, 55)',
+  { skip: process.platform === 'win32' || process.getuid?.() === 0 }, t => {
+    const vault = setup(t);
+    vault.append([event('TEST ONLY one')], true);
+    vault.init();
+    const first = vault.session().result;
+    vault.append([event('TEST ONLY two')], true);
+    const headPath = join(vault.drive, 'HEAD.json');
+    const head = readFileSync(headPath);
+    try {
+      // HEAD.json becomes unreadable after inspection: the re-check reads it again and gets EACCES.
+      assert.throws(() => vault.session({ recorded: first.head, afterInspection: () => chmodSync(headPath, 0o000) }),
+        { code: 'COPY_VERIFY_FAILED', reason: 'CHANGED' });
+    } finally {
+      chmodSync(headPath, 0o600);
+    }
+    assert.deepEqual(readFileSync(headPath), head);
+    assert.equal(existsSync(segmentDir(vault.drive, 2)), false, 'nothing copied');
+  });
+
 test('a drive folder with more entries than a valid one can hold stops with a fixed error before it is listed whole (R20-4, 39)', t => {
   assert.equal(MAX_SEGMENT_ENTRIES, 9365);
   assert.equal(MAX_ROOT_ENTRIES, 14);

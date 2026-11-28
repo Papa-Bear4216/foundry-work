@@ -1602,7 +1602,10 @@ function takeTargetLock(target: string) {
   }
 }
 
-/** After the lock: the drive is still what phase 1 verified. */
+/**
+ * After the lock: the drive is still what phase 1 verified. R22-2 (55): any error here (an OS error, a
+ * `SecondCopyError` such as `TOO_MANY_ENTRIES`, or a format fault) is `CHANGED`; it runs before the write probe.
+ */
 function recheck(target: string, inspection: Inspection, vaultId: string): void {
   try {
     const folders = segmentFolders(target);
@@ -1615,23 +1618,23 @@ function recheck(target: string, inspection: Inspection, vaultId: string): void 
     const head = readRegularFile(join(target, HEAD), MAX_HEAD_BYTES);
     check((head !== undefined) === inspection.headFile.present, 'INVENTORY');
     check(head === undefined || sha256(head) === inspection.headFile.sha256, 'INVENTORY');
-  } catch (error) {
-    if (error instanceof VaultFormatError) throw new SecondCopyError('COPY_VERIFY_FAILED', 'CHANGED');
-    throw error;
+  } catch {
+    throw new SecondCopyError('COPY_VERIFY_FAILED', 'CHANGED');
   }
 }
 
 /**
  * R21-1b (55): under the drive lock, immediately before a folder is removed, it is checked again as phase 1 checked
  * it (an uncommitted folder holds only names a copy writes; a legacy partial folder also still has no manifest).
+ * R22-2 (55): any error here (an OS error, `TOO_MANY_ENTRIES` from a folder that grew past its cap, or a format
+ * fault) is `CHANGED`, before anything in the folder is removed.
  */
 function stillUncommitted(folder: string, partial: boolean): void {
   try {
     checkUncommitted(folder);
     if (partial) check(!statIfPresent(join(folder, MANIFEST)), 'INVENTORY');
-  } catch (error) {
-    if (error instanceof VaultFormatError) throw new SecondCopyError('COPY_VERIFY_FAILED', 'CHANGED');
-    throw error;
+  } catch {
+    throw new SecondCopyError('COPY_VERIFY_FAILED', 'CHANGED');
   }
 }
 
