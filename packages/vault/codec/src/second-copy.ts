@@ -136,16 +136,22 @@ export interface FileSystemReport {
 
 export type FileSystemProbe = (path: string) => FileSystemReport;
 
-/** File systems with a 4 GiB file-size limit (every FAT variant). */
-export const FAT_FILE_SYSTEMS: ReadonlySet<string> = new Set(['vfat', 'msdos', 'fat', 'fat12', 'fat16', 'fat32', 'umsdos', 'uvfat']);
+let fatCache: ReadonlySet<string> | undefined;
+/** File systems with a 4 GiB file-size limit (every FAT variant). Built on first use (R18-8 D2). */
+export function fatFileSystems(): ReadonlySet<string> {
+  return fatCache ??= new Set(['vfat', 'msdos', 'fat', 'fat12', 'fat16', 'fat32', 'umsdos', 'uvfat']);
+}
 
-/** Linux `statfs` magic numbers (`linux/magic.h`). vfat and msdos share `MSDOS_SUPER_MAGIC`. */
-const LINUX_MAGIC: ReadonlyMap<number, string> = new Map([
-  [0x4d44, 'vfat'], [0x2011bab0, 'exfat'], [0xef53, 'ext4'], [0x5346544e, 'ntfs3'], [0x9123683e, 'btrfs'],
-  [0x58465342, 'xfs'], [0x01021994, 'tmpfs'], [0xf2f52010, 'f2fs'], [0x2fc12fc1, 'zfs'], [0xca451a4e, 'bcachefs'],
-  [0x6969, 'nfs'], [0xff534d42, 'cifs'], [0xfe534d42, 'smb2'], [0x794c7630, 'overlay'], [0x15013346, 'udf'],
-  [0x9660, 'iso9660'], [0x3153464a, 'jfs'], [0x52654973, 'reiserfs'],
-]);
+let magicCache: ReadonlyMap<number, string> | undefined;
+/** Linux `statfs` magic numbers (`linux/magic.h`). vfat and msdos share `MSDOS_SUPER_MAGIC`. Built on first use. */
+function linuxMagic(): ReadonlyMap<number, string> {
+  return magicCache ??= new Map([
+    [0x4d44, 'vfat'], [0x2011bab0, 'exfat'], [0xef53, 'ext4'], [0x5346544e, 'ntfs3'], [0x9123683e, 'btrfs'],
+    [0x58465342, 'xfs'], [0x01021994, 'tmpfs'], [0xf2f52010, 'f2fs'], [0x2fc12fc1, 'zfs'], [0xca451a4e, 'bcachefs'],
+    [0x6969, 'nfs'], [0xff534d42, 'cifs'], [0xfe534d42, 'smb2'], [0x794c7630, 'overlay'], [0x15013346, 'udf'],
+    [0x9660, 'iso9660'], [0x3153464a, 'jfs'], [0x52654973, 'reiserfs'],
+  ]);
+}
 
 function unescapeMount(value: string): string {
   return value.replace(/\\([0-7]{3})/gu, (_, octal: string) => String.fromCharCode(parseInt(octal, 8)));
@@ -195,7 +201,7 @@ export function probeFileSystem(path: string, { platform = hostPlatform, run = d
   if (platform === 'linux') {
     let magic: string | undefined;
     try {
-      magic = LINUX_MAGIC.get(statfsSync(path).type >>> 0);
+      magic = linuxMagic().get(statfsSync(path).type >>> 0);
     } catch {
       magic = undefined;
     }
@@ -212,7 +218,7 @@ export function probeFileSystem(path: string, { platform = hostPlatform, run = d
 
 /** Refuse FAT (4 GiB file limit, Architecture 4.1 and A-20). An undetected type is allowed and reported. */
 export function checkFileSystem(report: FileSystemReport): FileSystemReport {
-  if (report.type !== undefined && FAT_FILE_SYSTEMS.has(report.type)) throw new SecondCopyError('FILESYSTEM_UNSUPPORTED', 'fat');
+  if (report.type !== undefined && fatFileSystems().has(report.type)) throw new SecondCopyError('FILESYSTEM_UNSUPPORTED', 'fat');
   return report;
 }
 

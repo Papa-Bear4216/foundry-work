@@ -8,7 +8,7 @@ export * from './index.ts';
 export {
   addCopyRecord, assertCadence, assertCopyLabel, CADENCE_DAYS, CADENCES, canonicalPath, checkFileSystem, COPY_REGISTERED,
   COPY_SEALED, copyRegisteredBody, copyRegisterStatus, copySealedBody, defaultRunner, diskRelation, emptyRegister,
-  FAT_FILE_SYSTEMS, initSecondCopy, inspectCopyTarget, loadCopyRegister, MAX_REGISTER_BYTES, newCopyId,
+  fatFileSystems, initSecondCopy, inspectCopyTarget, loadCopyRegister, MAX_REGISTER_BYTES, newCopyId,
   openSecondCopySession, OVERDUE_DAYS, pathInside, probeFileSystem, readCopyIdentity, readCopyRegister, recordSeal,
   registerFromEvents, replayCopyRegister, SecondCopyError, selectCopy, writeCopyRegister,
 } from './second-copy.ts';
