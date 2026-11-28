@@ -571,6 +571,26 @@ test('a recorded segment left writable (a lost mode change) is made read-only ag
   assert.equal(statSync(pack).mode & 0o222, 0);
 });
 
+test('a repair stopped between chmod and its sync is synced by the retry although the modes look right (R20-1, 46)', t => {
+  const vault = setup(t);
+  vault.append([event('TEST ONLY one'), blob('TEST ONLY blob')], true);
+  vault.init();
+  const first = vault.session().result;
+  const folder = segmentDir(vault.drive, 1);
+  const files = readdirSync(folder).length;
+  chmodSync(join(folder, 'pack-0001.fvr'), 0o644);
+  const stop = new Error('TEST ONLY pulled between chmod and fsync');
+  assert.throws(() => vault.session({
+    recorded: first.head, checkpoint: (name, segment) => { if (name === 'after-chmod' && segment === 1) throw stop; },
+  }), error => error === stop);
+  assert.equal(statSync(join(folder, 'pack-0001.fvr')).mode & 0o222, 0, 'the mode change landed, its sync did not');
+  const events = [];
+  const retry = vault.session({ recorded: first.head, onSync: (name, segment) => events.push(`${name}:${segment}`) });
+  assert.equal(retry.report.protectedSegments, 0, 'nothing looked writable');
+  assert.deepEqual(events.filter(name => name.startsWith('segment-') && name.endsWith(':1')),
+    [...Array(files).fill('segment-file:1'), 'segment-dir:1']);
+});
+
 test('drive entries are type-checked before use: a linked keyring folder or keyring file is refused', t => {
   const vault = setup(t);
   vault.append([event('TEST ONLY link')], true);

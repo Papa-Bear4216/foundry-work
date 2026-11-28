@@ -994,11 +994,11 @@ export function initSecondCopy(workingVault: string, target: string, options: In
 
 export type CopyCheckpoint =
   | 'after-stream-files' | 'after-signature' | 'after-manifest-pending' | 'after-manifest-rename'
-  | 'after-read-back' | 'after-read-only' | 'after-keyring-rename' | 'after-keyring' | 'after-session-end'
-  | 'after-head-update';
+  | 'after-read-back' | 'after-chmod' | 'after-read-only' | 'after-keyring-rename' | 'after-keyring'
+  | 'after-session-end' | 'after-head-update';
 
 /** What a session makes durable on the drive (R20-1), as reported to the TEST ONLY `onSync` observer. */
-export type CopySync = 'keyring-file' | 'keyring-dir';
+export type CopySync = 'segment-file' | 'segment-dir' | 'keyring-file' | 'keyring-dir';
 
 export interface SessionOptions extends TargetOptions {
   /** The head recorded on this working device for this copy (null or absent: never sealed). */
@@ -1117,25 +1117,28 @@ function writeSessionState(target: string, position: ChainPosition): void {
   syncDirectory(target);
 }
 
+/** The TEST ONLY hooks of one session that the drive-protection steps report to. */
+interface SessionHooks {
+  point: (name: CopyCheckpoint, segment: number) => void;
+  sync: (event: CopySync, segment: number) => void;
+}
+
 /**
- * Make a segment folder read-only again when any entry is writable. On POSIX the mode changes are made durable
- * (fsync of every file and of the folder) when they changed or when `sync` is set; the result is checked (R19-2, 46).
+ * Make a segment folder read-only again when any entry is writable, then make its mode bits durable on POSIX (fsync
+ * of every file and of the folder) and check them. R20-1 (46): the sync runs whether or not this call changed a
+ * mode, because a mode change of an interrupted session can look right and still be lost by a power cut.
  */
-function protectSegment(folder: string, sync: boolean): boolean {
+function protectSegment(folder: string, segment: number, hooks: SessionHooks): boolean {
   const changed = writable(folder);
   if (changed) makeReadOnly(folder);
-  if ((changed || sync) && hostPlatform !== 'win32') {
-    for (const entry of readdirSync(folder, { withFileTypes: true })) {
-      check(entry.isFile(), 'INVENTORY');
-      const fd = openSync(join(folder, entry.name), 'r');
-      try {
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
-      }
-    }
-    syncDirectory(folder);
+  hooks.point('after-chmod', segment);
+  for (const entry of readdirSync(folder, { withFileTypes: true })) {
+    check(entry.isFile(), 'INVENTORY');
+    hooks.sync('segment-file', segment);
+    syncFile(join(folder, entry.name));
   }
+  hooks.sync('segment-dir', segment);
+  syncDirectory(folder);
   check(!writable(folder), 'INVENTORY');
   return changed;
 }
@@ -1507,6 +1510,10 @@ export function openSecondCopySession(workingVault: string, target: string, opti
   // Phase 1: steps 1 to 3, nothing written on either side.
   const { working, fileSystem, inspection } = inspectSession(workingVault, target, options);
   options.afterInspection?.();
+  const hooks: SessionHooks = {
+    point: (name, segment) => options.checkpoint?.(name, segment),
+    sync: (event, segment) => options.onSync?.(event, segment),
+  };
   // Phase 2: no write before the lock; the probe file only after the re-check.
   writableCheck(target);
   const lock = takeTargetLock(target);
@@ -1530,9 +1537,9 @@ export function openSecondCopySession(workingVault: string, target: string, opti
         for (const entry of readdirSync(join(target, 'keyring'), { withFileTypes: true })) {
           if (/^keyring\.json\.pending-[0-9a-f]{32}$/u.test(entry.name)) removeRegularFile(join(target, 'keyring', entry.name));
         }
-        // R19-2 (46): every committed segment, recorded ones included, is read-only again, durably, and checked.
+        // R19-2, R20-1 (46): every committed segment, recorded ones included, is read-only again, synced, and checked.
         for (let segment = 1; segment <= drive.segment; segment++) {
-          if (protectSegment(join(target, 'segments', segmentName(segment)), false)) protectedSegments++;
+          if (protectSegment(join(target, 'segments', segmentName(segment)), segment, hooks)) protectedSegments++;
         }
         syncDirectory(target);
       } catch (error) {
@@ -1556,7 +1563,7 @@ export function openSecondCopySession(workingVault: string, target: string, opti
     /** Steps 4 to 7. `unlocked` must belong to the working vault (it signs nothing here; it closes the open segment). */
     const seal = (unlocked: UnlockedKeyring, { now = () => new Date(), writer }: { now?: () => Date; writer?: string } = {}): SealResult => {
       check(!released, 'KEY');
-      const point = (name: CopyCheckpoint, segment: number) => options.checkpoint?.(name, segment);
+      const point = hooks.point;
       // Step 4. Opening the writer verifies the working chain's structure and hashes; damage there stops the session.
       let closed: ChainPosition;
       try {
@@ -1664,10 +1671,10 @@ export function openSecondCopySession(workingVault: string, target: string, opti
       const keyringVersion = keyringVersionOf(keyringBytes, meta.vault_id);
       let keyringWritten: boolean;
       try {
-        for (const { segment } of copied) protectSegment(join(target, 'segments', segmentName(segment)), true);
+        for (const { segment } of copied) protectSegment(join(target, 'segments', segmentName(segment)), segment, hooks);
         point('after-read-only', position.segment);
         keyringWritten = writeProtected(() => publishDriveKeyring(target, keyringBytes,
-          event => options.onSync?.(event, position.segment), () => point('after-keyring-rename', position.segment)));
+          event => hooks.sync(event, position.segment), () => point('after-keyring-rename', position.segment)));
       } catch (error) {
         if (error instanceof VaultFormatError) throw new SecondCopyError('COPY_VERIFY_FAILED', error.code);
         throw error;
