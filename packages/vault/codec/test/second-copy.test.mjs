@@ -383,7 +383,7 @@ test('a write-protected drive is reported and left unchanged', { skip: process.p
 
 test('an interrupted session at any step is finished or rolled back by the next one', t => {
   const points = ['after-stream-files', 'after-signature', 'after-manifest-pending', 'after-manifest-rename',
-    'after-read-back', 'after-read-only', 'after-keyring', 'after-head-update'];
+    'after-read-back', 'after-read-only', 'after-keyring', 'after-session-end', 'after-head-update'];
   for (const point of points) {
     const vault = setup(t);
     vault.append([event('TEST ONLY first'), blob('TEST ONLY first blob')], true);
@@ -397,11 +397,16 @@ test('an interrupted session at any step is finished or rolled back by the next 
     }), error => error === stop, point);
     // Segment 1 on the drive is untouched by the interrupted session.
     assert.equal(sha(readFileSync(join(segmentDir(vault.drive, 1), 'MANIFEST.json'))), first.head.hash);
+    // R19-2: until SESSION.json is removed, segment 2 is uncommitted: HEAD.json still names segment 1.
+    const committed = ['after-session-end', 'after-head-update'].includes(point);
+    assert.equal(existsSync(join(vault.drive, 'SESSION.json')), !committed, point);
+    if (point !== 'after-head-update') assert.equal(JSON.parse(readFileSync(join(vault.drive, 'HEAD.json'))).segment, 1, point);
     const next = vault.session({ recorded: first.head });
-    const index = points.indexOf(point);
-    assert.equal(next.report.removedPartialSegment, index <= points.indexOf('after-manifest-pending') ? 2 : undefined, point);
-    assert.equal(next.report.completedHead, index >= points.indexOf('after-manifest-rename') && point !== 'after-head-update', point);
-    assert.equal(next.report.protectedSegments, ['after-manifest-rename', 'after-read-back'].includes(point) ? 1 : 0, point);
+    assert.equal(next.report.removedPartialSegment, committed ? undefined : 2, point);
+    assert.equal(next.report.completedHead, point === 'after-session-end', point);
+    assert.equal(next.report.protectedSegments, 0, point);
+    assert.equal(next.result.segmentsCopied, committed ? 0 : 1, point);
+    assert.equal(existsSync(join(vault.drive, 'SESSION.json')), false, point);
     assert.equal(next.result.head.segment, 2, point);
     assert.equal(verifyVault(vault.drive, { anchor: next.result.anchor, secondCopy: true }).position.segment, 2, point);
     assert.deepEqual(readFileSync(keyringPath(vault.drive)), readFileSync(keyringPath(vault.working)), point);
@@ -427,7 +432,8 @@ test('a short or stale pending head is discarded and HEAD.json is rebuilt from t
     error => error === stop);
   writeFileSync(join(vault.drive, 'HEAD.json.pending'), '{');
   const next = vault.session({ recorded: first.head });
-  assert.deepEqual([next.report.completedHead, next.result.head.segment], [true, 2]);
+  // The interrupted session's segment 2 was uncommitted (R19-2): removed and copied again.
+  assert.deepEqual([next.report.removedPartialSegment, next.result.segmentsCopied, next.result.head.segment], [2, 1, 2]);
   assert.deepEqual(JSON.parse(readFileSync(join(vault.drive, 'HEAD.json'))).segment, 2);
   // A HEAD.json older than the recorded head is damage, not an interrupted session.
   makeWritable(vault.drive);
@@ -452,6 +458,75 @@ test('read-back checks exact file names and publishes HEAD.json only after it', 
     },
   }), { code: 'COPY_VERIFY_FAILED', reason: 'INVENTORY' });
   assert.deepEqual(readFileSync(join(vault.drive, 'HEAD.json')), head, 'HEAD.json is not published before read-back');
+  // R19-2 (36): the failed segment is uncommitted, so the retry removes it and copies it again.
+  const retry = vault.session({ recorded: first.head });
+  assert.deepEqual([retry.report.removedPartialSegment, retry.result.segmentsCopied, retry.result.head.segment], [2, 1, 2]);
+  assert.equal(verifyVault(vault.drive, { anchor: retry.result.anchor, secondCopy: true }).position.segment, 2);
+});
+
+test('a stream corrupted on the drive after the manifest rename is copied again by the retry; earlier seals stay (R19-2)', t => {
+  const vault = setup(t);
+  vault.append([event('TEST ONLY one'), blob('TEST ONLY blob one')], true);
+  vault.init();
+  const first = vault.session().result;
+  const segmentOne = tree(segmentDir(vault.drive, 1));
+  vault.append([event('TEST ONLY two'), blob('TEST ONLY blob two')]);
+  assert.throws(() => vault.session({
+    recorded: first.head,
+    checkpoint: (name, segment) => {
+      if (name !== 'after-manifest-rename') return;
+      // A media fault: one byte of a copied stream changes after the final manifest landed.
+      const path = join(segmentDir(vault.drive, segment), 'pack-0001.fvr');
+      const bytes = readFileSync(path);
+      bytes[bytes.length - 1] ^= 1;
+      writeFileSync(path, bytes);
+    },
+  }), { code: 'COPY_VERIFY_FAILED', reason: 'FILE_HASH' });
+  assert.equal(JSON.parse(readFileSync(join(vault.drive, 'HEAD.json'))).segment, 1);
+  assert.equal(existsSync(join(vault.drive, 'SESSION.json')), true);
+  const retry = vault.session({ recorded: first.head });
+  assert.deepEqual([retry.report.removedPartialSegment, retry.result.segmentsCopied, retry.result.head.segment], [2, 1, 2]);
+  assert.deepEqual(tree(segmentDir(vault.drive, 1)), segmentOne, 'the earlier seal is untouched');
+  assert.equal(verifyVault(vault.drive, { anchor: retry.result.anchor, secondCopy: true }).position.segment, 2);
+  assert.deepEqual(readFileSync(keyringPath(vault.drive)), readFileSync(keyringPath(vault.working)));
+});
+
+test('interrupted between the manifest and the keyring: no head names the new segment until the keyring is back (R19-2)', t => {
+  const vault = setup(t);
+  vault.append([event('TEST ONLY one')], true);
+  vault.init();
+  const first = vault.session().result;
+  const headBefore = readFileSync(join(vault.drive, 'HEAD.json'));
+  const keyringBefore = readFileSync(keyringPath(vault.drive));
+  vault.append([event('TEST ONLY two')]);
+  const stop = new Error('TEST ONLY pulled');
+  assert.throws(() => vault.session({ recorded: first.head, checkpoint: name => { if (name === 'after-read-only') throw stop; } }),
+    error => error === stop);
+  // The next session opens (recovery) and stops before its seal, like a failing working writer.
+  const opened = openSecondCopySession(vault.working, vault.drive, { probe: ntfs, copyId: ID, recorded: first.head });
+  opened.release();
+  assert.equal(opened.report.removedPartialSegment, 2);
+  assert.deepEqual(readFileSync(join(vault.drive, 'HEAD.json')), headBefore, 'HEAD.json still names segment 1');
+  assert.deepEqual(readFileSync(keyringPath(vault.drive)), keyringBefore);
+  assert.equal(existsSync(segmentDir(vault.drive, 2)), false);
+  const done = vault.session({ recorded: first.head });
+  assert.equal(done.result.head.segment, 2);
+  assert.deepEqual(JSON.parse(readFileSync(join(vault.drive, 'HEAD.json'))).segment, 2);
+  assert.deepEqual(readFileSync(keyringPath(vault.drive)), readFileSync(keyringPath(vault.working)));
+  assert.equal(existsSync(join(vault.drive, 'SESSION.json')), false);
+});
+
+test('a recorded segment left writable (a lost mode change) is made read-only again by the next session (R19-2, 46)', t => {
+  const vault = setup(t);
+  vault.append([event('TEST ONLY one'), blob('TEST ONLY blob')], true);
+  vault.init();
+  const first = vault.session().result;
+  const pack = join(segmentDir(vault.drive, 1), 'pack-0001.fvr');
+  chmodSync(pack, 0o644);
+  assert.notEqual(statSync(pack).mode & 0o222, 0);
+  const next = vault.session({ recorded: first.head });
+  assert.equal(next.report.protectedSegments, 1);
+  assert.equal(statSync(pack).mode & 0o222, 0);
 });
 
 test('drive entries are type-checked before use: a linked keyring folder or keyring file is refused', t => {

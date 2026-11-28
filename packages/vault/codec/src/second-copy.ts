@@ -7,24 +7,30 @@
  *  1. Detect the target folder, refuse a file system with a 4 GiB file limit (FAT), read VAULT.json and refuse a
  *     different vault, and read `COPY.json`: its `copy_id` must be the selected record's (`COPY_MISMATCH`, R18-3).
  *  2. Check the type of every root and keyring entry (a link is refused), bound every read of a drive file, and
- *     verify every manifest, signature, file hash and the whole chain without any secret. A trailing segment folder
- *     without a manifest (an interrupted earlier session) is left out of this check.
+ *     verify every manifest, signature, file hash and the whole chain without any secret. When `SESSION.json` (an
+ *     interrupted session, R19-2) exists, every segment folder after the head it names is uncommitted: those folders
+ *     are only type-checked, never read, and the committed chain must end at that head. Without it, a trailing
+ *     segment folder without a manifest (an interrupted session of an earlier version) is left out of this check.
  *  3. Compare the drive's verified chain with the head recorded on the working device for this copy, and with the
  *     working vault's own chain. Older than recorded: `ROLLBACK_DETECTED`. A different manifest hash at the same
  *     segment number: `TAMPER_DETECTED`. Only after this comparison is `HEAD.json` (a convenience copy that is never
  *     trusted) classified: it must name a verified chain position at or after the recorded head.
  *
- * Phase 2, after phase 1 passed: a writability probe (a hardware write-protect switch still on is reported as
- * `WRITE_PROTECTED`), the drive's writer lock, a re-check that the drive did not change, then recovery of an
- * interrupted session: an unfinished segment folder is removed, a pending head is discarded, segments past the
- * recorded head are made read-only again, and `HEAD.json` is rewritten from the verified chain when it is behind.
- *  4. Close the open segment on the working device (`seal`).
+ * Phase 2, after phase 1 passed (R19-7): a write-access check that writes nothing, the drive's writer lock, a
+ * re-check that the drive did not change, the writability probe (a hardware write-protect switch still on is
+ * reported as `WRITE_PROTECTED`), then recovery of an interrupted session: its uncommitted segment folders are
+ * removed, a pending head is discarded, and every committed segment (recorded ones included) is made read-only
+ * again, durably, and checked. `HEAD.json` is not written here.
+ *  4. Close the open segment on the working device (`seal`), then write `SESSION.json` (the session's durable
+ *     "in progress" state: the verified head it starts from), unless the interrupted session's one is still there.
  *  5. Copy each missing segment in order: stream files first, then `MANIFEST.sig`, then `MANIFEST.json` through a
  *     pending name and a rename, with fsync of every file and (on POSIX) of the segment folder and `segments/`.
  *  6. Re-read every copied segment from the drive: exact file names, the manifest hash, every stream hash; the chain
  *     head is derived from those bytes.
- *  7. Mark the copied segments read-only, write `keyring/keyring.json` (temp file, fsync, rename), and only then
- *     write `HEAD.json`.
+ *  7. Mark the copied segments read-only (on POSIX the mode changes are synced) and check them, write
+ *     `keyring/keyring.json` (temp file, fsync, rename) and read it back, remove `SESSION.json` (the new segments
+ *     are committed from here on), and only then write `HEAD.json` (also when no segment was copied and it was
+ *     behind).
  *  8. and 9. are done by the caller with the returned result: append `copy.sealed`, record the new head on the
  *     working device, and print the anchor.
  *
@@ -55,7 +61,8 @@ import type { ChainPosition, ManifestFile } from './manifest.ts';
 import { StreamScanner } from './record-file.ts';
 import type { UnlockedKeyring } from './record-file.ts';
 import {
-  checkRootInventory, COPY_IDENTITY, COPY_IDENTITY_PENDING, HEAD, HEAD_PENDING, headMatches, LOCK, makeReadOnly,
+  checkRootInventory, COPY_IDENTITY, COPY_IDENTITY_PENDING, COPY_SESSION, COPY_SESSION_PENDING, HEAD, HEAD_PENDING,
+  headMatches, LOCK, makeReadOnly,
   MANIFEST, MANIFEST_PENDING, metadata, publishHead, readHead, scanSealed, scanStreams, segmentName, SIGNATURE,
   statIfPresent, streamNames, VAULT_METADATA, writePending,
 } from './vault-directory.ts';
@@ -826,7 +833,9 @@ export function inspectCopyTarget(workingVault: string, target: string, options:
   target = resolve(target);
   const working = metadata(workingVault);
   checkPlacement(workingVault, target, platform);
-  const fileSystem = checkFileSystem((options.probe ?? (path => probeFileSystem(path, options)))(nearestExisting(target)));
+  // R19-1: the probe gets the fully resolved path (junctions and links followed to their final volume).
+  const fileSystem = checkFileSystem((options.probe ?? (path => probeFileSystem(path, options)))(
+    canonicalPath(nearestExisting(target), platform)));
   const stat = statIfPresent(target);
   if (!stat) return { state: 'empty', copyId: undefined, fileSystem };
   if (!stat.isDirectory()) throw new SecondCopyError('TARGET_UNSUITABLE', 'not-a-folder');
@@ -919,7 +928,7 @@ export function initSecondCopy(workingVault: string, target: string, options: In
 
 export type CopyCheckpoint =
   | 'after-stream-files' | 'after-signature' | 'after-manifest-pending' | 'after-manifest-rename'
-  | 'after-read-back' | 'after-read-only' | 'after-keyring' | 'after-head-update';
+  | 'after-read-back' | 'after-read-only' | 'after-keyring' | 'after-session-end' | 'after-head-update';
 
 export interface SessionOptions extends TargetOptions {
   /** The head recorded on this working device for this copy (null or absent: never sealed). */
@@ -950,11 +959,14 @@ export interface SessionReport {
   disk: DiskRelation;
   /** The verified head of the drive before this session. */
   driveHead: { segment: number; hash: string };
-  /** An unfinished segment folder left by an interrupted session, removed after the step-3 check. */
+  /**
+   * The first segment folder an interrupted session left uncommitted (or unfinished), removed after the step-3 check
+   * and copied again by this session.
+   */
   removedPartialSegment: number | undefined;
-  /** `HEAD.json` was behind the verified chain (an interrupted session) and was rewritten. */
+  /** `HEAD.json` was behind the verified chain (an interrupted session); `seal` rewrites it last (R19-2). */
   completedHead: boolean;
-  /** Segments past the recorded head that an interrupted session left writable and that were made read-only. */
+  /** Committed segments (recorded ones included) that were writable and were made read-only again. */
   protectedSegments: number;
 }
 
@@ -992,6 +1004,65 @@ function findPartialSegment(target: string, folders: readonly number[]): number 
     check(allowed, 'INVENTORY');
   }
   return last;
+}
+
+const SEGMENT_ENTRY = /^(?:MANIFEST\.json(?:\.pending)?|MANIFEST\.sig|(?:events|pack)-[0-9]{4,16}\.fvr)$/u;
+
+/** An uncommitted segment folder may hold only regular files with the names a copy writes (it is never read). */
+function checkUncommitted(folder: string): void {
+  for (const entry of readdirSync(folder, { withFileTypes: true })) check(entry.isFile() && SEGMENT_ENTRY.test(entry.name), 'INVENTORY');
+}
+
+const SESSION_FORMAT = 'foundry-copy-session/1';
+const MAX_SESSION_BYTES = 256;
+
+/**
+ * R19-2: the drive's durable "session in progress" state (`SESSION.json`): the verified head the session started
+ * from. While it exists, every segment folder after that head is uncommitted, and the next session removes and copies
+ * it again. Bounded and keyless; undefined when there is none.
+ */
+function readSessionState(target: string): { segment: number; hash: string } | undefined {
+  const bytes = readRegularFile(join(target, COPY_SESSION), MAX_SESSION_BYTES);
+  if (bytes === undefined) return undefined;
+  const value = parseCanonical(bytes);
+  object(value, 'format segment manifest_sha256');
+  check(value.format === SESSION_FORMAT, 'INVENTORY');
+  integer(value.segment);
+  hex(value.manifest_sha256, 32);
+  if (value.segment === 0) check(value.manifest_sha256 === GENESIS_HASH, 'INVENTORY');
+  return { segment: value.segment, hash: value.manifest_sha256 };
+}
+
+/** Write `SESSION.json` atomically (pending name, fsync, rename, folder sync) before the first change of a session. */
+function writeSessionState(target: string, position: ChainPosition): void {
+  const pending = join(target, COPY_SESSION_PENDING);
+  removeRegularFile(pending);
+  writePending(pending, Buffer.from(canonical({ format: SESSION_FORMAT, segment: position.segment, manifest_sha256: position.hash })));
+  renameWithRetry(pending, join(target, COPY_SESSION));
+  syncDirectory(target);
+}
+
+/**
+ * Make a segment folder read-only again when any entry is writable. On POSIX the mode changes are made durable
+ * (fsync of every file and of the folder) when they changed or when `sync` is set; the result is checked (R19-2, 46).
+ */
+function protectSegment(folder: string, sync: boolean): boolean {
+  const changed = writable(folder);
+  if (changed) makeReadOnly(folder);
+  if ((changed || sync) && hostPlatform !== 'win32') {
+    for (const entry of readdirSync(folder, { withFileTypes: true })) {
+      check(entry.isFile(), 'INVENTORY');
+      const fd = openSync(join(folder, entry.name), 'r');
+      try {
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+    }
+    syncDirectory(folder);
+  }
+  check(!writable(folder), 'INVENTORY');
+  return changed;
 }
 
 /** Every manifest and signature on the drive is a regular file within its size limit, before any is read. */
@@ -1046,6 +1117,9 @@ interface Inspection {
   copyId: string | undefined;
   folders: number[];
   partial: number | undefined;
+  /** The drive's "session in progress" state (R19-2), and the uncommitted segment folders after it. */
+  session: { segment: number; hash: string } | undefined;
+  uncommitted: number[];
   position: ChainPosition;
   previous: ChainPosition;
   expected: { segment: number; hash: string };
@@ -1053,40 +1127,83 @@ interface Inspection {
   head: 'current' | 'behind';
 }
 
-/** Phase 1 (steps 1 to 3 and the head classification): keyless and read-only. */
-function inspectDrive(workingVault: string, target: string, working: VaultMetadata, options: SessionOptions): Inspection {
-  const meta = targetMetadata(target, working);
-  const expected = options.recorded ?? { segment: 0, hash: GENESIS_HASH };
+/**
+ * What the drive is checked against: the working vault (its identity and signing key, its chain, the recorded head
+ * and the selected copy id), or only a printed anchor (R19-4: a person with the drive and the anchor, no Foundry home).
+ */
+type DriveTrust =
+  | { workingVault: string; working: VaultMetadata; recorded: { segment: number; hash: string } | null | undefined; copyId: string | undefined }
+  | { anchor: VaultAnchor };
+
+function anchoredMetadata(target: string): VaultMetadata {
+  if (!statIfPresent(join(target, VAULT_METADATA))?.isFile()) throw new SecondCopyError('NOT_A_COPY');
+  try {
+    return metadata(target);
+  } catch (error) {
+    if (error instanceof VaultFormatError) throw new SecondCopyError('NOT_A_COPY', 'metadata');
+    throw error;
+  }
+}
+
+/**
+ * Phase 1 (steps 1 to 3 and the head classification): keyless, read-only and bounded (every manifest, signature and
+ * identity file is size-checked before it is read). With an anchor, the anchor is the trust input: the chain must
+ * hold the anchored segment with the anchored hash under the anchored signing key.
+ */
+function inspectDrive(target: string, trust: DriveTrust): Inspection {
+  const anchor = 'anchor' in trust ? trust.anchor : undefined;
+  const meta = 'anchor' in trust ? anchoredMetadata(target) : targetMetadata(target, trust.working);
+  const expected = 'anchor' in trust
+    ? { segment: trust.anchor.segment, hash: trust.anchor.manifestHash }
+    : trust.recorded ?? { segment: 0, hash: GENESIS_HASH };
   integer(expected.segment);
   hex(expected.hash, 32);
   let copyId: string | undefined;
   let folders: number[];
   let partial: number | undefined;
+  let session: Inspection['session'];
+  let uncommitted: number[] = [];
   let position: ChainPosition;
   let previous: ChainPosition;
   try {
     checkRootInventory(target, true);
-    copyId = readCopyIdentity(target, working.vault_id);
-    if (options.copyId !== undefined && copyId !== options.copyId) {
+    copyId = readCopyIdentity(target, meta.vault_id);
+    if (!('anchor' in trust) && trust.copyId !== undefined && copyId !== trust.copyId) {
       throw new SecondCopyError('COPY_MISMATCH', copyId === undefined ? 'missing' : 'different');
     }
     check(!statIfPresent(join(target, 'open')), 'INVENTORY');
     checkDriveKeyring(target);
-    for (const name of [HEAD_PENDING, COPY_IDENTITY_PENDING]) {
+    for (const name of [HEAD_PENDING, COPY_IDENTITY_PENDING, COPY_SESSION_PENDING]) {
       const stat = statIfPresent(join(target, name));
       if (stat) check(stat.isFile(), 'INVENTORY');
     }
+    session = readSessionState(target);
     folders = segmentFolders(target);
-    partial = findPartialSegment(target, folders);
-    checkManifestSizes(target, folders);
-    ({ position, previous } = scanSealed(target, meta, new StreamScanner(), undefined, undefined, undefined, undefined, partial));
+    if (session !== undefined) {
+      // R19-2: an interrupted session's segments are uncommitted: never read, only type-checked, then removed.
+      const base = session.segment;
+      uncommitted = folders.filter(number => number > base);
+      for (const number of uncommitted) checkUncommitted(join(target, 'segments', segmentName(number)));
+    } else {
+      partial = findPartialSegment(target, folders);
+    }
+    checkManifestSizes(target, folders.filter(number => !uncommitted.includes(number)));
+    ({ position, previous } = scanSealed(target, meta, new StreamScanner(), undefined, anchor, undefined, undefined,
+      uncommitted[0] ?? partial));
     if (partial !== undefined) check(partial === position.segment + 1, 'INVENTORY');
   } catch (error) {
-    if (error instanceof VaultFormatError) throw new SecondCopyError('COPY_VERIFY_FAILED', error.code);
+    if (error instanceof VaultFormatError) {
+      if (error.code === 'ANCHOR') throw error;
+      throw new SecondCopyError('COPY_VERIFY_FAILED', error.code);
+    }
     throw error;
   }
   // Step 3 comes before any judgement of HEAD.json: a lost newest segment with a surviving HEAD is a rollback.
-  compareHeads(workingVault, target, position, expected, partial);
+  if (!('anchor' in trust)) compareHeads(trust.workingVault, target, position, expected, partial);
+  // The committed chain ends exactly where the interrupted session started.
+  if (session !== undefined && (session.segment !== position.segment || session.hash !== position.hash)) {
+    throw new SecondCopyError('COPY_VERIFY_FAILED', 'INVENTORY');
+  }
   let head: Inspection['head'];
   try {
     const recordedHead = readHead(target);
@@ -1101,13 +1218,21 @@ function inspectDrive(workingVault: string, target: string, working: VaultMetada
     if (error instanceof VaultFormatError) throw new SecondCopyError('COPY_VERIFY_FAILED', error.code === 'INVENTORY' ? 'INVENTORY' : 'HEAD');
     throw error;
   }
-  return { meta, copyId, folders, partial, position, previous, expected, head };
+  return { meta, copyId, folders, partial, session, uncommitted, position, previous, expected, head };
 }
 
-/** Phase 2 starts here: the medium accepts writes (root and keyring folder), without leaving anything lasting. */
-function writableProbe(target: string): void {
+/** Before the drive lock, without writing anything: the root and the keyring folder accept writes. */
+function writableCheck(target: string): void {
   writeProtected(() => {
     accessSync(target, constants.W_OK);
+    const keyring = join(target, 'keyring');
+    if (statIfPresent(keyring)) accessSync(keyring, constants.W_OK);
+  });
+}
+
+/** After the lock and the re-check (R19-7): the medium accepts writes, without leaving anything lasting. */
+function writableProbe(target: string): void {
+  writeProtected(() => {
     const keyring = join(target, 'keyring');
     if (!statIfPresent(keyring)) mkdirSync(keyring, { mode: 0o700 });
     check(statIfPresent(keyring)?.isDirectory(), 'INVENTORY');
@@ -1145,6 +1270,8 @@ function recheck(target: string, inspection: Inspection, vaultId: string): void 
     check(folders.length === inspection.folders.length && folders.every((n, i) => n === inspection.folders[i]), 'INVENTORY');
     check(manifestHash(target, inspection.position.segment) === inspection.position.hash, 'CHAIN');
     check(readCopyIdentity(target, vaultId) === inspection.copyId, 'INVENTORY');
+    const session = readSessionState(target);
+    check(session?.segment === inspection.session?.segment && session?.hash === inspection.session?.hash, 'INVENTORY');
   } catch (error) {
     if (error instanceof VaultFormatError) throw new SecondCopyError('COPY_VERIFY_FAILED', 'CHANGED');
     throw error;
@@ -1210,63 +1337,115 @@ function publishDriveKeyring(target: string, bytes: Buffer): boolean {
     throw error;
   }
   syncDirectory(folder);
+  // R19-2: the keyring that landed is re-checked before any head names the new segments.
+  check(readRegularFile(destination, bytes.length)?.equals(bytes), 'KEY');
   return true;
 }
 
 export const COPY_BUFFER_BYTES = 1024 * 1024;
 
+/** Phase 1 of a session (steps 1 to 3): keyless and read-only, nothing written on either side, no lock taken. */
+function inspectSession(workingVault: string, target: string, options: SessionOptions) {
+  const platform = options.platform ?? hostPlatform;
+  const working = metadata(workingVault);
+  checkPlacement(workingVault, target, platform);
+  if (!statIfPresent(target)?.isDirectory()) throw new SecondCopyError('NOT_A_COPY');
+  // R19-1: the probe gets the fully resolved path (junctions and links followed to their final volume).
+  const fileSystem = checkFileSystem((options.probe ?? (path => probeFileSystem(path, options)))(canonicalPath(target, platform)));
+  const inspection = inspectDrive(target, { workingVault, working, recorded: options.recorded, copyId: options.copyId });
+  return { working, fileSystem, inspection };
+}
+
 /**
- * Steps 1 to 3 (phase 1, keyless and read-only), then phase 2: the writability probe, the lock, a re-check and the
- * recovery of an interrupted session. On success the drive is verified, consistent with the recorded head and the
- * working chain, and locked for this session; `seal` then runs steps 4 to 7.
+ * Phase 1 only (R19-7): the CLI runs this before it takes the working-home lock, so a rollback, tamper or damaged
+ * drive is refused before anything is written on either side. The session repeats it under the locks.
+ */
+export function checkSecondCopySession(workingVault: string, target: string, options: SessionOptions = {}): void {
+  inspectSession(resolve(workingVault), resolve(target), options);
+}
+
+/** What `verifySecondCopy` checked: the committed chain head of the drive. */
+export interface CopyCheck {
+  segment: number;
+  hash: string;
+  /** Segment folders of an interrupted session that were left out (they are not part of the copy yet). */
+  uncommitted: number;
+}
+
+/**
+ * `vault verify-copy` (R19-4): the session's bounded, read-only, keyless inspection, and nothing else. Against the
+ * working vault: its identity and signing key, the selected copy id, the recorded head as an ancestor of the drive's
+ * chain, and the working chain. Against an anchor alone: the anchor's vault, signing key, segment and hash.
+ */
+export function verifySecondCopy(
+  target: string,
+  trust: { workingVault: string; recorded: { segment: number; hash: string }; copyId: string } | { anchor: VaultAnchor },
+): CopyCheck {
+  target = resolve(target);
+  let inspection: Inspection;
+  if ('anchor' in trust) {
+    if (!statIfPresent(target)?.isDirectory()) throw new SecondCopyError('NOT_A_COPY');
+    inspection = inspectDrive(target, { anchor: trust.anchor });
+  } else {
+    const workingVault = resolve(trust.workingVault);
+    const working = metadata(workingVault);
+    checkPlacement(workingVault, target, hostPlatform);
+    if (!statIfPresent(target)?.isDirectory()) throw new SecondCopyError('NOT_A_COPY');
+    inspection = inspectDrive(target, { workingVault, working, recorded: trust.recorded, copyId: trust.copyId });
+  }
+  return { segment: inspection.position.segment, hash: inspection.position.hash, uncommitted: inspection.uncommitted.length };
+}
+
+/**
+ * Steps 1 to 3 (phase 1, keyless and read-only), then phase 2: the drive lock, a re-check, the writability probe and
+ * the recovery of an interrupted session (R19-7). On success the drive is verified, consistent with the recorded
+ * head and the working chain, and locked for this session; `seal` then runs steps 4 to 7.
  */
 export function openSecondCopySession(workingVault: string, target: string, options: SessionOptions = {}) {
   const platform = options.platform ?? hostPlatform;
   workingVault = resolve(workingVault);
   target = resolve(target);
-  const working = metadata(workingVault);
-  checkPlacement(workingVault, target, platform);
-  if (!statIfPresent(target)?.isDirectory()) throw new SecondCopyError('NOT_A_COPY');
   // Phase 1: steps 1 to 3, nothing written on either side.
-  const fileSystem = checkFileSystem((options.probe ?? (path => probeFileSystem(path, options)))(target));
-  const inspection = inspectDrive(workingVault, target, working, options);
+  const { working, fileSystem, inspection } = inspectSession(workingVault, target, options);
   options.afterInspection?.();
-  // Phase 2.
-  writableProbe(target);
+  // Phase 2: no write before the lock; the probe file only after the re-check.
+  writableCheck(target);
   const lock = takeTargetLock(target);
   try {
     recheck(target, inspection, working.vault_id);
-    const { meta, partial, expected } = inspection;
+    writableProbe(target);
+    const { meta, partial, uncommitted } = inspection;
     const drive = inspection.position;
     let protectedSegments = 0;
-    let completedHead = false;
     writeProtected(() => {
-      if (partial !== undefined) {
-        removeFolder(join(target, 'segments', segmentName(partial)));
-        syncDirectory(join(target, 'segments'));
-      }
-      // A pending head is never trusted or read: the verified chain decides what HEAD.json must say.
-      removeRegularFile(join(target, HEAD_PENDING));
-      removeRegularFile(join(target, COPY_IDENTITY_PENDING));
-      for (const entry of readdirSync(join(target, 'keyring'), { withFileTypes: true })) {
-        if (/^keyring\.json\.pending-[0-9a-f]{32}$/u.test(entry.name)) removeRegularFile(join(target, 'keyring', entry.name));
-      }
-      for (let segment = expected.segment + 1; segment <= drive.segment; segment++) {
-        const folder = join(target, 'segments', segmentName(segment));
-        if (writable(folder)) {
-          makeReadOnly(folder);
-          protectedSegments++;
+      try {
+        // R19-2: an interrupted session's uncommitted segments (and an older unfinished folder) are removed and are
+        // copied again below; the committed segments and their seals are untouched.
+        for (const segment of [...uncommitted].reverse()) removeFolder(join(target, 'segments', segmentName(segment)));
+        if (partial !== undefined) removeFolder(join(target, 'segments', segmentName(partial)));
+        if (uncommitted.length > 0 || partial !== undefined) syncDirectory(join(target, 'segments'));
+        // A pending head is never trusted or read: the verified chain decides what HEAD.json must say.
+        removeRegularFile(join(target, HEAD_PENDING));
+        removeRegularFile(join(target, COPY_IDENTITY_PENDING));
+        removeRegularFile(join(target, COPY_SESSION_PENDING));
+        for (const entry of readdirSync(join(target, 'keyring'), { withFileTypes: true })) {
+          if (/^keyring\.json\.pending-[0-9a-f]{32}$/u.test(entry.name)) removeRegularFile(join(target, 'keyring', entry.name));
         }
+        // R19-2 (46): every committed segment, recorded ones included, is read-only again, durably, and checked.
+        for (let segment = 1; segment <= drive.segment; segment++) {
+          if (protectSegment(join(target, 'segments', segmentName(segment)), false)) protectedSegments++;
+        }
+        syncDirectory(target);
+      } catch (error) {
+        if (error instanceof VaultFormatError) throw new SecondCopyError('COPY_VERIFY_FAILED', error.code);
+        throw error;
       }
-      if (inspection.head === 'behind') {
-        publishHead(target, drive);
-        completedHead = true;
-      }
-      syncDirectory(target);
     });
+    // HEAD.json is not touched here: a head that is behind is rewritten by `seal`, after the keyring (R19-2, 35).
     const report: SessionReport = {
       fileSystem, disk: diskRelation(workingVault, target, platform),
-      driveHead: { segment: drive.segment, hash: drive.hash }, removedPartialSegment: partial, completedHead, protectedSegments,
+      driveHead: { segment: drive.segment, hash: drive.hash }, removedPartialSegment: uncommitted[0] ?? partial,
+      completedHead: inspection.head === 'behind', protectedSegments,
     };
     let released = false;
     const release = () => {
@@ -1293,6 +1472,9 @@ export function openSecondCopySession(workingVault: string, target: string, opti
         throw error;
       }
       check(closed.segment >= drive.segment, 'CHAIN');
+      // R19-2: one durable "in progress" state before the first change of this session (kept when an interrupted
+      // session left it: its base is the verified head, checked in phase 1).
+      if (inspection.session === undefined) writeProtected(() => writeSessionState(target, drive));
       const publicKey = Buffer.from(meta.signing_public_key, 'base64');
       const buffer = Buffer.allocUnsafe(COPY_BUFFER_BYTES);
       let position: ChainPosition = drive;
@@ -1378,20 +1560,26 @@ export function openSecondCopySession(workingVault: string, target: string, opti
         throw error;
       }
       point('after-read-back', position.segment);
-      // Step 7: read-only, keyring, and HEAD.json last.
-      for (const { segment } of copied) makeReadOnly(join(target, 'segments', segmentName(segment)));
-      point('after-read-only', position.segment);
+      // Step 7: read-only (durable and checked), keyring (re-read), the end of the session state, and HEAD.json last.
       const keyringBytes = readFileSync(join(workingVault, 'keyring', 'keyring.json'));
       const keyringVersion = keyringVersionOf(keyringBytes, meta.vault_id);
       let keyringWritten: boolean;
       try {
+        for (const { segment } of copied) protectSegment(join(target, 'segments', segmentName(segment)), true);
+        point('after-read-only', position.segment);
         keyringWritten = writeProtected(() => publishDriveKeyring(target, keyringBytes));
       } catch (error) {
         if (error instanceof VaultFormatError) throw new SecondCopyError('COPY_VERIFY_FAILED', error.code);
         throw error;
       }
       point('after-keyring', position.segment);
-      if (copied.length > 0) publishHead(target, position);
+      // Only now are the new segments committed; a stop before this line leaves them for the next session to remove.
+      writeProtected(() => {
+        removeRegularFile(join(target, COPY_SESSION));
+        syncDirectory(target);
+      });
+      point('after-session-end', position.segment);
+      if (copied.length > 0 || inspection.head === 'behind') publishHead(target, position);
       point('after-head-update', position.segment);
       return {
         previous: { segment: drive.segment, hash: drive.hash },

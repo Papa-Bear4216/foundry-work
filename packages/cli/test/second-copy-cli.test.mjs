@@ -1,6 +1,6 @@
 // TEST ONLY: `foundry vault` second-copy, export and reminder commands (P-3). Every vault, secret and path is synthetic.
 import assert from 'node:assert/strict';
-import { cpSync, existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { verifyVault } from 'vault';
@@ -114,7 +114,8 @@ test('a FAT drive and an unregistered folder are refused with fixed text; nothin
   assert.equal(existsSync(join(home, REGISTER_NAME)), false);
   const none = await seal(dir, home, drive);
   assert.equal(none.code, 2);
-  assert.match(none.stderr, /\[COPY_UNKNOWN\]\n$/u);
+  // R19-7: the keyless drive check before the lock finds no copy in the folder.
+  assert.match(none.stderr, /\[NOT_A_COPY\]\n$/u);
   const ok = await copyInit(dir, home, drive);
   assert.equal(ok.code, 0, ok.stderr);
   const fatSeal = await seal(dir, home, drive, [], { secondCopyProbe: fat });
@@ -209,9 +210,18 @@ test('a rolled-back drive stops the session with ROLLBACK_DETECTED and changes n
   cpSync(drive, old, { recursive: true });
   assert.equal((await seal(dir, home, drive)).code, 0);
   const head = readFileSync(join(home, 'vault', 'HEAD.json'));
-  const stopped = await seal(dir, home, old);
+  // R19-7 (42): the refusal comes from the check before the working-home lock, the secrets and any drive write.
+  const lockSeen = [];
+  const oldDrive = readdirSync(old).sort();
+  const stopped = await seal(dir, home, old, [], {
+    secondCopyProbe: () => { lockSeen.push(existsSync(join(home, 'foundry.lock'))); return ntfs(); },
+  });
   assert.equal(stopped.code, 2);
   assert.match(stopped.stderr, /^foundry: STOP: the second copy is older .*\[ROLLBACK_DETECTED\]\n$/u);
+  assert.deepEqual(lockSeen, [false], 'checked once, before the lock');
+  assert.equal(stopped.kdf, 0, 'refused before the passphrase is used');
+  assert.equal(existsSync(join(home, 'foundry.lock')), false);
+  assert.deepEqual(readdirSync(old).sort(), oldDrive, 'nothing added to the drive');
   assert.deepEqual(readFileSync(join(home, 'vault', 'HEAD.json')), head, 'the working head is unchanged');
   assert.equal(verifyVault(old, { secondCopy: true }).position.segment, 1);
 });

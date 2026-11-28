@@ -3,7 +3,8 @@
  *
  * The main thread parses arguments (secret guard first), refuses a terminal on stdin for the `--*-stdin` flags,
  * starts the wall-clock deadline, resolves the Foundry home, takes the lock, reads secrets and then runs the command
- * body in ONE worker thread while it acts as the watchdog. Secrets are read without blocking the main thread
+ * body in ONE worker thread while it acts as the watchdog (`vault seal` and `vault session` first run their keyless,
+ * read-only drive check in a worker of its own, before the lock, R19-7). Secrets are read without blocking the main thread
  * (terminal prompts and `readStdinText` are asynchronous), so the deadline also covers a stdin pipe that never sends
  * EOF. (A blocking `readSync` cannot be used for this, in this thread or in a worker: on Node 24 for Windows a
  * worker blocked in it stops both `process.exit` and `worker.terminate()`.)
@@ -338,16 +339,6 @@ export async function runCli(argv: readonly string[], options: RunOptions = {}):
   };
 
   const work = async (): Promise<number> => {
-    // Fixed text for file-system errors here: the path may hold a secret pasted into --vault or FOUNDRY_HOME.
-    withFixedFileErrors(() => {
-      checkHome(run, home);
-      if (run.command === 'init') mkdirSync(home, { recursive: true, mode: 0o700 });
-      lock = acquireLock(join(home, LOCK_NAME), run.command, io.err);
-      checkHome(run, home); // again under the lock
-    });
-    const credential = await readSecrets(run, stdinFd, terminal, secrets, read => { pendingRead = read; }, trackPrompt);
-    pendingRead = undefined;
-    pendingPrompt = undefined;
     const request: CommandRequest = {
       command: run.command,
       home,
@@ -376,9 +367,29 @@ export async function runCli(argv: readonly string[], options: RunOptions = {}):
       verifyChain: run.verifyChain,
       adopt: run.adopt,
       anchor: run.anchor,
-      credential: isKeyed(run.command) ? credential : undefined,
+      credential: undefined,
       secrets,
     };
+    const anchorOnly = false;
+    // Fixed text for file-system errors here: the path may hold a secret pasted into --vault or FOUNDRY_HOME.
+    if (!anchorOnly) withFixedFileErrors(() => checkHome(run, home));
+    if (run.command === 'vault seal' || run.command === 'vault session') {
+      // R19-7: the keyless, read-only drive check runs before the working-home lock and before any probe file.
+      const checked = { ...request, preflight: true };
+      const code = options.inline ? await executeCommand(checked, io, options.testHooks) : await runInWorker(checked, options.testHooks ?? {}, io, handle);
+      if (code !== 0 || finished) return code === 0 ? 2 : code;
+    }
+    if (!anchorOnly) {
+      withFixedFileErrors(() => {
+        if (run.command === 'init') mkdirSync(home, { recursive: true, mode: 0o700 });
+        lock = acquireLock(join(home, LOCK_NAME), run.command, io.err);
+        checkHome(run, home); // again under the lock
+      });
+    }
+    const credential = await readSecrets(run, stdinFd, terminal, secrets, read => { pendingRead = read; }, trackPrompt);
+    pendingRead = undefined;
+    pendingPrompt = undefined;
+    request.credential = isKeyed(run.command) ? credential : undefined;
     if (finished) return 2;
     return options.inline ? executeCommand(request, io, options.testHooks) : runInWorker(request, options.testHooks ?? {}, io, handle);
   };

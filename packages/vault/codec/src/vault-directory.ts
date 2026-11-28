@@ -83,6 +83,9 @@ export function removePending(path: string): boolean {
 /** P-3 (A-44): the copy identity file in the root of a Mode B second copy, and its pending name. */
 export const COPY_IDENTITY = 'COPY.json';
 export const COPY_IDENTITY_PENDING = COPY_IDENTITY + '.pending';
+/** P-3 (R19-2): the durable "session in progress" state of a Mode B second copy, and its pending name. */
+export const COPY_SESSION = 'SESSION.json';
+export const COPY_SESSION_PENDING = COPY_SESSION + '.pending';
 
 /**
  * The root may hold only these entries (links are refused: a Dirent of a link is neither a file nor a folder).
@@ -91,7 +94,7 @@ export const COPY_IDENTITY_PENDING = COPY_IDENTITY + '.pending';
 export function checkRootInventory(directory: string, secondCopy = false): void {
   const directories = ['keyring', 'segments', 'open'];
   const files = [VAULT_METADATA, HEAD, HEAD_PENDING, LOCK, LOCK + '-journal', LOCK + '-wal', LOCK + '-shm',
-    ...(secondCopy ? [COPY_IDENTITY, COPY_IDENTITY_PENDING] : [])];
+    ...(secondCopy ? [COPY_IDENTITY, COPY_IDENTITY_PENDING, COPY_SESSION, COPY_SESSION_PENDING] : [])];
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     check((entry.isDirectory() && directories.includes(entry.name)) || (entry.isFile() && files.includes(entry.name)),
       'INVENTORY');
@@ -204,7 +207,10 @@ export function scanSealed(
   directory: string, vault: VaultMetadata, scanner: StreamScanner, unlocked?: UnlockedKeyring, anchor?: VaultAnchor,
   inspect?: (segment: number, ...args: Parameters<InspectRecord>) => void,
   verified?: (segment: number, files: ManifestFile[]) => void,
-  /** P-3 second-copy session only: leave out this segment folder (an unfinished copy, checked by the caller). */
+  /**
+   * P-3 second-copy session only: leave out this segment folder and every later one (an unfinished or uncommitted
+   * copy, checked by the caller).
+   */
   exclude?: number,
 ) {
   const root = join(directory, 'segments');
@@ -214,7 +220,7 @@ export function scanSealed(
     check(entry.isDirectory() && Number.isSafeInteger(number) && number > 0 && entry.name === segmentName(number),
       'INVENTORY');
     return number;
-  }).filter(number => number !== exclude).sort((a, b) => a - b);
+  }).filter(number => exclude === undefined || number < exclude).sort((a, b) => a - b);
   const publicKey = Buffer.from(vault.signing_public_key, 'base64');
   if (anchor) {
     check(anchor.epoch === 1 && anchor.vaultId === vault.vault_id && anchor.signingKeyFingerprint === sha256(publicKey)

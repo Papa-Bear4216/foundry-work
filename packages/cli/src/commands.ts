@@ -67,6 +67,11 @@ export interface CommandRequest {
   anchor?: string;
   /** Keyed commands: which secret unlocks the vault. */
   credential?: 'passphrase' | 'recovery';
+  /**
+   * `vault seal` / `vault session` only (R19-7): run the keyless, read-only drive check that comes before the
+   * working-home lock and the secrets, instead of the command body.
+   */
+  preflight?: boolean;
   secrets: CommandSecrets;
 }
 
@@ -1148,6 +1153,29 @@ function selectSessionCopy(vault: VaultModule, register: CopyRegisterValue, ctx:
 }
 
 /**
+ * R19-7: before the working-home lock, the secrets and any probe file on the drive, the session's phase 1 runs
+ * keyless and read-only against the register as it is on disk (a register to rebuild, or no matching record, leaves
+ * only the drive's own checks here). The session repeats every check under the locks with the keyed register.
+ */
+async function sealPreflight(ctx: Context): Promise<void> {
+  const vault = await import('vault/second-copy');
+  const id = await vaultId(ctx);
+  let recorded: { segment: number; hash: string } | null = null;
+  let copyId: string | undefined;
+  try {
+    const copy = selectSessionCopy(vault, vault.readCopyRegister(registerPath(ctx), id), ctx, id);
+    recorded = copy.head === null ? null : { segment: copy.head.segment, hash: copy.head.manifest_sha256 };
+    copyId = copy.copy_id;
+  } catch (error) {
+    if (!(error instanceof vault.SecondCopyError)) throw error;
+  }
+  stall(ctx.hooks);
+  vault.checkSecondCopySession(ctx.paths.vault, ctx.request.target!, {
+    recorded, ...(copyId === undefined ? {} : { copyId }), ...targetOptions(ctx),
+  });
+}
+
+/**
  * Check a new output file before any work (findings 17 and 18): not inside the working vault or the copy (strict
  * verification would reject the extra entry), not existing, and its parent an existing folder. Fixed texts only.
  */
@@ -1519,7 +1547,9 @@ export async function executeCommand(request: CommandRequest, io: CommandIo, hoo
   try {
     if (hooks.leakHandle) setInterval(() => {}, 1000);
     if (hooks.throwWithSecret) throw new Error(`test hook: ${secretTexts(request.secrets).join(' | ')}`);
-    await BODIES[request.command](ctx);
+    const body = request.preflight && (request.command === 'vault seal' || request.command === 'vault session')
+      ? sealPreflight : BODIES[request.command];
+    await body(ctx);
     return 0;
   } catch (thrown) {
     // Last line of defence: a Node system error about the home folder (from a library call) becomes fixed text, so
