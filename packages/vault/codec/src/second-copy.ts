@@ -994,7 +994,11 @@ export function initSecondCopy(workingVault: string, target: string, options: In
 
 export type CopyCheckpoint =
   | 'after-stream-files' | 'after-signature' | 'after-manifest-pending' | 'after-manifest-rename'
-  | 'after-read-back' | 'after-read-only' | 'after-keyring' | 'after-session-end' | 'after-head-update';
+  | 'after-read-back' | 'after-read-only' | 'after-keyring-rename' | 'after-keyring' | 'after-session-end'
+  | 'after-head-update';
+
+/** What a session makes durable on the drive (R20-1), as reported to the TEST ONLY `onSync` observer. */
+export type CopySync = 'keyring-file' | 'keyring-dir';
 
 export interface SessionOptions extends TargetOptions {
   /** The head recorded on this working device for this copy (null or absent: never sealed). */
@@ -1003,6 +1007,11 @@ export interface SessionOptions extends TargetOptions {
   copyId?: string;
   /** TEST ONLY crash points. A throw here stops the session at that point, like a pulled drive. */
   checkpoint?: (point: CopyCheckpoint, segment: number) => void;
+  /**
+   * TEST ONLY observer: called, in order, each time the session decides to sync something on the drive, before the
+   * platform check (so the decision is visible on Windows too, where folder syncs do nothing).
+   */
+  onSync?: (event: CopySync, segment: number) => void;
   /** TEST ONLY: runs after phase 1 (read-only) and before phase 2 (lock, recovery). */
   afterInspection?: () => void;
 }
@@ -1382,26 +1391,50 @@ function keyringVersionOf(bytes: Buffer, vaultId: string): number {
   return value.version;
 }
 
+/** fsync one regular file. POSIX only: a Windows flush needs write access, and Windows folder syncs do nothing. */
+function syncFile(path: string): void {
+  if (hostPlatform === 'win32') return;
+  const fd = openSync(path, 'r');
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /**
  * Write the working keyring to the drive unless the drive holds exactly these bytes. The drive file is read only
  * when its size equals the working keyring's, and then only that many bytes, so a huge planted file costs nothing.
+ * R20-1 (35): the keyring file and its folder are synced in both cases, so a rename of an interrupted session that
+ * was never synced is durable before any head names the new segments.
  */
-function publishDriveKeyring(target: string, bytes: Buffer): boolean {
+function publishDriveKeyring(
+  target: string, bytes: Buffer, sync: (event: CopySync) => void, afterRename: () => void,
+): boolean {
   const folder = join(target, 'keyring');
   const destination = join(folder, 'keyring.json');
   const stat = statIfPresent(destination);
   if (stat) {
     check(stat.isFile(), 'INVENTORY');
-    if (stat.size === bytes.length && readRegularFile(destination, bytes.length)?.equals(bytes)) return false;
+    if (stat.size === bytes.length && readRegularFile(destination, bytes.length)?.equals(bytes)) {
+      sync('keyring-file');
+      syncFile(destination);
+      sync('keyring-dir');
+      syncDirectory(folder);
+      return false;
+    }
   }
   const pending = join(folder, `keyring.json.pending-${randomBytes(16).toString('hex')}`);
   try {
+    sync('keyring-file');
     writePending(pending, bytes);
     renameWithRetry(pending, destination);
   } catch (error) {
     try { unlinkSync(pending); } catch { /* keep the first failure */ }
     throw error;
   }
+  afterRename();
+  sync('keyring-dir');
   syncDirectory(folder);
   // R19-2: the keyring that landed is re-checked before any head names the new segments.
   check(readRegularFile(destination, bytes.length)?.equals(bytes), 'KEY');
@@ -1633,7 +1666,8 @@ export function openSecondCopySession(workingVault: string, target: string, opti
       try {
         for (const { segment } of copied) protectSegment(join(target, 'segments', segmentName(segment)), true);
         point('after-read-only', position.segment);
-        keyringWritten = writeProtected(() => publishDriveKeyring(target, keyringBytes));
+        keyringWritten = writeProtected(() => publishDriveKeyring(target, keyringBytes,
+          event => options.onSync?.(event, position.segment), () => point('after-keyring-rename', position.segment)));
       } catch (error) {
         if (error instanceof VaultFormatError) throw new SecondCopyError('COPY_VERIFY_FAILED', error.code);
         throw error;

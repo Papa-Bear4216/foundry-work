@@ -540,6 +540,24 @@ test('interrupted between the manifest and the keyring: no head names the new se
   assert.equal(existsSync(join(vault.drive, 'SESSION.json')), false);
 });
 
+test('a keyring rename that was never synced is synced by the retry although the bytes match (R20-1, 35)', t => {
+  const vault = setup(t);
+  vault.append([event('TEST ONLY one')], true);
+  vault.init();
+  const stop = new Error('TEST ONLY pulled between the keyring rename and its folder sync');
+  assert.throws(() => vault.session({ checkpoint: name => { if (name === 'after-keyring-rename') throw stop; } }),
+    error => error === stop);
+  assert.deepEqual(readFileSync(keyringPath(vault.drive)), readFileSync(keyringPath(vault.working)), 'the rename landed');
+  const events = [];
+  const retry = vault.session({ onSync: name => events.push(name) });
+  assert.equal(retry.result.keyringWritten, false, 'the drive already holds these bytes');
+  assert.deepEqual(events.filter(name => name.startsWith('keyring-')), ['keyring-file', 'keyring-dir']);
+  // A later session with nothing new syncs the matching keyring again.
+  const again = [];
+  vault.session({ recorded: retry.result.head, onSync: name => again.push(name) });
+  assert.deepEqual(again.filter(name => name.startsWith('keyring-')), ['keyring-file', 'keyring-dir']);
+});
+
 test('a recorded segment left writable (a lost mode change) is made read-only again by the next session (R19-2, 46)', t => {
   const vault = setup(t);
   vault.append([event('TEST ONLY one'), blob('TEST ONLY blob')], true);

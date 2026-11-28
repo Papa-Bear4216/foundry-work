@@ -14,7 +14,7 @@ export {
   registerFromEvents, replayCopyRegister, SecondCopyError, selectCopy, writeCopyRegister,
 } from './second-copy.ts';
 export type {
-  Cadence, CommandResult, CommandRunner, CopyCheck, CopyCheckpoint, CopyInitIntent, CopyEvent, CopyHead, CopyInitResult, CopyRecord, CopyRegister,
+  Cadence, CommandResult, CommandRunner, CopyCheck, CopyCheckpoint, CopyInitIntent, CopySync, CopyEvent, CopyHead, CopyInitResult, CopyRecord, CopyRegister,
   CopyStatus, CopyTargetState, DiskRelation, FileSystemProbe, FileSystemReport, InitOptions, RegisterState,
   RegisterStatus, SealResult, SecondCopyErrorCode, SessionOptions, SessionReport, TargetOptions,
 } from './second-copy.ts';
