@@ -186,11 +186,58 @@ test('an interrupted copy init is recognised and completed; a foreign or other-r
   writeFileSync(join(half, 'HEAD.json.pending'), '{');
   assert.equal(vault.init(half).resumed, true);
   assert.equal(verifyVault(half, asCopy).position.segment, 0);
-  // Only a pending identity file: the folder counts as empty.
-  const pending = join(vault.root, 'pending');
-  mkdirSync(pending);
-  writeFileSync(join(pending, 'COPY.json.pending'), '{');
-  assert.equal(vault.init(pending).created, true);
+  // R21-3a (37): only a pending identity file: the folder counts as empty only for the live intent's own record, when
+  // the file holds its identity or a prefix of it (empty included).
+  const own = Buffer.from(`{"copy_id":"${ID}","format":"foundry-copy/1","vault_id":"${identity.vaultId}"}`);
+  for (const [name, bytes] of [['empty', own.subarray(0, 0)], ['prefix', own.subarray(0, 20)], ['complete', own]]) {
+    const folder = join(vault.root, `pending-own-${name}`);
+    mkdirSync(folder);
+    writeFileSync(join(folder, 'COPY.json.pending'), bytes);
+    assert.equal(inspectCopyTarget(vault.working, folder, { probe: ntfs, ownPendingCopyId: ID }).state, 'empty', name);
+    assert.equal(vault.init(folder, { ownPendingCopyId: ID }).created, true, name);
+    assert.equal(readCopyIdentity(folder, identity.vaultId), ID, name);
+    assert.equal(existsSync(join(folder, 'COPY.json.pending')), false, name);
+  }
+  // Any other pending identity is refused and left in place: no live intent, another copy id, another vault, other
+  // bytes, over the size cap.
+  const refusedPending = { code: 'TARGET_NOT_EMPTY', reason: 'pending-identity' };
+  const otherVault = Buffer.from(`{"copy_id":"${ID}","format":"foundry-copy/1","vault_id":"${'e5'.repeat(16)}"}`);
+  for (const [name, bytes, expected] of [
+    ['no-intent', own, undefined], ['torn-no-intent', own.subarray(0, 20), undefined], ['other-id', own, OTHER],
+    ['other-vault', otherVault, ID], ['other-bytes', Buffer.from('{'.padEnd(10, ' ')), ID], ['over-cap', Buffer.alloc(257, 0x7b), ID],
+  ]) {
+    const folder = join(vault.root, `pending-${name}`);
+    mkdirSync(folder);
+    writeFileSync(join(folder, 'COPY.json.pending'), bytes);
+    const options = expected === undefined ? {} : { ownPendingCopyId: expected };
+    assert.throws(() => inspectCopyTarget(vault.working, folder, { probe: ntfs, ...options }), refusedPending, name);
+    assert.throws(() => vault.init(folder, options), refusedPending, name);
+    assert.deepEqual(readdirSync(folder), ['COPY.json.pending'], name);
+    assert.deepEqual(readFileSync(join(folder, 'COPY.json.pending')), bytes, name);
+  }
+  // The check is made again right before the removal: a pending file replaced after the inspection stays.
+  const swapped = join(vault.root, 'pending-swapped');
+  mkdirSync(swapped);
+  writeFileSync(join(swapped, 'COPY.json.pending'), own);
+  const foreignPending = Buffer.from(own.toString().replace(ID, OTHER));
+  assert.throws(() => vault.init(swapped, {
+    ownPendingCopyId: ID, afterInspection: () => writeFileSync(join(swapped, 'COPY.json.pending'), foreignPending),
+  }), refusedPending);
+  assert.deepEqual(readFileSync(join(swapped, 'COPY.json.pending')), foreignPending);
+  // Two initializers both saw an empty folder: the second one refuses and the first one's identity stays.
+  const raced = join(vault.root, 'raced');
+  assert.throws(() => vault.init(raced, { copyId: OTHER, afterInspection: () => vault.init(raced) }),
+    { code: 'COPY_MISMATCH', reason: 'interrupted-init' });
+  assert.equal(readCopyIdentity(raced, identity.vaultId), ID);
+  assert.equal(existsSync(join(raced, 'COPY.json.pending')), false);
+  assert.equal(verifyVault(raced, asCopy).position.segment, 0);
+  // --adopt never removes a pending identity it does not own.
+  const adoptFolder = join(vault.root, 'adopt-stale');
+  cpSync(vault.drive, adoptFolder, { recursive: true });
+  writeFileSync(join(adoptFolder, 'COPY.json.pending'), foreignPending);
+  assert.throws(() => vault.init(adoptFolder, { copyId: OTHER, adopt: true }), refusedPending);
+  assert.deepEqual(readFileSync(join(adoptFolder, 'COPY.json.pending')), foreignPending);
+  assert.equal(readCopyIdentity(adoptFolder, identity.vaultId), ID);
   // A head without COPY.json is not Foundry's own unfinished init.
   const foreign = join(vault.root, 'foreign-head');
   mkdirSync(foreign);

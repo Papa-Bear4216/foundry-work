@@ -115,6 +115,8 @@ const SECOND_COPY_MESSAGES: Readonly<Record<string, string>> = {
 const SECOND_COPY_REASON_MESSAGES: Readonly<Record<string, string>> = {
   'COPY_MISMATCH:adopt-again': 'an unfinished `copy init --adopt` of this folder was found, and the folder has no copy id '
     + 'that ties it to that run; to finish the takeover, run `foundry vault copy init <folder> --adopt` again',
+  'TARGET_NOT_EMPTY:pending-identity': 'the folder holds a COPY.json.pending file that no unfinished `copy init` on this '
+    + 'device wrote; it was left in place: check what it is, delete it by hand if it is not needed, then run the command again',
   'COPY_UNVERIFIABLE:needs-replay': 'the second-copy register on this device may be behind the vault\'s events, so its '
     + 'recorded seal cannot be trusted for this check; run `foundry vault seal <folder>` (it rebuilds the register '
     + 'first), or check the copy with --anchor <compact anchor>',

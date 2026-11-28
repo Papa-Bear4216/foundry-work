@@ -1084,8 +1084,6 @@ async function copyInitCommand(ctx: Context): Promise<void> {
     await recoverVaultWriter(ctx, session, id);
     const path = registerPath(ctx);
     let register = await keyedRegister(ctx, session, id);
-    // Keyless and read-only: placement, file system, and what the folder holds.
-    const inspected = vault.inspectCopyTarget(ctx.paths.vault, target, targetOptions(ctx));
     // R19-3: `copy init` is a transaction bound to its target. An intent recorded for THIS target (and a record that
     // was never sealed) is finished by a retry; another target never inherits it.
     const intentPath = join(ctx.request.home, INIT_INTENT_NAME);
@@ -1094,6 +1092,10 @@ async function copyInitCommand(ctx: Context): Promise<void> {
     const bound = intent?.target_sha256 === targetKey ? intent : undefined;
     const boundRecord = bound && register.copies.find(entry => entry.copy_id === bound.copy_id);
     const live = bound && !(boundRecord && boundRecord.head !== null) ? bound : undefined;
+    // R21-3b (37): only a live intent's record can own a `COPY.json.pending` in the folder (checked in the codec).
+    const ownPending = live === undefined ? {} : { ownPendingCopyId: live.copy_id };
+    // Keyless and read-only: placement, file system, and what the folder holds.
+    const inspected = vault.inspectCopyTarget(ctx.paths.vault, target, { ...targetOptions(ctx), ...ownPending });
     let copy: CopyRegisterValue['copies'][number];
     let adoptedFrom: string | null | undefined;
     let registered = false;
@@ -1151,7 +1153,7 @@ async function copyInitCommand(ctx: Context): Promise<void> {
     vault.writeCopyRegister(path, { ...register, needs_replay: false });
     if (ctx.hooks.failCopyInitAfterRegister) throw Object.assign(new Error('TEST ONLY drive pulled'), { code: 'EIO', syscall: 'open' });
     const result = vault.initSecondCopy(ctx.paths.vault, target, {
-      ...targetOptions(ctx), copyId: copy.copy_id, adopt: adoptedFrom !== undefined,
+      ...targetOptions(ctx), ...ownPending, copyId: copy.copy_id, adopt: adoptedFrom !== undefined,
     });
     // The folder is done: the intent for this record is finished.
     if (registered || intent?.copy_id === copy.copy_id) vault.clearInitIntent(intentPath);

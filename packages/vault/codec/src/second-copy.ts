@@ -48,7 +48,7 @@ import { Buffer } from 'node:buffer';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import {
-  accessSync, chmodSync, closeSync, constants, fstatSync, fsyncSync, mkdirSync, openSync, readFileSync,
+  accessSync, chmodSync, closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync,
   opendirSync, readSync, realpathSync, rmdirSync, statfsSync, statSync, unlinkSync, writeSync,
 } from 'node:fs';
 import { dirname, join, posix, resolve, win32 } from 'node:path';
@@ -842,11 +842,29 @@ function targetMetadata(target: string, working: VaultMetadata): VaultMetadata {
 
 const COPY_FORMAT = 'foundry-copy/1';
 
+/**
+ * The bytes of the identity file `name` (`COPY.json` or its pending file), or undefined when nothing is there. R21-3a:
+ * the entry itself must be a regular file (lstat: a link is never followed, a FIFO never opened) of at most
+ * `MAX_COPY_IDENTITY_BYTES`; anything else fails `INVENTORY`. The size is checked again on the open descriptor.
+ */
+function readIdentityFile(target: string, name: string): Buffer | undefined {
+  const path = join(target, name);
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return undefined;
+    throw error;
+  }
+  check(stat.isFile() && stat.size <= MAX_COPY_IDENTITY_BYTES, 'INVENTORY');
+  return readRegularFile(path, MAX_COPY_IDENTITY_BYTES);
+}
+
 /** The `copy_id` in the drive's `COPY.json`, or undefined when there is none. Bounded, keyless. */
 export function readCopyIdentity(target: string, vaultId: string): string | undefined {
   let value: Json;
   try {
-    const bytes = readRegularFile(join(target, COPY_IDENTITY), MAX_COPY_IDENTITY_BYTES);
+    const bytes = readIdentityFile(target, COPY_IDENTITY);
     if (bytes === undefined) return undefined;
     value = parseCanonical(bytes);
     object(value, 'format vault_id copy_id');
@@ -861,13 +879,61 @@ export function readCopyIdentity(target: string, vaultId: string): string | unde
   return value.copy_id;
 }
 
-/** Write `COPY.json` atomically: pending name, fsync, rename, folder sync. */
-function writeCopyIdentity(target: string, vaultId: string, copyId: string): void {
+function identityBytes(vaultId: string, copyId: string): Buffer {
+  return Buffer.from(canonical({ format: COPY_FORMAT, vault_id: vaultId, copy_id: copyId }));
+}
+
+/**
+ * R21-3a (37): what the folder's `COPY.json.pending` is. `ours` only when an unfinished `copy init` of this device
+ * expects it (`ownPendingCopyId`, set by the CLI from a live init intent bound to this target) and the file is a
+ * regular file whose bytes equal, or are a prefix (empty included) of, that record's identity for this vault. Any
+ * other file (another id or vault, other bytes, too large, not a regular file, unreadable) is `foreign`.
+ */
+function pendingIdentity(target: string, vaultId: string, ownPendingCopyId: string | undefined): 'absent' | 'ours' | 'foreign' {
+  let bytes: Buffer | undefined;
+  try {
+    bytes = readIdentityFile(target, COPY_IDENTITY_PENDING);
+  } catch {
+    return 'foreign';
+  }
+  if (bytes === undefined) return 'absent';
+  if (ownPendingCopyId === undefined || !/^[0-9a-f]{32}$/u.test(ownPendingCopyId)) return 'foreign';
+  const own = identityBytes(vaultId, ownPendingCopyId);
+  return bytes.length <= own.length && own.subarray(0, bytes.length).equals(bytes) ? 'ours' : 'foreign';
+}
+
+/** R21-3b: immediately before `COPY.json.pending` is removed, it is checked again; a foreign one stays in place. */
+function removeOwnPendingIdentity(target: string, vaultId: string, ownPendingCopyId: string | undefined): void {
+  const state = pendingIdentity(target, vaultId, ownPendingCopyId);
+  if (state === 'foreign') throw new SecondCopyError('TARGET_NOT_EMPTY', 'pending-identity');
+  if (state === 'ours') removeRegularFile(join(target, COPY_IDENTITY_PENDING));
+}
+
+/**
+ * Write `COPY.json` atomically: pending name, fsync, rename, folder sync. A pending file already there is removed
+ * only when it is this device's own (R21-3b). `fresh` (the empty-folder path): `COPY.json` must still be absent
+ * just before the rename, so a second initializer that also saw the folder empty never replaces the first one's id.
+ */
+function writeCopyIdentity(target: string, vaultId: string, copyId: string, ownPendingCopyId: string | undefined, fresh: boolean): void {
   hex(copyId, 16);
-  const bytes = Buffer.from(canonical({ format: COPY_FORMAT, vault_id: vaultId, copy_id: copyId }));
+  const bytes = identityBytes(vaultId, copyId);
   const pending = join(target, COPY_IDENTITY_PENDING);
-  removeRegularFile(pending);
+  removeOwnPendingIdentity(target, vaultId, ownPendingCopyId);
   writePending(pending, bytes);
+  if (fresh) {
+    let present = true;
+    try {
+      lstatSync(join(target, COPY_IDENTITY));
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT') throw error;
+      present = false;
+    }
+    if (present) {
+      // Only the file this call just wrote is removed; the other initializer's COPY.json stays.
+      try { unlinkSync(pending); } catch { /* keep the refusal */ }
+      throw new SecondCopyError('COPY_MISMATCH', 'interrupted-init');
+    }
+  }
   renameWithRetry(pending, join(target, COPY_IDENTITY));
   syncDirectory(target);
 }
@@ -953,8 +1019,16 @@ export interface CopyTargetState {
   fileSystem: FileSystemReport;
 }
 
+export interface InspectTargetOptions extends TargetOptions {
+  /**
+   * R21-3b (37): the copy id of this device's live `copy init` intent bound to this target (the CLI sets it only
+   * then). Without it, a `COPY.json.pending` is never this device's own.
+   */
+  ownPendingCopyId?: string;
+}
+
 /** Keyless and read-only: what the folder holds, after the placement and file-system checks. */
-export function inspectCopyTarget(workingVault: string, target: string, options: TargetOptions = {}): CopyTargetState {
+export function inspectCopyTarget(workingVault: string, target: string, options: InspectTargetOptions = {}): CopyTargetState {
   const platform = options.platform ?? hostPlatform;
   workingVault = resolve(workingVault);
   target = resolve(target);
@@ -985,18 +1059,26 @@ export function inspectCopyTarget(workingVault: string, target: string, options:
   if (!own) throw new SecondCopyError('TARGET_NOT_EMPTY');
   const copyId = readCopyIdentity(target, working.vault_id);
   if (copyId !== undefined) return { state: 'interrupted', copyId, fileSystem };
-  // `COPY.json` is written first, so without it only its own pending file can be Foundry's.
-  if (entries.every(entry => entry.name === COPY_IDENTITY_PENDING)) return { state: 'empty', copyId: undefined, fileSystem };
+  // `COPY.json` is written first, so without it only its own pending file can be Foundry's: and only when this
+  // device's live init intent for this target expects it (R21-3a, 37). Any other one is left in place.
+  if (entries.every(entry => entry.name === COPY_IDENTITY_PENDING)) {
+    if (pendingIdentity(target, working.vault_id, options.ownPendingCopyId) === 'ours') {
+      return { state: 'empty', copyId: undefined, fileSystem };
+    }
+    throw new SecondCopyError('TARGET_NOT_EMPTY', 'pending-identity');
+  }
   throw new SecondCopyError('TARGET_NOT_EMPTY');
 }
 
-export interface InitOptions extends TargetOptions {
+export interface InitOptions extends InspectTargetOptions {
   /** The id of the register record for this copy; written to `COPY.json`. */
   copyId: string;
   /** Take over a copy of this vault whose `COPY.json` names another (or no) id: it gets `copyId` (R18-3). */
   adopt?: boolean;
   /** TEST ONLY crash point after `COPY.json` is written, before the vault layout. */
   checkpoint?: (point: 'init-after-identity') => void;
+  /** TEST ONLY: runs after the folder is inspected and before anything is written (another initializer's gap). */
+  afterInspection?: () => void;
 }
 
 export interface CopyInitResult {
@@ -1021,13 +1103,14 @@ export function initSecondCopy(workingVault: string, target: string, options: In
   target = resolve(target);
   const working = metadata(workingVault);
   const inspected = inspectCopyTarget(workingVault, target, options);
+  options.afterInspection?.();
   let created = false;
   let resumed = false;
   let adoptedFrom: string | null | undefined;
   writeProtected(() => {
     if (inspected.state === 'empty') {
       mkdirSync(target, { recursive: true, mode: 0o700 });
-      writeCopyIdentity(target, working.vault_id, options.copyId);
+      writeCopyIdentity(target, working.vault_id, options.copyId, options.ownPendingCopyId, true);
       options.checkpoint?.('init-after-identity');
       initializeVault(target, {
         vaultId: working.vault_id, createdAt: working.created_at, signingPublicKey: Buffer.from(working.signing_public_key, 'base64'),
@@ -1035,7 +1118,7 @@ export function initSecondCopy(workingVault: string, target: string, options: In
       created = true;
     } else if (inspected.state === 'interrupted') {
       if (inspected.copyId !== options.copyId) throw new SecondCopyError('COPY_MISMATCH', 'interrupted-init');
-      removeRegularFile(join(target, COPY_IDENTITY_PENDING));
+      removeOwnPendingIdentity(target, working.vault_id, options.ownPendingCopyId);
       initializeVault(target, {
         vaultId: working.vault_id, createdAt: working.created_at, signingPublicKey: Buffer.from(working.signing_public_key, 'base64'),
       });
@@ -1044,7 +1127,7 @@ export function initSecondCopy(workingVault: string, target: string, options: In
       resumed = true;
     } else if (options.adopt) {
       adoptedFrom = inspected.copyId ?? null;
-      writeCopyIdentity(target, working.vault_id, options.copyId);
+      writeCopyIdentity(target, working.vault_id, options.copyId, options.ownPendingCopyId, false);
     } else {
       throw new SecondCopyError('COPY_MISMATCH', 'adopt-required');
     }

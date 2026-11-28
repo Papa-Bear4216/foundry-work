@@ -2,8 +2,8 @@
 import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
 import {
-  chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync,
-  writeFileSync,
+  chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync,
+  unlinkSync, writeFileSync,
 } from 'node:fs';
 import { join, sep } from 'node:path';
 import { test } from 'node:test';
@@ -293,6 +293,81 @@ test('a pending adoption of a folder without COPY.json needs --adopt again; a pl
   const finished = await copyInit(dir, home, two, ['--json']);
   assert.equal(finished.code, 0, finished.stderr);
   assert.equal(JSON.parse(finished.stdout).label, 'second');
+});
+
+test('a lone COPY.json.pending is resumed only for the live intent\'s own record; any other is refused and left (R21-3, 37)', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const copies = () => JSON.parse(readFileSync(join(home, REGISTER_NAME), 'utf8')).copies;
+  const vaultId = JSON.parse(readFileSync(join(home, 'vault', 'VAULT.json'), 'utf8')).vault_id;
+  const identityOf = copyId => `{"copy_id":"${copyId}","format":"foundry-copy/1","vault_id":"${vaultId}"}`;
+  const refusedText = /COPY\.json\.pending file that no unfinished `copy init` on this device wrote; it was left in place: .*delete it by hand.* \[TARGET_NOT_EMPTY\]\n$/u;
+  const plant = (folder, text) => {
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(join(folder, 'COPY.json.pending'), text);
+  };
+  const pulled = async (folder, extra = []) => {
+    const run = await copyInit(dir, home, folder, extra, { secondCopyProbe: ntfs, failCopyInitAfterRegister: true });
+    assert.match(run.stderr, /\[IO\]\n$/u);
+    return copies().at(-1).copy_id;
+  };
+  // The live intent's own identity (complete, or torn to a prefix) resumes with the intent's record.
+  for (const [name, cut] of [['complete', undefined], ['prefix', 25]]) {
+    const folder = join(dir, `own-${name}`);
+    const copyId = await pulled(folder, ['--label', `own-${name}`]);
+    plant(folder, identityOf(copyId).slice(0, cut));
+    const resumed = await copyInit(dir, home, folder, ['--json']);
+    assert.equal(resumed.code, 0, resumed.stderr);
+    assert.equal(JSON.parse(resumed.stdout).copyId, copyId);
+    assert.equal(JSON.parse(readFileSync(join(folder, 'COPY.json'), 'utf8')).copy_id, copyId);
+    assert.equal(existsSync(join(home, INIT_INTENT_NAME)), false);
+  }
+  // A live intent, but the pending file names another copy id: refused, the file stays; once removed by hand the
+  // retry finishes the intent's record.
+  const other = join(dir, 'other-id');
+  const otherId = await pulled(other, ['--label', 'other-id']);
+  plant(other, identityOf('f6'.repeat(16)));
+  const refused = await copyInit(dir, home, other);
+  assert.equal(refused.code, 2);
+  assert.match(refused.stderr, refusedText);
+  assert.equal(readFileSync(join(other, 'COPY.json.pending'), 'utf8'), identityOf('f6'.repeat(16)));
+  assert.ok(!refused.stderr.includes('other-id'), 'the folder path is not echoed');
+  unlinkSync(join(other, 'COPY.json.pending'));
+  const finished = await copyInit(dir, home, other, ['--json']);
+  assert.equal(finished.code, 0, finished.stderr);
+  assert.equal(JSON.parse(finished.stdout).copyId, otherId);
+  // No live intent: even an identity of a known record is refused.
+  const none = join(dir, 'no-intent');
+  plant(none, identityOf(otherId));
+  assert.match((await copyInit(dir, home, none)).stderr, refusedText);
+  assert.equal(readFileSync(join(none, 'COPY.json.pending'), 'utf8'), identityOf(otherId));
+  // An intent whose record has been sealed since is not live: its identity in a pending file is refused too.
+  const sealedTarget = join(dir, 'sealed');
+  const sealedId = await pulled(sealedTarget, ['--label', 'sealed']);
+  const intentBytes = readFileSync(join(home, INIT_INTENT_NAME));
+  assert.equal((await copyInit(dir, home, sealedTarget)).code, 0);
+  await addEvent(dir, home);
+  assert.equal((await seal(dir, home, sealedTarget, ['--copy', 'sealed'])).code, 0);
+  writeFileSync(join(home, INIT_INTENT_NAME), intentBytes);
+  renameSync(sealedTarget, join(dir, 'sealed-moved'));
+  plant(sealedTarget, identityOf(sealedId));
+  assert.match((await copyInit(dir, home, sealedTarget)).stderr, refusedText);
+  assert.equal(readFileSync(join(sealedTarget, 'COPY.json.pending'), 'utf8'), identityOf(sealedId));
+  rmSync(join(home, INIT_INTENT_NAME));
+  // --adopt never removes a stale pending identity it does not own; once removed by hand, the retry finishes.
+  const foreign = join(dir, 'adopt-stale');
+  cpSync(join(dir, 'own-complete'), foreign, { recursive: true });
+  const oldId = 'a7'.repeat(16);
+  writeFileSync(join(foreign, 'COPY.json'), identityOf(oldId));
+  writeFileSync(join(foreign, 'COPY.json.pending'), identityOf('b8'.repeat(16)));
+  const adoptRefused = await copyInit(dir, home, foreign, ['--label', 'adopted', '--adopt']);
+  assert.match(adoptRefused.stderr, refusedText);
+  assert.equal(readFileSync(join(foreign, 'COPY.json.pending'), 'utf8'), identityOf('b8'.repeat(16)));
+  assert.equal(JSON.parse(readFileSync(join(foreign, 'COPY.json'), 'utf8')).copy_id, oldId);
+  unlinkSync(join(foreign, 'COPY.json.pending'));
+  const adopted = await copyInit(dir, home, foreign, ['--adopt', '--json']);
+  assert.equal(adopted.code, 0, adopted.stderr);
+  assert.deepEqual([JSON.parse(adopted.stdout).label, JSON.parse(adopted.stdout).adoptedFrom], ['adopted', oldId]);
 });
 
 test('a rolled-back drive stops the session with ROLLBACK_DETECTED and changes nothing', async t => {
