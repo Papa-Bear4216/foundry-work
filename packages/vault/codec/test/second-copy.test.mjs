@@ -338,7 +338,15 @@ test('a lost recorded segment under a surviving head and an older SESSION.json i
   assert.deepEqual(tree(vault.drive), drive, 'nothing changed');
   // Recorded at segment 1, the same drive is a published head the chain does not end at.
   assert.throws(() => vault.session({ recorded: first.head }), { code: 'COPY_VERIFY_FAILED', reason: 'HEAD' });
+  // Checked against the anchor alone (no recorded head, no rollback check), it is head damage too.
+  assert.throws(() => verifySecondCopy(vault.drive, { anchor: first.anchor }), { code: 'COPY_VERIFY_FAILED', reason: 'HEAD' });
   assert.deepEqual(tree(vault.drive), drive);
+  // A forged published head (no rollback: recorded at segment 1) is head damage, with or without the anchor.
+  writeFileSync(join(vault.drive, 'HEAD.json'), `{"manifest_sha256":"${'c'.repeat(64)}","segment":2}`);
+  const forged = tree(vault.drive);
+  assert.throws(() => vault.session({ recorded: first.head }), { code: 'COPY_VERIFY_FAILED', reason: 'HEAD' });
+  assert.throws(() => verifySecondCopy(vault.drive, { anchor: first.anchor }), { code: 'COPY_VERIFY_FAILED', reason: 'HEAD' });
+  assert.deepEqual(tree(vault.drive), forged);
 });
 
 test('step 3 stops on a forked chain and on a recorded hash that differs at the same segment number', t => {
