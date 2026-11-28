@@ -366,6 +366,46 @@ test('a lost newest segment with a surviving HEAD.json is a rollback, not head d
   assert.throws(() => vault.session({ recorded: null }), { code: 'COPY_VERIFY_FAILED', reason: 'HEAD' });
 });
 
+test('an unreadable HEAD.json never hides a rollback; without one it is head damage, nothing written (R22-1, 57)',
+  { skip: process.platform === 'win32' || process.getuid?.() === 0 }, t => {
+    /** Run `work` with the drive's HEAD.json unreadable (mode 000); the mode is restored whatever happens. */
+    const unreadableHead = (drive, work) => {
+      const head = join(drive, 'HEAD.json');
+      chmodSync(head, 0o000);
+      try {
+        work();
+      } finally {
+        chmodSync(head, 0o600);
+      }
+    };
+    // A copy recorded at segment 2 that lost segment 2, with no SESSION.json.
+    const vault = setup(t);
+    vault.append([event('TEST ONLY one')], true);
+    vault.append([event('TEST ONLY two')], true);
+    vault.init();
+    const { result } = vault.session();
+    assert.equal(result.head.segment, 2);
+    makeWritable(vault.drive);
+    rmSync(segmentDir(vault.drive, 2), { recursive: true });
+    const truncated = tree(vault.drive);
+    unreadableHead(vault.drive, () => {
+      assert.throws(() => vault.session({ recorded: result.head }), { code: 'ROLLBACK_DETECTED', reason: 'drive-older-than-recorded' });
+    });
+    assert.deepEqual(tree(vault.drive), truncated, 'nothing written');
+    // The same unreadable HEAD.json on a copy that is not truncated is head damage, before the lock.
+    const whole = setup(t);
+    whole.append([event('TEST ONLY three')], true);
+    whole.append([event('TEST ONLY four')], true);
+    whole.init();
+    const sealed = whole.session().result;
+    const before = tree(whole.drive);
+    makeWritable(whole.drive);
+    unreadableHead(whole.drive, () => {
+      assert.throws(() => whole.session({ recorded: sealed.head }), { code: 'COPY_VERIFY_FAILED', reason: 'HEAD' });
+    });
+    assert.deepEqual(tree(whole.drive), before, 'nothing written');
+  });
+
 test('a lost recorded segment under a surviving head and an older SESSION.json is still a rollback (R21-2, 56)', t => {
   const vault = setup(t);
   vault.append([event('TEST ONLY one')], true);

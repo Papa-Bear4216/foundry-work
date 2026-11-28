@@ -1264,8 +1264,9 @@ const MAX_HEAD_BYTES = 128;
 
 /**
  * R21-1 (55): `HEAD.json` as phase 1 read it, once: whether a file was there, and the bytes read (undefined when it
- * was missing, or was not a regular file of at most `MAX_HEAD_BYTES`). This read never throws a format error; the
- * head judgement after step 3 reports a bad head, and the re-check under the drive lock compares these exact bytes.
+ * was missing, or was not a regular file of at most `MAX_HEAD_BYTES`). R22-1 (57): this read never throws; any error
+ * (a format fault or an OS error such as `EACCES` or `EIO`) gives the fault marker, so step 3 still runs first and
+ * the head judgement after it reports a bad head. The re-check under the drive lock compares these exact bytes.
  */
 interface HeadRead {
   present: boolean;
@@ -1278,9 +1279,9 @@ function readHeadOnce(target: string): HeadRead {
   try {
     const bytes = readRegularFile(path, MAX_HEAD_BYTES);
     return { present: bytes !== undefined, bytes, sha256: bytes === undefined ? undefined : sha256(bytes) };
-  } catch (error) {
-    if (error instanceof VaultFormatError) return { present: true, bytes: undefined, sha256: undefined };
-    throw error;
+  } catch {
+    // R22-1 (57): an unreadable head is a head fault, judged after the rollback check (never `[IO]` before it).
+    return { present: true, bytes: undefined, sha256: undefined };
   }
 }
 
