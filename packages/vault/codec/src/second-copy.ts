@@ -812,6 +812,72 @@ function writeCopyIdentity(target: string, vaultId: string, copyId: string): voi
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// The `copy init` transaction on the working device (R19-3).
+
+const INIT_INTENT_FORMAT = 'foundry-copy-init/1';
+const MAX_INIT_INTENT_BYTES = 1024;
+
+/**
+ * An unfinished `copy init`: the new record and the target it is bound to (the SHA-256 of the target's canonical
+ * path, case-folded on Windows; the path itself is never written). It is written before `copy.registered`, so a
+ * retry on the same target finishes this record, and it is removed once the folder is done.
+ */
+export interface CopyInitIntent {
+  copy_id: string;
+  label: string;
+  created_at: string;
+  target_sha256: string;
+  /** `--adopt`: the folder held a copy of this vault, with `previous_copy_id` (null: it had no `COPY.json`). */
+  adopt: boolean;
+  previous_copy_id: string | null;
+}
+
+/** The identity of a target folder for an init intent: the hash of its canonical path (case-folded on Windows). */
+export function copyTargetKey(target: string, platform: string = hostPlatform): string {
+  return sha256(Buffer.from(folded(canonicalPath(target, platform), platform)));
+}
+
+/** The pending init, or undefined when there is none. An unreadable or malformed file counts as none. */
+export function readInitIntent(path: string, vaultId: string): CopyInitIntent | undefined {
+  try {
+    const bytes = readRegularFile(path, MAX_INIT_INTENT_BYTES);
+    if (bytes === undefined) return undefined;
+    const value = parseCanonical(bytes);
+    object(value, 'format vault_id copy_id label created_at target_sha256 adopt previous_copy_id');
+    check(value.format === INIT_INTENT_FORMAT && value.vault_id === vaultId && typeof value.adopt === 'boolean');
+    hex(value.copy_id, 16);
+    assertCopyLabel(value.label);
+    timestamp(value.created_at);
+    hex(value.target_sha256, 32);
+    if (value.previous_copy_id !== null) hex(value.previous_copy_id, 16);
+    const { copy_id, label, created_at, target_sha256, adopt, previous_copy_id } = value as unknown as CopyInitIntent;
+    return { copy_id, label, created_at, target_sha256, adopt, previous_copy_id };
+  } catch (error) {
+    if (error instanceof VaultFormatError || error instanceof SecondCopyError) return undefined;
+    throw error;
+  }
+}
+
+/** Write the init intent atomically (unique temp file, fsync, rename, folder sync). */
+export function writeInitIntent(path: string, vaultId: string, intent: CopyInitIntent): void {
+  const bytes = Buffer.from(canonical({ format: INIT_INTENT_FORMAT, vault_id: vaultId, ...intent } as unknown as Json));
+  const pending = `${path}.pending-${randomBytes(16).toString('hex')}`;
+  writePending(pending, bytes);
+  try {
+    renameWithRetry(pending, path);
+  } catch (error) {
+    try { unlinkSync(pending); } catch { /* keep the first failure */ }
+    throw error;
+  }
+  syncDirectory(dirname(path));
+}
+
+/** Remove a finished init intent (a missing file is fine). */
+export function clearInitIntent(path: string): void {
+  if (removeRegularFile(path)) syncDirectory(dirname(path));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // `vault copy init`.
 
 /** What an interrupted `copy init` may leave in the folder before `VAULT.json` exists. */

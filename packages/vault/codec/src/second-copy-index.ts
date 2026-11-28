@@ -7,14 +7,14 @@
 export * from './index.ts';
 export {
   addCopyRecord, assertCadence, assertCopyLabel, CADENCE_DAYS, CADENCES, canonicalPath, checkFileSystem,
-  checkSecondCopySession, verifySecondCopy, COPY_REGISTERED,
+  checkSecondCopySession, clearInitIntent, copyTargetKey, readInitIntent, verifySecondCopy, writeInitIntent, COPY_REGISTERED,
   COPY_SEALED, copyRegisteredBody, copyRegisterStatus, copySealedBody, defaultRunner, diskRelation, emptyRegister,
   fatFileSystems, initSecondCopy, inspectCopyTarget, loadCopyRegister, MAX_REGISTER_BYTES, newCopyId,
   openSecondCopySession, OVERDUE_DAYS, pathInside, probeFileSystem, readCopyIdentity, readCopyRegister, recordSeal,
   registerFromEvents, replayCopyRegister, SecondCopyError, selectCopy, writeCopyRegister,
 } from './second-copy.ts';
 export type {
-  Cadence, CommandResult, CommandRunner, CopyCheck, CopyCheckpoint, CopyEvent, CopyHead, CopyInitResult, CopyRecord, CopyRegister,
+  Cadence, CommandResult, CommandRunner, CopyCheck, CopyCheckpoint, CopyInitIntent, CopyEvent, CopyHead, CopyInitResult, CopyRecord, CopyRegister,
   CopyStatus, CopyTargetState, DiskRelation, FileSystemProbe, FileSystemReport, InitOptions, RegisterState,
   RegisterStatus, SealResult, SecondCopyErrorCode, SessionOptions, SessionReport, TargetOptions,
 } from './second-copy.ts';

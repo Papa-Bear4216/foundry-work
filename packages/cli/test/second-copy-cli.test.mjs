@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { verifyVault } from 'vault';
 import { parseCommandLine } from '../dist/args.js';
-import { REGISTER_NAME } from '../dist/commands.js';
+import { INIT_INTENT_NAME, REGISTER_NAME } from '../dist/commands.js';
 import { cleanEnv, initVault, PASSPHRASE, runInline, scratch, takeoutFolder } from './helpers.mjs';
 
 const ntfs = () => ({ type: 'ntfs', method: 'injected' });
@@ -197,6 +197,53 @@ test('a copy has an identity: --copy must match the drive, a foreign copy needs 
   assert.match(adopted.stdout, new RegExp(`copy id ${oldId} is replaced by ${third.copy_id}`, 'u'));
   assert.equal(JSON.parse(readFileSync(join(foreign, 'COPY.json'), 'utf8')).copy_id, third.copy_id);
   assert.equal((await seal(dir, home, foreign)).code, 0);
+});
+
+test('copy init is a transaction bound to its target: a retry finishes it, another drive never inherits it (R19-3)', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const copies = () => JSON.parse(readFileSync(join(home, REGISTER_NAME), 'utf8')).copies;
+  // Finding 37: a second, different drive with the label of a finished but never sealed init gets no shared id.
+  const one = join(dir, 'one');
+  assert.equal((await copyInit(dir, home, one, ['--label', 'offsite'])).code, 0);
+  const two = join(dir, 'two');
+  const reused = await copyInit(dir, home, two, ['--label', 'offsite']);
+  assert.match(reused.stderr, /\[INVALID_LABEL\]\n$/u);
+  assert.equal(existsSync(two), false);
+  assert.equal(copies().length, 1);
+  assert.equal(existsSync(join(home, INIT_INTENT_NAME)), false, 'the finished init left no intent');
+  // Finding 43: the drive is pulled after the registration and before COPY.json; an unlabelled retry finishes it.
+  const three = join(dir, 'three');
+  const pulled = await copyInit(dir, home, three, [], { secondCopyProbe: ntfs, failCopyInitAfterRegister: true });
+  assert.match(pulled.stderr, /\[IO\]\n$/u);
+  assert.equal(copies().length, 2);
+  assert.equal(existsSync(join(home, INIT_INTENT_NAME)), true);
+  const retried = await copyInit(dir, home, three, ['--json']);
+  assert.equal(retried.code, 0, retried.stderr);
+  assert.equal(copies().length, 2, 'no second record');
+  assert.equal(JSON.parse(readFileSync(join(three, 'COPY.json'), 'utf8')).copy_id, JSON.parse(retried.stdout).copyId);
+  assert.equal(JSON.parse(retried.stdout).label, copies()[1].label);
+  assert.equal(existsSync(join(home, INIT_INTENT_NAME)), false);
+  // An adoption pulled at the same point is finished by the same command (its label is not "taken").
+  const foreign = join(dir, 'foreign');
+  cpSync(one, foreign, { recursive: true });
+  const metadata = JSON.parse(readFileSync(join(foreign, 'VAULT.json'), 'utf8'));
+  const oldId = 'd4'.repeat(16);
+  writeFileSync(join(foreign, 'COPY.json'), `{"copy_id":"${oldId}","format":"foundry-copy/1","vault_id":"${metadata.vault_id}"}`);
+  const adoptPulled = await copyInit(dir, home, foreign, ['--label', 'taken-over', '--adopt'], { secondCopyProbe: ntfs, failCopyInitAfterRegister: true });
+  assert.match(adoptPulled.stderr, /\[IO\]\n$/u);
+  const adopted = await copyInit(dir, home, foreign, ['--label', 'taken-over', '--adopt', '--json']);
+  assert.equal(adopted.code, 0, adopted.stderr);
+  assert.deepEqual([JSON.parse(adopted.stdout).adopted, JSON.parse(adopted.stdout).adoptedFrom], [true, oldId]);
+  assert.equal(copies().filter(c => c.label === 'taken-over').length, 1);
+  // A different target never inherits a pending intent.
+  const four = join(dir, 'four');
+  assert.equal((await copyInit(dir, home, four, [], { secondCopyProbe: ntfs, failCopyInitAfterRegister: true })).code, 2);
+  const pending = copies().at(-1);
+  const five = join(dir, 'five');
+  const other = await copyInit(dir, home, five, ['--json']);
+  assert.equal(other.code, 0, other.stderr);
+  assert.notEqual(JSON.parse(other.stdout).copyId, pending.copy_id);
 });
 
 test('a rolled-back drive stops the session with ROLLBACK_DETECTED and changes nothing', async t => {

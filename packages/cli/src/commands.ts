@@ -122,6 +122,8 @@ export interface TestHooks {
   schedulerConfigHome?: string;
   /** P-3: the environment and bus-socket check the Linux reminder notification uses (default: this process). */
   reminderEnv?: Readonly<Record<string, string | undefined>>;
+  /** P-3: `vault copy init` stops after the register write and before the folder is written (a pulled drive). */
+  failCopyInitAfterRegister?: boolean;
   /** P-3: make the `--anchor-svg` write fail after the seal is committed. */
   failAnchorSvgWrite?: boolean;
   reminderBusExists?: (path: string) => boolean;
@@ -983,6 +985,8 @@ async function collectionListCommand(ctx: Context): Promise<void> {
 
 /** The working-device register of second copies, in the Foundry home next to `vault/` and `index/`. */
 export const REGISTER_NAME = 'second-copies.json';
+/** R19-3: the unfinished `copy init` (its record and the hash of its target), next to the register. */
+export const INIT_INTENT_NAME = 'second-copy-init.json';
 
 function registerPath(ctx: Context): string {
   return join(ctx.request.home, REGISTER_NAME);
@@ -1082,14 +1086,36 @@ async function copyInitCommand(ctx: Context): Promise<void> {
     let register = await keyedRegister(ctx, session, id);
     // Keyless and read-only: placement, file system, and what the folder holds.
     const inspected = vault.inspectCopyTarget(ctx.paths.vault, target, targetOptions(ctx));
+    // R19-3: `copy init` is a transaction bound to its target. An intent recorded for THIS target (and a record that
+    // was never sealed) is finished by a retry; another target never inherits it.
+    const intentPath = join(ctx.request.home, INIT_INTENT_NAME);
+    const targetKey = vault.copyTargetKey(target);
+    const intent = vault.readInitIntent(intentPath, id);
+    const bound = intent?.target_sha256 === targetKey ? intent : undefined;
+    const boundRecord = bound && register.copies.find(entry => entry.copy_id === bound.copy_id);
+    const live = bound && !(boundRecord && boundRecord.head !== null) ? bound : undefined;
     let copy: CopyRegisterValue['copies'][number];
     let adoptedFrom: string | null | undefined;
     let registered = false;
     const known = inspected.copyId === undefined ? undefined : register.copies.find(entry => entry.copy_id === inspected.copyId);
+    const resumable = live !== undefined && (live.adopt
+      ? inspected.state === 'copy' && (inspected.copyId ?? null) === live.previous_copy_id
+      : inspected.state === 'empty');
     if (known) {
       // This record's own folder (complete, or an interrupted init): finish it, no new record.
       if (label !== undefined && vault.assertCopyLabel(label) !== known.label) throw new vault.SecondCopyError('COPY_MISMATCH', 'label');
       copy = known;
+      if (live?.copy_id === known.copy_id && live.adopt) adoptedFrom = live.previous_copy_id;
+    } else if (live && resumable) {
+      // The intent's record (registered, or not yet) for this target: finish it with the same id and label.
+      if (label !== undefined && vault.assertCopyLabel(label) !== live.label) throw new vault.SecondCopyError('COPY_MISMATCH', 'label');
+      if (live.adopt) adoptedFrom = live.previous_copy_id;
+      if (boundRecord) {
+        copy = boundRecord;
+      } else {
+        ({ register, copy } = vault.addCopyRecord(register, live.label, new Date(live.created_at), live.copy_id));
+        registered = true;
+      }
     } else if (inspected.state === 'copy') {
       if (!ctx.request.adopt) throw new vault.SecondCopyError('COPY_MISMATCH', 'adopt-required');
       adoptedFrom = inspected.copyId ?? null;
@@ -1099,18 +1125,18 @@ async function copyInitCommand(ctx: Context): Promise<void> {
       // Another record's (or device's) unfinished init: not this device's to finish.
       throw new vault.SecondCopyError('COPY_MISMATCH', 'interrupted-init');
     } else {
-      const unsealed = label === undefined ? undefined : register.copies.find(entry => entry.label === label && entry.head === null);
-      if (unsealed) {
-        // The record exists (its event and register write happened) but its folder was never finished.
-        copy = unsealed;
-      } else {
-        ({ register, copy } = vault.addCopyRecord(register, label, nowOf(ctx)));
-        registered = true;
-      }
+      // A new drive always gets a new record: a label already in the register is refused (INVALID_LABEL).
+      ({ register, copy } = vault.addCopyRecord(register, label, nowOf(ctx)));
+      registered = true;
     }
     stall(ctx.hooks);
     if (registered) {
-      // Events first, register second (R18-2): flag the register, append `copy.registered`, then write it.
+      // The intent first (bound to this target), then events, then the register (R18-2): flag the register,
+      // append `copy.registered`, then write it.
+      vault.writeInitIntent(intentPath, id, {
+        copy_id: copy.copy_id, label: copy.label, created_at: copy.created_at, target_sha256: targetKey,
+        adopt: adoptedFrom !== undefined, previous_copy_id: adoptedFrom ?? null,
+      });
       const keyId = await systemKeyId(ctx, session, id);
       const previous = { ...register, copies: register.copies.filter(entry => entry.copy_id !== copy.copy_id) };
       vault.writeCopyRegister(path, { ...previous, needs_replay: true });
@@ -1118,9 +1144,12 @@ async function copyInitCommand(ctx: Context): Promise<void> {
         vault.copyRegisteredBody(copy, register.cadence, adoptedFrom));
     }
     vault.writeCopyRegister(path, { ...register, needs_replay: false });
+    if (ctx.hooks.failCopyInitAfterRegister) throw Object.assign(new Error('TEST ONLY drive pulled'), { code: 'EIO', syscall: 'open' });
     const result = vault.initSecondCopy(ctx.paths.vault, target, {
       ...targetOptions(ctx), copyId: copy.copy_id, adopt: adoptedFrom !== undefined,
     });
+    // The folder is done: the intent for this record is finished.
+    if (registered || intent?.copy_id === copy.copy_id) vault.clearInitIntent(intentPath);
     fileSystemNotice(ctx, result.fileSystem);
     diskWarning(ctx, result.disk);
     const summary = {
