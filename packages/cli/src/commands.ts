@@ -1389,6 +1389,9 @@ async function verifyCopyCommand(ctx: Context): Promise<void> {
     const id = await vaultId(ctx);
     const state = vault.loadCopyRegister(registerPath(ctx), id);
     if (!state.readable) throw new vault.SecondCopyError('COPY_UNVERIFIABLE', 'register');
+    // R20-3 (38): a register flagged `needs_replay` may be behind the events (a `copy.sealed` whose projection was
+    // never written), so its recorded head is not a seal this command may compare against.
+    if (state.rebuild) throw new vault.SecondCopyError('COPY_UNVERIFIABLE', 'needs-replay');
     let driveId: string | undefined;
     try {
       driveId = vault.readCopyIdentity(target, id);

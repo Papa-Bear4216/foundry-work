@@ -530,6 +530,29 @@ test('verify-copy checks a copy against the printed anchor and the recorded seal
   assert.match((await seal(dir, home, drive)).stdout, /foundry vault verify-copy <folder> --anchor/u);
 });
 
+test('verify-copy without --anchor refuses a register flagged needs_replay (R20-3, 38)', async t => {
+  const dir = scratch(t);
+  const { home } = await initVault(dir);
+  const drive = join(dir, 'drive');
+  assert.equal((await copyInit(dir, home, drive)).code, 0);
+  await addEvent(dir, home);
+  const sealed = JSON.parse((await seal(dir, home, drive, ['--json'])).stdout);
+  assert.equal((await runInline(dir, ['vault', 'verify-copy', drive, '--vault', home])).code, 0);
+  // A copy.sealed committed before its projection was written leaves this flag (the register may be behind).
+  const path = join(home, REGISTER_NAME);
+  const bytes = readFileSync(path, 'utf8');
+  assert.ok(bytes.includes('"needs_replay":false'));
+  writeFileSync(path, bytes.replace('"needs_replay":false', '"needs_replay":true'));
+  const flagged = await runInline(dir, ['vault', 'verify-copy', drive, '--vault', home, '--json']);
+  assert.equal(flagged.code, 2);
+  assert.equal(flagged.stdout, '', 'never ok: true');
+  assert.match(flagged.stderr, /may be behind the vault's events.*\[COPY_UNVERIFIABLE\]\n$/u);
+  // The anchor alone is still a trust input, and a keyed seal rebuilds the register.
+  assert.equal((await runInline(dir, ['vault', 'verify-copy', drive, '--vault', home, '--anchor', sealed.anchor])).code, 0);
+  assert.equal((await seal(dir, home, drive)).code, 0);
+  assert.equal((await runInline(dir, ['vault', 'verify-copy', drive, '--vault', home])).code, 0);
+});
+
 test('verify-copy reads a planted 256 MiB manifest by no more than its size check (keyless ceiling, R19-4, 39)', async t => {
   const dir = scratch(t);
   const { home } = await initVault(dir);
